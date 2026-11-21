@@ -58,26 +58,36 @@
 //! statt `digest: None` einzusetzen und weiterzugehen.
 //!
 //! # Die abgelehnte Andockung
-//! [`dock_security_finding`] dockt einen Befund nur an, wenn er laut
-//! [`harw_dod_escalate::Ladder::stage_for_or_reject`] überhaupt eine
-//! Eskalationsstufe erreicht — ein Befund, der keine Stufe rechtfertigt,
-//! wird nicht als Nachweis angehängt und erzeugt auch keinen
-//! Invalidierungs-Vorschlag. Die Ablehnung ist
-//! [`crate::error::PlanBridgeError::SecurityDocking`], das den bereits
-//! inhaltsfreien [`harw_dod_escalate::EscalateError`] unverändert einbettet
-//! (siehe dessen Moduldoku, Abschnitt „Inhaltsfreie Fehlermeldungen") — diese
-//! Crate fügt selbst keinen zusätzlichen Inhalt hinzu.
+//! [`dock_security_finding`] dockt einen Befund nur an, wenn er überhaupt
+//! eine Eskalationsstufe rechtfertigt: eine ausgelöste Regel
+//! (`FindingKind::RuleTriggered`), von einem Menschen bestätigt
+//! (`Verdict::Confirmed`) — genau die Bedingung, unter der
+//! `harw_dod_ladder::Ladder::stage_for` eine Stufe liefert. Ein Befund, der
+//! keine Stufe rechtfertigt, wird nicht als Nachweis angehängt und erzeugt
+//! auch keinen Invalidierungs-Vorschlag. Die Ablehnung ist
+//! [`crate::error::PlanBridgeError::SecurityDocking`] mit einer festen, nicht
+//! interpolierten Meldung — wörtlich dieselbe wie vor PL-100 WP 3.0; diese
+//! Crate fügt keinen Befundinhalt hinzu.
 //!
-//! # Wer die Kante zieht
-//! `harw-dod-escalate` kennt `harw-plan` und `harw-plan-bridge` nicht — kein
+//! # Wer die Kante zieht (PL-100 WP 3.0, Leitprinzip I8)
+//! `harw-dod-rules` kennt `harw-plan` und `harw-plan-bridge` nicht — kein
 //! Abhängigkeitseintrag, kein `use`. Dieses Modul zieht die Kante in die
-//! einzig zulässige Richtung: `harw-plan-bridge` hängt von
-//! `harw-dod-escalate` und `harw-dod-signals` ab, nie umgekehrt (siehe
-//! `harw-dod-escalate/src/ladder.rs`-Moduldoku, Abschnitt „Andockung für
-//! harw-plan-bridge"). Der Warden-Abhängigkeitspfad
-//! (`harw-dod-escalate` → `harw-dod-warden-proto`/`harw-session-store`) bleibt
-//! davon unberührt: kein Eintrag in `harw-dod-escalate/Cargo.toml` hat sich
-//! geändert.
+//! einzig zulässige Richtung: `harw-plan-bridge` hängt von `harw-dod-rules`
+//! und `harw-dod-signals` ab, nie umgekehrt. Bis WP 3.0 lief die Kante über
+//! `harw-dod-escalate` und zog damit dessen Signier- und Speicherpfad
+//! (`harw-dod-warden-proto`, `harw-session-store`-Freezes) in jeden Prozess,
+//! der dieses Crate linkt — auch in modellnahe wie `harw-runtime`.
+//!
+//! Seit WP 3.0 linkt dieses Crate weder `harw-dod-escalate` noch die
+//! Eskalationsleiter `harw-dod-ladder`: `xtask/arch-policy.toml` verbietet
+//! modellnahen Prozessen beide (`[[forbidden_crates]]`, I8). Die Andockung
+//! braucht von der Leiter nur die Frage „gibt es überhaupt eine Stufe" und
+//! prüft sie deshalb selbst (`justifies_an_escalation_stage`). Damit diese
+//! zweite Formulierung nicht still von der Leiter abweicht, vergleicht
+//! `tests::test_docking_condition_matches_the_ladder_on_every_combination`
+//! sie mit `Ladder::stage_for` über jede Kombination aus Art, Urteil,
+//! Gewicht und Nachweisgrad; `harw-dod-ladder` ist dafür nur
+//! Dev-Abhängigkeit und liegt nie in der ausgelieferten Hülle.
 //!
 //! # Determinismus
 //! Beide öffentlichen Funktionen sind reine Funktionen ihrer Argumente:
@@ -90,7 +100,7 @@
 //! # Fehler
 //! [`crate::error::PlanBridgeError::SecurityDocking`] — siehe oben.
 
-use harw_dod_escalate::{Finding, Ladder, Triaged};
+use harw_dod_rules::{Finding, FindingKind, Triaged, Verdict};
 use harw_dod_signals::SecurityEvidence;
 use harw_plan::admission::ScopeViolation;
 use harw_plan::{EvidenceKind, EvidenceRef, TaskId};
@@ -147,7 +157,7 @@ fn security_finding_locator(finding: &Finding<Triaged>) -> String {
 ///
 /// # Examples
 /// ```rust,no_run
-/// use harw_dod_escalate::{Finding, Triaged};
+/// use harw_dod_rules::{Finding, Triaged};
 /// use harw_dod_signals::SecurityEvidence;
 /// use harw_plan_bridge::security_bridge::evidence_for_security_finding;
 ///
@@ -224,14 +234,33 @@ pub fn propose_invalidation_for_contract_violation(
     }
 }
 
+/// Ob `finding` überhaupt eine Eskalationsstufe rechtfertigt: eine
+/// ausgelöste Regel (`FindingKind::RuleTriggered` statt `Anomaly`), von einem
+/// Menschen bestätigt (`Verdict::Confirmed` statt `FalsePositive` oder
+/// `NeedsReview`).
+///
+/// # Description
+/// Dieselbe Bedingung, unter der `harw_dod_ladder::Ladder::stage_for`
+/// `Some` liefert — ohne die Leiter zu linken (siehe Moduldoku, Abschnitt
+/// „Wer die Kante zieht"). Gewicht und Nachweisgrad entscheiden dort nur
+/// zwischen den beiden Stufen, nicht darüber, ob es eine gibt; diese
+/// Funktion fragt sie deshalb nicht ab. Die Gleichheit mit der Leiter pinnt
+/// `tests::test_docking_condition_matches_the_ladder_on_every_combination`.
+///
+/// # Returns
+/// `true`, wenn der Befund eine Stufe rechtfertigt.
+fn justifies_an_escalation_stage(finding: &Finding<Triaged>) -> bool {
+    finding.kind() == FindingKind::RuleTriggered && *finding.verdict() == Verdict::Confirmed
+}
+
 /// Dockt einen triagierten Sicherheitsbefund vollständig an den Plan an:
 /// Nachweis anhängen, und — falls ein Vertragsverstoß vorliegt — einen
 /// Invalidierungs-Vorschlag anfügen.
 ///
 /// # Description
-/// Lehnt zuerst über [`harw_dod_escalate::Ladder::stage_for_or_reject`] ab,
-/// wenn der Befund keine Eskalationsstufe rechtfertigt — siehe Moduldoku,
-/// Abschnitt „Die abgelehnte Andockung". Danach reine Verdrahtung:
+/// Lehnt zuerst ab, wenn der Befund keine Eskalationsstufe rechtfertigt
+/// (`justifies_an_escalation_stage`) — siehe Moduldoku, Abschnitt „Die
+/// abgelehnte Andockung". Danach reine Verdrahtung:
 /// [`evidence_for_security_finding`] gefolgt, falls `violation` gesetzt ist,
 /// von [`propose_invalidation_for_contract_violation`]. Die zurückgegebene
 /// Schrittfolge enthält an keiner Stelle [`ReconcileStep::Invalidate`].
@@ -264,7 +293,11 @@ pub fn dock_security_finding(
     violation: Option<&ScopeViolation>,
     actor: &str,
 ) -> PlanBridgeResult<Vec<ReconcileStep>> {
-    Ladder::stage_for_or_reject(finding).map_err(PlanBridgeError::from)?;
+    // Ohne Leiter (PL-100 WP 3.0, I8): dieselbe Bedingung wie
+    // `Ladder::stage_for(..).is_some()`, siehe Moduldoku.
+    if !justifies_an_escalation_stage(finding) {
+        return Err(PlanBridgeError::SecurityDocking);
+    }
 
     let evidence = evidence_for_security_finding(finding, security_evidence, actor);
     let mut steps = vec![ReconcileStep::AttachEvidence {
@@ -286,7 +319,7 @@ mod tests {
     use harw_authority::NetworkScope;
     use harw_dod_rules::rule::{Rule, RuleContext};
     use harw_dod_rules::rules::EgressFlowRule;
-    use harw_dod_rules::{Verdict, run_rules, triaged_finding_for_test};
+    use harw_dod_rules::{run_rules, triaged_finding_for_test};
     use harw_dod_signals::{EventKind, Hardness, SecurityEvent, Severity};
     use harw_plan::admission::PathRule;
     use harw_plan::{PlanNodeStatus, PlanStore};
@@ -301,12 +334,14 @@ mod tests {
     }
 
     /// Wie [`triaged_finding`], aber mit injizierbarem `observed_at`
-    /// (`RuleContext::now` — siehe `EgressFlowRule::evaluate`, das den Befund
-    /// exakt darauf datiert). Gebraucht von den Rand-Tests der
+    /// (die Zeit des auslösenden `SecurityEvent` — `EgressFlowRule::evaluate`
+    /// datiert den Befund seit PL-100 WP0.2 exakt darauf, nicht auf
+    /// `RuleContext::now`). Gebraucht von den Rand-Tests der
     /// `offset_from_timestamp`-Umrechnung: `Finding`s Felder sind read-only
     /// (F-023, `harw-dod-rules::finding`-Moduldoku), es gibt also keinen
-    /// nachträglichen Setter — nur der Weg über `RuleContext` erreicht einen
-    /// beliebigen `observed_at`-Wert.
+    /// nachträglichen Setter — nur der Weg über das ausgewertete Ereignis
+    /// erreicht einen beliebigen `observed_at`-Wert. `RuleContext::now` wird
+    /// zur Konsistenz auf denselben Wert gesetzt.
     ///
     /// `severity`/`hardness` bleiben Parameter (statt sie aus dem
     /// `EgressFlowRule`-Ergebnis zu übernehmen), damit jeder Aufrufer explizit
@@ -322,7 +357,7 @@ mod tests {
         let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
         let events = vec![SecurityEvent {
             sensor: SensorId::from_str("net-0"),
-            observed_at: jiff::Timestamp::UNIX_EPOCH,
+            observed_at,
             actor: None,
             kind: EventKind::EgressFlow {
                 destination: "evil.example.com".to_owned(),
@@ -335,6 +370,8 @@ mod tests {
             events: &events,
             baselines: &[],
             network_scope: &scope,
+            listener_history: None,
+            rule_config: None,
         };
         // `run_rules` wertet seit der Engine-Überarbeitung intern immer
         // `ALL_RULES` aus (kein `&[&dyn Rule]`-Parameter mehr) und liefert
@@ -557,10 +594,246 @@ mod tests {
                 "ein nicht bestaetigter Befund dockt nicht an".to_string(),
             ));
         };
-        assert!(matches!(error, PlanBridgeError::SecurityDocking(_)));
+        assert!(matches!(error, PlanBridgeError::SecurityDocking));
         let text = error.to_string();
+        // Die Meldung ist durch PL-100 WP 3.0 (Andockung ohne
+        // `harw-dod-escalate` und ohne `harw-dod-ladder`) unverändert.
+        assert_eq!(
+            text,
+            "Sicherheitsbefund qualifiziert sich nicht für eine Eskalationsstufe: \
+             finding is not eligible for any escalation stage"
+        );
         assert!(!text.chars().any(|c| c.is_ascii_digit()));
         assert!(!text.contains("t-1"));
         Ok(())
+    }
+
+    // -- Andockbedingung = Stufenregel der Leiter (I8) ----------------------
+
+    // Exhaustive Indizes der vier Eingabe-Enums des Paritätstests. Eine neue
+    // Variante bricht hier den Build (kein Platzhalter-Arm, keines der Enums
+    // ist `#[non_exhaustive]`); fehlt sie danach in einer der Wertelisten des
+    // Tests, schlägt dessen Vollständigkeitsprüfung fehl.
+    const KIND_COUNT: usize = 2;
+    const VERDICT_COUNT: usize = 3;
+    const SEVERITY_COUNT: usize = 5;
+    const HARDNESS_COUNT: usize = 3;
+
+    // Index einer `FindingKind`-Variante, `0..KIND_COUNT`.
+    fn kind_index(kind: FindingKind) -> usize {
+        match kind {
+            FindingKind::RuleTriggered => 0,
+            FindingKind::Anomaly => 1,
+        }
+    }
+
+    // Index einer `Verdict`-Variante, `0..VERDICT_COUNT`.
+    fn verdict_index(verdict: Verdict) -> usize {
+        match verdict {
+            Verdict::Confirmed => 0,
+            Verdict::FalsePositive => 1,
+            Verdict::NeedsReview => 2,
+        }
+    }
+
+    // Index einer `Severity`-Variante, `0..SEVERITY_COUNT`.
+    fn severity_index(severity: Severity) -> usize {
+        match severity {
+            Severity::Info => 0,
+            Severity::Low => 1,
+            Severity::Medium => 2,
+            Severity::High => 3,
+            Severity::Critical => 4,
+        }
+    }
+
+    // Index einer `Hardness`-Variante, `0..HARDNESS_COUNT`.
+    fn hardness_index(hardness: Hardness) -> usize {
+        match hardness {
+            Hardness::Observed => 0,
+            Hardness::Correlated => 1,
+            Hardness::Inferred => 2,
+        }
+    }
+
+    // Alle Indizes `0..count` als Menge, zum Vergleich mit den gesehenen.
+    fn all_indices(count: usize) -> std::collections::BTreeSet<usize> {
+        (0..count).collect()
+    }
+
+    /// PL-100 WP 3.0 (I8): `justifies_an_escalation_stage` ist genau die
+    /// Bedingung, unter der `Ladder::stage_for` eine Stufe liefert — für jede
+    /// Kombination aus Art, Urteil, Gewicht und Nachweisgrad. Die Leiter ist
+    /// hier nur Dev-Abhängigkeit; ändert sich ihre Regel, schlägt dieser Test
+    /// fehl, statt dass Andockung und Leiter still auseinanderlaufen. Dass die
+    /// Wertelisten wirklich jede Variante enthalten, erzwingen die
+    /// exhaustiven `*_index`-Funktionen oben: der Test vergleicht die
+    /// gesehenen Indizes mit `0..*_COUNT`.
+    #[test]
+    fn test_docking_condition_matches_the_ladder_on_every_combination() -> TestResult {
+        let id = FindingId::try_from_str("plan-bridge-ladder-parity").map_err(ctx("finding id"))?;
+        let mut checked = 0usize;
+        let mut docked = 0usize;
+        let mut kinds = std::collections::BTreeSet::new();
+        let mut verdicts = std::collections::BTreeSet::new();
+        let mut severities = std::collections::BTreeSet::new();
+        let mut hardnesses = std::collections::BTreeSet::new();
+        for kind in [FindingKind::RuleTriggered, FindingKind::Anomaly] {
+            for verdict in [
+                Verdict::Confirmed,
+                Verdict::FalsePositive,
+                Verdict::NeedsReview,
+            ] {
+                for severity in [
+                    Severity::Info,
+                    Severity::Low,
+                    Severity::Medium,
+                    Severity::High,
+                    Severity::Critical,
+                ] {
+                    for hardness in [Hardness::Observed, Hardness::Correlated, Hardness::Inferred] {
+                        let finding = triaged_finding_for_test(
+                            "egress-flow",
+                            kind,
+                            severity,
+                            hardness,
+                            "ladder parity fixture",
+                            jiff::Timestamp::UNIX_EPOCH,
+                            id.clone(),
+                            verdict,
+                        );
+                        kinds.insert(kind_index(kind));
+                        verdicts.insert(verdict_index(verdict));
+                        severities.insert(severity_index(severity));
+                        hardnesses.insert(hardness_index(hardness));
+                        let docks = justifies_an_escalation_stage(&finding);
+                        assert_eq!(
+                            docks,
+                            harw_dod_ladder::Ladder::stage_for(&finding).is_some(),
+                            "{kind:?} / {verdict:?} / {severity:?} / {hardness:?}"
+                        );
+                        if docks {
+                            docked = docked.saturating_add(1);
+                        }
+                        checked = checked.saturating_add(1);
+                    }
+                }
+            }
+        }
+        assert_eq!(kinds, all_indices(KIND_COUNT), "jede FindingKind-Variante");
+        assert_eq!(
+            verdicts,
+            all_indices(VERDICT_COUNT),
+            "jede Verdict-Variante"
+        );
+        assert_eq!(
+            severities,
+            all_indices(SEVERITY_COUNT),
+            "jede Severity-Variante"
+        );
+        assert_eq!(
+            hardnesses,
+            all_indices(HARDNESS_COUNT),
+            "jede Hardness-Variante"
+        );
+        // 2 Arten x 3 Urteile x 5 Gewichte x 3 Nachweisgrade = 90; angedockt
+        // wird nur RuleTriggered + Confirmed (5 x 3 = 15).
+        let combinations = KIND_COUNT
+            .saturating_mul(VERDICT_COUNT)
+            .saturating_mul(SEVERITY_COUNT)
+            .saturating_mul(HARDNESS_COUNT);
+        assert_eq!(checked, combinations);
+        assert_eq!(docked, SEVERITY_COUNT.saturating_mul(HARDNESS_COUNT));
+        Ok(())
+    }
+
+    // -- Abhängigkeiten: keine Eskalations- oder Signierkante (I8) -----------
+
+    /// Ob eine Nicht-Kommentarzeile von `manifest` den Paketnamen
+    /// `forbidden` nennt (auch in Unterstrich-Schreibweise). Bewusst grob:
+    /// jede Schreibweise einer Abhängigkeit (Schlüssel, Tabellenform
+    /// `[dependencies.<name>]`, gequoteter Schlüssel, `[target.'…']`-Tabelle,
+    /// `package = …` mit beliebigen Leerzeichen und Anführungszeichen) trägt
+    /// den Namen wörtlich in einer solchen Zeile. Ein Fehlalarm (etwa ein
+    /// Name in einem Zeilenend-Kommentar) ist billiger als ein Durchschlupf.
+    fn manifest_mentions(manifest: &str, forbidden: &str) -> bool {
+        let underscored = forbidden.replace('-', "_");
+        manifest
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with('#'))
+            .any(|line| line.contains(forbidden) || line.contains(underscored.as_str()))
+    }
+
+    /// Der Detektor `manifest_mentions` erkennt jede Schreibweise einer
+    /// Abhängigkeit und überspringt reine Kommentarzeilen.
+    #[test]
+    fn test_manifest_mentions_detects_every_dependency_spelling() {
+        let name = "harw-dod-escalate";
+        for spelling in [
+            "harw-dod-escalate = { path = \"../x\" }",
+            "[dependencies.harw-dod-escalate]",
+            "\"harw-dod-escalate\" = { path = \"../x\" }",
+            "[target.'cfg(unix)'.dependencies.harw-dod-escalate]",
+            "[target.'cfg(unix)'.build-dependencies]\nladder = { package = \"harw-dod-escalate\" }",
+            "ladder = { package='harw-dod-escalate', path = \"../x\" }",
+            "ladder = {package=\"harw-dod-escalate\"}",
+            "    harw_dod_escalate = { path = \"../x\" }",
+        ] {
+            let manifest = format!("[package]\nname = \"x\"\n\n[dependencies]\n{spelling}\n");
+            assert!(manifest_mentions(&manifest, name), "{spelling}");
+        }
+        assert!(!manifest_mentions(
+            "# nie harw-dod-escalate\n  # auch nicht harw_dod_escalate\n",
+            name
+        ));
+    }
+
+    /// PL-100 WP 3.0 (Leitprinzip I8): dieses Crate nennt weder
+    /// `harw-dod-escalate` noch den Signierteil `harw-dod-warden-proto` noch
+    /// den künftigen `harw-escalator` in einer Zeile seines Manifests außer
+    /// Kommentaren — weder als Schlüssel noch umbenannt (`package = …`), in
+    /// Tabellenform, unter `[target.'…']` oder als Dev-Abhängigkeit. Die
+    /// transitive Hülle prüft das xtask-Gate `arch` (`[[forbidden_crates]]`).
+    #[test]
+    fn test_manifest_names_no_escalation_or_signing_crate() {
+        let manifest = include_str!("../Cargo.toml");
+        for forbidden in [
+            "harw-dod-escalate",
+            "harw-dod-warden-proto",
+            "harw-escalator",
+        ] {
+            assert!(
+                !manifest_mentions(manifest, forbidden),
+                "Cargo.toml nennt {forbidden}"
+            );
+        }
+    }
+
+    /// PL-100 WP 3.0 (Leitprinzip I8): `harw-dod-ladder` steht im Manifest
+    /// genau einmal, und zwar unter `[dev-dependencies]` — für
+    /// `test_docking_condition_matches_the_ladder_on_every_combination`, nie
+    /// in einer ausgelieferten Tabelle (`[dependencies]`,
+    /// `[build-dependencies]`, `[target.'…']`, Tabellenform). Die transitive
+    /// Hülle prüft das xtask-Gate `arch` (`[[forbidden_crates]]`).
+    #[test]
+    fn test_manifest_names_the_ladder_only_as_a_dev_dependency() {
+        let manifest = include_str!("../Cargo.toml");
+        let mut section = "";
+        let mut mentions = 0usize;
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('[') {
+                section = line;
+            }
+            if !manifest_mentions(line, "harw-dod-ladder") {
+                continue;
+            }
+            assert_eq!(
+                section, "[dev-dependencies]",
+                "harw-dod-ladder außerhalb von [dev-dependencies]: {line}"
+            );
+            mentions = mentions.saturating_add(1);
+        }
+        assert_eq!(mentions, 1, "harw-dod-ladder genau einmal im Manifest");
     }
 }

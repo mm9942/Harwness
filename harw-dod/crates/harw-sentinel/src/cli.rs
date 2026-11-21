@@ -7,9 +7,20 @@
 //! eingebetteten Dateisystem-Sensoren (`--proc-root`, `--thermal-root`,
 //! `--workspace-root`, `--blockio-root`, `--gpu-root`, `--cgroup-root`), den
 //! Pfad des IPC-Empfangssockets, die Poll-Taktung, den expliziten
-//! Konfigurationspfad (`--config`) und die beiden optionalen Exporte
-//! (`--findings-export`, `--health-export`). Diese Datei parst
+//! Konfigurationspfad (`--config`), die beiden optionalen Exporte
+//! (`--findings-export`, `--health-export`), die Sonden-Konten der
+//! `SO_PEERCRED`-Zulassung (`--probe-peer-user`, PL-100 WP0.5), den
+//! Container-Schalter (`--container-sensor`, PL-100 WP1.8) und den
+//! Diagnosemodus `--print-sandbox` (PL-100 WP0.7). Diese Datei parst
 //! nur — sie kennt weder `Sentinel` noch einen Sensor.
+//!
+//! # Kein Arbeitsverzeichnis als Lesewurzel (PL-100 WP0.7)
+//! `--workspace-root` hat **keine** Vorgabe mehr: früher stand sie auf `.`,
+//! und weil die Unit kein `WorkingDirectory=` setzte, lag das
+//! Arbeitsverzeichnis von systemd (`/`) als Leseregel in der
+//! Landlock-Sandbox — die Lese-Sandbox umfasste damit das ganze
+//! Dateisystem. Der Workspace-Sensor läuft jetzt nur, wenn
+//! `--workspace-root` ausdrücklich und absolut angegeben ist.
 //!
 //! # Nebenläufigkeit
 //! Reine Werttypen, `Send + Sync`.
@@ -165,9 +176,12 @@ pub struct Cli {
     pub thermal_root: PathBuf,
 
     /// Wurzel des Cargo-Workspace, den
-    /// [`harw_dod_workspace::WorkspaceDriftSensor`] beobachtet.
-    #[arg(long, value_name = "DIR", default_value = ".")]
-    pub workspace_root: PathBuf,
+    /// [`harw_dod_workspace::WorkspaceDriftSensor`] beobachtet. Muss absolut
+    /// sein. Ohne Angabe läuft kein Workspace-Sensor und keine
+    /// Workspace-Leseregel entsteht (PL-100 WP0.7: nie das
+    /// Arbeitsverzeichnis).
+    #[arg(long, value_name = "DIR", value_parser = parse_absolute_path)]
+    pub workspace_root: Option<PathBuf>,
 
     /// Wurzel des `/sys/block`-Lesebereichs für
     /// [`harw_dod_blockio::BlockioSensor`]. Nur zum Testen gegen ein
@@ -234,9 +248,165 @@ pub struct Cli {
     /// `sentinel_export` (`harw-retention`).
     #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
     pub findings_export_keep: u32,
+
+    /// Abklingzeit des Befund-Throttles in Sekunden (PL-100 WP0.4): ein
+    /// Befund mit demselben `dedup_key` (Regel, uid, Cgroup, grobes Subjekt)
+    /// wird innerhalb dieser Zeit nur gezählt, nicht erneut gemeldet — außer
+    /// bei stärkerer Härte oder höherer Schwere. `0` meldet jede
+    /// Wiederholung, höchstens 604800 (7 Tage). Ohne Angabe gilt
+    /// `[sentinel] finding_cooldown_secs` der DoD-Konfiguration, sonst die
+    /// Vorgabe 600 (10 min; `crate::throttle::DEFAULT_COOLDOWN_SECS`) — das
+    /// Flag gewinnt immer. Siehe `crate::throttle`.
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = clap::value_parser!(u64).range(0..=crate::throttle::MAX_COOLDOWN_SECS)
+    )]
+    pub finding_cooldown_secs: Option<u64>,
+
+    /// Konto, dessen Prozesse Ereignisse über den IPC-Socket einreichen
+    /// dürfen (`SO_PEERCRED`, PL-100 WP0.5): ein Kontoname (aufgelöst beim
+    /// Start über `/etc/passwd`) oder eine numerische uid. Mehrfach
+    /// angebbar; eine Angabe ersetzt die Konfiguration und die Vorgabe
+    /// vollständig. uid `0` ist immer zugelassen. Ohne Angabe gilt
+    /// `[sentinel] probe_peer_users` der DoD-Konfiguration, sonst die
+    /// Sonden-Konten aus `deploy/sysusers.d/harw.conf`
+    /// (`crate::peer_allow::DEFAULT_PROBE_PEER_USERS`).
+    #[arg(
+        long = "probe-peer-user",
+        value_name = "USER|UID",
+        value_parser = parse_peer_user
+    )]
+    pub probe_peer_users: Option<Vec<String>>,
+
+    /// Schalter des Container-Sensors (PL-100 WP1.8): `auto` registriert je
+    /// bekannter Anordnung (`libpod-*.scope` unter `machine.slice`,
+    /// `docker-*.scope` unter `system.slice`) einen Sensor, auch ohne
+    /// erkannte Laufzeit (ein fehlendes Verzeichnis ist auf cgroup v2 eine
+    /// leere Messung), `on` ebenso, meldet aber das fehlende Verzeichnis einer
+    /// beim Start nicht erkannten Laufzeit als beeinträchtigt, `off` keinen.
+    /// Ohne cgroup v2 melden sich die Sensoren als beeinträchtigt. Ohne Angabe
+    /// gilt `[sentinel] container_sensor` der DoD-Konfiguration, sonst `auto`
+    /// — das Flag gewinnt immer. Siehe `crate::container_plan`.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub container_sensor: Option<ContainerSensorArg>,
+
+    /// Lokaler Checkout von `rustsec/advisory-db` für den Offline-Sensor
+    /// [`harw_dod_advisory::AdvisorySensor`] (PL-100 WP1.8, O11-Quelle
+    /// „Advisory"). Muss absolut sein und verlangt mindestens ein
+    /// `--advisory-lockfile`. Ohne Angabe läuft kein Advisory-Sensor und
+    /// keine zusätzliche Leseregel entsteht. Den Checkout aktuell zu halten
+    /// (eigene Kennung, eigener Timer) ist Aufgabe des Betriebs: der Sentinel
+    /// hat kein Netz und meldet einen veralteten Checkout als
+    /// `SensorDegraded`.
+    #[arg(
+        long,
+        value_name = "DIR",
+        value_parser = parse_absolute_path,
+        requires = "advisory_lockfiles"
+    )]
+    pub advisory_db: Option<PathBuf>,
+
+    /// Eine `Cargo.lock`, die der Advisory-Sensor gegen `--advisory-db`
+    /// prüft. Absolut, mehrfach angebbar, höchstens
+    /// [`MAX_ADVISORY_LOCKFILES`] (siehe [`Cli::validate`]); verlangt
+    /// `--advisory-db`. Jede Datei wird eine eigene, nur lesbare
+    /// Landlock-Regel (nie ihr Verzeichnis).
+    #[arg(
+        long = "advisory-lockfile",
+        value_name = "PATH",
+        value_parser = parse_absolute_path,
+        requires = "advisory_db"
+    )]
+    pub advisory_lockfiles: Vec<PathBuf>,
+
+    /// Gibt die wirksamen Landlock-Lese-/Schreibwurzeln, die abgewiesenen
+    /// Wurzeln und die zugelassenen IPC-Peer-uids auf stdout aus und beendet
+    /// sich, ohne Socket, Sink oder Landlock anzufassen (Host-Verifikation,
+    /// PL-100 WP0.7). Wertet dieselben Flags aus wie der normale Start.
+    #[arg(long, default_value_t = false)]
+    pub print_sandbox: bool,
 }
 
+/// Werte von `--container-sensor` (dieselben wie `[sentinel]
+/// container_sensor`, [`harw_dod_config::ContainerSensorMode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum ContainerSensorArg {
+    /// Je bekannter Anordnung ein Sensor; fehlendes Verzeichnis leer.
+    Auto,
+    /// Je bekannter Anordnung ein Sensor; fehlendes Verzeichnis einer nicht
+    /// erkannten Laufzeit beeinträchtigt.
+    On,
+    /// Kein Container-Sensor.
+    Off,
+}
+
+impl From<ContainerSensorArg> for harw_dod_config::ContainerSensorMode {
+    fn from(arg: ContainerSensorArg) -> Self {
+        match arg {
+            ContainerSensorArg::Auto => Self::Auto,
+            ContainerSensorArg::On => Self::On,
+            ContainerSensorArg::Off => Self::Off,
+        }
+    }
+}
+
+/// Höchstzahl der `--advisory-lockfile`-Angaben.
+///
+/// Jede Lockfile ist eine eigene Landlock-Regel und wird je Prüfung bis zu
+/// 1 MiB gelesen; die Grenze hält Regelsatz und Prüfaufwand endlich.
+pub const MAX_ADVISORY_LOCKFILES: usize = 64;
+
 impl Cli {
+    /// Prüft Grenzen, die `clap` je Angabe nicht ausdrücken kann.
+    ///
+    /// # Description
+    /// Heute nur [`MAX_ADVISORY_LOCKFILES`]. `main` ruft das direkt nach dem
+    /// Parsen auf; ein Verstoß endet wie ein Parse-Fehler.
+    ///
+    /// # Errors
+    /// Ein `clap::Error` (`TooManyValues`) bei mehr als
+    /// [`MAX_ADVISORY_LOCKFILES`] Lockfiles.
+    pub fn validate(self) -> Result<Self, clap::Error> {
+        if self.advisory_lockfiles.len() > MAX_ADVISORY_LOCKFILES {
+            return Err(<Self as clap::CommandFactory>::command().error(
+                clap::error::ErrorKind::TooManyValues,
+                format!(
+                    "--advisory-lockfile is given {} times, at most {MAX_ADVISORY_LOCKFILES} are allowed",
+                    self.advisory_lockfiles.len()
+                ),
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Die Konfiguration des Advisory-Sensors (PL-100 WP1.8).
+    ///
+    /// # Returns
+    /// `Some` mit `--advisory-db`, den `--advisory-lockfile`-Angaben (ohne
+    /// Duplikate, Reihenfolge erhalten) und
+    /// [`harw_dod_advisory::DEFAULT_MAX_ADVISORIES`]; `None` ohne
+    /// `--advisory-db` oder ohne Lockfile (kein Sensor).
+    #[must_use]
+    pub fn advisory_config(&self) -> Option<harw_dod_advisory::AdvisoryConfig> {
+        let db_path = self.advisory_db.clone()?;
+        let mut lockfiles: Vec<PathBuf> = Vec::new();
+        for lockfile in &self.advisory_lockfiles {
+            if !lockfiles.contains(lockfile) {
+                lockfiles.push(lockfile.clone());
+            }
+        }
+        if lockfiles.is_empty() {
+            return None;
+        }
+        Some(harw_dod_advisory::AdvisoryConfig {
+            lockfiles,
+            db_path,
+            max_advisories: harw_dod_advisory::DEFAULT_MAX_ADVISORIES,
+        })
+    }
+
     /// The effective health export path.
     ///
     /// # Returns
@@ -253,8 +423,8 @@ impl Cli {
     }
 }
 
-/// `clap`-Wertparser für `--findings-export`/`--health-export`: nur
-/// absolute Pfade.
+/// `clap`-Wertparser für `--findings-export`/`--health-export`/
+/// `--workspace-root`: nur absolute Pfade.
 fn parse_absolute_path(raw: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(raw);
     if path.is_absolute() {
@@ -262,6 +432,32 @@ fn parse_absolute_path(raw: &str) -> Result<PathBuf, String> {
     } else {
         Err(format!("'{raw}' is not an absolute path"))
     }
+}
+
+/// Höchstlänge eines `--probe-peer-user`-Eintrags in Bytes.
+const MAX_PEER_USER_LEN: usize = 256;
+
+/// `clap`-Wertparser für `--probe-peer-user`: nicht leer, höchstens
+/// [`MAX_PEER_USER_LEN`] Bytes, kein `:` (Feldtrenner von `passwd(5)`),
+/// kein Leer- oder Steuerzeichen.
+fn parse_peer_user(raw: &str) -> Result<String, String> {
+    if raw.is_empty() {
+        return Err("probe peer user must not be empty".to_owned());
+    }
+    if raw.len() > MAX_PEER_USER_LEN {
+        return Err(format!(
+            "probe peer user is longer than {MAX_PEER_USER_LEN} bytes"
+        ));
+    }
+    if raw
+        .chars()
+        .any(|c| c == ':' || c.is_whitespace() || c.is_control())
+    {
+        return Err(
+            "probe peer user must not contain ':', whitespace or control characters".to_owned(),
+        );
+    }
+    Ok(raw.to_owned())
 }
 
 /// `clap`-Wertparser für `--findings-host`: nicht leer, keine Steuerzeichen.
@@ -317,10 +513,199 @@ mod tests {
         );
     }
 
+    /// Ohne Flag bleibt der Wert offen: `main` nimmt dann die
+    /// DoD-Konfiguration oder die Vorgabe (CLI gewinnt, PL-100).
     #[test]
-    fn test_workspace_root_defaults_to_current_directory_marker() -> TestResult {
+    fn test_finding_cooldown_is_unset_without_the_flag_and_bounded() -> TestResult {
         let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
-        assert_eq!(cli.workspace_root, std::path::PathBuf::from("."));
+        assert_eq!(cli.finding_cooldown_secs, None);
+        let zero = Cli::try_parse_from(["harw-sentinel", "--finding-cooldown-secs", "0"])
+            .map_err(ctx("zero cooldown"))?;
+        assert_eq!(zero.finding_cooldown_secs, Some(0));
+        let most = Cli::try_parse_from(["harw-sentinel", "--finding-cooldown-secs", "604800"])
+            .map_err(ctx("seven days"))?;
+        assert_eq!(most.finding_cooldown_secs, Some(604_800));
+        assert!(
+            Cli::try_parse_from(["harw-sentinel", "--finding-cooldown-secs", "604801"]).is_err(),
+            "more than seven days is rejected"
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP1.8: ohne Flag bleibt der Container-Schalter offen (dann
+    /// Konfiguration bzw. `auto`); jeder der drei Werte wird angenommen.
+    #[test]
+    fn test_container_sensor_is_unset_without_the_flag_and_takes_three_values() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert_eq!(cli.container_sensor, None);
+        for (raw, mode) in [
+            ("auto", harw_dod_config::ContainerSensorMode::Auto),
+            ("on", harw_dod_config::ContainerSensorMode::On),
+            ("off", harw_dod_config::ContainerSensorMode::Off),
+        ] {
+            let cli = Cli::try_parse_from(["harw-sentinel", "--container-sensor", raw])
+                .map_err(ctx("container mode"))?;
+            let arg = cli
+                .container_sensor
+                .ok_or(TestError::Missing("container mode"))?;
+            assert_eq!(harw_dod_config::ContainerSensorMode::from(arg), mode);
+        }
+        assert!(Cli::try_parse_from(["harw-sentinel", "--container-sensor", "yes"]).is_err());
+        Ok(())
+    }
+
+    /// PR #168 review (`harw-dod-advisory/src/lib.rs:5`): the advisory
+    /// sensor is opt-in, needs both flags, only absolute paths, and at most
+    /// `MAX_ADVISORY_LOCKFILES` lockfiles.
+    #[test]
+    fn test_advisory_flags_are_opt_in_paired_absolute_and_bounded() -> TestResult {
+        let none = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no advisory flags"))?;
+        assert_eq!(none.advisory_config(), None);
+
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--advisory-db",
+            "/var/lib/harw-dod/advisory-db",
+            "--advisory-lockfile",
+            "/srv/a/Cargo.lock",
+            "--advisory-lockfile",
+            "/srv/b/Cargo.lock",
+            "--advisory-lockfile",
+            "/srv/a/Cargo.lock",
+        ])
+        .and_then(Cli::validate)
+        .map_err(ctx("valid advisory flags"))?;
+        let config = cli
+            .advisory_config()
+            .ok_or(TestError::Missing("advisory config"))?;
+        assert_eq!(
+            config.db_path,
+            std::path::PathBuf::from("/var/lib/harw-dod/advisory-db")
+        );
+        assert_eq!(
+            config.lockfiles,
+            [
+                std::path::PathBuf::from("/srv/a/Cargo.lock"),
+                std::path::PathBuf::from("/srv/b/Cargo.lock"),
+            ],
+            "duplicates collapse, order is kept"
+        );
+        assert_eq!(
+            config.max_advisories,
+            harw_dod_advisory::DEFAULT_MAX_ADVISORIES
+        );
+
+        for args in [
+            &["harw-sentinel", "--advisory-db", "/var/lib/db"][..],
+            &["harw-sentinel", "--advisory-lockfile", "/srv/a/Cargo.lock"][..],
+            &[
+                "harw-sentinel",
+                "--advisory-db",
+                "db",
+                "--advisory-lockfile",
+                "/srv/a/Cargo.lock",
+            ][..],
+            &[
+                "harw-sentinel",
+                "--advisory-db",
+                "/var/lib/db",
+                "--advisory-lockfile",
+                "Cargo.lock",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "{args:?} must not parse"
+            );
+        }
+
+        let mut too_many = vec![
+            "harw-sentinel".to_owned(),
+            "--advisory-db".to_owned(),
+            "/var/lib/db".to_owned(),
+        ];
+        for index in 0..=super::MAX_ADVISORY_LOCKFILES {
+            too_many.push("--advisory-lockfile".to_owned());
+            too_many.push(format!("/srv/p{index}/Cargo.lock"));
+        }
+        let error = Cli::try_parse_from(&too_many)
+            .and_then(Cli::validate)
+            .err()
+            .ok_or(TestError::Missing("bound violation"))?;
+        assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
+        Ok(())
+    }
+
+    /// PL-100 WP0.7: ohne Flag gibt es keine Workspace-Wurzel — nie das
+    /// Arbeitsverzeichnis.
+    #[test]
+    fn test_workspace_root_has_no_default() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert_eq!(cli.workspace_root, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_workspace_root_accepts_an_absolute_path_only() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel", "--workspace-root", "/srv/harw/ws"])
+            .map_err(ctx("absolute workspace root"))?;
+        assert_eq!(
+            cli.workspace_root,
+            Some(std::path::PathBuf::from("/srv/harw/ws"))
+        );
+        for relative in [".", "ws", "./ws", ""] {
+            assert!(
+                Cli::try_parse_from(["harw-sentinel", "--workspace-root", relative]).is_err(),
+                "{relative:?} must not parse as a workspace root"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ohne Flag bleibt die Liste offen (Konfiguration oder Vorgabe, siehe
+    /// `main`); die Vorgabe selbst prüft `main`.
+    #[test]
+    fn test_probe_peer_users_are_unset_without_the_flag() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert_eq!(cli.probe_peer_users, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_explicit_probe_peer_users_replace_the_default() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--probe-peer-user",
+            "harw-probe-netlink",
+            "--probe-peer-user",
+            "991",
+        ])
+        .map_err(ctx("explicit peer users"))?;
+        assert_eq!(
+            cli.probe_peer_users,
+            Some(vec!["harw-probe-netlink".to_owned(), "991".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_probe_peer_user_rejects_empty_separator_and_control_characters() {
+        let too_long = "a".repeat(257);
+        for bad in ["", "a:b", "two words", "evil\n", too_long.as_str()] {
+            assert!(
+                Cli::try_parse_from(["harw-sentinel", "--probe-peer-user", bad]).is_err(),
+                "{bad:?} must not parse as a probe peer user"
+            );
+        }
+    }
+
+    #[test]
+    fn test_print_sandbox_is_off_by_default_and_parses() -> TestResult {
+        let cli = Cli::try_parse_from(["harw-sentinel"]).map_err(ctx("no required args"))?;
+        assert!(!cli.print_sandbox);
+        let cli = Cli::try_parse_from(["harw-sentinel", "--print-sandbox"])
+            .map_err(ctx("--print-sandbox"))?;
+        assert!(cli.print_sandbox);
         Ok(())
     }
 

@@ -44,6 +44,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(unix)]
+pub mod chatgpt_plan;
 mod codex_refresh;
 mod error;
 mod flow;

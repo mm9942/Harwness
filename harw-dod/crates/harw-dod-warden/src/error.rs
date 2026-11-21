@@ -2,24 +2,41 @@
 //! Crate).
 //!
 //! # Verantwortungsbereich
-//! [`WardenError`] deckt genau die Fehlerpfade ab, die **nach** einer
-//! erfolgreichen Beleg-Nachprüfung entstehen können — also innerhalb der
-//! Ausführungs-Traits (`executor.rs`), wenn eine an sich autorisierte und
-//! zulässige Aktion an der eigentlichen Systemoperation scheitert (z. B. ein
-//! Dateisystemzugriff auf `/sys/fs/cgroup/...`). Die Nachprüfung selbst
-//! (Bindung, Zulässigkeit) liefert ihre eigenen Fehler bereits fertig als
-//! [`harw_dod_warden_proto::WardenProtoError`] bzw. dessen inhaltsfreie
-//! Ablehnungskategorie [`harw_dod_warden_proto::Denial`] — dieser Typ
-//! dupliziert das nicht.
+//! [`WardenError`] deckt drei Gruppen von Fehlerpfaden ab:
+//!
+//! 1. **Ausführung** (`executor.rs`, `observe.rs`): eine an sich autorisierte
+//!    Aktion scheitert an der eigentlichen Systemoperation (z. B. ein
+//!    Dateisystemzugriff auf `/sys/fs/cgroup/...`) oder das Ziel lässt sich
+//!    nicht beobachten.
+//! 2. **Start** (`config.rs`, `keys.rs`, `trust.rs`): die Warden-eigene
+//!    Policy `/etc/harw-dod/warden.toml` oder ein Schlüssel aus
+//!    `proof_key_dir` ist syntaktisch falsch, unvollständig oder liegt nicht
+//!    root-eigen und schreibgeschützt vor (PL-100 WP 3.1).
+//! 3. **Zustand** (`nonce_ledger.rs`, `action_ledger.rs`, `holds.rs`,
+//!    `containment.rs`, `state.rs`): der persistente Zustand im
+//!    StateDirectory ist beschädigt, voll oder nicht schreibbar — der Warden
+//!    arbeitet dann fail closed. Das Indexverzeichnis der Eindämmungsmarker
+//!    (`containment.rs`) meldet sich als [`WardenError::UntrustedFile`] bzw.
+//!    [`WardenError::Io`]; dort gilt „Eindämmung geht vor“.
+//!
+//! Die Nachprüfung einer Autorisierung selbst liefert ihre eigenen Fehler
+//! bereits fertig als [`harw_dod_warden_proto::ProofError`] bzw. dessen
+//! inhaltsfreie Ablehnungskategorie [`harw_dod_warden_proto::Denial`] —
+//! dieser Typ dupliziert das nicht; [`WardenError::Proof`] trägt einen
+//! `ProofError` nur dort, wo er beim **Aufbau** (Key-ID, Schlüssel, Policy)
+//! entsteht.
+//!
+//! # Inhaltsfreie Meldungen
+//! Keine Meldung interpoliert einen Pfad, einen Schlüssel, eine Kennung oder
+//! Bytes aus einer Datei: die Meldungen landen im Journal, Pfade und
+//! Schlüsselmaterial gehören dort nicht hin. Zeilennummern und feste
+//! Gründe (`&'static str`) reichen für die Diagnose.
 //!
 //! # Dieser Typ verlässt den Prozess nie
 //! Wie `harw-dod-warden-proto::WardenProtoError` implementiert auch dieser
-//! Typ absichtlich **kein** `Serialize` — er beschreibt einen internen
-//! Ausführungsfehler, nicht etwas, das über die Leitung ginge. Was der
-//! Warden nach außen meldet, ist ausschließlich
-//! [`crate::warden::WardenOutcome`] bzw. dessen `to_wire`-Abbildung auf
-//! [`harw_dod_warden_proto::WardenResponse`] — beide bewusst ohne
-//! Fehlerdetail (siehe `warden.rs`-Moduldoku).
+//! Typ absichtlich **kein** `Serialize`. Was der Warden nach außen meldet,
+//! ist ausschließlich [`crate::warden::WardenOutcome`] bzw. dessen
+//! `to_wire`-Abbildung auf [`harw_dod_warden_proto::WardenResponse`].
 //!
 //! # Nebenläufigkeit
 //! Trägt keinen inneren Zustand außer den Fehlerdaten selbst; kein Locking,
@@ -27,19 +44,19 @@
 
 use std::fmt;
 
+use harw_dod_warden_proto::ProofError;
+
 /// Fehler dieser Crate.
 ///
 /// # Description
-/// Zwei Varianten: eine cgroup-Kennung, die sich nicht gefahrlos in einen
-/// Dateisystempfad einbetten lässt ([`Self::InvalidCgroupId`]), und ein
-/// fehlgeschlagener Dateisystemzugriff während einer Ausführungsoperation
-/// ([`Self::Io`]). `#[derive(harw_macros::HarwError)]` erzeugt daraus
-/// `Display`, `std::error::Error` (mit `source()` für [`Self::Io`]) und den
-/// Typalias [`WardenResult`] — **kein** `Debug` (siehe `impl Debug`
-/// unterhalb).
+/// Siehe Moduldoku für die drei Gruppen. `#[derive(harw_macros::HarwError)]`
+/// erzeugt daraus `Display`, `std::error::Error` (mit `source()` für
+/// [`Self::Io`], [`Self::Proof`] und [`Self::Encode`]) und den Typalias
+/// [`WardenResult`] — **kein** `Debug` (siehe `impl Debug` unterhalb).
 ///
 /// # Errors
-/// Wird von den Ausführungs-Traits in `executor.rs` zurückgegeben.
+/// Wird von den Ausführungs-Traits, dem Konfigurations- und Schlüssellader
+/// und den Zustandsdateien zurückgegeben.
 #[derive(harw_macros::HarwError)]
 pub enum WardenError {
     /// Eine cgroup-Kennung ist kein gefahrloser relativer Pfad unterhalb der
@@ -55,11 +72,103 @@ pub enum WardenError {
     #[msg("cgroup-Kennung enthält unzulässige Zeichen für einen Dateisystempfad")]
     InvalidCgroupId,
 
-    /// Der Dateisystemzugriff für eine cgroup-Operation (Einfrieren,
-    /// Freigeben, Beenden) ist fehlgeschlagen.
+    /// Ein Dateisystemzugriff (cgroup-Operation, Zustandsdatei, Policy- oder
+    /// Schlüsseldatei) ist fehlgeschlagen.
     #[msg("Dateisystemzugriff für die cgroup-Operation ist fehlgeschlagen: {0}")]
     #[from]
     Io(std::io::Error),
+
+    /// Das beobachtete Ziel ist kein cgroup-Verzeichnis (oder hat eine
+    /// Kernel-ID `0`) — der Warden handelt dann nicht.
+    #[msg("Ziel ist kein cgroup-Verzeichnis")]
+    TargetNotCgroup,
+
+    /// Unter dem signierten Pfad liegt beim Eingriff eine andere cgroup als
+    /// die geprüfte (Kernel-ID am geöffneten Verzeichnis weicht ab, B21).
+    /// Der Ausführer hat nichts geschrieben.
+    #[msg("Ziel ist nicht mehr die geprüfte cgroup")]
+    TargetChanged,
+
+    /// Eine stillgelegte Aktion (`ReleaseCgroup`) erreichte die Ausführung.
+    /// Unerreichbar, solange `SignedAuthorization::verify` sie vorher
+    /// ablehnt; der Ausführer verweigert sie trotzdem selbst.
+    #[msg("stillgelegte Aktion wird nie ausgeführt")]
+    RetiredAction,
+
+    /// Eine Datei oder ein Verzeichnis, dem der Warden vertrauen muss
+    /// (Policy, Schlüssel, StateDirectory), erfüllt die Eigentums- oder
+    /// Modusregeln nicht (z. B. nicht root-eigen, gruppen- oder
+    /// weltschreibbar, Symlink, kein reguläres File).
+    #[msg("{what} ist nicht vertrauenswürdig abgelegt: {reason}")]
+    UntrustedFile {
+        /// Welche Datei (fester Name, kein Pfad), z. B. `"warden policy"`.
+        what: &'static str,
+        /// Fester Grund, z. B. `"group or world writable"`.
+        reason: &'static str,
+    },
+
+    /// `warden.toml` verletzt die unterstützte TOML-Teilmenge oder nennt
+    /// einen unbekannten Schlüssel.
+    #[msg("warden policy: Fehler in Zeile {line}: {reason}")]
+    ConfigSyntax {
+        /// 1-basierte Zeilennummer.
+        line: usize,
+        /// Fester Grund (kein Dateiinhalt).
+        reason: &'static str,
+    },
+
+    /// `warden.toml` ist syntaktisch korrekt, aber inhaltlich unzulässig
+    /// (fehlender Pflichtwert, unbekannte Aktion, widersprüchliche Angaben).
+    #[msg("warden policy ist unzulässig: {reason}")]
+    ConfigInvalid {
+        /// Fester Grund (kein Dateiinhalt).
+        reason: &'static str,
+    },
+
+    /// Der Schlüsselordner `proof_key_dir` ist unbrauchbar (leer, zu viele
+    /// Dateien, ungültiger Dateiname, falsches Schlüsselformat).
+    #[msg("proof key store ist unbrauchbar: {reason}")]
+    KeyStore {
+        /// Fester Grund (kein Schlüsselmaterial, kein Pfad).
+        reason: &'static str,
+    },
+
+    /// Ein Proof-v2-Baustein (Key-ID, Schlüssel, Schlüsselring, Policy)
+    /// ließ sich nicht konstruieren.
+    #[msg("proof v2 setup failed: {0}")]
+    #[from]
+    Proof(ProofError),
+
+    /// Eine Zustandsdatei im StateDirectory ist beschädigt (Hash-Kette
+    /// gebrochen, Sequenzlücke, unlesbare Zeile). Der Warden startet dann
+    /// nicht (fail closed).
+    #[msg("Zustandsdatei {ledger} ist beschädigt (Zeile {line})")]
+    LedgerCorrupt {
+        /// Welche Datei (fester Name: `"nonce"`, `"action"`, `"holds"`,
+        /// `"containment"`).
+        ledger: &'static str,
+        /// 1-basierte Zeilennummer (`0` für eine Datei ohne Zeilenstruktur).
+        line: usize,
+    },
+
+    /// Eine Zustandsdatei hat ihre Obergrenze erreicht oder ist nach einem
+    /// Schreibfehler gesperrt; neue Einträge werden fail closed abgelehnt.
+    #[msg("Zustandsdatei {ledger} nimmt keine Einträge mehr an: {reason}")]
+    LedgerUnavailable {
+        /// Welche Datei (fester Name).
+        ledger: &'static str,
+        /// Fester Grund (`"full"`, `"locked after a write error"`, ...).
+        reason: &'static str,
+    },
+
+    /// Ein Zustandsdatensatz ließ sich nicht als JSON kodieren.
+    #[msg("Zustandsdatensatz ließ sich nicht kodieren: {0}")]
+    Encode(#[source] serde_json::Error),
+
+    /// Ein interner Mutex ist vergiftet (ein Thread ist mit gehaltener
+    /// Sperre abgebrochen) — fail closed.
+    #[msg("interner Zustand des Wardens ist gesperrt (vergifteter Mutex)")]
+    StatePoisoned,
 }
 
 /// Formatiert `WardenError` über seine [`std::fmt::Display`]-Meldung.
@@ -72,6 +181,55 @@ pub enum WardenError {
 impl fmt::Debug for WardenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
+    }
+}
+
+impl WardenError {
+    /// Returns whether this error means "the target does not exist (any more)".
+    ///
+    /// # Description
+    /// `true` für [`Self::TargetNotCgroup`] und ein [`Self::Io`] mit
+    /// `ErrorKind::NotFound`. Der Warden meldet ein verschwundenes Ziel als
+    /// geändertes Ziel (`Denial::TargetChanged`), jeden anderen
+    /// Beobachtungsfehler als vorübergehend nicht prüfbar
+    /// (`Denial::Unavailable`).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_warden::WardenError;
+    ///
+    /// let gone = WardenError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+    /// assert!(gone.is_target_gone());
+    /// assert!(!WardenError::StatePoisoned.is_target_gone());
+    /// ```
+    #[must_use]
+    pub fn is_target_gone(&self) -> bool {
+        match self {
+            Self::TargetNotCgroup => true,
+            Self::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
+
+    /// Returns whether this error means "the target is not the verified cgroup any more".
+    ///
+    /// # Description
+    /// `true` für [`Self::TargetChanged`] (andere Kernel-ID am geöffneten
+    /// Verzeichnis) und für jedes [`Self::is_target_gone`]. Der Warden meldet
+    /// einen solchen Ausführungsfehler als `Denial::TargetChanged` statt als
+    /// `ExecutionFailed`: nichts wurde ausgeführt, die Ursache ist das Ziel.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_warden::WardenError;
+    ///
+    /// assert!(WardenError::TargetChanged.is_target_replaced_or_gone());
+    /// assert!(WardenError::TargetNotCgroup.is_target_replaced_or_gone());
+    /// assert!(!WardenError::InvalidCgroupId.is_target_replaced_or_gone());
+    /// ```
+    #[must_use]
+    pub fn is_target_replaced_or_gone(&self) -> bool {
+        matches!(self, Self::TargetChanged) || self.is_target_gone()
     }
 }
 
@@ -122,5 +280,55 @@ mod tests {
             Err(WardenError::InvalidCgroupId)
         }
         assert!(always_fails().is_err());
+    }
+
+    #[test]
+    fn test_setup_errors_render_only_fixed_reasons() {
+        let untrusted = WardenError::UntrustedFile {
+            what: "warden policy",
+            reason: "group or world writable",
+        };
+        assert_eq!(
+            untrusted.to_string(),
+            "warden policy ist nicht vertrauenswürdig abgelegt: group or world writable"
+        );
+        let syntax = WardenError::ConfigSyntax {
+            line: 7,
+            reason: "unknown key",
+        };
+        assert_eq!(
+            syntax.to_string(),
+            "warden policy: Fehler in Zeile 7: unknown key"
+        );
+        let corrupt = WardenError::LedgerCorrupt {
+            ledger: "action",
+            line: 3,
+        };
+        assert!(corrupt.to_string().contains("action"));
+        assert!(corrupt.source().is_none());
+    }
+
+    #[test]
+    fn test_is_target_gone_distinguishes_missing_from_other_failures() {
+        assert!(WardenError::TargetNotCgroup.is_target_gone());
+        assert!(
+            WardenError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)).is_target_gone()
+        );
+        assert!(!WardenError::from(sample_io_error()).is_target_gone());
+        assert!(!WardenError::InvalidCgroupId.is_target_gone());
+        assert!(!WardenError::TargetChanged.is_target_gone());
+    }
+
+    #[test]
+    fn test_target_changed_is_content_free_and_counts_as_replaced() {
+        let err = WardenError::TargetChanged;
+        assert_eq!(err.to_string(), "Ziel ist nicht mehr die geprüfte cgroup");
+        assert!(err.source().is_none());
+        assert!(err.is_target_replaced_or_gone());
+        assert!(
+            WardenError::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+                .is_target_replaced_or_gone()
+        );
+        assert!(!WardenError::from(sample_io_error()).is_target_replaced_or_gone());
     }
 }

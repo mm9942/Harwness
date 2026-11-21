@@ -51,6 +51,7 @@ Status: Completed (Contract abgeschlossen; Implementierung h24 übernimmt die be
 6. **Langlauf-Sichtbarkeit.** Der Job-Status (`work_driver.status`,
    `work_driver.rs:1142`) macht Langlauf (Runden, Budgets, Fortschritt) sowie
    Stop (`work_driver.rs:1311`), Crash- und Resume-Grenzen für den Nutzer sichtbar.
+   - Recovery-/Status-Semantik: siehe docs/planning/20-job-runtime/HARW_LINUX_JOB_RUNTIME_FOUNDATION.md §15/§21.4/§25.
 
 ## Handoff
 

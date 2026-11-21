@@ -731,6 +731,9 @@ fn previous_meta_with(
         origin_tool: None,
         owner_agent: None,
         origin: None,
+        suspended_at: None,
+        suspended_secs: 0,
+        suspend_phase: None,
     })
 }
 
@@ -824,6 +827,96 @@ mod recovery {
         )
         .map_err(ctx("restart"))?;
         Ok((manager, recorder))
+    }
+
+    #[tokio::test]
+    async fn test_detach_reported_on_restart() -> TestResult {
+        let env = Env::new()?;
+        let sleeper = Sleeper::spawn()?;
+        let mut meta = previous_meta(
+            "job-watch-gone",
+            sleeper.pid(),
+            Some(sleeper.identity()?.start_ticks),
+        )?;
+        meta.state = JobState::Detached;
+        meta.detached = true;
+        write_previous(&env, &meta)?;
+
+        let (manager, recorder) = restart(&env)?;
+        let id = meta.job_id.clone();
+        // Prozess endet (Drop beendet ihn); die Watch bzw. die nächste
+        // Abfrage meldet das Ende dem Besitzer — genau einmal.
+        drop(sleeper);
+        let seen = eventually(LIMIT, || {
+            state_of(&manager, &id).is_ok_and(|state| state == JobState::Unknown)
+        })
+        .await;
+        assert!(seen, "detached job end was not reported");
+        let finished: Vec<_> = recorder
+            .notifications()
+            .into_iter()
+            .filter(|notification| notification.event.job_id() == &id)
+            .filter(|notification| notification.event.is_finished())
+            .collect();
+        assert_eq!(finished.len(), 1, "exactly one end report expected");
+        match &finished[0].event {
+            JobEvent::Finished {
+                state,
+                exit_code,
+                signal,
+                ..
+            } => {
+                assert_eq!(*state, JobState::Unknown);
+                assert_eq!(*exit_code, None);
+                assert_eq!(*signal, None);
+            }
+            _ => unreachable!("filtered to Finished"),
+        }
+        Ok(())
+    }
+
+    /// harw ended in the middle of a `job.stop` (its `stop_requested` is
+    /// already in `meta.json`, the job still running): after the restart
+    /// that stale mark must not hide the end. The detached watch itself (no
+    /// query) reports it once as `unknown`.
+    #[tokio::test]
+    async fn test_stale_stop_mark_does_not_hide_the_end_after_restart() -> TestResult {
+        let env = Env::new()?;
+        let sleeper = Sleeper::spawn()?;
+        let mut meta = v2_meta("job-stale-stop", sleeper.pid(), sleeper.identity()?)?;
+        meta.stop_requested = true;
+        write_previous(&env, &meta)?;
+
+        let (manager, recorder) = restart(&env)?;
+        let id = meta.job_id.clone();
+        let entry = lock(&manager.jobs)
+            .get(&id)
+            .cloned()
+            .ok_or(TestError::Missing("entry"))?;
+        assert_eq!(entry.state(), JobState::Detached);
+        drop(sleeper);
+        let seen = eventually(LIMIT, || entry.state() == JobState::Unknown).await;
+        assert!(seen, "the end behind a stale stop mark was not reported");
+        let finished: Vec<JobEvent> = recorder
+            .notifications()
+            .into_iter()
+            .map(|notification| notification.event)
+            .filter(|event| event.job_id() == &id && event.is_finished())
+            .collect();
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        assert!(
+            matches!(
+                &finished[0],
+                JobEvent::Finished {
+                    state: JobState::Unknown,
+                    exit_code: None,
+                    signal: None,
+                    ..
+                }
+            ),
+            "{finished:?}"
+        );
+        Ok(())
     }
 
     fn job_id(raw: &str) -> TestResult<JobId> {
@@ -1158,6 +1251,38 @@ mod recovery {
         );
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn test_stop_of_detached_reports_finished() -> TestResult {
+    let env = Env::new()?;
+    let prepared = env.prepare("sleep 30").await?;
+    let started = env
+        .manager
+        .start(request("detached", "agent-a", &[]), prepared)
+        .await
+        .map_err(ctx("start"))?;
+    let id = started.meta.job_id.clone();
+
+    assert_eq!(env.manager.detach_all().detached, 1);
+    assert!(!events_of(&env, &id).iter().any(JobEvent::is_finished));
+    let stopped = env
+        .manager
+        .stop(&id, Caller::Operator, JobSignal::Term)
+        .await
+        .map_err(ctx("stop"))?;
+    assert_eq!(stopped.meta.state, JobState::Stopped);
+
+    let finished: Vec<_> = events_of(&env, &id)
+        .into_iter()
+        .filter(|event| event.is_finished())
+        .collect();
+    assert_eq!(finished.len(), 1, "exactly one Finished expected");
+    match &finished[0] {
+        JobEvent::Finished { state, .. } => assert_eq!(*state, JobState::Stopped),
+        _ => unreachable!("filtered to Finished"),
+    }
+    Ok(())
 }
 
 #[tokio::test]

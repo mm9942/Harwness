@@ -5,6 +5,16 @@
 //! explizite administrative/Test-Override des selben vertrauenswuerdigen
 //! Laders; ohne Flag wird `/etc/harw-dod/config.toml` verwendet.
 //!
+//! `--dev-allow-missing-bpf` ist ein reiner Entwicklungsschalter (nie in der
+//! systemd-Unit): ein gewählter Sensor mit fehlendem oder ungültigem Objekt
+//! degradiert dann, statt den Start mit Exit-Status 78 abzulehnen. `clap`
+//! nimmt ihn nur zusammen mit `--bpf-manifest` an (`requires`): jedes
+//! aufgelöste Objekt wird auch im Entwicklungsmodus gegen das Manifest
+//! geprüft, ein Teilbau (z. B. nur die Prozess-Objekte) lädt also seine
+//! vollständigen Sensoren, aber nie ungeprüfte Bytes. Ohne den Schalter gilt
+//! die produktive Regel (siehe `main::verify_selected_objects`, Owner-Review
+//! zu PR #168).
+//!
 //! Optionaler Unterbefehl `completions` (`harw_completions::CompletionsSubcommand`).
 //! `subcommand_negates_reqs` hebt die Pflichtangaben für diesen Pfad auf;
 //! deshalb ist `sentinel_socket` ein `Option<PathBuf>` mit `required = true`
@@ -91,6 +101,30 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub tcp_v6_program_path: Option<PathBuf>,
 
+    /// SHA-256 manifest of the BPF build (`manifest.json`, TOML despite the
+    /// extension, written by `harw-dod/bpf/scripts/write-manifest.sh`).
+    /// Production setting: when set, the manifest is always read and checked
+    /// (even if no object resolves), every resolved object is verified
+    /// against it before loading, and the file plus every directory above it
+    /// must be root-owned and neither group- nor world-writable (see
+    /// `bpf_manifest`). Every selected object must resolve: a missing, empty,
+    /// truncated or non-ELF object refuses the start with exit status 78.
+    /// Without this flag any resolved object is refused as well. No default
+    /// and no discovery next to the objects.
+    #[arg(long, value_name = "PATH")]
+    pub bpf_manifest: Option<PathBuf>,
+
+    /// Development only, never in production or in the systemd unit: a
+    /// selected sensor whose objects are missing or invalid degrades (one
+    /// `SensorDegraded`) instead of refusing the start with exit status 78.
+    /// Requires `--bpf-manifest`: every object that does resolve (including
+    /// the resolved sibling of a missing one) is still verified against the
+    /// manifest, so this mode never loads unverified bytes; a partial build
+    /// runs its complete sensors and degrades the rest. Logs one warning at
+    /// startup.
+    #[arg(long = "dev-allow-missing-bpf", requires = "bpf_manifest")]
+    pub dev_allow_missing_bpf: bool,
+
     /// Optional subcommand; without it the binary runs normally.
     #[command(subcommand)]
     pub command: Option<harw_completions::CompletionsSubcommand>,
@@ -103,7 +137,7 @@ mod tests {
     use super::{
         Cli, DEFAULT_CGROUP_ROOT, DEFAULT_SENSOR_ID_FLOW, DEFAULT_SENSOR_ID_PROCMON, LogLevel,
     };
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
 
     fn minimal_args() -> [&'static str; 3] {
         [
@@ -143,6 +177,8 @@ mod tests {
             "/usr/local/lib/harw-dod/bpf/tcp-v4.bpf.o",
             "--tcp-v6-program-path",
             "/usr/local/lib/harw-dod/bpf/tcp-v6.bpf.o",
+            "--bpf-manifest",
+            "/usr/local/lib/harw-dod/bpf/manifest.json",
         ])
         .map_err(ctx("all explicit runtime paths parse"))?;
         assert_eq!(
@@ -153,6 +189,75 @@ mod tests {
         assert!(cli.exit_program_path.is_some());
         assert!(cli.tcp_v4_program_path.is_some());
         assert!(cli.tcp_v6_program_path.is_some());
+        assert_eq!(
+            cli.bpf_manifest,
+            Some(std::path::PathBuf::from(
+                "/usr/local/lib/harw-dod/bpf/manifest.json"
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bpf_manifest_has_no_default() -> TestResult {
+        // Kein Rückfall auf ein Manifest neben den Objekten: ohne Flag bleibt
+        // es leer, und `run` verweigert dann das Laden aufgelöster Objekte.
+        let cli = Cli::try_parse_from(minimal_args()).map_err(ctx("minimal arguments parse"))?;
+        assert!(cli.bpf_manifest.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dev_allow_missing_bpf_defaults_to_false() -> TestResult {
+        let cli = Cli::try_parse_from(minimal_args()).map_err(ctx("minimal arguments parse"))?;
+        assert!(!cli.dev_allow_missing_bpf);
+        Ok(())
+    }
+
+    #[test]
+    fn dev_allow_missing_bpf_without_bpf_manifest_is_refused() -> TestResult {
+        // Ohne Manifest gäbe es keine Prüfung der aufgelösten Objekte.
+        match Cli::try_parse_from([
+            "harw-probe-bpf",
+            "--sentinel-socket",
+            "/run/harw-dod/sentinel.sock",
+            "--dev-allow-missing-bpf",
+        ]) {
+            Err(err) if err.kind() == clap::error::ErrorKind::MissingRequiredArgument => Ok(()),
+            other => Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    #[test]
+    fn dev_allow_missing_bpf_parses_together_with_bpf_manifest() -> TestResult {
+        // In beiden Reihenfolgen; das Manifest bleibt gesetzt.
+        let manifest = "/usr/local/lib/harw-dod/bpf/manifest.json";
+        for args in [
+            [
+                "harw-probe-bpf",
+                "--sentinel-socket",
+                "/run/harw-dod/sentinel.sock",
+                "--bpf-manifest",
+                manifest,
+                "--dev-allow-missing-bpf",
+            ],
+            [
+                "harw-probe-bpf",
+                "--sentinel-socket",
+                "/run/harw-dod/sentinel.sock",
+                "--dev-allow-missing-bpf",
+                "--bpf-manifest",
+                manifest,
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args)
+                .map_err(ctx("the development flag parses with a manifest"))?;
+            assert!(cli.dev_allow_missing_bpf);
+            assert_eq!(
+                cli.bpf_manifest.as_deref(),
+                Some(std::path::Path::new(manifest))
+            );
+        }
         Ok(())
     }
 

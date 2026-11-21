@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-protocol = { path = "../harw-protocol" }
 harw-session-host = { path = "../harw-session-host" }
 harw-session-ws = { path = "../harw-session-ws" }
 harw-session-com = { path = "../harw-session-com" }
@@ -22,7 +23,6 @@ bytes = "1"
 rustix = { workspace = true, features = ["fs", "process"] }
 
 [dev-dependencies]
-harw-protocol = { path = "../harw-protocol" }
 tempfile = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

@@ -4,8 +4,8 @@
 
 ## Wann welches Werkzeug
 
-- **Läuft Prozess X? Welche PID?** `sys.pgrep` (`pattern`, `exact`, `full` für die Kommandozeile) oder `sys.ps` mit `name_contains` und `fields`.
-- **Was verbraucht gerade CPU/RAM?** `sys.top` (echtes Messintervall, `sort` nach cpu oder mem); für eine Momentaufnahme ohne Messung `sys.ps` mit `sort`.
+- **Läuft einer meiner Prozesse X? Welche PID?** `sys.pgrep` (`pattern`, `exact`) oder `sys.ps` mit `name_contains` und `fields`. Beide sehen standardmäßig **nur die eigenen Prozesse** dieser Sitzung (eigener cgroup-Teilbaum samt Job-cgroups, sonst der eigene Prozessbaum; Feld `scope`). Fehlt ein Prozess, heißt das nur „nicht unter meinen Prozessen“, nicht „läuft nicht auf dem System“. `scope: "all"` sieht alle Prozesse, gilt aber nur im Freigabemodus Full Access; sonst kommt ein Fehler.
+- **Was verbraucht gerade CPU/RAM?** `sys.top` (echtes Messintervall, `sort` nach cpu oder mem); Liste und Taskzahlen nur über die eigenen Prozesse, CPU-, Last- und Speicherwerte systemweit. Für eine Momentaufnahme ohne Messung `sys.ps` mit `sort`.
 - **Speicher/Last:** `sys.free`, `sys.uptime` (Last 1/5/15 Minuten), `sys.uname` (Kernel, Architektur).
 - **Welche Ports lauschen?** `sys.ss` mit `listening`, `tcp`/`udp`, `port`. Prozessnamen liefert es nicht (das verlangt Root).
 - **Was hält Prozess P offen?** `sys.lsof` mit `pid` (nur eigene Prozesse): Dateien, Sockets, `cwd`, `exe`. Nützlich, bevor man etwas beendet oder wenn eine Datei „busy“ ist.
@@ -15,7 +15,7 @@
 
 - JSON mit `tool`, `summary`, den Daten und Zählern (`count`, `matched`, `total`). `matched` > `count` heißt: Liste gekürzt.
 - `sys.env`: Werte mit `masked: true` sind `***`; Namen mit KEY/TOKEN/SECRET/PASSWORD und tokenartige Werte werden immer maskiert. Filter wirken nur auf Namen, nie auf Werte — es gibt keinen Weg, maskierte Werte zu erraten oder zu enthüllen.
-- Kommandozeilen in `sys.ps`/`sys.top`/`sys.pgrep` sind maskiert (Passwörter in URLs, `--token=...`).
+- `command` in `sys.ps`/`sys.top`/`sys.pgrep` ist vollständig geschwärzt: nur Prozessname plus Argumentanzahl (`curl <redacted: 4 args>`, Kernel-Threads als `[name]`). Argumentwerte erscheinen nie; `full`/`command_contains` filtern nur diese geschwärzte Form.
 - Prozesse können zwischen zwei Aufrufen verschwinden; ein fehlender Eintrag ist normal, kein Fehler.
 
 ## Grenzen und `truncated`

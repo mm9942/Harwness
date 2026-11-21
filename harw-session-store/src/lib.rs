@@ -29,6 +29,7 @@ mod test_support;
 
 pub mod approval;
 pub mod child_lease;
+pub mod dod_verdict;
 pub mod error;
 pub mod freeze;
 pub mod injection;
@@ -41,6 +42,11 @@ pub mod store;
 
 pub use approval::{ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, DEFAULT_APPROVAL_TTL};
 pub use child_lease::{ChildLeaseCompletionRecord, ChildLeaseRecord, ChildLeaseStore};
+pub use dod_verdict::{
+    ChainBreak, NewVerdict, StoredClassification, StoredResponse, StoredSeverity,
+    VerdictChainSummary, VerdictRecord, VerdictRef, VerdictRetentionReport, VerdictStore,
+    VerdictStoreError, VerdictStoreResult, genesis_prev_hash, sanitize_rationale,
+};
 pub use error::{SessionStoreError, SessionStoreResult};
 pub use freeze::{Freeze, FreezeResolution, FreezeResolutionOutcome, FreezeStore};
 pub use injection::{INJECTION_MARKER, InjectionRecord, is_injection_payload};

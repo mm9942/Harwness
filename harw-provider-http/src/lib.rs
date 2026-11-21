@@ -88,6 +88,7 @@ pub mod discovery;
 mod error;
 mod images;
 pub mod rate_limiter;
+mod replay_bounds;
 mod responses_reasoning;
 pub mod retry;
 pub mod routing;
@@ -130,6 +131,7 @@ pub use retry::{
 };
 pub use routing::{RoutingBackends, RoutingModelProvider};
 
+mod chatgpt_plan;
 mod codex;
 mod credential_pool;
 
@@ -185,7 +187,6 @@ const UNKNOWN_TOOL_NAME: &str = "unknown";
 /// `include`-Wert der Responses-API für zustandslos wiederverwendbares Reasoning.
 const INCLUDE_ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 /// Höchstzahl gemerkter Reasoning-Runden je Provider (FIFO).
-const MAX_REASONING_REPLAY_ENTRIES: usize = 64;
 /// Obergrenze für provider-gelieferte Grund-Strings in `StopReason::Other`.
 const MAX_STOP_REASON_CHARS: usize = 64;
 
@@ -763,6 +764,7 @@ fn build_named_provider(
         ));
         backend.configure_credential_pool(pool);
         backend.configure_concurrency(provider.max_concurrency);
+        backend.configure_strict_replay_models(strict_replay_models(provider_name, config));
         // Runde 7, Teil L4: Request- und Streaming-Leerlauf-Zeitlimit.
         backend.configure_timeouts(
             Duration::from_secs(provider.effective_request_timeout_secs()),
@@ -1637,6 +1639,7 @@ pub struct OpenAiResponsesProvider {
     model: String,
     api_key: SecretString,
     codex_route: Option<codex::CodexRoute>,
+    chatgpt_plan: Option<harw_oauth::chatgpt_plan::ChatGptPlanStore>,
     auth_header: String,
     headers: reqwest::header::HeaderMap,
     transport: Transport,
@@ -1644,6 +1647,10 @@ pub struct OpenAiResponsesProvider {
     reasoning_replay: ReasoningReplay,
     chat_reasoning_cache: chat_reasoning::ChatReasoningCache,
     chat_reasoning_overrides: std::collections::HashMap<String, harw_config::ChatReasoningReplay>,
+    /// Modelle (IDs und Aliase) mit `[capabilities] reasoning_replay =
+    /// "strict"`; alle übrigen degradieren bei verlorener Kontinuität
+    /// (siehe [`replay_bounds`]).
+    strict_replay_models: BTreeSet<String>,
     /// Modell-ID → Prompt-Caching-Override (`ModelToml::prompt_caching`),
     /// befüllt aus `config.models` beim Bau über [`Self::from_named_config`].
     /// Leer, wenn der Provider über [`Self::new`]/[`Self::with_transport`]
@@ -1773,12 +1780,14 @@ impl OpenAiResponsesProvider {
             model: model.into(),
             api_key,
             codex_route: None,
+            chatgpt_plan: None,
             auth_header: "bearer".into(),
             headers: reqwest::header::HeaderMap::new(),
             transport,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reasoning_replay: ReasoningReplay::default(),
             chat_reasoning_cache: chat_reasoning::ChatReasoningCache::default(),
+            strict_replay_models: BTreeSet::new(),
             chat_reasoning_overrides: std::collections::HashMap::new(),
             cache_overrides: std::collections::HashMap::new(),
             stream_policy: sse::StreamPolicy::default(),
@@ -1896,6 +1905,7 @@ impl OpenAiResponsesProvider {
         sources: SecretSources<'_>,
         budgets: &budget::ProviderBudgetRegistry,
     ) -> HttpProviderResult<Self> {
+        let plan = chatgpt_plan::route(provider, sources.home)?;
         let codex_route = codex::CodexRoute::from_provider(provider)?;
         let base_url = if codex_route.is_some() {
             codex::BASE_URL
@@ -1926,31 +1936,34 @@ impl OpenAiResponsesProvider {
         // Credential, übernimmt stattdessen der erste Pool-Eintrag diese
         // Rolle. Codex-Routen haben ihre eigene OAuth-Auflösung
         // (`route.headers()`) und nehmen nie am Pool teil.
-        let primary: Option<SecretString> = if let Some(reference) = &provider.auth {
+        let primary: Option<SecretString> = if plan.is_some() {
+            Some(SecretString::new(String::new().into()))
+        } else if let Some(reference) = &provider.auth {
             Some(resolve_secret(reference, sources)?)
         } else if auth_header == "none" {
             Some(SecretString::new(String::new().into()))
         } else {
             None
         };
-        let pool: Option<credential_pool::CredentialPool<SecretString>> = if codex_route.is_none() {
-            let pool = credential_pool::CredentialPool::from_auth_config(
-                &config.auth,
-                provider_name,
-                sources,
-                Ok,
-            )?;
-            if let Some(pool) = &pool {
-                for index in 0..pool.len() {
-                    if let Some(url) = &pool.entry(index).base_url {
-                        validate_endpoint_with(url, provider.allow_insecure_lan)?;
+        let pool: Option<credential_pool::CredentialPool<SecretString>> =
+            if codex_route.is_none() && plan.is_none() {
+                let pool = credential_pool::CredentialPool::from_auth_config(
+                    &config.auth,
+                    provider_name,
+                    sources,
+                    Ok,
+                )?;
+                if let Some(pool) = &pool {
+                    for index in 0..pool.len() {
+                        if let Some(url) = &pool.entry(index).base_url {
+                            validate_endpoint_with(url, provider.allow_insecure_lan)?;
+                        }
                     }
                 }
-            }
-            pool
-        } else {
-            None
-        };
+                pool
+            } else {
+                None
+            };
         let (api_key, pool) = match (pool, primary) {
             (Some(pool), Some(primary_value)) => {
                 let pool = pool.prepend_primary(primary_value, format!("{provider_name}#primary"));
@@ -1987,10 +2000,11 @@ impl OpenAiResponsesProvider {
         )?;
         http_provider.auth_header = auth_header.to_owned();
         http_provider.codex_route = codex_route;
+        http_provider.chatgpt_plan = plan;
         http_provider.credential_pool = pool.map(std::sync::Arc::new);
         if !matches!(
             provider.api.as_str(),
-            "openai-chat" | "openai-responses" | "ollama"
+            "openai-chat" | "openai-responses" | "ollama" | chatgpt_plan::API
         ) {
             return Err(HttpProviderError::Decode(format!(
                 "unsupported provider API '{}'",
@@ -2060,6 +2074,7 @@ impl OpenAiResponsesProvider {
             }
         }
         http_provider.toolless_models = toolless_models(provider_name, config);
+        http_provider.strict_replay_models = strict_replay_models(provider_name, config);
         http_provider.imageless_models = imageless_models(provider_name, config);
         Ok(http_provider)
     }
@@ -2335,7 +2350,7 @@ pub(crate) fn parse_retry_after(
 /// (z. B. `"openai-chat"`) ergibt [`Transport::Chat`].
 fn transport_from_api(api: &str) -> Transport {
     match api {
-        "openai-responses" => Transport::Responses,
+        "openai-responses" | chatgpt_plan::API => Transport::Responses,
         _ => Transport::Chat,
     }
 }
@@ -3481,6 +3496,27 @@ fn toolless_models(provider_name: &str, config: &harw_config::ResolvedConfig) ->
 }
 
 /// Modell-IDs und Aliase von `provider_name`, deren Modelldatei
+/// `[capabilities] reasoning_replay = "strict"` sagt.
+pub(crate) fn strict_replay_models(
+    provider_name: &str,
+    config: &harw_config::ResolvedConfig,
+) -> BTreeSet<String> {
+    let mut models = BTreeSet::new();
+    for model in config
+        .models
+        .values()
+        .filter(|model| model.provider == provider_name)
+        .filter(|model| {
+            model.capabilities.reasoning_replay == Some(harw_config::ReasoningReplayPolicy::Strict)
+        })
+    {
+        models.insert(model.id.clone());
+        models.extend(model.aliases.iter().cloned());
+    }
+    models
+}
+
+/// Modell-IDs und Aliase von `provider_name`, deren Modelldatei
 /// `[capabilities] image_input = false` sagt.
 fn imageless_models(provider_name: &str, config: &harw_config::ResolvedConfig) -> BTreeSet<String> {
     let mut models = BTreeSet::new();
@@ -4074,6 +4110,13 @@ impl OpenAiResponsesProvider {
         if let Some(route) = &self.codex_route {
             return Ok(builder.headers(route.headers(&self.client).await?));
         }
+        if let Some(store) = &self.chatgpt_plan {
+            let token = store
+                .access_token()
+                .await
+                .map_err(chatgpt_plan::model_auth_error)?;
+            return Ok(builder.bearer_auth(token.expose_secret()));
+        }
         let mut builder = match self.auth_header.as_str() {
             "none" => builder,
             "api-key" | "x-api-key" => builder.header(
@@ -4150,6 +4193,8 @@ impl OpenAiResponsesProvider {
             model,
             self.chat_reasoning_overrides.get(model).copied(),
         );
+        let replay_policy =
+            replay_bounds::ReplayPolicy::for_model(&self.strict_replay_models, model);
         let (url, mut wire) = match self.transport {
             Transport::Responses => {
                 let replay = self.reasoning_replay.for_request(
@@ -4157,6 +4202,7 @@ impl OpenAiResponsesProvider {
                     model,
                     base_url,
                     &request,
+                    replay_policy,
                 )?;
                 tracing::debug!(
                     model,
@@ -4181,6 +4227,7 @@ impl OpenAiResponsesProvider {
                         model,
                         &request,
                         &mut body,
+                        replay_policy,
                     )?;
                 }
                 cache_strategy::apply_chat_cache_control(&mut body, strategy);
@@ -4191,6 +4238,9 @@ impl OpenAiResponsesProvider {
 
         if self.codex_route.is_some() {
             codex::prepare_body(&mut wire);
+        }
+        if self.chatgpt_plan.is_some() {
+            chatgpt_plan::prepare_body(&mut wire);
         }
         // Natives SSE-Streaming (Codex streamt ohnehin, siehe oben).
         let stream_sink = request
@@ -4274,7 +4324,7 @@ impl OpenAiResponsesProvider {
             let response = send_with_timeout(
                 builder.json(&wire),
                 self.request_timeout,
-                stream_sink.is_some(),
+                stream_sink.is_some() || self.chatgpt_plan.is_some(),
             )
             .await?;
 
@@ -4297,6 +4347,8 @@ impl OpenAiResponsesProvider {
         let request_id = provider_request_id(response.headers());
         let value: Value = if status.is_success() && self.codex_route.is_some() {
             codex::read_response(response, request.stream.as_ref()).await?
+        } else if status.is_success() && self.chatgpt_plan.is_some() {
+            chatgpt_plan::read_response(response, stream_sink, self.stream_idle_timeout).await?
         } else if status.is_success()
             && let Some(sink) = stream_sink
         {
@@ -4308,6 +4360,12 @@ impl OpenAiResponsesProvider {
                 .map_err(|error| model_error_for_transport(error, true))?;
 
             if !status.is_success() {
+                if self.chatgpt_plan.is_some()
+                    && let Ok(value) = serde_json::from_str(&body)
+                    && let Some(error) = chatgpt_plan::response_error(&value)
+                {
+                    return Err(error);
+                }
                 if status.as_u16() == 429 {
                     // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
                     // dieses Providers, unabhängig davon, ob sie unten als
@@ -4330,8 +4388,17 @@ impl OpenAiResponsesProvider {
                             .note_rate_limit_cooldown(Duration::from_secs(secs));
                     }
                 }
-                let error =
-                    model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
+                let diagnostic_body = if self.chatgpt_plan.is_some() {
+                    ""
+                } else {
+                    &body
+                };
+                let error = model_error_for_status(
+                    status.as_u16(),
+                    request_id.as_deref(),
+                    hint,
+                    diagnostic_body,
+                );
                 tracing::debug!(
                     status = status.as_u16(),
                     retryable = error.is_retryable(),
@@ -4373,8 +4440,12 @@ impl OpenAiResponsesProvider {
         }
         budget_permit.reconcile(&response.usage);
         if let Some(replay) = response_replay {
-            self.reasoning_replay
-                .remember(replay, base_url, &request, &response)?;
+            replay_bounds::remember_or_warn(
+                "responses",
+                model,
+                self.reasoning_replay
+                    .remember(replay, base_url, &request, &response),
+            );
         }
         if self.transport == Transport::Chat
             && chat_reasoning_mode == harw_config::ChatReasoningReplay::ReasoningContent
@@ -4385,13 +4456,17 @@ impl OpenAiResponsesProvider {
                     | StopReason::ContextWindowExceeded
             )
         {
-            self.chat_reasoning_cache.remember(
-                &chat_replay_namespace,
+            replay_bounds::remember_or_warn(
+                "chat",
                 model,
-                &request,
-                &response,
-                &value,
-            )?;
+                self.chat_reasoning_cache.remember(
+                    &chat_replay_namespace,
+                    model,
+                    &request,
+                    &response,
+                    &value,
+                ),
+            );
         }
         Ok(response)
     }
@@ -4690,8 +4765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identityless_responses_tool_results_require_identity_only_for_reasoning() -> TestResult
-    {
+    async fn identityless_responses_tool_results_keep_the_paid_response() -> TestResult {
         for (case, effort, encrypted, identity, succeeds) in [
             ("ordinary tool round", None, false, None, true),
             (
@@ -4699,15 +4773,18 @@ mod tests {
                 Some(harw_types::ReasoningEffort::High),
                 false,
                 None,
-                false,
+                true,
             ),
-            ("encrypted reasoning", None, true, None, false),
+            // Eine nicht merkbare Runde verwirft die bezahlte Antwort nicht
+            // mehr (HARW-REPLAY-003); erst eine `strict`-Folgeanfrage würde
+            // an der fehlenden Kontinuität scheitern.
+            ("encrypted reasoning", None, true, None, true),
             (
                 "invalid provided identity",
                 None,
                 false,
                 Some(test_identity("", "", "reader")),
-                false,
+                true,
             ),
         ] {
             let mut output = Vec::new();
@@ -4750,10 +4827,10 @@ mod tests {
                 assert_eq!(response.tool_calls[0].id.as_str(), "a");
                 assert_eq!(response.tool_calls[0].name.as_str(), "lookup");
                 assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
-                assert!(response.reasoning.is_none());
+                assert_eq!(response.reasoning.is_some(), encrypted, "{case}");
             } else {
                 assert!(
-                    matches!(result, Err(ModelError::RequestFailed(ref detail)) if detail.contains("request identity is missing")),
+                    matches!(result, Err(ModelError::ReplayUnavailable { ref detail, .. }) if detail.contains("request identity is missing")),
                     "{case} must retain its identity requirement: {result:?}"
                 );
             }
@@ -6354,6 +6431,28 @@ mod tests {
     fn test_build_provider_skips_stale_codex_failover_entry() -> TestResult {
         let config = config_with_stale_codex_failover("OPENAI_API_KEY");
         build_provider(&config).map_err(ctx("stale failover must not block startup"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn chatgpt_plan_provider_can_start_before_account_linking() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create Harw home"))?;
+        let mut config = harw_config::ResolvedConfig::default();
+        let mut provider = configured_provider(
+            "chatgpt-plan",
+            "https://api.openai.com/v1".to_owned(),
+            vec!["gpt-test"],
+            "UNUSED",
+        );
+        provider.api = "openai-chatgpt-plan".to_owned();
+        provider.auth = None;
+        provider.headers.clear();
+        config.harness.default_provider = Some(provider.name.clone());
+        config.harness.default_model = Some("gpt-test".to_owned());
+        config.providers.insert(provider.name.clone(), provider);
+
+        build_provider_with_home(&config, home.path(), None)
+            .map_err(ctx("an unlinked ChatGPT plan provider must still start"))?;
         Ok(())
     }
 

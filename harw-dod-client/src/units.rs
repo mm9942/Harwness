@@ -1,7 +1,7 @@
 //! systemd state of the Harw-DoD units.
 //!
 //! One read-only `systemctl show -p ActiveState,SubState,UnitFileState`
-//! query for the six units of the suite. `systemctl` is looked up in the
+//! query for the units of the suite. `systemctl` is looked up in the
 //! given search path (absolute entries only); when it is absent, every unit
 //! is [`UnitStatus::NotAvailable`] — a host without systemd is a normal
 //! state, not an error. The query is bounded in time and output size.
@@ -19,14 +19,15 @@ use serde::{Deserialize, Serialize};
 use crate::error::DodClientError;
 use crate::fsio::sanitize;
 
-/// The six units of the suite, in display order.
-pub const DOD_UNITS: [&str; 6] = [
+/// The units of the suite, in display order.
+pub const DOD_UNITS: [&str; 7] = [
     "harw-dod.target",
     "harw-sentinel.service",
     "harw-probe-fs.service",
     "harw-probe-bpf.service",
     "harw-warden.socket",
     "harw-warden.service",
+    "harw-probe-netlink.service",
 ];
 
 /// Properties queried per unit.
@@ -107,7 +108,7 @@ impl UnitState {
     }
 }
 
-/// Queries the six DoD units, looking `systemctl` up in `$PATH`.
+/// Queries the DoD units, looking `systemctl` up in `$PATH`.
 ///
 /// # Errors
 /// See [`unit_states_in`].
@@ -115,7 +116,7 @@ pub fn unit_states() -> Result<Vec<UnitState>, DodClientError> {
     unit_states_in(std::env::var_os("PATH").as_deref())
 }
 
-/// Queries the six DoD units, looking `systemctl` up in `search_path`
+/// Queries the DoD units, looking `systemctl` up in `search_path`
 /// (a `PATH`-style list; relative entries are ignored).
 ///
 /// # Errors
@@ -292,12 +293,16 @@ UnitFileState=disabled
 
 SubState=dead
 UnitFileState=disabled
+
+ActiveState=inactive
+SubState=dead
+UnitFileState=disabled
 ";
 
     #[test]
     fn parses_one_block_per_unit() {
         let states = parse_show_output(SHOW_OUTPUT);
-        assert_eq!(states.len(), 6);
+        assert_eq!(states.len(), DOD_UNITS.len());
         assert_eq!(states[0].unit, "harw-dod.target");
         assert!(states[0].is_active());
         assert_eq!(states[0].unit_file_state(), Some("enabled"));
@@ -313,12 +318,25 @@ UnitFileState=disabled
         assert!(!states[3].is_active());
         assert_eq!(states[4].unit, "harw-warden.socket");
         assert!(matches!(states[5].status, UnitStatus::Unknown { .. }));
+        assert_eq!(states[6].unit, "harw-probe-netlink.service");
+        assert_eq!(states[6].unit_file_state(), Some("disabled"));
+    }
+
+    #[test]
+    fn status_includes_the_opt_in_netlink_probe() -> TestResult {
+        let states = unit_states_in(None)?;
+        assert!(
+            states
+                .iter()
+                .any(|state| state.unit == "harw-probe-netlink.service")
+        );
+        Ok(())
     }
 
     #[test]
     fn mismatched_block_count_is_unknown_for_every_unit() {
         let states = parse_show_output("ActiveState=active\nSubState=running\n");
-        assert_eq!(states.len(), 6);
+        assert_eq!(states.len(), DOD_UNITS.len());
         assert!(
             states
                 .iter()
@@ -351,7 +369,7 @@ UnitFileState=disabled
         // Absent: an empty directory as the whole search path.
         let empty = tempfile::tempdir()?;
         let states = unit_states_in(Some(empty.path().as_os_str()))?;
-        assert_eq!(states.len(), 6);
+        assert_eq!(states.len(), DOD_UNITS.len());
         assert!(
             states
                 .iter()
@@ -369,13 +387,13 @@ UnitFileState=disabled
                 .all(|state| state.status == UnitStatus::NotAvailable)
         );
 
-        // A fake systemctl that checks its arguments and prints six blocks.
+        // A fake systemctl that checks its arguments and prints a block per unit.
         let fake = tempfile::tempdir()?;
         let output = fake.path().join("show.txt");
         fs::write(&output, SHOW_OUTPUT)?;
         let script = format!(
             "#!/bin/sh\n\
-             [ \"$1\" = show ] && [ \"$2\" = -p ] && [ \"$3\" = {SHOW_PROPERTIES} ] && [ \"$4\" = harw-dod.target ] && [ \"$9\" = harw-warden.service ] || exit 7\n\
+             [ \"$1\" = show ] && [ \"$2\" = -p ] && [ \"$3\" = {SHOW_PROPERTIES} ] && [ \"$4\" = harw-dod.target ] && [ \"${{10}}\" = harw-probe-netlink.service ] || exit 7\n\
              cat '{}'\n",
             output.display()
         );

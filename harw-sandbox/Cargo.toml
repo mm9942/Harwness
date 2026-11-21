@@ -27,6 +27,11 @@ harw-types = { path = "../harw-types" }
 # Version/Feature-Stil wie in harw-tool-shell/Cargo.toml.
 tokio = { version = "1", features = ["macros", "time"] }
 
+# PL-100 Phase 4 (B22): Host-Arbeitsphasen laufen (auch) auf CLOCK_BOOTTIME ab,
+# das Suspend mitzählt (`process_permit::LeaseInstant`); nur `time`.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix = { workspace = true, features = ["time"] }
+
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
 # `#[tokio::test]` für die neuen `wait_or_cancel`-Tests braucht zusätzlich

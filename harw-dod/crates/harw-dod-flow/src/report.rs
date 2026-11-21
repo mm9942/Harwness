@@ -68,9 +68,18 @@
 //!
 //! # Keine Nutzdaten
 //! Eine erzeugte `SecurityEvent` trägt ausschließlich `sensor`,
-//! `observed_at`, einen aus `uid` gebauten `Actor` und
-//! `EventKind::EgressFlow { destination, port }` — keines dieser Felder kann
-//! beliebig lange Verbindungsinhalte tragen. [`tests::test_observe_never_leaks_bytes_beyond_the_flow_layout_into_the_serialized_event`]
+//! `observed_at`, einen aus `uid` (und, falls bekannt, `pid`) gebauten
+//! `Actor` und `EventKind::EgressFlow { destination, port }` — keines dieser
+//! Felder kann beliebig lange Verbindungsinhalte tragen.
+//!
+//! # Die pid (PL-100 WP0.15)
+//! [`FlowEvent::pid`](crate::event::FlowEvent::pid) wird nicht mehr
+//! verworfen: `Actor::process` trägt sie als
+//! `harw_dod_signals::ProcessContext::from_pid(pid)` (eine `0` bleibt
+//! „unbekannt", `process: None`). `ppid`, `comm` und `euid` kennt ein
+//! Flow-Ereignis nicht; wer den v1-Wire-Kopf hat (`harw-probe-bpf`), trägt
+//! die Eltern-pid selbst nach. Damit lässt sich ein Egress-Befund dem
+//! verbindenden Prozess zuordnen, statt nur einer uid. [`tests::test_observe_never_leaks_bytes_beyond_the_flow_layout_into_the_serialized_event`]
 //! belegt das für den vollständigen Pfad von [`harw_dod_bpf::RawBpfEvent`]
 //! bis zur serialisierten `SecurityEvent`.
 //!
@@ -122,7 +131,7 @@
 
 use harw_authority::NetworkScope;
 use harw_dod_bpf::RawBpfEvent;
-use harw_dod_signals::{Actor, EventKind, SecurityEvent};
+use harw_dod_signals::{Actor, EventKind, ProcessContext, SecurityEvent};
 use harw_types::SensorId;
 use jiff::Timestamp;
 
@@ -174,6 +183,7 @@ pub fn to_security_event(
             uid: event.uid,
             auid: None,
             cgroup: None,
+            process: ProcessContext::from_pid(event.pid),
         }),
         kind: EventKind::EgressFlow {
             destination: event.remote_addr.to_string(),
@@ -266,6 +276,75 @@ mod tests {
             harw_dod_signals::EventKind::EgressFlow { ref destination, port: 443 }
                 if destination == "203.0.113.9"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_to_security_event_carries_the_pid_in_the_actor_process_context() -> TestResult {
+        let event = outbound_event(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
+        let reported = to_security_event(
+            &event,
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
+        )
+        .ok_or(TestError::Missing("outbound flow must be reported"))?;
+
+        let process = reported
+            .actor
+            .and_then(|actor| actor.process)
+            .ok_or(TestError::Missing("pid must reach Actor::process"))?;
+        assert_eq!(
+            process,
+            harw_dod_signals::ProcessContext {
+                pid: 100,
+                ppid: None,
+                comm: None,
+                euid: None,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_to_security_event_treats_pid_zero_as_unknown() -> TestResult {
+        let mut event = outbound_event(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
+        event.pid = 0;
+        let reported = to_security_event(
+            &event,
+            &sensor(),
+            Timestamp::UNIX_EPOCH,
+            &NetworkScope::empty(),
+        )
+        .ok_or(TestError::Missing("outbound flow must be reported"))?;
+
+        let actor = reported
+            .actor
+            .ok_or(TestError::Missing("uid still yields an Actor"))?;
+        assert_eq!(actor.uid, 1_000);
+        assert_eq!(actor.process, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_observe_forwards_the_payload_pid() -> TestResult {
+        let payload = well_formed_flow_payload(443, [203, 0, 113, 9], &[]);
+        let raw = RawBpfEvent {
+            pid: 100,
+            comm: "curl".to_owned(),
+            observed_at: Timestamp::UNIX_EPOCH,
+            payload,
+        };
+        let reported = observe(&raw, &sensor(), &NetworkScope::empty())
+            .map_err(ctx("well-formed payload must parse"))?
+            .ok_or(TestError::Missing("destination outside scope"))?;
+        assert_eq!(
+            reported
+                .actor
+                .and_then(|actor| actor.process)
+                .map(|process| process.pid),
+            Some(100)
+        );
         Ok(())
     }
 

@@ -12,7 +12,9 @@
 //! Prozess ist eine nicht durchsetzbare Selbstbeschränkung ein **harter
 //! Startfehler**, kein akzeptabler Teilbetrieb: ein Warden, der ohne
 //! Landlock liefe, hätte vollen Dateisystemzugriff, obwohl er nachweislich
-//! nur `/sys/fs/cgroup` (lesend-schreibend) und das `nft`-Programm samt
+//! nur `/sys/fs/cgroup` und sein StateDirectory (lesend-schreibend), im
+//! Indexverzeichnis der Eindämmungsmarker Marker anlegen und entfernen und —
+//! nur bei erlaubter Netzaktion — das `nft`-Programm samt
 //! Laufzeitbibliotheken (nur lesend/ausführend, siehe unten) braucht — die
 //! Selbstbeschränkung ist hier nicht eine von mehreren Verteidigungslinien, sondern die einzige, die den
 //! deklarierten Zugriff gegen das tatsächliche Berechtigungsvermögen des
@@ -28,22 +30,62 @@
 //! scheitert jede echte Ausführung nach einem sonst erfolgreichen Start an
 //! einem von Landlock selbst verweigerten `write()`.
 //!
-//! # Schreibzugriff nur auf die cgroup-Wurzel
-//! Seit `IsolateNetwork` über [`crate::isolation::NftNetworkIsolator`]
-//! läuft, führt dieser Prozess das `nft`-Programm aus
+//! # Das StateDirectory (PL-100 WP 3.1)
+//! Nonce-Ledger, Aktions-Ledger und Hold-Timer liegen im StateDirectory
+//! (`--state-dir`, Vorgabe `/var/lib/harw-warden`). Der Warden hängt dort zur
+//! Laufzeit an und ersetzt Dateien atomar (`<name>.tmp` → `rename` im selben
+//! Verzeichnis). Es bekommt deshalb dieselbe lesend-schreibende Regel wie die
+//! cgroup-Wurzel. Unter ABI V1 bleibt ein Umbenennen **über**
+//! Verzeichnisgrenzen hinweg verboten (`REFER` ist dort nie erlaubt); der
+//! Warden benennt nur innerhalb des StateDirectory um. Wie die cgroup-Wurzel
+//! ist das StateDirectory **Pflicht**: ist es nicht öffenbar, startet der
+//! Warden nicht.
+//!
+//! # Das Indexverzeichnis der Eindämmungsmarker (Owner-Review 4505015305)
+//! Je eingefrorener cgroup legt der Warden eine leere Datei
+//! `<holds>/<Kernel-ID>` an (`--holds-dir`, Vorgabe
+//! `/run/harw-warden/holds`, `harw_dod_warden::containment`); harw taut eine
+//! markierte cgroup nie auf (`job.resume`). Die Regel für dieses Verzeichnis
+//! ist **enger** als die der beiden Wurzeln: nur [`holds_index_access`] —
+//! auflisten (`ReadDir`), eine reguläre Datei anlegen und zum Schreiben
+//! öffnen (`MakeReg`, `WriteFile`), eine Datei entfernen (`RemoveFile`). Kein
+//! Symlink, kein Verzeichnis, kein Gerät, kein Lesen von Markerinhalten,
+//! kein Ausführen. Die Regel gilt nur unterhalb von `holds`; der
+//! root-eigene Elternordner `/run/harw-warden` bleibt für den Warden
+//! unbeschreibbar. `flock` und `fstatat` regelt Landlock (ABI V1) nicht.
+//! Wie StateDirectory und cgroup-Wurzel ist das Verzeichnis **Pflicht**
+//! (tmpfiles legt es an; fehlt es, startet der Warden nicht, wie auch
+//! systemd ohne den Pfad aus `ReadWritePaths=` nicht startet).
+//!
+//! # Schreibzugriff nur auf cgroup-Wurzel, StateDirectory und Marker
+//! Erlaubt die Policy eine Netzaktion, führt dieser Prozess über
+//! [`crate::isolation::NftCommandBackend`] das `nft`-Programm aus
 //! ([`crate::isolation::DEFAULT_NFT_BINARY`]). Die Landlock-Domäne vererbt
 //! sich über `execve` auf das Kindprogramm; ohne weitere Regeln scheiterte
 //! schon das `execve` selbst, spätestens aber das Laden des dynamischen
-//! Laders und der geteilten Bibliotheken mit `EACCES`. Die Regel gewährt
-//! deshalb zusätzlich — **ausschließlich** `AccessFs::from_read(abi)`
-//! (`Execute | ReadFile | ReadDir`), **niemals** Schreibrechte — Zugriff auf
-//! die in [`read_exec_paths`] aufgezählten Pfade: das `nft`-Programm, die
-//! Bibliotheks- und Laderverzeichnisse (`/usr/lib`, `/lib`, `/lib64`,
-//! `/usr/lib64` — `Execute` ist dort nötig, weil der Kernel den
-//! ELF-Interpreter `ld-linux*.so` wie ein Programm öffnet),
-//! `/etc/ld.so.cache` und nftables' Konfiguration (`/etc/nftables.conf`,
-//! `/etc/nftables`, `/etc/nftables.d`). Der Schreibzugriff bleibt exakt wie
-//! zuvor auf `cgroup_root` beschränkt.
+//! Laders und der geteilten Bibliotheken mit `EACCES`. Was das Backend
+//! braucht, meldet es selbst ([`crate::isolation::SandboxNeeds`]):
+//!
+//! - **ausschließlich** `AccessFs::from_read(abi)` (`Execute | ReadFile |
+//!   ReadDir`), **niemals** Schreibrechte, für die in [`read_exec_paths`]
+//!   aufgezählten Pfade: das `nft`-Programm, die Bibliotheks- und
+//!   Laderverzeichnisse (`/usr/lib`, `/lib`, `/lib64`, `/usr/lib64` —
+//!   `Execute` ist dort nötig, weil der Kernel den ELF-Interpreter
+//!   `ld-linux*.so` wie ein Programm öffnet), `/etc/ld.so.cache` und
+//!   nftables' Konfiguration (`/etc/nftables.conf`, `/etc/nftables`,
+//!   `/etc/nftables.d`);
+//! - Lesen und Schreiben **einzelner Dateien**: `/dev/null`, das
+//!   `std::process::Stdio::null()` für Standard-Ein- und -Ausgabe des
+//!   Kindes öffnet. Für Dateien beschneidet `path_beneath_rules` die Rechte
+//!   auf `Execute | WriteFile | ReadFile`; ein Verzeichnis ist hier nie
+//!   gemeint.
+//!
+//! Ohne erlaubte Netzaktion (Vorgabe: nur Freeze/Thaw) ist der Bedarf leer:
+//! dann bekommt der Warden weder Ausführungsrechte noch `/dev/null`. Der
+//! Schreibzugriff auf Verzeichnisse bleibt immer auf `cgroup_root`, das
+//! StateDirectory und (nur Marker anlegen und entfernen) das
+//! Indexverzeichnis beschränkt. Policy, Schlüssel und `/etc/passwd` liest der
+//! Warden **vor** dieser Beschränkung; danach sind sie unerreichbar.
 //!
 //! Anders als die cgroup-Wurzel sind diese Pfade **optional**: je nach
 //! Distribution fehlt z. B. `/lib64` oder `/etc/nftables.d`. Ein nicht
@@ -88,14 +130,16 @@
 //! teilweiser Schutz kein Schutz, dem man vertrauen sollte.
 //!
 //! # Exportierte Typen
-//! Keine — nur die Funktionen [`enforce_cgroup_root`],
-//! [`enforce_warden_scope`] und die reine Hilfsfunktion [`read_exec_paths`].
+//! Keine — nur die Funktion [`enforce_runtime_scope`] und die reinen
+//! Hilfsfunktionen [`read_exec_paths`] und [`holds_index_access`].
 //!
 //! # Nebenläufigkeit
-//! [`enforce_cgroup_root`] bzw. [`enforce_warden_scope`] muss vor jedem weiteren Thread aus dem
+//! [`enforce_runtime_scope`] muss vor jedem weiteren Thread aus dem
 //! Hauptthread aufgerufen werden — eine Landlock-Regel gilt prozessweit für
 //! alle danach entstehenden Threads (insbesondere für jeden von
-//! [`crate::ipc::serve_forever`] gestarteten Verbindungs-Thread).
+//! [`crate::ipc::serve_forever`] gestarteten Verbindungs-Thread). Danach
+//! folgt der seccomp-Filter (`crate::seccomp`), der `landlock_*` nicht mehr
+//! erlaubt.
 //!
 //! # Fehler
 //! [`crate::error::WardenBinError::LandlockUnavailable`], siehe oben.
@@ -103,12 +147,12 @@
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, RestrictionStatus, Ruleset,
-    RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
+    ABI, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError,
+    RestrictionStatus, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
 };
 
 use crate::error::WardenBinError;
-use crate::isolation::DEFAULT_NFT_BINARY;
+use crate::isolation::SandboxNeeds;
 
 /// Bibliotheks- und Laderverzeichnisse, die `nft` (und sein dynamischer
 /// Lader) zum Start lesen bzw. ausführen muss; fehlende werden übersprungen.
@@ -127,7 +171,7 @@ const NFTABLES_CONFIG_PATHS: [&str; 3] = ["/etc/nftables.conf", "/etc/nftables",
 /// # Description
 /// Reine Funktion ohne Dateisystemzugriff: sie liefert Kandidaten, das
 /// Überspringen nicht vorhandener Pfade erledigt der Aufrufer
-/// ([`enforce_warden_scope`] über `landlock::path_beneath_rules`).
+/// ([`enforce_runtime_scope`] über `landlock::path_beneath_rules`).
 /// Reihenfolge: `nft_binary`, [`LIBRARY_DIRS`], [`LD_SO_CACHE`],
 /// [`NFTABLES_CONFIG_PATHS`]. Ein **nicht absoluter** `nft_binary` (ein
 /// bloßer Programmname, den `Command` über `PATH` auflöst) wird
@@ -138,7 +182,7 @@ const NFTABLES_CONFIG_PATHS: [&str; 3] = ["/etc/nftables.conf", "/etc/nftables",
 ///
 /// # Arguments
 /// - `nft_binary` (`&Path`): Pfad des `nft`-Programms, das
-///   [`crate::isolation::NftNetworkIsolator`] ausführt.
+///   [`crate::isolation::NftCommandBackend`] ausführt.
 ///
 /// # Returns
 /// Die Kandidatenliste in obiger Reihenfolge, ohne Duplikate.
@@ -159,57 +203,72 @@ pub fn read_exec_paths(nft_binary: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Wie [`enforce_warden_scope`] mit [`DEFAULT_NFT_BINARY`] — dem Programm,
-/// das der produktive [`crate::isolation::NftNetworkIsolator`] ausführt.
+/// Die Rechte unterhalb des Indexverzeichnisses der Eindämmungsmarker.
 ///
-/// # Arguments
-/// - `cgroup_root` (`&Path`): siehe [`enforce_warden_scope`].
+/// # Description
+/// Genau, was das Marker-Protokoll und der Abgleich beim Start brauchen
+/// (`harw_dod_warden::containment`, `harw_dod_warden::reconcile`): das
+/// Verzeichnis öffnen und auflisten (`ReadDir`), einen Marker anlegen
+/// (`MakeReg`, `O_CREAT | O_EXCL`) und dabei zum Schreiben öffnen
+/// (`WriteFile`), einen Marker entfernen (`RemoveFile`). Siehe Moduldoku,
+/// Abschnitt „Das Indexverzeichnis der Eindämmungsmarker“.
 ///
 /// # Returns
-/// Siehe [`enforce_warden_scope`].
-///
-/// # Errors
-/// Siehe [`enforce_warden_scope`].
-pub fn enforce_cgroup_root(cgroup_root: &Path) -> Result<(), WardenBinError> {
-    enforce_warden_scope(cgroup_root, Path::new(DEFAULT_NFT_BINARY))
+/// Die Rechte (eine Teilmenge der unter ABI V1 behandelten).
+#[must_use]
+pub fn holds_index_access() -> BitFlags<AccessFs> {
+    AccessFs::ReadDir | AccessFs::WriteFile | AccessFs::MakeReg | AccessFs::RemoveFile
 }
 
-/// Erzwingt Lese- und Schreibzugriff auf `cgroup_root` sowie reinen
-/// Lese-/Ausführungszugriff auf `nft` und dessen Laufzeitpfade, sonst
-/// nichts, bevor dieser Prozess auch nur eine Anfrage annimmt.
+/// Erzwingt Lese- und Schreibzugriff auf `cgroup_root` und `state_dir`,
+/// Marker-Rechte im Indexverzeichnis `holds_dir` sowie den Bedarf des
+/// Netfilter-Backends, sonst nichts, bevor dieser Prozess auch nur eine
+/// Anfrage annimmt.
 ///
 /// # Description
 /// Baut ein `landlock::Ruleset` mit `CompatLevel::BestEffort` (damit ein
 /// älterer Kernel `PartiallyEnforced` statt eines harten `Err` aus der
 /// `landlock`-Crate selbst liefert — diese Funktion entscheidet danach
 /// trotzdem selbst, siehe Moduldoku, dass auch das nicht genügt), nimmt für
-/// `cgroup_root` eine lesend-schreibende `PathBeneath`-Regel unter
-/// [`landlock::ABI::V1`] auf, dazu für jeden öffenbaren Pfad aus
-/// [`read_exec_paths`] eine rein lesende (`Execute | ReadFile | ReadDir`,
-/// für Dateien beschnitten auf `Execute | ReadFile`), und ruft
-/// `restrict_self()` auf. Nur [`RulesetStatus::FullyEnforced`] gilt als
-/// Erfolg; ist `cgroup_root` selbst nicht als `PathFd` öffenbar, ist das
-/// ebenfalls ein Fehlschlag dieser Funktion (siehe Moduldoku, Abschnitt
-/// „Ein Wurzelverzeichnis, kein optionaler Satz"). Nicht vorhandene
-/// Zusatzpfade werden übersprungen (Moduldoku, Abschnitt „Schreibzugriff
-/// nur auf die cgroup-Wurzel").
+/// `cgroup_root` und für `state_dir` je eine lesend-schreibende
+/// `PathBeneath`-Regel unter [`landlock::ABI::V1`] auf, für `holds_dir`
+/// eine mit nur [`holds_index_access`], dazu für jeden
+/// öffenbaren Pfad aus `needs.read_exec_paths` eine rein lesende
+/// (`Execute | ReadFile | ReadDir`, für Dateien beschnitten auf
+/// `Execute | ReadFile`) und für jede öffenbare Datei aus
+/// `needs.read_write_files` eine lesend-schreibende (beschnitten auf die
+/// Dateirechte), und ruft `restrict_self()` auf. Nur
+/// [`RulesetStatus::FullyEnforced`] gilt als Erfolg; ist `cgroup_root`,
+/// `state_dir` oder `holds_dir` nicht als `PathFd` öffenbar, ist das
+/// ebenfalls ein Fehlschlag dieser Funktion (siehe Moduldoku, Abschnitt „Ein
+/// Wurzelverzeichnis, kein optionaler Satz"). Nicht vorhandene Zusatzpfade
+/// werden übersprungen (Moduldoku, Abschnitt „Schreibzugriff nur auf
+/// cgroup-Wurzel, StateDirectory und Marker").
 ///
 /// # Arguments
 /// - `cgroup_root` (`&Path`): das Wurzelverzeichnis, auf das sich der
 ///   Schreibzugriff dieses Prozesses beschränken soll (Produktion:
 ///   `/sys/fs/cgroup`).
-/// - `nft_binary` (`&Path`): das `nft`-Programm, das der Isolator ausführt
-///   (Produktion: [`DEFAULT_NFT_BINARY`]); muss absolut sein, sonst wird es
-///   ausgelassen (siehe [`read_exec_paths`]).
+/// - `state_dir` (`&Path`): das StateDirectory (Produktion:
+///   `/var/lib/harw-warden`).
+/// - `holds_dir` (`&Path`): das Indexverzeichnis der Eindämmungsmarker
+///   (Produktion: `/run/harw-warden/holds`).
+/// - `needs` (`&SandboxNeeds`): Bedarf des Netfilter-Backends (leer, wenn
+///   die Policy keine Netzaktion erlaubt).
 ///
 /// # Returns
 /// `Ok(())` ausschließlich bei `RulesetStatus::FullyEnforced`.
 ///
 /// # Errors
 /// - [`WardenBinError::LandlockUnavailable`]: bei jedem Aufbaufehler, bei
-///   einem nicht öffenbaren `cgroup_root`, und bei jedem Ausgang außer
-///   `FullyEnforced`.
-pub fn enforce_warden_scope(cgroup_root: &Path, nft_binary: &Path) -> Result<(), WardenBinError> {
+///   einem nicht öffenbaren `cgroup_root`, `state_dir` oder `holds_dir`, und
+///   bei jedem Ausgang außer `FullyEnforced`.
+pub fn enforce_runtime_scope(
+    cgroup_root: &Path,
+    state_dir: &Path,
+    holds_dir: &Path,
+    needs: &SandboxNeeds,
+) -> Result<(), WardenBinError> {
     let abi = ABI::V1;
     let read_access = AccessFs::from_read(abi);
     let access = read_access | AccessFs::from_write(abi);
@@ -229,40 +288,64 @@ pub fn enforce_warden_scope(cgroup_root: &Path, nft_binary: &Path) -> Result<(),
         .set_compatibility(CompatLevel::BestEffort);
 
     let root_fd = PathFd::new(cgroup_root).map_err(|error| {
+        // `PathFdError` nennt den Pfad: der volle Fehler nur auf `debug`.
+        tracing::debug!(error = %error, "cgroup root that could not be opened");
         tracing::error!(
-            path = %cgroup_root.display(),
-            error = %error,
+            kind = ?open_error_kind(&error),
             "cgroup root not openable while building the landlock rule; refusing to start"
         );
         WardenBinError::LandlockUnavailable
     })?;
     let rule: PathBeneath<PathFd> = PathBeneath::new(root_fd, access);
+    let state_fd = PathFd::new(state_dir).map_err(|error| {
+        tracing::debug!(error = %error, "state directory that could not be opened");
+        tracing::error!(
+            kind = ?open_error_kind(&error),
+            "state directory not openable while building the landlock rule; refusing to start"
+        );
+        WardenBinError::LandlockUnavailable
+    })?;
+    let state_rule: PathBeneath<PathFd> = PathBeneath::new(state_fd, access);
+    let holds_fd = PathFd::new(holds_dir).map_err(|error| {
+        tracing::debug!(error = %error, "containment holds directory that could not be opened");
+        tracing::error!(
+            kind = ?open_error_kind(&error),
+            "containment holds directory not openable while building the landlock rule; refusing to start"
+        );
+        WardenBinError::LandlockUnavailable
+    })?;
+    let holds_rule: PathBeneath<PathFd> = PathBeneath::new(holds_fd, holds_index_access());
 
     let created = created
-        .add_rules([Ok::<_, landlock::RulesetError>(rule)])
+        .add_rules([
+            Ok::<_, landlock::RulesetError>(rule),
+            Ok::<_, landlock::RulesetError>(state_rule),
+            Ok::<_, landlock::RulesetError>(holds_rule),
+        ])
         .map_err(|error| {
             tracing::error!(error = %error, "landlock add_rules failed; refusing to start");
             WardenBinError::LandlockUnavailable
         })?;
 
-    let extra_paths = read_exec_paths(nft_binary);
-    if !nft_binary.is_absolute() {
-        tracing::warn!(
-            nft = %nft_binary.display(),
-            "nft binary path is not absolute; no landlock rule for it, isolation will likely fail"
-        );
-    }
-    for path in &extra_paths {
+    for path in needs.read_exec_paths.iter().chain(&needs.read_write_files) {
         if PathFd::new(path).is_err() {
-            tracing::debug!(path = %path.display(), "optional landlock read path not openable; skipped");
+            tracing::debug!(path = %path.display(), "optional landlock path not openable; skipped");
         }
     }
     // `path_beneath_rules` lässt nicht öffenbare Pfade selbst aus und
-    // beschneidet die Rechte regulärer Dateien auf `Execute | ReadFile`.
-    let created = created.add_rules(path_beneath_rules(&extra_paths, read_access)).map_err(|error| {
-        tracing::error!(error = %error, "landlock add_rules for nft paths failed; refusing to start");
-        WardenBinError::LandlockUnavailable
-    })?;
+    // beschneidet die Rechte regulärer Dateien auf die Dateirechte.
+    let created = created
+        .add_rules(path_beneath_rules(&needs.read_exec_paths, read_access))
+        .map_err(|error| {
+            tracing::error!(error = %error, "landlock add_rules for backend read paths failed; refusing to start");
+            WardenBinError::LandlockUnavailable
+        })?;
+    let created = created
+        .add_rules(path_beneath_rules(&needs.read_write_files, access))
+        .map_err(|error| {
+            tracing::error!(error = %error, "landlock add_rules for backend files failed; refusing to start");
+            WardenBinError::LandlockUnavailable
+        })?;
 
     let status: RestrictionStatus = created.restrict_self().map_err(|error| {
         tracing::error!(error = %error, "landlock restrict_self failed; refusing to start");
@@ -272,8 +355,11 @@ pub fn enforce_warden_scope(cgroup_root: &Path, nft_binary: &Path) -> Result<(),
     if status.ruleset == RulesetStatus::FullyEnforced {
         tracing::info!(
             root = %cgroup_root.display(),
-            nft = %nft_binary.display(),
-            "landlock cgroup root and nft read scope fully enforced"
+            state = %state_dir.display(),
+            holds = %holds_dir.display(),
+            backend_read_paths = needs.read_exec_paths.len(),
+            backend_files = needs.read_write_files.len(),
+            "landlock cgroup root, state directory, containment index and backend scope fully enforced"
         );
         Ok(())
     } else {
@@ -285,8 +371,28 @@ pub fn enforce_warden_scope(cgroup_root: &Path, nft_binary: &Path) -> Result<(),
     }
 }
 
-// Getestet wird nur die reine Pfadliste [`read_exec_paths`]:
-// `enforce_warden_scope`/`enforce_cgroup_root` selbst würden eine echte
+/// Returns the `io::ErrorKind` behind a `PathFdError` (never its path).
+///
+/// # Description
+/// `landlock::PathFdError` zeigt in `Display` den Pfad
+/// (`failed to open "<pfad>": …`). Auf `error`-Stufe steht deshalb nur die
+/// Fehlerart; ein unbekannter (künftiger) Variantentyp wird `Other`.
+///
+/// # Arguments
+/// - `error` (`&PathFdError`): der Öffnungsfehler.
+///
+/// # Returns
+/// Die Fehlerart des zugrunde liegenden `open()`.
+fn open_error_kind(error: &PathFdError) -> std::io::ErrorKind {
+    match error {
+        PathFdError::OpenCall { source, .. } => source.kind(),
+        _ => std::io::ErrorKind::Other,
+    }
+}
+
+// Getestet werden nur die reine Pfadliste [`read_exec_paths`] und
+// [`open_error_kind`] (`PathFd::new` öffnet nur, bindet keine Regel):
+// `enforce_runtime_scope` selbst würde eine echte
 // Landlock-Regel binden (`restrict_self`) — nach Aufgabenstellung
 // ausdrücklich untersagt, dieselbe Disziplin wie `harw-sentinel::sandbox`
 // und `harw-probe-fs::landlock`. Deren Entscheidungslogik (Schreibzugriff nur
@@ -296,9 +402,26 @@ pub fn enforce_warden_scope(cgroup_root: &Path, nft_binary: &Path) -> Result<(),
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{LD_SO_CACHE, LIBRARY_DIRS, NFTABLES_CONFIG_PATHS, read_exec_paths};
+    use super::{
+        LD_SO_CACHE, LIBRARY_DIRS, NFTABLES_CONFIG_PATHS, holds_index_access, open_error_kind,
+        read_exec_paths,
+    };
     use crate::isolation::DEFAULT_NFT_BINARY;
     use crate::test_support::{TestError, TestResult};
+
+    #[test]
+    fn test_open_error_kind_reports_the_kind_without_the_path() -> TestResult {
+        let missing = Path::new("/nonexistent/harw-warden-landlock-test");
+        let Err(error) = landlock::PathFd::new(missing) else {
+            return Err(TestError::Unexpected(
+                "a missing path must not be openable".to_owned(),
+            ));
+        };
+        assert_eq!(open_error_kind(&error), std::io::ErrorKind::NotFound);
+        // Genau deshalb steht auf `error`-Stufe nur die Fehlerart.
+        assert!(error.to_string().contains("harw-warden-landlock-test"));
+        Ok(())
+    }
 
     fn expected_tail() -> Vec<PathBuf> {
         LIBRARY_DIRS
@@ -376,6 +499,42 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    // Nur Marker anlegen, öffnen und entfernen, das Verzeichnis auflisten;
+    // alles innerhalb der unter ABI V1 behandelten Rechte (sonst
+    // `PartiallyEnforced`, ein harter Startfehler).
+    #[test]
+    fn test_holds_index_access_only_creates_lists_and_removes_markers() {
+        use landlock::{ABI, AccessFs};
+
+        let access = holds_index_access();
+        for needed in [
+            AccessFs::ReadDir,
+            AccessFs::WriteFile,
+            AccessFs::MakeReg,
+            AccessFs::RemoveFile,
+        ] {
+            assert!(access.contains(needed), "{needed:?} missing");
+        }
+        for forbidden in [
+            AccessFs::Execute,
+            AccessFs::ReadFile,
+            AccessFs::RemoveDir,
+            AccessFs::MakeDir,
+            AccessFs::MakeSym,
+            AccessFs::MakeChar,
+            AccessFs::MakeBlock,
+            AccessFs::MakeFifo,
+            AccessFs::MakeSock,
+            AccessFs::Refer,
+            AccessFs::Truncate,
+        ] {
+            assert!(!access.contains(forbidden), "{forbidden:?} granted");
+        }
+        let handled = AccessFs::from_read(ABI::V1) | AccessFs::from_write(ABI::V1);
+        assert!(handled.contains(access));
+        assert_eq!(access.len(), 4);
     }
 
     #[test]

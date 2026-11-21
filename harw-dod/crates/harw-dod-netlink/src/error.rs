@@ -3,9 +3,13 @@
 //!
 //! # Verantwortungsbereich
 //! [`NetlinkError`] ist der eine Fehlertyp von `harw-dod-netlink`. Er trägt
-//! zwei Fälle: [`NetlinkError::MalformedRecord`] für einen Audit-Record, der
+//! vier Fälle: [`NetlinkError::MalformedRecord`] für einen Audit-Record, der
 //! nicht dem erwarteten `key=value`-Format entspricht oder ein Pflichtfeld
-//! vermissen lässt, und [`NetlinkError::Sensor`] für alles, was aus dem
+//! vermissen lässt, [`NetlinkError::Overrun`], wenn der Kernel Records
+//! verworfen hat, weil der Empfangspuffer des Sockets voll war,
+//! [`NetlinkError::Truncated`], wenn ein Datagramm größer als der
+//! Lesepuffer war und sein Record deshalb verloren ist, und
+//! [`NetlinkError::Sensor`] für alles, was aus dem
 //! gemeinsamen Zugriffsvokabular [`harw_dod_cap::SensorError`] kommt —
 //! insbesondere [`harw_dod_cap::SensorError::SourceUnavailable`], wenn der
 //! `AUDIT`-Netlink-Socket auf diesem Host nicht geöffnet oder gebunden werden
@@ -48,10 +52,12 @@ use harw_macros::HarwError;
 /// Fehler dieser Crate.
 ///
 /// # Description
-/// Zwei Varianten: ein lokal erkannter Formfehler eines Audit-Records
-/// ([`Self::MalformedRecord`]) und alles, was aus dem gemeinsamen
+/// Vier Varianten: ein lokal erkannter Formfehler eines Audit-Records
+/// ([`Self::MalformedRecord`]), ein vom Kernel gemeldeter Verlust von
+/// Records ([`Self::Overrun`]), ein beim Lesen abgeschnittenes Datagramm
+/// ([`Self::Truncated`]) und alles, was aus dem gemeinsamen
 /// Zugriffsvokabular [`harw_dod_cap::SensorError`] stammt ([`Self::Sensor`]).
-/// Beide sind inhaltsfrei — siehe Moduldokumentation.
+/// Alle sind inhaltsfrei — siehe Moduldokumentation.
 #[derive(Debug, HarwError)]
 pub enum NetlinkError {
     /// Ein Audit-Record entspricht nicht dem erwarteten `key=value`-Format,
@@ -61,6 +67,26 @@ pub enum NetlinkError {
     /// Nennt **nie** den Recordinhalt — siehe Moduldokumentation.
     #[msg("audit record is malformed")]
     MalformedRecord,
+
+    /// Der Kernel hat Audit-Records verworfen, weil der Empfangspuffer des
+    /// Netlink-Sockets voll war (`ENOBUFS`).
+    ///
+    /// **Vorübergehend:** der Socket bleibt benutzbar, der nächste Lesevorgang
+    /// liefert wieder Records. Der Verlust selbst ist aber nicht
+    /// rückgängig zu machen; ein Aufrufer meldet ihn (etwa als
+    /// `SensorDegraded`), statt ihn still zu übergehen.
+    #[msg("audit netlink socket overran; records were lost")]
+    Overrun,
+
+    /// Ein empfangenes Datagramm war größer als der Lesepuffer; der Kernel
+    /// hat den Rest beim `recv()` verworfen (erkannt über `MSG_TRUNC`).
+    ///
+    /// **Vorübergehend** wie [`Self::Overrun`]: der Socket bleibt benutzbar,
+    /// aber der Record in diesem Datagramm ist verloren. Ein Aufrufer zählt
+    /// und meldet ihn wie einen Überlauf, statt ihn still zu übergehen.
+    /// Trägt weder Länge noch Inhalt.
+    #[msg("audit netlink datagram exceeded the receive buffer; a record was lost")]
+    Truncated,
 
     /// Ein Fehler aus dem gemeinsamen Zugriffsvokabular.
     ///
@@ -98,6 +124,26 @@ mod tests {
     fn test_sensor_variant_links_source() {
         let err: NetlinkError = SensorError::OutsideScope.into();
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn test_overrun_display_is_exact_and_content_free() {
+        let err = NetlinkError::Overrun;
+        assert_eq!(
+            err.to_string(),
+            "audit netlink socket overran; records were lost"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn test_truncated_display_is_exact_and_content_free() {
+        let err = NetlinkError::Truncated;
+        assert_eq!(
+            err.to_string(),
+            "audit netlink datagram exceeded the receive buffer; a record was lost"
+        );
+        assert!(std::error::Error::source(&err).is_none());
     }
 
     #[test]

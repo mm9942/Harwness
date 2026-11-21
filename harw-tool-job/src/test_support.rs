@@ -234,3 +234,367 @@ pub(crate) fn install_host_port() {
         }
     });
 }
+
+/// Fake cgroup backend for `job.suspend` / `job.resume` tests (PL-100
+/// WP 3.5): records every freeze and thaw, keeps the requested
+/// (`cgroup.freeze`) and the kernel (`cgroup.events frozen`) state per
+/// cgroup, can deny both operations, and lets a test change the state
+/// "outside harw" (`FakeCgroup::set_outside`). [`fake_cgroup::FakeHolds`]
+/// is the Warden's containment index for these tests;
+/// [`fake_cgroup::marker_index`] builds a real marker directory
+/// (`MarkerDirHolds`) in a temporary directory.
+#[cfg(target_os = "linux")]
+pub(crate) mod fake_cgroup {
+    use super::{TestResult, ctx};
+    use crate::freeze::{
+        CgroupFreezer, ContainmentHolds, ContainmentLease, FreezeError, JobFreezer, MarkerDirHolds,
+    };
+    use harw_job_linux::cgroup::{CgroupBackend, CgroupHandle, CgroupSpec, CgroupStats};
+    use harw_job_linux::{CgroupError, LinuxProcess};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    /// The effective uid of the test process (the owner of everything a
+    /// test creates).
+    pub(crate) fn own_uid() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
+    /// Sets `mode` on `path` (tests must not depend on the umask).
+    pub(crate) fn chmod(path: &Path, mode: u32) -> TestResult {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(ctx("chmod"))
+    }
+
+    /// A Warden runtime directory `<base>/harw-warden` (`0755`) with an
+    /// empty marker directory `holds` (`0755`), read by a
+    /// [`MarkerDirHolds`] that accepts the test user as owner of both and
+    /// knows no evidence of an installed Warden.
+    pub(crate) fn marker_index(base: &Path) -> TestResult<MarkerDirHolds> {
+        let runtime = base.join("harw-warden");
+        let dir = runtime.join("holds");
+        fs::create_dir_all(&dir).map_err(ctx("create marker dir"))?;
+        chmod(&runtime, 0o755)?;
+        chmod(&dir, 0o755)?;
+        Ok(trusting_test_user(MarkerDirHolds::new(dir)))
+    }
+
+    /// `holds` accepting the test user as owner of the runtime directory
+    /// and of the index, without evidence of an installed Warden (the
+    /// host's real `/run/harw/warden.sock` must not matter).
+    pub(crate) fn trusting_test_user(holds: MarkerDirHolds) -> MarkerDirHolds {
+        holds
+            .trusting_runtime_owner(own_uid())
+            .allowing_own_index()
+            .with_owner_evidence(Vec::<PathBuf>::new())
+    }
+
+    /// Writes the marker of `kernel_id` as a regular `0644` file.
+    pub(crate) fn write_marker(holds: &MarkerDirHolds, kernel_id: u64) -> TestResult<PathBuf> {
+        let marker = holds.dir().join(kernel_id.to_string());
+        fs::write(&marker, b"").map_err(ctx("write marker"))?;
+        chmod(&marker, 0o644)?;
+        Ok(marker)
+    }
+
+    /// The kernel id the fake reports for the cgroup `name`: a stable
+    /// FNV-1a hash of the name (wrapping on purpose, as every hash does).
+    pub(crate) fn fake_kernel_id(name: &str) -> u64 {
+        name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// In-memory containment index of the Warden: the kernel ids it holds,
+    /// a switch that makes the index unreadable, and switches for its lease
+    /// (refused as untrusted, or contended: someone else holds the lock).
+    #[derive(Debug, Default)]
+    pub(crate) struct FakeHolds {
+        held: Mutex<BTreeSet<u64>>,
+        unreadable: AtomicBool,
+        lease_unavailable: AtomicBool,
+        lease_contended: AtomicBool,
+    }
+
+    impl FakeHolds {
+        /// The Warden writes its marker for `kernel_id` (before it freezes).
+        pub(crate) fn hold(&self, kernel_id: u64) {
+            lock(&self.held).insert(kernel_id);
+        }
+
+        /// The Warden removes its marker for `kernel_id` (after it thawed).
+        pub(crate) fn release(&self, kernel_id: u64) {
+            lock(&self.held).remove(&kernel_id);
+        }
+
+        /// Makes every lookup fail (`true`) or work again (`false`).
+        pub(crate) fn set_unreadable(&self, unreadable: bool) {
+            self.unreadable.store(unreadable, Ordering::SeqCst);
+        }
+
+        /// Makes every lease fail as an untrusted index (`true`) or work
+        /// again (`false`); lookups are not affected.
+        pub(crate) fn set_lease_unavailable(&self, unavailable: bool) {
+            self.lease_unavailable.store(unavailable, Ordering::SeqCst);
+        }
+
+        /// Makes every lease contended (`true`: someone else holds the
+        /// index lock for the whole retry budget) or unlocked again
+        /// (`false`).
+        pub(crate) fn set_lease_contended(&self, contended: bool) {
+            self.lease_contended.store(contended, Ordering::SeqCst);
+        }
+    }
+
+    impl ContainmentHolds for FakeHolds {
+        fn is_held(&self, kernel_id: u64) -> Result<bool, FreezeError> {
+            if self.unreadable.load(Ordering::SeqCst) {
+                return Err(FreezeError::ContainmentIndexUnreadable {
+                    reason: "the fake index is unreadable",
+                });
+            }
+            Ok(lock(&self.held).contains(&kernel_id))
+        }
+
+        fn lease(&self) -> Result<ContainmentLease, FreezeError> {
+            if self.lease_unavailable.load(Ordering::SeqCst) {
+                return Err(FreezeError::ContainmentIndexUnreadable {
+                    reason: "the fake lease is unavailable",
+                });
+            }
+            if self.lease_contended.load(Ordering::SeqCst) {
+                return Ok(ContainmentLease::contended());
+            }
+            Ok(ContainmentLease::unlocked())
+        }
+    }
+
+    /// One recorded call: `(operation, cgroup name)`.
+    pub(crate) type Call = (&'static str, String);
+
+    /// The fake backend.
+    #[derive(Debug, Default)]
+    pub(crate) struct FakeCgroup {
+        calls: Mutex<Vec<Call>>,
+        // Cgroups whose own `cgroup.freeze` is 1.
+        requested: Mutex<BTreeSet<String>>,
+        // Cgroups the kernel reports frozen (own or inherited freeze).
+        frozen: Mutex<BTreeSet<String>>,
+        deny: bool,
+    }
+
+    // Poison-tolerant lock (a failed test must not hide the next failure).
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Error for every operation the job tool never uses.
+    fn unused(name: &str) -> CgroupError {
+        CgroupError::NotFound {
+            path: name.to_owned(),
+        }
+    }
+
+    impl FakeCgroup {
+        /// A backend whose `freeze` and `thaw` fail with `PermissionDenied`.
+        pub(crate) fn denying() -> Self {
+            Self {
+                deny: true,
+                ..Self::default()
+            }
+        }
+
+        /// All recorded freeze/thaw calls in order.
+        pub(crate) fn calls(&self) -> Vec<Call> {
+            lock(&self.calls).clone()
+        }
+
+        /// Changes the state of `name` as someone other than harw would
+        /// (an operator, the Warden, an ancestor freeze): `requested` is its
+        /// own `cgroup.freeze`, `frozen` the kernel view. Not recorded as a
+        /// call.
+        pub(crate) fn set_outside(&self, name: &str, requested: bool, frozen: bool) {
+            for (set, member) in [(&self.requested, requested), (&self.frozen, frozen)] {
+                let mut set = lock(set);
+                if member {
+                    set.insert(name.to_owned());
+                } else {
+                    set.remove(name);
+                }
+            }
+        }
+
+        // Records `operation` on `group` and applies it to both sets (the
+        // fake freezes at once).
+        fn apply(&self, operation: &'static str, group: &CgroupHandle) -> Result<(), CgroupError> {
+            lock(&self.calls).push((operation, group.name().to_owned()));
+            if self.deny {
+                return Err(CgroupError::PermissionDenied {
+                    path: group.name().to_owned(),
+                });
+            }
+            let freeze = operation == "freeze";
+            self.set_outside(group.name(), freeze, freeze);
+            Ok(())
+        }
+    }
+
+    impl CgroupBackend for FakeCgroup {
+        fn create(&self, spec: &CgroupSpec) -> Result<CgroupHandle, CgroupError> {
+            Err(unused(&spec.name))
+        }
+
+        fn reopen(&self, name: &str) -> Result<CgroupHandle, CgroupError> {
+            Ok(CgroupHandle::new(
+                name.to_owned(),
+                format!("/fake/{name}"),
+                None,
+            ))
+        }
+
+        fn attach(&self, group: &CgroupHandle, _process: &LinuxProcess) -> Result<(), CgroupError> {
+            Err(unused(group.name()))
+        }
+
+        fn attach_self(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(unused(group.name()))
+        }
+
+        fn freeze(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            self.apply("freeze", group)
+        }
+
+        fn thaw(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            self.apply("thaw", group)
+        }
+
+        fn is_frozen(&self, group: &CgroupHandle) -> Result<bool, CgroupError> {
+            Ok(lock(&self.frozen).contains(group.name()))
+        }
+
+        fn freeze_requested(&self, group: &CgroupHandle) -> Result<bool, CgroupError> {
+            Ok(lock(&self.requested).contains(group.name()))
+        }
+
+        fn kernel_id(&self, group: &CgroupHandle) -> Result<u64, CgroupError> {
+            Ok(fake_kernel_id(group.name()))
+        }
+
+        fn kill(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(unused(group.name()))
+        }
+
+        fn stats(&self, group: &CgroupHandle) -> Result<CgroupStats, CgroupError> {
+            Err(unused(group.name()))
+        }
+
+        fn remove(&self, group: CgroupHandle) -> Result<(), CgroupError> {
+            Err(unused(group.name()))
+        }
+    }
+
+    /// The delegated root the fake freezer is rooted at.
+    pub(crate) const FAKE_ROOT: &str = "/harw.slice";
+
+    /// A [`CgroupFreezer`] over `fake` rooted at [`FAKE_ROOT`] whose
+    /// containment index holds nothing (never the host's real index).
+    pub(crate) fn freezer(fake: &Arc<FakeCgroup>) -> Arc<dyn JobFreezer> {
+        freezer_with_holds(fake, &Arc::new(FakeHolds::default()))
+    }
+
+    /// A [`CgroupFreezer`] over `fake` rooted at [`FAKE_ROOT`] that reads
+    /// the containment index `holds`.
+    pub(crate) fn freezer_with_holds(
+        fake: &Arc<FakeCgroup>,
+        holds: &Arc<FakeHolds>,
+    ) -> Arc<dyn JobFreezer> {
+        freezer_over(fake, Arc::clone(holds) as Arc<dyn ContainmentHolds>)
+    }
+
+    /// A [`CgroupFreezer`] over `fake` rooted at [`FAKE_ROOT`] that reads
+    /// (and locks) the containment index `holds`, e.g. a [`MarkerDirHolds`]
+    /// from [`marker_index`].
+    pub(crate) fn freezer_over(
+        fake: &Arc<FakeCgroup>,
+        holds: Arc<dyn ContainmentHolds>,
+    ) -> Arc<dyn JobFreezer> {
+        Arc::new(CgroupFreezer::with_holds(
+            Arc::clone(fake) as Arc<dyn CgroupBackend>,
+            FAKE_ROOT,
+            holds,
+        ))
+    }
+}
+
+/// Builds the `meta.json` of a stub job for suspend tests (PL-100 WP 3.5):
+/// `state`, owner `session` with `ancestors`, no process (`pid` unset), and
+/// — with `attempt` — a runtime-proven own cgroup
+/// `<FAKE_ROOT>/harw-job-<attempt>`.
+#[cfg(target_os = "linux")]
+pub(crate) fn stub_job_meta(
+    id: &str,
+    state: crate::model::JobState,
+    session: &str,
+    ancestors: &[&str],
+    attempt: Option<&str>,
+) -> TestResult<crate::model::JobMeta> {
+    use crate::model::{DedicatedCgroupProof, JobId, JobMeta, JobProcessIdentity};
+    let job_id = JobId::parse(id).ok_or(TestError::Missing("valid job id"))?;
+    let identity = attempt.map(|attempt| JobProcessIdentity {
+        start_ticks: 1,
+        executable: None,
+        cgroup_path: Some(format!("{}/harw-job-{attempt}", fake_cgroup::FAKE_ROOT)),
+        dedicated_cgroup: Some(DedicatedCgroupProof {
+            job_id: Some(job_id.clone()),
+            attempt_id: attempt.to_owned(),
+            delegated_root: fake_cgroup::FAKE_ROOT.to_owned(),
+        }),
+    });
+    let now = jiff::Timestamp::now();
+    Ok(JobMeta {
+        version: crate::model::META_VERSION,
+        job_id,
+        name: id.to_owned(),
+        command: "sleep 1000".to_owned(),
+        cwd: None,
+        env_keys: Vec::new(),
+        state,
+        pid: None,
+        proc_start_ticks: None,
+        identity,
+        executed_on_host: true,
+        harw_instance: "harw-test".to_owned(),
+        owner: JobOwner::new(
+            session,
+            ancestors
+                .iter()
+                .map(|ancestor| (*ancestor).to_owned())
+                .collect(),
+        ),
+        created_at: now,
+        started_at: Some(now),
+        ended_at: None,
+        exit_code: None,
+        signal: None,
+        stop_requested: false,
+        detached: false,
+        notify_every_secs: 0,
+        progress: None,
+        warnings: 0,
+        errors: 0,
+        launch_error: None,
+        stragglers_reaped: false,
+        log_truncated: false,
+        launch_warnings: Vec::new(),
+        origin_call_id: None,
+        origin_tool: None,
+        owner_agent: None,
+        origin: None,
+        suspended_at: None,
+        suspended_secs: 0,
+        suspend_phase: None,
+    })
+}

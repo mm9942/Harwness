@@ -115,6 +115,13 @@ pub struct ModelCapabilitiesToml {
     /// compatible endpoints keep replay disabled. `disabled` explicitly opts out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_reasoning_replay: Option<ChatReasoningReplay>,
+    /// Was passiert, wenn natives Reasoning einer früheren Runde nicht mehr
+    /// wiederhergestellt werden kann (verdrängt, nach Kompaktierung
+    /// verändert, nach Neustart verloren). Vorgabe `degrade`: die Runde wird
+    /// ohne natives Reasoning gesendet und protokolliert. `strict` bricht den
+    /// Request mit `HARW-REPLAY-001` ab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay: Option<ReasoningReplayPolicy>,
 }
 
 /// Explicit model-level chat reasoning protocol; never executes reasoning text.
@@ -123,6 +130,18 @@ pub struct ModelCapabilitiesToml {
 pub enum ChatReasoningReplay {
     Disabled,
     ReasoningContent,
+}
+
+/// Verhalten bei verlorener nativer Reasoning-Kontinuität
+/// ([`ModelCapabilitiesToml::reasoning_replay`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplayPolicy {
+    /// Ohne natives Reasoning weitersenden (Vorgabe).
+    #[default]
+    Degrade,
+    /// Request mit `HARW-REPLAY-001` abbrechen.
+    Strict,
 }
 
 #[cfg(test)]

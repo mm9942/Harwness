@@ -47,6 +47,9 @@ mod context_ext;
 mod delegate_wave;
 // #22 Welle 1B: `[return] validators` der Agent-IR v2.
 pub mod return_validators;
+// PL-100 WP 2.3: `accept_security_verdict`, die gemeinsame Annahmestelle für
+// Triage-Verdicts (Wave-Pfad und DodWatch), mit `VerdictSink`.
+pub mod security_verdict;
 
 pub use agent_tool::{
     AgentProductAdapter, AgentToolAdapter, ChildReturnContract, UnknownReturnContract,
@@ -78,6 +81,13 @@ pub use delegate_wave::{
     delegable_roles, delegate_wave, wave_budget_cap,
 };
 pub use harw_core::child_controller::AGENT_RESULT_TOOL;
+// PL-100 WP 2.3.
+pub use security_verdict::{
+    AcceptedVerdict, BOUND_FIELD, FINDING_WITHHELD_FIELD, ISSUED_BY_WITHHELD, MODEL_AUTHORED_FIELD,
+    RATIONALE_WITHHELD_FIELD, ScreenedVerdict, UNBOUND_VERDICT, VerdictAcceptError,
+    VerdictAcceptResult, VerdictBinding, VerdictSink, accept_security_verdict,
+    screen_security_verdict,
+};
 
 // Test-Fehlertyp (Bible R087/R165/R182), nur für Tests.
 #[cfg(test)]

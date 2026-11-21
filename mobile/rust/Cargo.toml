@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "harw-mobile-ffi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[lib]
+name = "harw_mobile_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "mobile-bootstrap"
+path = "src/bin/mobile-bootstrap.rs"
+required-features = ["bootstrap"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+bootstrap = [
+    "dep:clap", "dep:harw-infra-client", "dep:harw-node-listener", "dep:rustix",
+    "dep:harw-tailscale", "dep:tempfile", "dep:toml", "tokio/process", "tokio/signal", "tokio/io-util",
+]
+
+[dependencies]
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+blake3 = "1.8.7"
+bytes = "1"
+clap = { version = "4.6", features = ["derive"], optional = true }
+harw-infra-client = { path = "../../harw-infra-client", optional = true }
+harw-mobile-core = { path = "../../harw-mobile-core" }
+harw-node-listener = { path = "../../harw-node-listener", optional = true }
+harw-node-transport = { path = "../../harw-node-transport" }
+harw-protocol = { path = "../../harw-protocol" }
+harw-session-remote = { path = "../../harw-session-remote" }
+harw-tailscale = { path = "../../harw-tailscale", optional = true }
+harw-types = { path = "../../harw-types" }
+hex = "0.4.3"
+http = "1"
+jiff = "0.2"
+rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tempfile = { version = "3.27.0", optional = true }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = { version = "1.1.3", optional = true }
+uniffi = { version = "=0.32.2", default-features = false }
+zeroize = "1.9.0"
+
+[profile.release]
+strip = "debuginfo"
+
+[dev-dependencies]
+harw-node-listener = { path = "../../harw-node-listener" }
+harw-session-host = { path = "../../harw-session-host" }
+harw-session-store = { path = "../../harw-session-store" }
+harw-session-ws = { path = "../../harw-session-ws" }
+tempfile = "3.27.0"

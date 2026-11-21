@@ -63,6 +63,21 @@ pub(super) struct BodyRows {
     pub(super) history_min: u16,
     /// A dialog replaces the composer (mouse routing).
     pub(super) dialog_open: bool,
+    /// Rows below the composer kept free for the agent counts footer (0 or 1).
+    pub(super) footer_rows: u16,
+}
+
+impl BodyRows {
+    /// The frame area the body may use: everything above the footer rows.
+    fn body_area(self, frame: &Frame<'_>) -> Rect {
+        let area = frame.area();
+        Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(self.footer_rows),
+        )
+    }
 }
 
 /// Areas the rest of `render_viewport` draws into.
@@ -143,7 +158,7 @@ pub(super) fn compose_body(
     // oder Zusammenfassungs-/Kompakt-Fallback. `status_rows` und
     // `input_height` sind exakt die Zeilen, die Statuszeile bzw. Composer
     // reservieren.
-    let area = frame.area();
+    let area = rows.body_area(frame);
     let content = MissionContent::new(app, area.width, Instant::now());
     let areas = crate::panes::classify_mission(
         area,
@@ -408,7 +423,7 @@ fn compose_columns(
     content: &MissionContent<'_>,
 ) -> BodyAreas {
     let theme = app.theme;
-    let area = frame.area();
+    let area = rows.body_area(frame);
     let focus = app.panels.focus;
     let three_columns = areas.placement == MissionPlacement::LandscapeThreeColumns;
     // Im dreispaltigen Querformat ist der Chat ein eigenes gerahmtes
@@ -689,12 +704,13 @@ fn compose_side_or_summary(
     finished: &[TerminalRow],
 ) -> BodyAreas {
     let theme = app.theme;
-    let area = frame.area();
+    let area = rows.body_area(frame);
     let BodyRows {
         status_rows,
         input_height,
         history_min,
         dialog_open,
+        footer_rows: _,
     } = rows;
     // Schmale Terminals: das Agenten-Panel klappt zu einer Zeile über der
     // Statuszeile zusammen (ab `AGENTS_SUMMARY_MIN_HEIGHT` Zeilen, darunter

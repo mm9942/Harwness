@@ -101,9 +101,26 @@ const FIELD_METRICS: [(&str, usize); 8] = [
 /// NICs, Bridges, VPN-Tunnel, Bonding-Mitglieder) großzügig ab, ohne
 /// unbegrenzt zu wachsen. Schnittstellen über diese Zahl hinaus werden nach
 /// Sortierung nach Namen verworfen (siehe [`cap_and_sort_interfaces`]) —
-/// still, ohne Fehler: das ist eine Schutzmaßnahme, keine fehlerhafte
-/// Quelle.
+/// ohne Fehler: das ist eine Schutzmaßnahme, keine fehlerhafte Quelle. Die
+/// Zahl der verworfenen Schnittstellen meldet [`TRUNCATED_METRIC`].
 const MAX_INTERFACES: usize = 16;
+
+/// Metrikname der Kürzungsmarke: wie viele Schnittstellen dieser Poll über
+/// [`MAX_INTERFACES`] hinaus verworfen hat (PL-100 WP0.15).
+///
+/// # Description
+/// Jeder erfolgreiche Poll meldet genau ein `HostSample` mit diesem Namen,
+/// Wert `0` ohne Kürzung. So ist eine Kürzung sichtbar, statt still eine
+/// alphabetisch späte Schnittstelle (etwa ein neu angelegtes `veth`)
+/// auszublenden. Der Punkt im Namen ist Absicht: ein sanitisiertes
+/// Schnittstellenlabel enthält nie einen Punkt (siehe [`sanitize_label`]),
+/// die Kürzungsmarke kann also mit keiner Zählermetrik kollidieren.
+///
+/// # Examples
+/// ```rust
+/// assert_eq!(harw_dod_netcounters::sensor::TRUNCATED_METRIC, "netcounters.truncated");
+/// ```
+pub const TRUNCATED_METRIC: &str = "netcounters.truncated";
 
 /// Ersatzlabel, falls die Sanitisierung eines Schnittstellennamens ein leeres
 /// Ergebnis liefern würde (praktisch unerreichbar bei gültigen
@@ -126,14 +143,15 @@ const MAX_LABEL_LEN: usize = 32;
 /// # Description
 /// `FIELD_METRICS.len()` Zähler je Schnittstelle, höchstens
 /// [`MAX_INTERFACES`] Schnittstellen je Poll (siehe `crate`-Moduldoku,
-/// Abschnitt „Kardinalität"). Dieser Wert ist der Fixture-seitige Spiegel,
-/// den [`harw_dod_fixtures::sensor_suite!`] als `max_cardinality` erwartet.
+/// Abschnitt „Kardinalität"), plus die eine Kürzungsmarke
+/// [`TRUNCATED_METRIC`]. Dieser Wert ist der Fixture-seitige Spiegel, den
+/// [`harw_dod_fixtures::sensor_suite!`] als `max_cardinality` erwartet.
 ///
 /// # Examples
 /// ```rust
-/// assert_eq!(harw_dod_netcounters::sensor::MAX_CARDINALITY, 128);
+/// assert_eq!(harw_dod_netcounters::sensor::MAX_CARDINALITY, 129);
 /// ```
-pub const MAX_CARDINALITY: usize = FIELD_METRICS.len() * MAX_INTERFACES;
+pub const MAX_CARDINALITY: usize = FIELD_METRICS.len() * MAX_INTERFACES + 1;
 
 /// Liest die Netzschnittstellen-Zähler aus `/proc/net/dev` — genau eine
 /// Quelle, genau eine Fähigkeit ([`Capability::ReadProcNetDev`]).
@@ -252,9 +270,11 @@ impl Sensor for NetCountersSensor {
     /// Einträge (siehe [`cap_and_sort_interfaces`]). Für jede verbleibende
     /// Schnittstelle entstehen [`FIELD_METRICS`]`.len()` `HostSample`s,
     /// deren `metric` das sanitisierte Schnittstellenlabel als Suffix trägt
-    /// (siehe [`sanitize_label`]). `now` wird unverändert in jedes
-    /// `HostSample` durchgereicht; die Systemuhr wird an keiner Stelle
-    /// gelesen.
+    /// (siehe [`sanitize_label`]). Zuletzt folgt genau ein Sample
+    /// [`TRUNCATED_METRIC`] mit der Zahl der über [`MAX_INTERFACES`] hinaus
+    /// verworfenen Schnittstellen (`0` ohne Kürzung). `now` wird unverändert
+    /// in jedes `HostSample` durchgereicht; die Systemuhr wird an keiner
+    /// Stelle gelesen.
     ///
     /// # Arguments
     /// - `now` (`jiff::Timestamp`): injizierte Zeit für
@@ -324,9 +344,15 @@ impl Sensor for NetCountersSensor {
             .iter()
             .map(|fields| parse_one_interface_row(fields))
             .collect::<Result<Vec<_>, _>>()?;
+        // PL-100 WP0.15: die Kürzung zählen, bevor sie geschieht.
+        let dropped = parsed.len().saturating_sub(MAX_INTERFACES);
         let kept = cap_and_sort_interfaces(parsed);
 
-        let mut samples = Vec::with_capacity(kept.len() * FIELD_METRICS.len());
+        let mut samples = Vec::with_capacity(
+            kept.len()
+                .saturating_mul(FIELD_METRICS.len())
+                .saturating_add(1),
+        );
         for (name, values) in &kept {
             let label = sanitize_label(name);
             for (metric_name, idx) in FIELD_METRICS {
@@ -338,6 +364,14 @@ impl Sensor for NetCountersSensor {
                     value: value as f64,
                 });
             }
+        }
+        if !kept.is_empty() {
+            samples.push(HostSample {
+                sensor: self.handle.id().clone(),
+                observed_at: now,
+                metric: Cow::Borrowed(TRUNCATED_METRIC),
+                value: dropped as f64,
+            });
         }
 
         Ok(SensorReading {
@@ -491,8 +525,8 @@ mod tests {
     use jiff::Timestamp;
 
     use super::{
-        FIELD_METRICS, MAX_CARDINALITY, MAX_INTERFACES, NetCountersSensor, cap_and_sort_interfaces,
-        parse_one_interface_row, sanitize_label,
+        FIELD_METRICS, MAX_CARDINALITY, MAX_INTERFACES, NetCountersSensor, TRUNCATED_METRIC,
+        cap_and_sort_interfaces, parse_one_interface_row, sanitize_label,
     };
 
     /// Das `fixtures/`-Wurzelverzeichnis dieser Crate.
@@ -526,8 +560,8 @@ mod tests {
 
     #[test]
     fn test_max_cardinality_matches_field_metrics_times_max_interfaces() {
-        assert_eq!(MAX_CARDINALITY, FIELD_METRICS.len() * MAX_INTERFACES);
-        assert_eq!(MAX_CARDINALITY, 128);
+        assert_eq!(MAX_CARDINALITY, FIELD_METRICS.len() * MAX_INTERFACES + 1);
+        assert_eq!(MAX_CARDINALITY, 129);
     }
 
     // ---- parse_one_interface_row ----
@@ -728,9 +762,16 @@ mod tests {
             .poll(Timestamp::UNIX_EPOCH)
             .map_err(ctx("multi-interface Fixture muss erfolgreich pollen"))?;
 
-        assert_eq!(reading.samples.len(), 16);
+        assert_eq!(reading.samples.len(), 17);
         assert!(reading.samples[0].metric.ends_with("_eth0"));
         assert!(reading.samples[8].metric.ends_with("_lo"));
+        // Die Kürzungsmarke steht zuletzt; zwei Schnittstellen → nichts verworfen.
+        let marker = reading
+            .samples
+            .last()
+            .ok_or(TestError::Missing("Kürzungsmarke"))?;
+        assert_eq!(marker.metric, TRUNCATED_METRIC);
+        assert!(marker.value.abs() < f64::EPSILON, "{}", marker.value);
         Ok(())
     }
 
@@ -744,6 +785,29 @@ mod tests {
         assert_eq!(reading.samples.len(), MAX_CARDINALITY);
         assert!(reading.samples.iter().any(|s| s.metric.ends_with("_if00")));
         assert!(!reading.samples.iter().any(|s| s.metric.ends_with("_if16")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_many_interfaces_fixture_reports_the_number_of_dropped_interfaces() -> TestResult {
+        // 20 Schnittstellen, 16 bleiben: die Kürzung ist sichtbar, nicht still.
+        let sensor = build_sensor(fixtures_root().join("many-interfaces/tree"));
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("many-interfaces Fixture muss erfolgreich pollen"))?;
+
+        let markers: Vec<_> = reading
+            .samples
+            .iter()
+            .filter(|s| s.metric == TRUNCATED_METRIC)
+            .collect();
+        assert_eq!(markers.len(), 1, "genau eine Kürzungsmarke je Poll");
+        let marker = markers.first().ok_or(TestError::Missing("Kürzungsmarke"))?;
+        assert!(
+            (marker.value - 4.0).abs() < f64::EPSILON,
+            "{}",
+            marker.value
+        );
         Ok(())
     }
 
@@ -777,7 +841,13 @@ mod tests {
             "IPv4-artiges Adressmuster im serialisierten Ergebnis gefunden: {json}"
         );
 
-        for sample in &reading.samples {
+        // Die feste Kürzungsmarke trägt ihren Punkt absichtlich (siehe
+        // `TRUNCATED_METRIC`); jede aus der Quelle abgeleitete Metrik nicht.
+        for sample in reading
+            .samples
+            .iter()
+            .filter(|s| s.metric != TRUNCATED_METRIC)
+        {
             assert!(
                 !sample.metric.contains(':'),
                 "ein Metrikname darf keinen Doppelpunkt enthalten (möglicher Port-/Adress- \

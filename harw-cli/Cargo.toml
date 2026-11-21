@@ -30,6 +30,8 @@ default = []
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
+bytes = "1"
+http = "1"
 harw-fsutil = { path = "../harw-fsutil" }
 harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
@@ -105,7 +107,7 @@ harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
 # `sync`: watch/oneshot für den geordneten Shutdown von `harw serve`
 # (`main.rs::serve_until`); `signal`: SIGTERM/SIGINT (`lifecycle::ShutdownSignals`).
-tokio = { version = "1", features = ["rt", "net", "macros", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal", "sync"] }
 jiff = { workspace = true }
 clap = { version = "4.6.1", features = ["derive"] }
 harw-home = { path = "../harw-home" }

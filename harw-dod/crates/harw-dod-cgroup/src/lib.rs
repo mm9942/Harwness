@@ -168,10 +168,14 @@
 //! echte Kind-cgroups gefiltert (F-095, siehe oben), erst danach nach Namen
 //! sortiert **vor** dem Kürzen, damit die Auswahl deterministisch ist und
 //! ein Sortierfehler sofort sichtbar würde (siehe
-//! [`sensor::cap_and_sort_cgroups`]). Mit vier Metriken je cgroup ergibt das
-//! eine feste Obergrenze von [`sensor::MAX_CARDINALITY`] `= 64`
-//! verschiedenen Labelkombinationen je Poll, unabhängig davon, wie viele
-//! Container tatsächlich auf dem Host laufen.
+//! [`sensor::cap_and_sort_cgroups`]). Verworfen wird nicht still (PL-100
+//! WP0.15): jeder Poll meldet zusätzlich genau ein Sample
+//! [`sensor::TRUNCATED_METRIC`] (`cgroup.truncated`) mit der Zahl der über
+//! die Grenze hinaus verworfenen Kind-cgroups, `0` ohne Kürzung. Mit vier
+//! Metriken je cgroup plus dieser Marke ergibt das eine feste Obergrenze von
+//! [`sensor::MAX_CARDINALITY`] `= 65` verschiedenen Labelkombinationen je
+//! Poll, unabhängig davon, wie viele Container tatsächlich auf dem Host
+//! laufen.
 //!
 //! # cgroup-Namen werden bereinigt
 //! Ein cgroup-Name landet unmittelbar in einem Metriknamen (analog zu

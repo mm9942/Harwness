@@ -205,7 +205,7 @@ fn lock_path_for(auth_json_path: &Path) -> PathBuf {
 
 /// Hält den Refresh-Lock (exklusiver OS-Advisory-Lock auf dem offenen Handle
 /// der Lock-Datei), bis er gedroppt wird.
-struct RefreshLockGuard {
+pub(crate) struct RefreshLockGuard {
     file: std::fs::File,
 }
 
@@ -245,7 +245,13 @@ async fn acquire_refresh_lock(auth_json_path: &Path) -> OAuthResult<RefreshLockG
         options.mode(0o600);
     }
     let file = options.open(&lock_path)?;
+    acquire_token_file_lock(file, &lock_path).await
+}
 
+pub(crate) async fn acquire_token_file_lock(
+    file: std::fs::File,
+    lock_path: &Path,
+) -> OAuthResult<RefreshLockGuard> {
     let deadline = Instant::now() + LOCK_ACQUIRE_TIMEOUT;
     loop {
         match fs4::FileExt::try_lock(&file) {

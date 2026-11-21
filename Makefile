@@ -31,7 +31,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
 .PHONY: help clippy-tests clippy tests fmt check build install uninstall service gates \
-	dod-build dod-install dod-enable dod-uninstall release release-publish
+	dod-build dod-install dod-enable dod-uninstall release release-publish site site-check
 
 .DEFAULT_GOAL := help
 
@@ -127,10 +127,9 @@ release: ## Build and package a release tarball + SHA256SUMS into $(DIST)/ (RELE
 	$(CARGO) build --profile release-runner --locked -p harw-agent-runner --target $(RELEASE_TARGET)
 	scripts/package-release.sh $(RELEASE_TAG) $(RELEASE_TARGET) $(DIST)
 
-release-publish: ## Create the GitHub release $(RELEASE_TAG) from $(DIST)/ (needs the gh CLI, logged in)
-	@ls $(DIST)/*.tar.gz $(DIST)/SHA256SUMS >/dev/null
-	gh release create $(RELEASE_TAG) $(DIST)/*.tar.gz $(DIST)/SHA256SUMS \
-		--title "harw $(RELEASE_TAG)" --notes "See CHANGELOG.md for $(RELEASE_TAG)."
+release-publish: ## Refuse unverified publication; use the guarded Release workflow
+	@echo "Publication disabled here: use Release workflow_dispatch with publish=true and exact-commit CI evidence." >&2
+	@exit 1
 
 uninstall: ## Remove harw, killer, harw-job-exec and the agent runner from BINDIR, plus the regenerable agent-build cache
 	rm -f $(BINDIR)/harw $(BINDIR)/killer $(BINDIR)/harw-job-exec $(BINDIR)/harw-agent-runner
@@ -151,5 +150,11 @@ dod-install: ## DoD: install the system package onto the host (root; see docs/se
 dod-enable: ## DoD: explicitly validate config and enable observation
 	$(MAKE) -C harw-dod enable
 
-dod-uninstall: ## DoD: remove only manifest-owned files (config/state/logs are preserved)
+dod-uninstall: ## DoD: stop/disable all DoD units, remove manifest-owned files (config/state/logs preserved; re-enable opt-ins after reinstall)
 	$(MAKE) -C harw-dod uninstall
+
+site: ## Website: build site/dist from site/src
+	python3 -I site/build_content.py
+
+site-check: site ## Website: build and validate site/dist
+	python3 -I site/validate_site.py

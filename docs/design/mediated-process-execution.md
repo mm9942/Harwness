@@ -91,19 +91,25 @@ triggers a `HostPermitPrompt` in the local UI
 (`worker_definition = "sandbox-lease"`, `command = reason`, preselecting
 the session-lease variant) and waits up to 300 seconds for a decision:
 
-- **`SessionLease`** (`mark_global_approval`, no expiry): from confirmation
+- **`SessionLease`** (`mark_global_approval`, expires after
+  `[sandbox] host_lease_ttl_secs`, default 8 h,
+  [ADR 0002](../adr/0002-session-lease-expiry.md)): from confirmation
   onward, every `shell.exec` call in this harw session **and all its child
   agents** runs on the host — no bubblewrap, with the user environment
   inherited from harw (including `PATH`, `HOME`, `CARGO_HOME`/`RUSTUP_HOME`),
   `cwd` at the workspace root, still under the existing `prlimit` limits;
   tool output carries `"executed_on": "host"` to distinguish it. The lease
-  stays active until **the user** ends it (user decision 2026-09-24):
+  stays active until its window ends or **the user** ends it earlier:
   `Ctrl+H` in the TUI (`ChatApp::end_host_mode`) or the typed
   `/sandbox-lease revoke` slash command end it immediately and process-wide
-  (see below); the next call then runs in the strict sandbox again. There
-  is no time-based expiry — neither the registry grant nor the
-  `SessionLease` permits in the `ProcessPermitLedger` (issued with
-  `ttl = None`) expire — and the model cannot end the lease.
+  (see below); the next call then runs in the strict sandbox again. The
+  window is measured suspend-safe (`LeaseInstant`: monotonic plus
+  `CLOCK_BOOTTIME`), and the `SessionLease` permits in the
+  `ProcessPermitLedger` are bound to it (`issue_for_lease`), so none
+  outlives the phase. After expiry the next call needs a new approval
+  (under Full Access the TUI grants it without asking). The model can
+  neither extend nor end the lease. This supersedes the "no expiry" part of
+  the user decision 2026-09-24 (PL-100 Phase 4, B22).
 - **`SingleExecution`** (`mark_global_single_use`): only the immediately
   next `shell.exec` call, from **any session of this process**, runs on the
   host; the strict default profile applies automatically afterward.

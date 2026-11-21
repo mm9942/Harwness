@@ -37,6 +37,15 @@
 //!    `cc` gibt es keinen Allowlist-Eintrag, sondern eine fest codierte,
 //!    begründete Ausnahme (siehe [`CC_EXCEPTION_VIA`]): erlaubt nur, wenn
 //!    *jeder* Pfad zu `cc` über `blake3` läuft, kein Blanket-Allow.
+//! 6. **Verbotene Crates.** Ein Paket, für das eine `[[forbidden_crates]]`-
+//!    Zeile gilt (per Schicht, per Name oder als TCB-Paket), darf keinen der
+//!    dort genannten Namen transitiv erreichen — intern wie extern. Die Hülle
+//!    dafür liest die Manifeste selbst ([`ManifestEdges`], siehe den
+//!    übernächsten Abschnitt), nicht nur den [`WorkspaceGraph`]. Ein Name in
+//!    einer solchen Hülle, der weder lokales Paket noch in `Cargo.lock`
+//!    verzeichnet ist, ist ein Verstoß (fail closed), für **jedes** Paket,
+//!    nicht nur für J/TCB: sonst schlüpfte etwa eine umbenannte Kante als
+//!    unbekannter Name an der Prüfung vorbei.
 //!
 //! # Wie die `*-sys`-Hülle entsteht
 //! Innerhalb des Workspace folgt sie den internen und externen
@@ -54,16 +63,45 @@
 //! `Cargo.lock`-Eintrag ist ein Verstoß: die Hülle wäre sonst still
 //! unvollständig.
 //!
+//! # Wie die `[[forbidden_crates]]`-Hülle entsteht (PL-100 WP 3.0, B16)
+//! Die Verbots-Zeilen tragen Leitprinzip I8 („Prozesse, die mit Modellen
+//! sprechen, linken keinen Signier-Code"); README §4, 3.0 verlangt dafür eine
+//! Prüfung wie `cargo tree`, also auf der **aufgelösten** Paketidentität. Der
+//! [`WorkspaceGraph`] kennt dagegen nur die Schlüssel aus `[dependencies]` und
+//! `[build-dependencies]`: eine umbenannte Kante
+//! (`signing = { package = "harw-dod-warden-proto", … }`) hieße dort
+//! `signing`, und eine Kante nur unter `[target.'cfg(..)'.dependencies]`
+//! fehlte ganz. Für lokale Pakete folgt diese Hülle deshalb
+//! [`ManifestEdges`]: jede Nicht-Dev-Tabelle (`[dependencies]`,
+//! `[build-dependencies]`, die alte Unterstrich-Schreibweise und jede
+//! `[target.'…']`-Variante), jeder Eintrag unter seinem Paketnamen
+//! (`package = "…"`, mit `workspace = true` der des Wurzeleintrags; ein
+//! lokales `package` daneben zählt konservativ mit). Gelesen werden dieselben
+//! Manifeste wie im Gate `operator-decision` (Wurzel, Member und jedes über
+//! `path` erreichte Paket). Ab einer externen Crate folgt sie `Cargo.lock`,
+//! das Paketnamen führt und keine Plattformfilter kennt. Optionale
+//! Abhängigkeiten zählen immer mit (Überschätzung, wie bei `Cargo.lock`).
+//!
 //! # Was dieses Gate nicht prüft
 //! `[target.'cfg(..)'.dependencies]` samt den `build-`/`dev-`Varianten sieht
 //! der [`WorkspaceGraph`] nicht — dieselbe Grenze wie bei `edges` und
 //! `privileges`. Dort deklarierte Kanten fehlen der Schichtregel, den
-//! TCB-Allowlisten **und** der `*-sys`-Hülle: bei einer J-Crate, die ihre
+//! TCB-Allowlisten **und** der `*-sys`-Hülle (nicht aber der
+//! `[[forbidden_crates]]`-Hülle, siehe oben): bei einer J-Crate, die ihre
 //! plattformspezifischen Abhängigkeiten nur dort deklariert (etwa
 //! `harw-job-linux` mit `rustix`/`landlock`), prüft die `*-sys`-Regel genau
 //! diese Kanten nicht; ihren `[dependencies]` folgt die Hülle weiterhin.
 //! Schließen lässt sich das erst mit Target-Kanten im Graphen
 //! (`harw-code-graph`). Und es prüft Kanten, keine Aufrufe.
+//!
+//! Ebenso wenig sieht es Quelltext, der ohne Kante in ein Paket gelangt:
+//! `#[path = "../…"] mod x;` oder `include!("../…")` übersetzen Code eines
+//! anderen Pakets mit, ohne dass eine `[[forbidden_crates]]`-Zeile
+//! anschlägt. Für Leitprinzip I8 (modellnahe Prozesse linken keinen
+//! Signier-Code) ist das die verbleibende Lücke. Stand PL-100 WP 3.0 nutzt
+//! kein Paket der I8-Zeile `#[path]` oder `include!` mit einem Pfad
+//! außerhalb seines Verzeichnisses (die `include_str!`-Szenarien in
+//! `harw-ops` sind TOML-Daten, kein Code); ein Gate dafür gibt es nicht.
 //!
 //! # Formfehler der Richtlinie
 //! Eine unlesbare oder in sich widersprüchliche Richtlinie (unbekannte
@@ -90,7 +128,7 @@ const SYS_SUFFIX: &str = "-sys";
 /// C/Asm-Bauhelfer ohne `-sys`-Namensendung (Tier C,
 /// `docs/architecture/dependency-review.md`): `cargo tree -i <name>` findet
 /// sie, der `-sys`-Suffix-Test allein nicht. Werden wie `*-sys`-Crates in
-/// [`sys_hull`] erfasst und in [`evaluate`] geprüft.
+/// [`sys_hull`] erfasst und in [`evaluate_with_manifests`] geprüft.
 const C_BUILD_HELPERS: &[&str] = &["ring", "cmake", "bindgen", "cc"];
 
 /// Name der Crate, für die es — statt eines Allowlist-Eintrags — eine fest
@@ -102,10 +140,11 @@ const CC: &str = "cc";
 ///
 /// # Description
 /// Kein Blanket-Allow von `cc`: die Ausnahme gilt nur, wenn **jeder** Pfad
-/// zu `cc` über [`CC_EXCEPTION_VIA`] läuft. [`evaluate`] prüft das, indem es
-/// die Hülle ein zweites Mal bildet, ohne durch [`CC_EXCEPTION_VIA`] zu
-/// treten ([`sys_hull_excluding`]) — bleibt `cc` darin erreichbar, führt ein
-/// Pfad an `blake3` vorbei, und es ist ein Verstoß.
+/// zu `cc` über [`CC_EXCEPTION_VIA`] läuft. [`evaluate_with_manifests`] prüft
+/// das, indem es die Hülle ein zweites Mal bildet, ohne durch
+/// [`CC_EXCEPTION_VIA`] zu treten ([`sys_hull_excluding`]) — bleibt `cc`
+/// darin erreichbar, führt ein Pfad an `blake3` vorbei, und es ist ein
+/// Verstoß.
 const CC_EXCEPTION_VIA: &str = "blake3";
 
 /// Ob `name` als `*-sys`-Crate oder als C-Bauhelfer ohne `-sys`-Namen zählt.
@@ -178,7 +217,8 @@ pub struct Policy {
 
 /// Eine Regel aus `[[forbidden_crates]]`: `names` darf von keinem Paket der
 /// Schichten `layers` (und, mit `tcb = true`, von keinem TCB-Paket) über
-/// `[dependencies]`/`[build-dependencies]` erreicht werden.
+/// `[dependencies]`/`[build-dependencies]` samt ihren `[target.'…']`-Varianten
+/// erreicht werden, verglichen nach Paketname (siehe [`ManifestEdges`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ForbiddenCrates {
     names: BTreeSet<String>,
@@ -660,18 +700,163 @@ impl LockIndex {
     }
 }
 
+/// Die Abhängigkeitstabellen, deren Kanten in ein ausgeliefertes Artefakt
+/// gelangen: normale und Build-Abhängigkeiten, auch in der alten
+/// Unterstrich-Schreibweise, die Cargo weiterhin liest. Dev-Tabellen fehlen
+/// bewusst; jede gilt zusätzlich unter `[target.'…']`.
+const SHIPPED_DEPENDENCY_TABLES: [&str; 3] =
+    ["dependencies", "build-dependencies", "build_dependencies"];
+
+/// Die aufgelösten, ausgelieferten Abhängigkeiten jedes lokalen Pakets, aus
+/// den Manifesten gelesen — die Kanten der `[[forbidden_crates]]`-Hülle.
+///
+/// # Description
+/// Je Paket die Paketnamen aller Einträge in [`SHIPPED_DEPENDENCY_TABLES`]
+/// und deren `[target.'…']`-Varianten. Ein Eintrag zählt unter seiner
+/// Paketidentität, nicht unter seinem Tabellenschlüssel:
+///
+/// - ohne `workspace = true`: `package = "…"`, sonst der Schlüssel;
+/// - mit `workspace = true`: `package` des gleichnamigen Eintrags in
+///   `[workspace.dependencies]` der Wurzel, sonst der Schlüssel; ein lokales
+///   `package` daneben (das Cargo nicht auswertet) zählt konservativ mit.
+///
+/// Siehe Moduldoku, Abschnitt „Wie die `[[forbidden_crates]]`-Hülle
+/// entsteht".
+///
+/// # Concurrency
+/// Ein reiner Wert ohne innere Veränderlichkeit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestEdges {
+    deps: HashMap<String, BTreeSet<String>>,
+}
+
+impl ManifestEdges {
+    /// Baut die Kanten aus bereits geparsten Manifesten.
+    ///
+    /// # Arguments
+    /// - `root` (`&toml::Table`): die Wurzel-`Cargo.toml`; liefert
+    ///   `[workspace.dependencies]` und zählt selbst als Paket, wenn sie
+    ///   `[package].name` trägt und nicht schon in `packages` steht.
+    /// - `packages` (`&[(String, toml::Table)]`): je lokalem Paket
+    ///   `(Paketname, Manifest)`, wie
+    ///   [`super::operator_decision::load_manifests`] sie liefert. Mehrere
+    ///   Manifeste desselben Namens werden vereinigt (Überschätzung).
+    ///
+    /// # Returns
+    /// Die Kanten je Paketname.
+    #[must_use]
+    pub fn from_manifests(root: &toml::Table, packages: &[(String, toml::Table)]) -> Self {
+        let workspace = root
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|section| section.get("dependencies"))
+            .and_then(toml::Value::as_table);
+        let root_package = root
+            .get("package")
+            .and_then(toml::Value::as_table)
+            .and_then(|package| package.get("name"))
+            .and_then(toml::Value::as_str)
+            .filter(|name| !packages.iter().any(|(known, _)| known.as_str() == *name))
+            .map(|name| (name, root));
+        let mut deps: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (name, manifest) in packages
+            .iter()
+            .map(|(name, manifest)| (name.as_str(), manifest))
+            .chain(root_package)
+        {
+            let entry = deps.entry(name.to_owned()).or_default();
+            for table in shipped_dependency_tables(manifest) {
+                for (key, value) in table {
+                    entry.extend(resolved_packages(key, value, workspace));
+                }
+            }
+        }
+        Self { deps }
+    }
+
+    /// Liest die Manifeste unterhalb von `repo_root` (dieselbe Eingabemenge
+    /// wie das Gate `operator-decision`) und baut daraus die Kanten.
+    ///
+    /// # Errors
+    /// Wie [`super::operator_decision::load_manifests`]: ein unlesbarer
+    /// Workspace, ein unlesbares oder ungültiges Manifest oder ein fehlendes
+    /// Ziel einer `path`-Abhängigkeit.
+    pub fn load(repo_root: &Path) -> Result<Self, String> {
+        let (root, packages) = super::operator_decision::load_manifests(repo_root)?;
+        Ok(Self::from_manifests(&root, &packages))
+    }
+
+    /// Die aufgelösten Abhängigkeiten von `name`, oder `None`, wenn kein
+    /// Manifest dieses Namens gelesen wurde.
+    #[must_use]
+    pub fn deps_of(&self, name: &str) -> Option<&BTreeSet<String>> {
+        self.deps.get(name)
+    }
+}
+
+/// Die Tabellen aus [`SHIPPED_DEPENDENCY_TABLES`] eines Manifests, auf
+/// oberster Ebene und unter jedem `[target.'…']`.
+fn shipped_dependency_tables(manifest: &toml::Table) -> Vec<&toml::Table> {
+    let targets = manifest
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|table| table.values())
+        .filter_map(toml::Value::as_table);
+    std::iter::once(manifest)
+        .chain(targets)
+        .flat_map(|section| {
+            SHIPPED_DEPENDENCY_TABLES
+                .iter()
+                .filter_map(move |kind| section.get(*kind).and_then(toml::Value::as_table))
+        })
+        .collect()
+}
+
+/// Die Paketnamen, unter denen ein Abhängigkeitseintrag `key = value` zählt
+/// (siehe [`ManifestEdges`]).
+fn resolved_packages(
+    key: &str,
+    value: &toml::Value,
+    workspace: Option<&toml::Table>,
+) -> Vec<String> {
+    let entry = value.as_table();
+    let local = entry
+        .and_then(|table| table.get("package"))
+        .and_then(toml::Value::as_str);
+    let inherits = entry
+        .and_then(|table| table.get("workspace"))
+        .and_then(toml::Value::as_bool)
+        == Some(true);
+    if !inherits {
+        return vec![local.unwrap_or(key).to_owned()];
+    }
+    let inherited = workspace
+        .and_then(|dependencies| dependencies.get(key))
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("package"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or(key);
+    let mut names = vec![inherited.to_owned()];
+    if let Some(local) = local.filter(|local| *local != inherited) {
+        names.push(local.to_owned());
+    }
+    names
+}
+
 /// Führt das Gate `arch` aus.
 ///
 /// # Errors
-/// Wenn Graph, Richtlinie oder `Cargo.lock` nicht lesbar sind oder die
-/// Richtlinie einen Formfehler hat. Ein **Verstoß** ist kein `Err`, sondern
-/// steht im Bericht.
+/// Wenn Graph, Richtlinie, `Cargo.lock` oder ein Manifest nicht lesbar sind
+/// oder die Richtlinie einen Formfehler hat. Ein **Verstoß** ist kein `Err`,
+/// sondern steht im Bericht.
 pub fn run() -> Result<GateReport, String> {
     let repo_root = Path::new(".");
     let graph = super::load_all_workspaces(repo_root)?;
     let policy = load_policy(repo_root)?;
     let lock = LockIndex::load(repo_root)?;
-    Ok(evaluate(&graph, &policy, &lock))
+    let manifests = ManifestEdges::load(repo_root)?;
+    Ok(evaluate_with_manifests(&graph, &policy, &lock, &manifests))
 }
 
 /// Liest und parst [`POLICY_PATH`] unterhalb von `repo_root`.
@@ -685,17 +870,52 @@ pub fn load_policy(repo_root: &Path) -> Result<Policy, String> {
     Policy::parse(&text)
 }
 
+/// Prüft einen geladenen Graphen gegen die Richtlinie, ohne gelesene
+/// Manifeste — nur für Tests.
+///
+/// # Description
+/// Wie [`evaluate_with_manifests`] mit leeren [`ManifestEdges`]: die
+/// `[[forbidden_crates]]`-Hülle folgt dann den Schlüsseln des Graphen. Ein
+/// umbenannter Schlüssel ist dort ein unbekannter Name und damit rot (fail
+/// closed); Target-Tabellen sieht diese Fassung nicht. [`run`] nutzt deshalb
+/// [`evaluate_with_manifests`]; diese Kurzform existiert nur unter
+/// `cfg(test)`, damit der Binär-Build keinen toten Code trägt.
+///
+/// # Returns
+/// Den Bericht, wie [`evaluate_with_manifests`].
+#[cfg(test)]
+#[must_use]
+fn evaluate(graph: &WorkspaceGraph, policy: &Policy, lock: &LockIndex) -> GateReport {
+    evaluate_with_manifests(graph, policy, lock, &ManifestEdges::default())
+}
+
 /// Prüft einen geladenen Graphen gegen die Richtlinie.
 ///
 /// # Description
 /// Getrennt von [`run`], damit jede Regel gegen einen **konstruierten**
-/// Graphen samt Lockfile prüfbar ist, einschließlich ihres roten Zweigs.
+/// Graphen samt Lockfile und Manifesten prüfbar ist, einschließlich ihres
+/// roten Zweigs. Für die `[[forbidden_crates]]`-Hülle folgt ein lokales
+/// Paket den Kanten aus `manifests`, falls dort verzeichnet, sonst denen des
+/// Graphen; Schichtregel, TCB-Allowlisten und `*-sys`-Hülle folgen immer dem
+/// Graphen.
+///
+/// # Arguments
+/// - `graph` (`&WorkspaceGraph`): der Abhängigkeitsgraph.
+/// - `policy` (`&Policy`): die geparste Richtlinie.
+/// - `lock` (`&LockIndex`): die Kanten externer Crates.
+/// - `manifests` (`&ManifestEdges`): die aufgelösten Kanten lokaler Pakete.
 ///
 /// # Returns
-/// Den Bericht; `checked` zählt klassifizierte Pakete, interne Kanten und
-/// die Einträge jeder geprüften `*-sys`-Hülle.
+/// Den Bericht; `checked` zählt klassifizierte Pakete, interne Kanten, die
+/// Einträge jeder geprüften `*-sys`-Hülle und jede geprüfte
+/// `[[forbidden_crates]]`-Hülle.
 #[must_use]
-pub fn evaluate(graph: &WorkspaceGraph, policy: &Policy, lock: &LockIndex) -> GateReport {
+pub fn evaluate_with_manifests(
+    graph: &WorkspaceGraph,
+    policy: &Policy,
+    lock: &LockIndex,
+    manifests: &ManifestEdges,
+) -> GateReport {
     let mut checked = 0usize;
     let mut violations = Vec::new();
     let mut used_exceptions: HashSet<(&str, &str)> = HashSet::new();
@@ -844,6 +1064,8 @@ pub fn evaluate(graph: &WorkspaceGraph, policy: &Policy, lock: &LockIndex) -> Ga
             }
         }
     }
+    // Je (Paket, Name) nur eine Meldung, auch wenn mehrere Zeilen gelten.
+    let mut unresolved_forbidden: BTreeSet<(&str, String)> = BTreeSet::new();
     for rule in &policy.forbidden {
         for node in &graph.crates {
             let Some(class) = policy.packages.get(&node.name) else {
@@ -852,10 +1074,13 @@ pub fn evaluate(graph: &WorkspaceGraph, policy: &Policy, lock: &LockIndex) -> Ga
             if !rule.applies_to(&node.name, class) {
                 continue;
             }
-            let hull = hull_matching(node, &by_name, lock, None, &|name| {
+            let hull = hull_matching(node, &by_name, lock, None, Some(manifests), &|name| {
                 rule.names.contains(name)
             });
             checked += 1;
+            for missing in hull.unresolved {
+                unresolved_forbidden.insert((node.name.as_str(), missing));
+            }
             for (name, path) in &hull.sys_crates {
                 violations.push(format!(
                     "{} erreicht die verbotene Crate '{name}' über {} — [[forbidden_crates]]: {}",
@@ -865,6 +1090,11 @@ pub fn evaluate(graph: &WorkspaceGraph, policy: &Policy, lock: &LockIndex) -> Ga
                 ));
             }
         }
+    }
+    for (package, missing) in &unresolved_forbidden {
+        violations.push(format!(
+            "{package}: '{missing}' ist weder lokales Paket noch in Cargo.lock — die [[forbidden_crates]]-Hülle wäre unvollständig (fail closed)"
+        ));
     }
 
     for name in policy.sys_allowed.keys() {
@@ -909,9 +1139,10 @@ fn sys_hull(root: &CrateNode, by_name: &HashMap<&str, &CrateNode>, lock: &LockIn
 /// nicht weiterverfolgt, `blocked` selbst bleibt ein Sackgassen-Knoten.
 ///
 /// # Description
-/// Dient der `cc`-Ausnahme in [`evaluate`]: bleibt eine gesuchte Crate auch
-/// ohne die Zwischenstation [`CC_EXCEPTION_VIA`] erreichbar, führt mindestens
-/// ein Pfad an ihr vorbei — die Ausnahme gilt dann nicht.
+/// Dient der `cc`-Ausnahme in [`evaluate_with_manifests`]: bleibt eine
+/// gesuchte Crate auch ohne die Zwischenstation [`CC_EXCEPTION_VIA`]
+/// erreichbar, führt mindestens ein Pfad an ihr vorbei — die Ausnahme gilt
+/// dann nicht.
 fn sys_hull_excluding(
     root: &CrateNode,
     by_name: &HashMap<&str, &CrateNode>,
@@ -927,16 +1158,22 @@ fn sys_hull_impl(
     lock: &LockIndex,
     blocked: Option<&str>,
 ) -> SysHull {
-    hull_matching(root, by_name, lock, blocked, &is_native_build_crate)
+    hull_matching(root, by_name, lock, blocked, None, &is_native_build_crate)
 }
 
 /// Breitensuche wie [`sys_hull`]; gemeldet wird jeder erreichte Name, für den
 /// `matches` gilt (im Feld `sys_crates`, mit kürzestem Pfad).
+///
+/// # Description
+/// Mit `manifests` folgt ein dort verzeichnetes lokales Paket seinen
+/// aufgelösten Manifest-Kanten (Paketnamen, auch aus `[target.'…']`), sonst
+/// den Kanten des Graphen; ab einer externen Crate gilt `Cargo.lock`.
 fn hull_matching(
     root: &CrateNode,
     by_name: &HashMap<&str, &CrateNode>,
     lock: &LockIndex,
     blocked: Option<&str>,
+    manifests: Option<&ManifestEdges>,
     matches: &dyn Fn(&str) -> bool,
 ) -> SysHull {
     let mut hull = SysHull::default();
@@ -949,7 +1186,10 @@ fn hull_matching(
             // Nicht durch die blockierte Zwischenstation treten.
             continue;
         }
-        let children: Vec<String> = if let Some(node) = by_name.get(current.as_str()) {
+        let resolved = manifests.and_then(|edges| edges.deps_of(current.as_str()));
+        let children: Vec<String> = if let Some(resolved) = resolved {
+            resolved.iter().cloned().collect()
+        } else if let Some(node) = by_name.get(current.as_str()) {
             // `build_deps` mischt interne und externe Namen; die Unterscheidung
             // trifft `by_name` beim nächsten Schritt, Unbekanntes landet in
             // `unresolved`.
@@ -992,7 +1232,7 @@ fn hull_matching(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestError, TestResult};
+    use crate::test_support::{TestError, TestResult, ctx};
     use std::path::PathBuf;
 
     fn node(name: &str, deps: &[&str], external: &[&str]) -> CrateNode {
@@ -1587,7 +1827,10 @@ version = "0.2.0"
     }
 
     /// Das echte Repository muss grün sein: jede Crate klassifiziert, jede
-    /// Inversion als Ausnahme begründet, keine veraltete Ausnahme.
+    /// Inversion als Ausnahme begründet, keine veraltete Ausnahme, und keine
+    /// `[[forbidden_crates]]`-Hülle erreicht einen verbotenen oder
+    /// unauflösbaren Namen — geprüft wie in [`run`], mit den aufgelösten
+    /// Manifest-Kanten (Target-Tabellen, Umbenennungen).
     #[test]
     fn test_real_repository_is_green() -> TestResult {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1596,10 +1839,504 @@ version = "0.2.0"
         let graph = super::super::load_all_workspaces(repo_root).map_err(TestError::Unexpected)?;
         let policy = load_policy(repo_root).map_err(TestError::Unexpected)?;
         let lock = LockIndex::load(repo_root).map_err(TestError::Unexpected)?;
+        let manifests = ManifestEdges::load(repo_root).map_err(TestError::Unexpected)?;
 
-        let report = evaluate(&graph, &policy, &lock);
+        let report = evaluate_with_manifests(&graph, &policy, &lock, &manifests);
 
         assert!(report.is_green(), "{:#?}", report.violations);
+        // Die Manifest-Kanten decken jedes Paket des Graphen ab; sonst fiele
+        // die Verbots-Hülle still auf die Graph-Schlüssel zurück.
+        for node in &graph.crates {
+            assert!(
+                manifests.deps_of(&node.name).is_some(),
+                "{} fehlt in ManifestEdges",
+                node.name
+            );
+        }
+        // harw-job-runtime deklariert harw-job-linux nur unter
+        // `[target.'cfg(target_os = "linux")'.dependencies]`; der Graph sieht
+        // die Kante nicht, die Verbots-Hülle schon.
+        let job_runtime = manifests
+            .deps_of("harw-job-runtime")
+            .ok_or(TestError::Missing("harw-job-runtime in ManifestEdges"))?;
+        assert!(job_runtime.contains("harw-job-linux"), "{job_runtime:?}");
+        Ok(())
+    }
+
+    /// Baut [`ManifestEdges`] aus TOML-Texten: `root` ist die Wurzel,
+    /// `packages` je `(Paketname, Manifest)`.
+    fn manifest_edges(root: &str, packages: &[(&str, &str)]) -> TestResult<ManifestEdges> {
+        let root: toml::Table = toml::from_str(root).map_err(ctx("Wurzel-Manifest parsen"))?;
+        let mut parsed = Vec::with_capacity(packages.len());
+        for (name, text) in packages {
+            let manifest: toml::Table = toml::from_str(text).map_err(ctx("Manifest parsen"))?;
+            parsed.push(((*name).to_owned(), manifest));
+        }
+        Ok(ManifestEdges::from_manifests(&root, &parsed))
+    }
+
+    /// Die echte Richtlinie aus [`POLICY_PATH`].
+    fn real_policy() -> TestResult<Policy> {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or(TestError::Missing("Repo-Wurzel über xtask/"))?;
+        load_policy(repo_root).map_err(TestError::Unexpected)
+    }
+
+    /// [`ManifestEdges`] liest jede ausgelieferte Tabelle (auch unter
+    /// `[target.'…']` und in Unterstrich-Schreibweise) unter dem Paketnamen
+    /// des Eintrags und lässt Dev-Tabellen weg.
+    #[test]
+    fn test_manifest_edges_resolve_packages_target_tables_and_inheritance() -> TestResult {
+        let edges = manifest_edges(
+            r#"
+[workspace.dependencies]
+signing = { package = "harw-dod-warden-proto", path = "w" }
+plain = { path = "p" }
+both = { package = "root-name", path = "b" }
+"#,
+            &[(
+                "a",
+                r#"
+[package]
+name = "a"
+
+[dependencies]
+renamed = { package = "real-renamed", path = "../r" }
+signing = { workspace = true }
+plain = { workspace = true }
+both = { workspace = true, package = "local-name" }
+missing-root = { workspace = true }
+direct = "1"
+
+[build-dependencies]
+builder = "1"
+
+[build_dependencies]
+old-builder = "1"
+
+[dev-dependencies]
+dev-only = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-only = { path = "../l" }
+
+[target.'cfg(unix)'.build-dependencies]
+unix-builder = "1"
+
+[target.'cfg(unix)'.dev-dependencies]
+unix-dev = "1"
+"#,
+            )],
+        )?;
+
+        let deps = edges.deps_of("a").ok_or(TestError::Missing("a"))?;
+        let expected: BTreeSet<String> = [
+            "real-renamed",
+            "harw-dod-warden-proto",
+            "plain",
+            "root-name",
+            "local-name",
+            "missing-root",
+            "direct",
+            "builder",
+            "old-builder",
+            "linux-only",
+            "unix-builder",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(deps, &expected);
+        assert!(edges.deps_of("b").is_none());
+        Ok(())
+    }
+
+    /// Eine Wurzel mit `[package]` ist selbst ein Paket und bekommt Kanten.
+    #[test]
+    fn test_manifest_edges_count_a_root_package() -> TestResult {
+        let edges = manifest_edges(
+            "[package]\nname = \"root-pkg\"\n\n[dependencies]\nx = \"1\"\n",
+            &[],
+        )?;
+
+        let deps = edges
+            .deps_of("root-pkg")
+            .ok_or(TestError::Missing("root-pkg"))?;
+        assert_eq!(deps, &BTreeSet::from(["x".to_owned()]));
+        Ok(())
+    }
+
+    /// B16: eine **umbenannte** Kante von harw-runtime auf den Signierteil
+    /// (`signing = { package = "harw-dod-warden-proto" }`) ist rot. Der Graph
+    /// kennt nur den Schlüssel `signing`; die Manifest-Kanten lösen ihn auf.
+    #[test]
+    fn test_renamed_edge_to_the_signing_crate_is_red() -> TestResult {
+        let policy = real_policy()?;
+        let edges = manifest_edges(
+            "[workspace]\n",
+            &[(
+                "harw-runtime",
+                "[package]\nname = \"harw-runtime\"\n\n[dependencies]\nsigning = { package = \"harw-dod-warden-proto\", path = \"../w\" }\n",
+            )],
+        )?;
+        let crates = graph(vec![
+            node("harw-runtime", &[], &["signing"]),
+            node("harw-dod-warden-proto", &[], &[]),
+        ]);
+
+        let report = evaluate_with_manifests(&crates, &policy, &LockIndex::default(), &edges);
+
+        assert_hits(
+            &forbidden_hits(&report),
+            &[
+                "harw-runtime erreicht die verbotene Crate 'harw-dod-warden-proto' über harw-runtime → harw-dod-warden-proto —",
+            ],
+        );
+        Ok(())
+    }
+
+    /// B16: auch über `workspace = true` geerbt und umbenannt ist die Kante
+    /// rot (harw-ops → `harw-dod-escalate` über den Wurzeleintrag `ladder`).
+    #[test]
+    fn test_inherited_renamed_edge_to_escalate_is_red() -> TestResult {
+        let policy = real_policy()?;
+        let edges = manifest_edges(
+            "[workspace.dependencies]\nladder = { package = \"harw-dod-escalate\", path = \"e\" }\n",
+            &[(
+                "harw-ops",
+                "[package]\nname = \"harw-ops\"\n\n[dependencies]\nladder = { workspace = true }\n",
+            )],
+        )?;
+        let crates = graph(vec![
+            node("harw-ops", &[], &["ladder"]),
+            node("harw-dod-escalate", &[], &[]),
+        ]);
+
+        let report = evaluate_with_manifests(&crates, &policy, &LockIndex::default(), &edges);
+
+        assert_hits(
+            &forbidden_hits(&report),
+            &[
+                "harw-ops erreicht die verbotene Crate 'harw-dod-escalate' über harw-ops → harw-dod-escalate —",
+            ],
+        );
+        Ok(())
+    }
+
+    /// B16: eine Kante nur unter `[target.'cfg(target_os = "linux")'.dependencies]`
+    /// ist rot — direkt von harw-runtime und transitiv über ein Paket, das
+    /// seine Linux-Kanten nur dort deklariert (wie harw-job-runtime). Der
+    /// Graph sieht keine der beiden Kanten.
+    #[test]
+    fn test_target_only_edges_to_signing_crates_are_red() -> TestResult {
+        let policy = real_policy()?;
+        let edges = manifest_edges(
+            "[workspace]\n",
+            &[
+                (
+                    "harw-runtime",
+                    r#"
+[package]
+name = "harw-runtime"
+
+[dependencies]
+harw-job-runtime = { path = "../harw-job-runtime" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+harw-dod-warden-proto = { path = "../w" }
+"#,
+                ),
+                (
+                    "harw-job-runtime",
+                    r#"
+[package]
+name = "harw-job-runtime"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+harw-dod-escalate = { path = "../e" }
+"#,
+                ),
+            ],
+        )?;
+        let crates = graph(vec![
+            node("harw-runtime", &["harw-job-runtime"], &[]),
+            node("harw-job-runtime", &[], &[]),
+            node("harw-dod-warden-proto", &[], &[]),
+            node("harw-dod-escalate", &[], &[]),
+        ]);
+
+        let blind = evaluate(&crates, &policy, &LockIndex::default());
+        assert!(
+            forbidden_hits(&blind).is_empty(),
+            "der Graph allein sieht keine Target-Kante: {:#?}",
+            blind.violations
+        );
+
+        let report = evaluate_with_manifests(&crates, &policy, &LockIndex::default(), &edges);
+
+        assert_hits(
+            &forbidden_hits(&report),
+            &[
+                "harw-runtime erreicht die verbotene Crate 'harw-dod-warden-proto' über harw-runtime → harw-dod-warden-proto —",
+                "harw-runtime erreicht die verbotene Crate 'harw-dod-escalate' über harw-runtime → harw-job-runtime → harw-dod-escalate —",
+            ],
+        );
+        Ok(())
+    }
+
+    /// Dev-Abhängigkeiten (auch unter `[target.'…']`) landen in keinem
+    /// ausgelieferten Artefakt und bleiben aus der Verbots-Hülle.
+    #[test]
+    fn test_dev_only_edges_to_signing_crates_stay_green() -> TestResult {
+        let policy = real_policy()?;
+        let edges = manifest_edges(
+            "[workspace]\n",
+            &[(
+                "harw-runtime",
+                r#"
+[package]
+name = "harw-runtime"
+
+[dev-dependencies]
+harw-dod-warden-proto = { path = "../w" }
+
+[target.'cfg(unix)'.dev-dependencies]
+harw-dod-escalate = { path = "../e" }
+"#,
+            )],
+        )?;
+        let crates = graph(vec![
+            node("harw-runtime", &[], &[]),
+            node("harw-dod-warden-proto", &[], &[]),
+            node("harw-dod-escalate", &[], &[]),
+        ]);
+
+        let report = evaluate_with_manifests(&crates, &policy, &LockIndex::default(), &edges);
+
+        let hits = forbidden_hits(&report);
+        assert!(hits.is_empty(), "{hits:#?}");
+        Ok(())
+    }
+
+    /// Fail closed in jeder Schicht: ein Name in einer Verbots-Hülle, der
+    /// weder lokales Paket noch in `Cargo.lock` ist (hier der umbenannte
+    /// Schlüssel ohne Manifest-Kanten), ist rot — auch für ein Paket der
+    /// Schicht A, für das die `*-sys`-Regel nicht gilt. Gelten mehrere Zeilen
+    /// (harw-dod-submit-proto steht in drei), erscheint die Meldung trotzdem
+    /// nur einmal.
+    #[test]
+    fn test_unresolved_name_in_a_forbidden_hull_fails_closed() -> TestResult {
+        let policy = real_policy()?;
+        let crates = graph(vec![
+            node("harw-runtime", &[], &["signing"]),
+            node("harw-dod-submit-proto", &[], &["signing"]),
+        ]);
+        let submission_lines = policy
+            .forbidden
+            .iter()
+            .filter(|rule| {
+                policy
+                    .packages
+                    .get("harw-dod-submit-proto")
+                    .is_some_and(|class| rule.applies_to("harw-dod-submit-proto", class))
+            })
+            .count();
+        assert!(submission_lines >= 2, "{submission_lines}");
+
+        let report = evaluate(&crates, &policy, &LockIndex::default());
+
+        let runtime = "harw-runtime: 'signing' ist weder lokales Paket noch in Cargo.lock";
+        let submission =
+            "harw-dod-submit-proto: 'signing' ist weder lokales Paket noch in Cargo.lock";
+        assert!(
+            report.violations.iter().any(|v| v.starts_with(runtime)),
+            "{:#?}",
+            report.violations
+        );
+        assert_eq!(
+            report
+                .violations
+                .iter()
+                .filter(|v| v.starts_with(submission))
+                .count(),
+            1,
+            "{:#?}",
+            report.violations
+        );
+        Ok(())
+    }
+
+    /// Fail closed auch auf dem Pfad, den [`run`] nimmt: ein Name, der nur in
+    /// den [`ManifestEdges`] steht (hier umbenannt unter `[target.'…']`), der
+    /// weder lokales Paket noch in `Cargo.lock` ist, ist über
+    /// [`evaluate_with_manifests`] genau einmal rot. Die graphbasierte
+    /// Kurzform sieht die Target-Kante nicht und meldet ihn deshalb nicht.
+    #[test]
+    fn test_unresolved_manifest_name_fails_closed_through_evaluate_with_manifests() -> TestResult {
+        let policy = real_policy()?;
+        let edges = manifest_edges(
+            "[workspace]\n",
+            &[(
+                "harw-runtime",
+                "[package]\nname = \"harw-runtime\"\n\n[target.'cfg(unix)'.dependencies]\nx = { package = \"ghost-crate\", path = \"../g\" }\n",
+            )],
+        )?;
+        let crates = graph(vec![node("harw-runtime", &[], &[])]);
+        let ghost = "harw-runtime: 'ghost-crate' ist weder lokales Paket noch in Cargo.lock";
+
+        let report = evaluate_with_manifests(&crates, &policy, &LockIndex::default(), &edges);
+
+        assert_eq!(
+            report
+                .violations
+                .iter()
+                .filter(|v| v.starts_with(ghost))
+                .count(),
+            1,
+            "{:#?}",
+            report.violations
+        );
+        let graph_only = evaluate(&crates, &policy, &LockIndex::default());
+        assert!(
+            !graph_only
+                .violations
+                .iter()
+                .any(|v| v.contains("ghost-crate")),
+            "{:#?}",
+            graph_only.violations
+        );
+        Ok(())
+    }
+
+    /// Die `[[forbidden_crates]]`-Treffer eines Berichts; andere Verstöße
+    /// (etwa veraltete TCB-Zeilen in einem konstruierten Graphen) bleiben
+    /// draußen.
+    fn forbidden_hits(report: &GateReport) -> Vec<&str> {
+        report
+            .violations
+            .iter()
+            .map(String::as_str)
+            .filter(|violation| violation.contains("[[forbidden_crates]]"))
+            .collect()
+    }
+
+    /// Prüft, dass zu jedem erwarteten Präfix ein Treffer existiert.
+    fn assert_hits(hits: &[&str], expected: &[&str]) {
+        for &prefix in expected {
+            assert!(
+                hits.iter().any(|hit| hit.starts_with(prefix)),
+                "erwartet: {prefix}\nTreffer: {hits:#?}"
+            );
+        }
+    }
+
+    /// PL-100 WP 3.0 / Leitprinzip I8: die **echten** Verbots-Zeilen aus
+    /// [`POLICY_PATH`] gegen konstruierte Graphen. Der Pfad vor WP 3.0
+    /// (harw-runtime → harw-plan-bridge → harw-dod-escalate →
+    /// harw-dod-warden-proto) ist an jeder Station rot, ebenso eine Andockung
+    /// über die Leiter (harw-plan-bridge → harw-dod-ladder). Grün ist die
+    /// Andockung über die signierfreien Crates `harw-dod-rules`,
+    /// `harw-dod-submit-proto` und `harw-dod-warden-types`.
+    #[test]
+    fn test_real_policy_keeps_signing_code_out_of_model_facing_packages() -> TestResult {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or(TestError::Missing("Repo-Wurzel über xtask/"))?;
+        let policy = load_policy(repo_root).map_err(TestError::Unexpected)?;
+        let lock = LockIndex::default();
+
+        let before = evaluate(
+            &graph(vec![
+                node("harw-runtime", &["harw-plan-bridge"], &[]),
+                node("harw-plan-bridge", &["harw-dod-escalate"], &[]),
+                node("harw-dod-escalate", &["harw-dod-warden-proto"], &[]),
+                node("harw-dod-warden-proto", &[], &[]),
+            ]),
+            &policy,
+            &lock,
+        );
+        assert_hits(
+            &forbidden_hits(&before),
+            &[
+                "harw-runtime erreicht die verbotene Crate 'harw-dod-escalate' über harw-runtime → harw-plan-bridge → harw-dod-escalate —",
+                "harw-runtime erreicht die verbotene Crate 'harw-dod-warden-proto' über harw-runtime → harw-plan-bridge → harw-dod-escalate → harw-dod-warden-proto —",
+                "harw-plan-bridge erreicht die verbotene Crate 'harw-dod-escalate' über harw-plan-bridge → harw-dod-escalate —",
+                "harw-plan-bridge erreicht die verbotene Crate 'harw-dod-warden-proto' über harw-plan-bridge → harw-dod-escalate → harw-dod-warden-proto —",
+                "harw-dod-escalate erreicht die verbotene Crate 'harw-dod-warden-proto' über harw-dod-escalate → harw-dod-warden-proto —",
+            ],
+        );
+
+        // Auch die signierfreie Leiter liegt außerhalb modellnaher Prozesse.
+        let ladder_docking = evaluate(
+            &graph(vec![
+                node("harw-runtime", &["harw-plan-bridge"], &[]),
+                node("harw-plan-bridge", &["harw-dod-ladder"], &[]),
+                node("harw-dod-ladder", &["harw-dod-warden-types"], &[]),
+                node("harw-dod-warden-types", &[], &[]),
+            ]),
+            &policy,
+            &lock,
+        );
+        let ladder_hits = forbidden_hits(&ladder_docking);
+        assert_hits(
+            &ladder_hits,
+            &[
+                "harw-runtime erreicht die verbotene Crate 'harw-dod-ladder' über harw-runtime → harw-plan-bridge → harw-dod-ladder —",
+                "harw-plan-bridge erreicht die verbotene Crate 'harw-dod-ladder' über harw-plan-bridge → harw-dod-ladder —",
+            ],
+        );
+        assert!(
+            !ladder_hits
+                .iter()
+                .any(|hit| hit.contains("'harw-dod-warden-types'")),
+            "das signierfreie Vokabular bleibt erlaubt: {ladder_hits:#?}"
+        );
+
+        let docking = evaluate(
+            &graph(vec![
+                node("harw-runtime", &["harw-plan-bridge"], &[]),
+                node(
+                    "harw-plan-bridge",
+                    &[
+                        "harw-dod-rules",
+                        "harw-dod-submit-proto",
+                        "harw-dod-warden-types",
+                    ],
+                    &[],
+                ),
+                node("harw-dod-rules", &[], &[]),
+                node("harw-dod-submit-proto", &[], &[]),
+                node("harw-dod-warden-types", &[], &[]),
+            ]),
+            &policy,
+            &lock,
+        );
+        let docking_hits = forbidden_hits(&docking);
+        assert!(docking_hits.is_empty(), "{docking_hits:#?}");
+
+        // Der angekündigte Escalator ist verboten, sobald es ihn gibt —
+        // auch über eine sonst nur der Eskalationsseite erlaubte Crate.
+        let escalator = evaluate(
+            &graph(vec![
+                node("harw-core", &["harw-dod-ladder"], &[]),
+                node("harw-ops", &["harw-dod-ladder"], &[]),
+                node("harw-dod-ladder", &["harw-escalator"], &[]),
+                node("harw-escalator", &[], &[]),
+            ]),
+            &policy,
+            &lock,
+        );
+        assert_hits(
+            &forbidden_hits(&escalator),
+            &[
+                "harw-core erreicht die verbotene Crate 'harw-dod-ladder' über harw-core → harw-dod-ladder —",
+                "harw-core erreicht die verbotene Crate 'harw-escalator' über harw-core → harw-dod-ladder → harw-escalator —",
+                "harw-ops erreicht die verbotene Crate 'harw-dod-ladder' über harw-ops → harw-dod-ladder —",
+                "harw-ops erreicht die verbotene Crate 'harw-escalator' über harw-ops → harw-dod-ladder → harw-escalator —",
+                "harw-dod-ladder erreicht die verbotene Crate 'harw-escalator' über harw-dod-ladder → harw-escalator —",
+            ],
+        );
         Ok(())
     }
 

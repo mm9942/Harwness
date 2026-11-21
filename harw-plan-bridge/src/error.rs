@@ -123,13 +123,19 @@ pub enum PlanBridgeError {
     NoReadyNodes,
 
     /// Ein Sicherheitsbefund qualifiziert sich nicht für die Plan-Andockung
-    /// (Knoten AW6-04, [`crate::security_bridge`]): [`harw_dod_escalate::Ladder::stage_for_or_reject`]
-    /// hat abgelehnt. Die gewrappte [`harw_dod_escalate::EscalateError`] trägt
-    /// selbst nur eine feste, nicht interpolierte Meldung — diese Variante
-    /// fügt keinen zusätzlichen Inhalt hinzu, sie bettet nur ein.
-    #[msg("Sicherheitsbefund qualifiziert sich nicht für eine Eskalationsstufe: {0}")]
-    #[from]
-    SecurityDocking(harw_dod_escalate::EscalateError),
+    /// (Knoten AW6-04, [`crate::security_bridge`]): er rechtfertigt keine
+    /// Eskalationsstufe (keine ausgelöste Regel oder nicht bestätigt).
+    ///
+    /// Eine feste, nicht interpolierte Meldung ohne Befundfelder — wörtlich
+    /// dieselbe wie bis PL-100 WP 3.0, als diese Variante noch
+    /// `harw_dod_escalate::EscalateError::NotEscalatable` einbettete. Seit
+    /// WP 3.0 (Leitprinzip I8) linkt dieses Crate weder `harw-dod-escalate`
+    /// noch die Eskalationsleiter `harw-dod-ladder`; die Variante trägt
+    /// deshalb keinen Fremdfehler mehr und hat keine `source()`.
+    #[msg(
+        "Sicherheitsbefund qualifiziert sich nicht für eine Eskalationsstufe: finding is not eligible for any escalation stage"
+    )]
+    SecurityDocking,
 }
 
 /// Übersetzt einen `harw-knowledge`-Fehler in einen Bridge-Fehler.
@@ -212,12 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn test_security_docking_error_wraps_content_free_message() {
-        let error = PlanBridgeError::from(harw_dod_escalate::EscalateError::NotEscalatable);
+    fn test_security_docking_error_has_a_fixed_content_free_message() {
+        let error = PlanBridgeError::SecurityDocking;
         let text = error.to_string();
         assert!(text.contains("Sicherheitsbefund qualifiziert sich nicht"));
+        assert!(text.ends_with("finding is not eligible for any escalation stage"));
         assert!(!text.chars().any(|c| c.is_ascii_digit()));
-        assert!(std::error::Error::source(&error).is_some());
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

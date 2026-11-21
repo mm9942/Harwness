@@ -41,6 +41,13 @@ serde_json = { workspace = true }
 harw-secrets = { path = "../harw-secrets" }
 crypt_guard = { workspace = true }
 
+# PL-100 I4 / WP0.8: the one escaper for untrusted text. The posture
+# document exposes export-derived text (`summary`, ids that fail their
+# grammar) only as `UntrustedText`, which renders through `escape_line`;
+# `is_clean` is part of the finding id grammar. Layer F, no dependencies of
+# its own (`xtask/arch-policy.toml`: I → F is allowed).
+harw-untrusted-text = { path = "../harw-untrusted-text" }
+
 [dev-dependencies]
 # In-test hub: a tiny hyper HTTP/1 server on a tempdir Unix socket.
 hyper = { version = "1", features = ["client", "server", "http1"] }

@@ -45,7 +45,9 @@ use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
 use harw_session_store::{JobListQuery, JobStore};
 use harw_tool_job::logs::tail_of_file;
 use harw_tool_job::model::{STDERR_LOG, STDOUT_LOG};
-use harw_tool_job::{Caller, JobId, JobManager, JobSignal, JobState, JobStatus, format_duration};
+use harw_tool_job::{
+    Caller, JobId, JobManager, JobMeta, JobSignal, JobState, JobStatus, format_duration,
+};
 
 /// Vorgabe für `/jobs logs <id>` ohne Zeilenzahl.
 const DEFAULT_LOG_LINES: usize = 40;
@@ -76,11 +78,27 @@ pub fn state_label(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "wartet",
         JobState::Running => "läuft",
+        // PL-100 WP 3.5: eingefroren (`job.suspend`), lebt weiter.
+        JobState::Suspended => "angehalten",
         JobState::Succeeded => "fertig",
         JobState::Failed => "fehlgeschlagen",
         JobState::Stopped => "gestoppt",
         JobState::Detached => "abgelöst",
         JobState::Unknown => "unbekannt",
+    }
+}
+
+/// Kurzform des Zustands eines Jobs für Listen: wie [`state_label`], aber
+/// ein noch eingefrorener Job heißt immer „angehalten“ — auch ein
+/// abgelöster aus einer früheren Sitzung, dessen cgroup eingefroren blieb
+/// ([`JobMeta::is_suspended`]; PL-100 WP 3.5, THREAT-MODEL B13: ein Freeze
+/// bleibt sichtbar).
+#[must_use]
+pub fn meta_state_label(meta: &JobMeta) -> &'static str {
+    if meta.is_suspended() {
+        state_label(JobState::Suspended)
+    } else {
+        state_label(meta.state)
     }
 }
 
@@ -108,7 +126,7 @@ pub fn job_line(status: &JobStatus) -> String {
     format!(
         "{} · {} · {} · {} · {}",
         status.meta.job_id,
-        state_label(status.meta.state),
+        meta_state_label(&status.meta),
         runtime_label(status),
         progress_label(status),
         status.meta.name
@@ -340,13 +358,26 @@ fn list_text(manager: &JobManager) -> String {
     text
 }
 
+/// Zeile der Detailansicht für ein ungeklärtes Anhalten
+/// ([`JobMeta::is_suspension_unresolved`], PL-100 WP 3.5): harw kann nicht
+/// belegen, dass ein Freeze der cgroup sein eigener ist.
+const UNRESOLVED_SUSPENSION: &str = "Anhalten ungeklärt: nur die Absicht ist vermerkt; \
+     job.resume lehnt ab. Von Hand klären: job.stop (beendet ohne Auftauen) oder \
+     job.suspend erneut senden, nur solange die cgroup nicht eingefroren ist";
+
 fn show_text(status: &JobStatus) -> String {
     let meta = &status.meta;
     let mut lines = vec![
         format!("Job {} „{}“", meta.job_id, meta.name),
         format!(
-            "Zustand: {} · Laufzeit: {}{}",
-            state_label(meta.state),
+            "Zustand: {}{} · Laufzeit: {}{}",
+            meta_state_label(meta),
+            // Ein abgelöster, noch eingefrorener Job nennt beides.
+            if meta.state == JobState::Detached && meta.is_suspended() {
+                " (abgelöst)"
+            } else {
+                ""
+            },
             runtime_label(status),
             meta.exit_code
                 .map(|code| format!(" · Exit-Code {code}"))
@@ -373,6 +404,10 @@ fn show_text(status: &JobStatus) -> String {
         ),
         format!("Logs: {}", status.log_dir.display()),
     ];
+    // PL-100 WP 3.5: nur die Absicht vermerkt, harws Freeze nicht belegt.
+    if meta.is_suspension_unresolved() {
+        lines.push(UNRESOLVED_SUSPENSION.to_owned());
+    }
     if let Some(error) = &meta.launch_error {
         lines.push(format!("Startfehler: {error}"));
     }
@@ -475,6 +510,90 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// PL-100 WP 3.5: der angehaltene Zustand hat eine eigene Kurzform, die
+    /// sich von allen anderen unterscheidet (die TUI bildet Kurzformen in
+    /// Tests auf den Zustand zurück).
+    #[test]
+    fn state_labels_are_distinct_and_name_suspended() -> TestResult {
+        assert_eq!(state_label(JobState::Suspended), "angehalten");
+        let states = [
+            JobState::Queued,
+            JobState::Running,
+            JobState::Suspended,
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Stopped,
+            JobState::Detached,
+            JobState::Unknown,
+        ];
+        let labels: std::collections::BTreeSet<&str> =
+            states.into_iter().map(state_label).collect();
+        assert_eq!(labels.len(), states.len(), "{labels:?}");
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5 (THREAT-MODEL B13): ein abgelöster Job, dessen cgroup
+    /// noch eingefroren ist (`detached` mit `suspended_at`), heißt in Liste
+    /// und Detailansicht „angehalten“; ohne Vermerk bleibt er „abgelöst“,
+    /// ein beendeter Job mit altem Vermerk zeigt seinen Endzustand.
+    #[test]
+    fn frozen_detached_job_is_labelled_suspended() -> TestResult {
+        let status = |state: &str, suspended_at: Option<&str>| -> TestResult<JobStatus> {
+            let mut meta = serde_json::json!({
+                "version": 2,
+                "job_id": "job-1",
+                "name": "schlaf",
+                "command": "sleep 30",
+                "state": state,
+                "harw_instance": "harw-t",
+                "owner": {"session": "uia"},
+                "created_at": "2026-01-01T00:00:00Z",
+                "notify_every_secs": 60,
+            });
+            if let (Some(fields), Some(at)) = (meta.as_object_mut(), suspended_at) {
+                fields.insert("suspended_at".to_owned(), serde_json::json!(at));
+            }
+            Ok(JobStatus {
+                meta: serde_json::from_value(meta).map_err(ctx("meta.json"))?,
+                runtime_secs: Some(3),
+                stdout_lines: 0,
+                stderr_lines: 0,
+                last_lines: Vec::new(),
+                log_dir: std::path::PathBuf::from("/nonexistent/harw-job-test"),
+            })
+        };
+        let frozen_at = Some("2026-01-01T00:00:03Z");
+
+        let frozen = status("detached", frozen_at)?;
+        assert_eq!(meta_state_label(&frozen.meta), "angehalten");
+        let line = job_line(&frozen);
+        assert!(line.contains(" · angehalten · "), "{line}");
+        let show = show_text(&frozen);
+        assert!(show.contains("Zustand: angehalten (abgelöst)"), "{show}");
+
+        let suspended = status("suspended", frozen_at)?;
+        assert_eq!(meta_state_label(&suspended.meta), "angehalten");
+        let suspended_show = show_text(&suspended);
+        assert!(suspended_show.contains("Zustand: angehalten ·"));
+        // Ohne vermerkte Phase ist das Anhalten ungeklärt (fail closed), auch
+        // bei einem abgelösten Job; ein belegtes (`applied`) bekommt keinen
+        // Hinweis.
+        assert!(
+            suspended_show.contains(UNRESOLVED_SUSPENSION),
+            "{suspended_show}"
+        );
+        assert!(show.contains(UNRESOLVED_SUSPENSION), "{show}");
+        let mut applied = status("suspended", frozen_at)?;
+        applied.meta.suspend_phase = Some(harw_tool_job::SuspendPhase::Applied);
+        assert!(!show_text(&applied).contains(UNRESOLVED_SUSPENSION));
+
+        let detached = status("detached", None)?;
+        assert_eq!(meta_state_label(&detached.meta), "abgelöst");
+        let stopped = status("stopped", frozen_at)?;
+        assert_eq!(meta_state_label(&stopped.meta), "gestoppt");
+        Ok(())
     }
 
     #[tokio::test]

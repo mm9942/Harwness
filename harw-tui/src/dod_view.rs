@@ -464,6 +464,14 @@ impl DodView {
             "  {prefix}health written {}{stale}",
             field(sensors, "written_at")
         )));
+        if let Some(warnings) = sensors.get("warnings").and_then(Value::as_array) {
+            for warning in warnings.iter().take(2).filter_map(Value::as_str) {
+                lines.push(Line::styled(
+                    format!("  {prefix}{}", clean(warning)),
+                    style::warning_style(theme),
+                ));
+            }
+        }
         let list = sensors
             .get("sensors")
             .and_then(Value::as_array)
@@ -565,7 +573,11 @@ impl DodView {
 impl OverlayView for DodView {
     fn render(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
         Clear.render(area, buf);
-        let lines = self.lines(theme);
+        // `render_panel` draws one terminal row per `Line` and clips the
+        // rest; wrapping to the inner width (frame minus both borders) keeps
+        // degradation warnings and the UNVERIFIED label readable in portrait
+        // layouts (PR #168 review, `dod_view.rs:470`).
+        let lines = wrap_to_width(self.lines(theme), usize::from(area.width.saturating_sub(2)));
         let viewport = content_height(area, false);
         let total = lines.len();
         self.measure.set((total, viewport));
@@ -654,6 +666,88 @@ impl OverlayView for DodView {
 }
 
 // ── Line helpers ────────────────────────────────────────────────────────────
+
+/// Wraps every line wider than `width` columns onto further rows.
+///
+/// # Description
+/// Word-wise via [`crate::history_cell::wrap_styled`], so span styles (the
+/// warning colour, the health colour) survive. A line's leading indent is
+/// repeated on each continuation row, so a wrapped warning stays visually
+/// inside its section. When the indent leaves fewer than two columns, the
+/// line wraps without it. Lines that already fit are returned unchanged.
+///
+/// # Arguments
+/// - `lines`: the content lines, one terminal row each before wrapping.
+/// - `width`: the inner panel width in columns (`0` returns `lines` as is,
+///   nothing is drawn then).
+///
+/// # Returns
+/// The rows to draw; never fewer than `lines`.
+fn wrap_to_width(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    let mut rows = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.width() <= width {
+            rows.push(line);
+            continue;
+        }
+        let indent = leading_spaces(&line);
+        if indent == 0 || indent + 2 > width {
+            rows.extend(crate::history_cell::wrap_styled(line, width));
+            continue;
+        }
+        let body = strip_leading_spaces(line, indent);
+        for row in crate::history_cell::wrap_styled(body, width - indent) {
+            let row_style = row.style;
+            let mut spans = Vec::with_capacity(row.spans.len() + 1);
+            spans.push(Span::raw(" ".repeat(indent)));
+            spans.extend(row.spans);
+            rows.push(Line::from(spans).style(row_style));
+        }
+    }
+    rows
+}
+
+/// Number of leading ASCII spaces of `line`, across span boundaries.
+fn leading_spaces(line: &Line<'_>) -> usize {
+    let mut count = 0;
+    for span in &line.spans {
+        let spaces = span.content.chars().take_while(|ch| *ch == ' ').count();
+        count += spaces;
+        if spaces < span.content.chars().count() {
+            break;
+        }
+    }
+    count
+}
+
+/// `line` without its first `count` leading spaces (see [`leading_spaces`]).
+fn strip_leading_spaces(line: Line<'static>, count: usize) -> Line<'static> {
+    let line_style = line.style;
+    let mut remaining = count;
+    let mut spans = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        if remaining == 0 {
+            spans.push(span);
+            continue;
+        }
+        let spaces = span
+            .content
+            .chars()
+            .take_while(|ch| *ch == ' ')
+            .count()
+            .min(remaining);
+        remaining -= spaces;
+        // Spaces are one byte each, so `spaces` is a char boundary.
+        let rest = span.content[spaces..].to_owned();
+        if !rest.is_empty() {
+            spans.push(Span::styled(rest, span.style));
+        }
+    }
+    Line::from(spans).style(line_style)
+}
 
 /// Terminal-safe, bounded text from the export.
 fn clean(text: &str) -> String {
@@ -842,6 +936,7 @@ pub(crate) mod tests {
                 {"id": "tcp-connect", "health": "degraded", "degrade_reason": "btf missing", "readings_total": 0, "errors_total": 3},
             ],
             "ipc": {"probes_connected": 1, "events_total": 120, "dropped_total": 0},
+            "warnings": ["1 IPC decode error", "Landlock not enforced"],
             "path": "/var/lib/harw-dod/export/health.json",
             "source": if verified { "system" } else { "home" },
             "verified": verified,
@@ -914,6 +1009,8 @@ pub(crate) mod tests {
             "harw-warden.socket",
             "systemd not available",
             "SENSORS",
+            "1 IPC decode error",
+            "Landlock not enforced",
             "tcp-connect",
             "degraded",
             "btf missing",
@@ -984,6 +1081,124 @@ pub(crate) mod tests {
                 .any(|line| line.contains("attention UNVERIFIED 1 high/critical")),
             "{lines:?}"
         );
+    }
+
+    /// The rendered rows of `view` at `width` x `height`, right-trimmed.
+    fn screen_rows(view: &DodView, width: u16, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf, Theme::Dark);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Whether `words` appear in order on consecutive rows (one wrapped
+    /// warning), each row inside the frame.
+    fn wrapped_in_order(rows: &[String], words: &[&str]) -> bool {
+        (0..rows.len()).any(|start| {
+            let mut word = 0;
+            for row in rows.iter().skip(start).take(words.len()) {
+                let inner = row.trim_start_matches('│').trim_end_matches('│');
+                for token in inner.split_whitespace() {
+                    if words.get(word) == Some(&token) {
+                        word += 1;
+                    } else if word > 0 {
+                        return false;
+                    }
+                }
+                if word == words.len() {
+                    return true;
+                }
+                if word == 0 {
+                    return false;
+                }
+            }
+            false
+        })
+    }
+
+    /// PR #168 review (`dod_view.rs:470`): at 24 columns the 22 inner
+    /// columns must still show the whole "Landlock not enforced" warning,
+    /// verified and unverified, and nothing of it may be clipped.
+    #[test]
+    fn dod_view_wraps_degradation_warnings_in_portrait_width() {
+        for verified in [true, false] {
+            let mut view = DodView::new();
+            view.apply_data(&status_fixture(0, verified));
+            view.apply_data(&sensors_fixture(verified));
+            view.apply_data(&findings_fixture(verified));
+            let rows = screen_rows(&view, 24, 120);
+            let expected: &[&str] = if verified {
+                &["Landlock", "not", "enforced"]
+            } else {
+                &["UNVERIFIED", "Landlock", "not", "enforced"]
+            };
+            assert!(
+                wrapped_in_order(&rows, expected),
+                "verified={verified}: {rows:#?}"
+            );
+            assert!(
+                wrapped_in_order(&rows, &["tcp-connect"])
+                    && rows.iter().any(|row| row.contains("degraded")),
+                "sensor health stays readable: {rows:#?}"
+            );
+        }
+    }
+
+    /// The same view after a resize (landscape → portrait → landscape)
+    /// re-wraps every time instead of keeping a stale layout.
+    #[test]
+    fn dod_view_rewraps_warnings_after_resize() {
+        let mut view = DodView::new();
+        view.apply_data(&status_fixture(0, false));
+        view.apply_data(&sensors_fixture(false));
+        view.apply_data(&findings_fixture(false));
+        let words = ["UNVERIFIED", "Landlock", "not", "enforced"];
+        let wide = screen_rows(&view, 110, 40);
+        assert!(
+            wide.iter()
+                .any(|row| row.contains("UNVERIFIED Landlock not enforced")),
+            "one row when it fits: {wide:#?}"
+        );
+        let narrow = screen_rows(&view, 24, 120);
+        assert!(wrapped_in_order(&narrow, &words), "{narrow:#?}");
+        let wide_again = screen_rows(&view, 110, 40);
+        assert_eq!(wide, wide_again);
+    }
+
+    #[test]
+    fn wrap_to_width_keeps_indent_and_styles_on_continuation_rows() {
+        let warning = style::warning_style(Theme::Dark);
+        let line = Line::styled("  UNVERIFIED Landlock not enforced", warning);
+        let rows = wrap_to_width(vec![line, Line::raw("  ok")], 22);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(texts, ["  UNVERIFIED Landlock", "  not enforced", "  ok"]);
+        assert!(rows.iter().all(|row| row.width() <= 22), "{texts:?}");
+        let styled = rows.iter().take(2).all(|row| {
+            row.spans
+                .iter()
+                .filter(|span| !span.content.trim().is_empty())
+                .all(|span| row.style.patch(span.style) == warning)
+        });
+        assert!(styled, "warning colour survives the wrap");
+        assert_eq!(wrap_to_width(vec![Line::raw("abc")], 0).len(), 1);
     }
 
     #[test]

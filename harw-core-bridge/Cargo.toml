@@ -24,13 +24,28 @@ harw-dod-signals = { path = "../harw-dod/crates/harw-dod-signals" }
 # #22 Welle 1B: das geschlossene Vokabular der Return-Contracts und
 # -Validatoren der Agent-IR v2 (`ChildReturnContract::parse` ist strikt).
 harw-agent-dsl = { path = "../harw-agent-dsl" }
-# `#[derive(KebabEnum)]` für die Labels von `WaveJoin`/`WaveComplexity`.
+# `#[derive(KebabEnum)]` für die Labels von `WaveJoin`/`WaveComplexity`;
+# `#[derive(HarwError)]` für `VerdictAcceptError` (`security_verdict.rs`).
 harw-macros = { path = "../harw-macros" }
+# PL-100 WP 2.3 (`security_verdict.rs`): `accept_security_verdict` legt
+# gebundene Verdicts über `VerdictSink` im `VerdictStore` ab. Schicht A → I
+# (`xtask/arch-policy.toml`), erlaubt; kein Zyklus, `harw-session-store`
+# kennt diese Crate nicht (und kam vorher schon transitiv über `harw-core`).
+harw-session-store = { path = "../harw-session-store" }
+# PL-100 WP 2.3: der eine gemeinsame Escaper für modellverfasste Textfelder
+# eines Verdicts (`issued_by`, `finding`). Schicht A → F, erlaubt.
+harw-untrusted-text = { path = "../harw-untrusted-text" }
+# PL-100 WP 2.3: Nullzähler `unbound_verdict_total` (`UNBOUND_VERDICT`).
+# Schicht A → I, erlaubt.
+harw-observe = { path = "../harw-observe" }
 serde_json = "1.0.150"
 tracing = "0.1.44"
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }
+# Nur für Tests: feste `jiff::Timestamp`-Werte für die `Clock` und die
+# Verdict-Fixtures in `security_verdict.rs`.
+jiff = { workspace = true }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 # Nur für Tests: eine ChildRegistryFactory implementieren, um die
 # Contract-Auflösung über den OpContext zu prüfen (`harw-agent-dsl` ist seit

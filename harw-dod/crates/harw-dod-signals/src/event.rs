@@ -1,7 +1,8 @@
 //! Sicherheitsereignisse: wer etwas ausgelöst hat und welcher Art es ist (Contract-Master §G).
 //!
 //! # Verantwortungsbereich
-//! Trägt [`Actor`], [`AuthOutcome`], [`EventKind`] und [`SecurityEvent`] —
+//! Trägt [`Actor`] (samt optionalem [`ProcessContext`]), [`AuthOutcome`],
+//! [`EventKind`] und [`SecurityEvent`] —
 //! den zweiten, seltenen und wichtigen Beobachtungsstrom neben
 //! [`crate::sample::HostSample`] (siehe dortige Moduldoku für die Begründung
 //! der Trennung).
@@ -11,9 +12,19 @@
 //!
 //! # Fehler
 //! Keine eigenen — dieses Modul definiert nur Daten und liest keine Quelle.
-//! `#[serde(deny_unknown_fields)]` auf [`SecurityEvent`] und [`EventKind`]
-//! lässt `serde_json` beim Deserialisieren mit einem Serde-Fehler scheitern,
-//! wenn ein unbekanntes Feld auftaucht.
+//! `#[serde(deny_unknown_fields)]` auf [`SecurityEvent`], [`EventKind`],
+//! [`Actor`] und [`ProcessContext`] lässt `serde_json` beim Deserialisieren
+//! mit einem Serde-Fehler scheitern, wenn ein unbekanntes Feld auftaucht.
+//!
+//! # Prozesskontext (PL-100 WP0.15)
+//! [`Actor::process`] ist **optional** und wird nur serialisiert, wenn er
+//! gesetzt ist (`skip_serializing_if`). Damit gilt:
+//! - Bestands-JSON ohne `process` bleibt lesbar (`serde(default)`).
+//! - Ein `Actor` ohne Prozesskontext serialisiert byte-gleich wie vor
+//!   diesem Feld; Digests über solche Ereignisse ändern sich nicht.
+//! - Ein Leser **vor** diesem Feld lehnt nur Ereignisse **mit**
+//!   Prozesskontext ab (`deny_unknown_fields`). Ausgerollt wird deshalb
+//!   lesend zuerst (Leitprinzip I11): erst der Sentinel, dann die Sonden.
 //!
 //! # Wire-Stabilität von `EventKind`
 //! `EventKind` landet in Dateien (Belege, Fixtures) und in einem
@@ -31,7 +42,7 @@
 //! let event = SecurityEvent {
 //!     sensor: SensorId::from_str("authlog-0"),
 //!     observed_at: jiff::Timestamp::UNIX_EPOCH,
-//!     actor: Some(Actor { uid: 1000, auid: Some(1000), cgroup: None }),
+//!     actor: Some(Actor { uid: 1000, auid: Some(1000), cgroup: None, process: None }),
 //!     kind: EventKind::AuthEvent { outcome: AuthOutcome::Failure },
 //! };
 //! assert!(matches!(event.kind, EventKind::AuthEvent { .. }));
@@ -53,7 +64,7 @@ use jiff::Timestamp;
 /// ```rust
 /// use harw_dod_signals::Actor;
 ///
-/// let root_via_sudo = Actor { uid: 0, auid: Some(1000), cgroup: None };
+/// let root_via_sudo = Actor { uid: 0, auid: Some(1000), cgroup: None, process: None };
 /// assert_ne!(root_via_sudo.uid, root_via_sudo.auid.unwrap());
 /// ```
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -77,6 +88,120 @@ pub struct Actor {
     /// zusätzlichen disambiguierenden Kontext (siehe [`CgroupId`]-Dokumentation
     /// in `harw-types`).
     pub cgroup: Option<CgroupId>,
+    /// Der auslösende Prozess, falls der Sensor ihn kennt (PL-100 WP0.15,
+    /// Korrelation von Befund und Prozess).
+    ///
+    /// `None`, wenn der Sensor keinen Prozess beobachtet (etwa ein
+    /// Anmeldeversuch aus dem Audit-Log ohne pid). Optional und nur
+    /// serialisiert, wenn gesetzt — siehe Moduldoku, Abschnitt
+    /// „Prozesskontext", für die Wire-Verträglichkeit. **PID-Wiederverwendung:**
+    /// eine pid ist nur zum Beobachtungszeitpunkt eindeutig; wer sie später
+    /// nutzt (etwa für ein Signal), muss sie erneut gegen `cgroup` und
+    /// Startzeit prüfen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessContext>,
+}
+
+/// Der Prozess hinter einem [`Actor`] (PL-100 WP0.15).
+///
+/// # Description
+/// Trägt, was ein Sensor über den auslösenden Prozess **beobachtet** hat —
+/// nie Geratenes. Jedes Feld außer `pid` ist optional, weil nicht jede
+/// Quelle alles liefert: der eBPF-Wire-Kopf trägt `tgid`, die Eltern-`tgid`
+/// und die **reale** UID, aber keine effektive UID; ein Flow-Ereignis trägt
+/// keinen `comm`.
+///
+/// `comm` ist **angreiferkontrolliert** (jeder Prozess setzt seinen Namen
+/// selbst, `prctl(PR_SET_NAME)`). Der erzeugende Sensor escapt ihn deshalb,
+/// bevor er hier landet: unsichtbare und steuernde Zeichen erscheinen als
+/// sichtbares `\u{…}`, die Länge ist auf [`Self::COMM_MAX_CHARS`] Zeichen
+/// begrenzt (gemeinsamer Escaper `harw-untrusted-text`, PL-100 WP0.8).
+/// Diese Crate selbst escapt nicht — sie ist Vokabular ohne Parselogik.
+///
+/// # Errors
+/// Keine eigenen; `#[serde(deny_unknown_fields)]` lässt Deserialisierung
+/// mit unbekanntem Feld scheitern.
+///
+/// # Concurrency
+/// Reiner Werttyp: `Send + Sync`.
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_signals::{Actor, ProcessContext};
+///
+/// let process = ProcessContext::from_pid(4_242).map(|p| ProcessContext {
+///     ppid: Some(1),
+///     comm: Some("sshd".to_owned()),
+///     ..p
+/// });
+/// let actor = Actor { uid: 0, auid: None, cgroup: None, process };
+/// assert_eq!(actor.process.as_ref().map(|p| p.pid), Some(4_242));
+/// assert_eq!(ProcessContext::from_pid(0), None);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessContext {
+    /// Die Prozess-ID im Sinn des Userlands (Kernel: `tgid`), nie `0`.
+    pub pid: u32,
+    /// Die Prozess-ID des Elternprozesses (Kernel: `tgid` von
+    /// `real_parent`), falls bekannt. Nie `Some(0)`: eine nicht lesbare
+    /// Eltern-ID ist `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
+    /// Der Prozessname (`comm`, höchstens `TASK_COMM_LEN` Byte im Kernel),
+    /// **bereits escapt** und auf [`Self::COMM_MAX_CHARS`] Zeichen begrenzt.
+    /// `None`, wenn die Quelle keinen Namen liefert oder er leer war.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comm: Option<String>,
+    /// Die effektive UID zum Beobachtungszeitpunkt, falls die Quelle sie
+    /// kennt. Nicht zu verwechseln mit [`Actor::uid`], die je nach Quelle
+    /// die reale UID ist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub euid: Option<u32>,
+}
+
+impl ProcessContext {
+    /// Linux' `TASK_COMM_LEN`: die Breite des Kernel-Feldes `comm` in Byte,
+    /// abschließendes NUL eingerechnet.
+    ///
+    /// # Description
+    /// Ein Erzeuger kürzt einen rohen `comm` auf höchstens so viele Byte,
+    /// bevor er ihn escapt — mehr kann der Kernel nicht geliefert haben.
+    pub const KERNEL_COMM_BYTES: usize = 16;
+
+    /// Obergrenze für [`Self::comm`] **nach** dem Escapen, in Zeichen.
+    ///
+    /// # Description
+    /// Dieselbe Grenze wie `process.comm` in der Evidence-Card des
+    /// Findings-Exports v3, damit ein Konsument den Wert ohne zweites
+    /// Kürzen übernehmen kann.
+    pub const COMM_MAX_CHARS: usize = 32;
+
+    /// Baut einen Prozesskontext, der nur die pid kennt.
+    ///
+    /// # Arguments
+    /// - `pid` (`u32`): die Prozess-ID (Kernel: `tgid`).
+    ///
+    /// # Returns
+    /// `Some` mit allen optionalen Feldern `None`; `None` für `pid == 0`
+    /// (der Idle-Task ist nie ein Akteur, eine `0` heißt „unbekannt").
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_signals::ProcessContext;
+    ///
+    /// assert_eq!(ProcessContext::from_pid(7).map(|p| p.pid), Some(7));
+    /// assert_eq!(ProcessContext::from_pid(0), None);
+    /// ```
+    #[must_use]
+    pub fn from_pid(pid: u32) -> Option<Self> {
+        (pid != 0).then_some(Self {
+            pid,
+            ppid: None,
+            comm: None,
+            euid: None,
+        })
+    }
 }
 
 /// Prefix that marks an [`Actor::cgroup`] value as a **raw kernel cgroup
@@ -88,7 +213,9 @@ pub struct Actor {
 /// travels in the existing `cgroup` field (`"cgroup-id:<decimal>"`) instead
 /// of a new field, because [`Actor`] is `deny_unknown_fields`: a new field
 /// would make an older sentinel reject every event, while this encoding is
-/// accepted by every reader of the existing schema. A resolved path is
+/// accepted by every reader of the existing schema. (The later, optional
+/// [`Actor::process`] field is skipped when absent, so only events that
+/// actually carry a process context need a reader that knows it.) A resolved path is
 /// always absolute (starts with `/`), so the two forms never collide.
 pub const RAW_CGROUP_ID_PREFIX: &str = "cgroup-id:";
 
@@ -107,7 +234,7 @@ impl Actor {
     /// ```rust
     /// use harw_dod_signals::Actor;
     ///
-    /// let actor = Actor { uid: 1000, auid: None, cgroup: Actor::raw_cgroup(42) };
+    /// let actor = Actor { uid: 1000, auid: None, cgroup: Actor::raw_cgroup(42), process: None };
     /// assert_eq!(actor.raw_cgroup_id(), Some(42));
     /// assert_eq!(Actor::raw_cgroup(0), None);
     /// ```
@@ -265,6 +392,15 @@ pub enum EventKind {
         port: u16,
     },
     /// Ein Anmeldeversuch wurde beobachtet.
+    ///
+    /// **Kein Eins-zu-eins mit Versuchen:** ein einzelner Anmeldeversuch
+    /// ergibt je nach Quelle mehrere `AuthEvent`s mit demselben `outcome` —
+    /// bei Audit-Records etwa ein PAM-`USER_AUTH` und ein `USER_LOGIN` des
+    /// Dienstes, bei `sshd` zusätzlich eines je gescheiterter Methode. Der
+    /// `actor` ist der meldende Dienst (bei `sshd` meist `uid` 0), nicht das
+    /// Zielkonto. Eine Regel, die gescheiterte Anmeldungen zählt, muss mit
+    /// dieser Vielfachheit rechnen und darf `uid == 0` nicht als „Anmeldung
+    /// als root" lesen (siehe `harw_dod_authlog::LOGIN_RECORD_TYPES`).
     AuthEvent {
         /// Erfolg oder Fehlschlag der Anmeldung.
         outcome: AuthOutcome,
@@ -466,6 +602,7 @@ mod tests {
                 uid: 0,
                 auid: Some(1000),
                 cgroup: None,
+                process: None,
             }),
             kind: EventKind::AuthEvent {
                 outcome: AuthOutcome::Failure,
@@ -506,6 +643,7 @@ mod tests {
             uid: 0,
             auid: Some(1000),
             cgroup: None,
+            process: None,
         };
         assert_ne!(
             actor.uid,
@@ -520,6 +658,7 @@ mod tests {
             uid: 1,
             auid: None,
             cgroup: Actor::raw_cgroup(4_242),
+            process: None,
         };
         assert_eq!(
             actor.cgroup.as_ref().map(CgroupId::as_str),
@@ -538,8 +677,105 @@ mod tests {
                 uid: 1,
                 auid: None,
                 cgroup: Some(CgroupId::from_str(other)),
+                process: None,
             };
             assert_eq!(actor.raw_cgroup_id(), None, "{other}");
         }
+    }
+
+    // --- PL-100 WP0.15: Prozesskontext ---------------------------------------
+
+    fn actor_with_process() -> Actor {
+        Actor {
+            uid: 1000,
+            auid: None,
+            cgroup: None,
+            process: Some(ProcessContext {
+                pid: 4_242,
+                ppid: Some(1),
+                comm: Some("sshd".to_owned()),
+                euid: Some(0),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_actor_without_process_serializes_byte_identical_to_legacy_form() -> TestResult {
+        let actor = Actor {
+            uid: 1000,
+            auid: Some(1000),
+            cgroup: None,
+            process: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&actor).map_err(ctx("Actor serializes"))?,
+            r#"{"uid":1000,"auid":1000,"cgroup":null}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_actor_legacy_json_without_process_still_deserializes() -> TestResult {
+        let legacy = r#"{"uid":0,"auid":1000,"cgroup":null}"#;
+        let actor: Actor =
+            serde_json::from_str(legacy).map_err(ctx("Bestandsform bleibt lesbar"))?;
+        assert_eq!(actor.process, None);
+        assert_eq!(actor.uid, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_actor_with_process_json_is_stable_and_round_trips() -> TestResult {
+        let actor = actor_with_process();
+        let json = serde_json::to_string(&actor).map_err(ctx("Actor serializes"))?;
+        assert_eq!(
+            json,
+            r#"{"uid":1000,"auid":null,"cgroup":null,"process":{"pid":4242,"ppid":1,"comm":"sshd","euid":0}}"#
+        );
+        let back: Actor = serde_json::from_str(&json).map_err(ctx("Actor deserializes"))?;
+        assert_eq!(back, actor);
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_context_omits_absent_optional_fields() -> TestResult {
+        let process = ProcessContext::from_pid(7).ok_or(TestError::Missing("pid 7 gültig"))?;
+        let json = serde_json::to_string(&process).map_err(ctx("serializes"))?;
+        assert_eq!(json, r#"{"pid":7}"#);
+        let back: ProcessContext = serde_json::from_str(&json).map_err(ctx("deserializes"))?;
+        assert_eq!(back, process);
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_context_rejects_unknown_field() {
+        let fixture = r#"{"pid":7,"cmdline":"curl --data secret"}"#;
+        assert!(serde_json::from_str::<ProcessContext>(fixture).is_err());
+        let in_actor = r#"{"uid":1,"auid":null,"cgroup":null,"process":{"pid":7,"x":1}}"#;
+        assert!(serde_json::from_str::<Actor>(in_actor).is_err());
+    }
+
+    #[test]
+    fn test_process_context_from_pid_rejects_zero() {
+        assert_eq!(ProcessContext::from_pid(0), None);
+        assert_eq!(
+            ProcessContext::from_pid(1),
+            Some(ProcessContext {
+                pid: 1,
+                ppid: None,
+                comm: None,
+                euid: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_security_event_with_process_round_trips() -> TestResult {
+        let mut expected = event();
+        expected.actor = Some(actor_with_process());
+        let json = serde_json::to_string(&expected).map_err(ctx("event serializes"))?;
+        let back: SecurityEvent = serde_json::from_str(&json).map_err(ctx("event deserializes"))?;
+        assert_eq!(back, expected);
+        Ok(())
     }
 }

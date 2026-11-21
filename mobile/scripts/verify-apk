@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+apk=${1:?usage: verify-apk /path/to/Harw.apk}
+sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+build_tools="$sdk/build-tools/${MOBILE_BUILD_TOOLS:-37.0.0}"
+"$build_tools/apksigner" verify --verbose --print-certs "$apk"
+"$build_tools/zipalign" -c -P 16 4 "$apk"
+package=$("$build_tools/aapt" dump badging "$apk")
+if [[ "$package" != *"package: name='dev.harw.mobile'"* ]]; then
+    echo "Unexpected package ID in $apk." >&2
+    exit 1
+fi
+entries=$(unzip -Z -1 "$apk")
+if ! grep -Fxq 'lib/arm64-v8a/libharw_mobile_ffi.so' <<<"$entries"; then
+    echo "The APK is missing the arm64 Harw library." >&2
+    exit 1
+fi
+if grep -Eq '^lib/[^/]+/' <<<"$(sed '/^lib\/arm64-v8a\//d' <<<"$entries")"; then
+    echo "Unexpected non-arm64 library in $apk." >&2
+    exit 1
+fi
+if ! grep -Fxq 'lib/arm64-v8a/libjnidispatch.so' <<<"$entries"; then
+    echo "The APK is missing the arm64 JNA runtime." >&2
+    exit 1
+fi
+staged=$(mktemp)
+trap 'rm -f -- "$staged"' EXIT
+while IFS= read -r library; do
+    unzip -p "$apk" "$library" > "$staged"
+    # Android maps each PT_LOAD segment separately. ZIP alignment alone checks only the container.
+    readelf -lW "$staged" | awk '$1 == "LOAD" { print $NF }' | (
+        segments=0
+        while IFS= read -r alignment; do
+            if [[ ! "$alignment" =~ ^0x[[:xdigit:]]+$ ]] || ((alignment < 16384)); then
+                echo "ELF load alignment below 16 KiB in $library" >&2
+                exit 1
+            fi
+            segments=$((segments + 1))
+        done
+        ((segments > 0))
+    )
+done < <(grep -E '^lib/arm64-v8a/[^/]+\.so$' <<<"$entries")
+sha256sum -- "$apk"

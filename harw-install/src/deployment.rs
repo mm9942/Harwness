@@ -129,6 +129,10 @@ pub const DEPLOYMENT_ASSETS: &[EmbeddedDeploymentAsset] = &[
         AssetKind::SystemdService
     ),
     deployment_asset!(
+        "deploy/systemd/harw-probe-netlink.service",
+        AssetKind::SystemdService
+    ),
+    deployment_asset!(
         "deploy/systemd/harw-security-hub.service",
         AssetKind::SystemdService
     ),
@@ -157,18 +161,39 @@ pub const DEPLOYMENT_ASSETS: &[EmbeddedDeploymentAsset] = &[
 ///
 /// # Description
 /// Mirrors the `systemd/`, `sysusers/` and `tmpfiles/` entries of
-/// `harw-dod/packaging/manifest`; the parity tests check both directions. The
-/// infrastructure units (`harw-infra.target`, `harw-auth-hub.*`, …) are
-/// embedded but not part of the DoD package.
+/// `harw-dod/packaging/manifest` in manifest order; the parity tests check
+/// both directions, and `harw-install/tests/staged_install.rs` installs the
+/// package into a `DESTDIR` and compares every installed file with its
+/// rendered embedded copy. The infrastructure units (`harw-infra.target`,
+/// `harw-auth-hub.*`, …) are embedded but not part of the DoD package.
 pub const DOD_PACKAGE_ASSETS: &[&str] = &[
     "deploy/systemd/harw-dod.target",
     "deploy/systemd/harw-sentinel.service",
     "deploy/systemd/harw-probe-bpf.service",
     "deploy/systemd/harw-probe-fs.service",
+    "deploy/systemd/harw-probe-netlink.service",
     "deploy/systemd/harw-warden.service",
     "deploy/systemd/harw-warden.socket",
     "deploy/sysusers.d/harw.conf",
     "deploy/tmpfiles.d/harw.conf",
+];
+
+/// The DoD binaries the installer ships to `libexec/harw-dod`, in manifest order.
+///
+/// # Description
+/// Single source of truth for the `libexec/` entries of
+/// `harw-dod/packaging/manifest` and for the `for binary in` loops of
+/// `harw-dod/scripts/install.sh`. `harw-probe-netlink` is installed with its
+/// unit but is opt-in: `harw-dod.target` does not pull it in.
+/// `harw-install/tests/staged_install.rs` checks the manifest, both loops,
+/// the uninstall path and that every shipped unit's `ExecStart=` resolves to
+/// one of these binaries.
+pub const DOD_PACKAGE_BINARIES: &[&str] = &[
+    "harw-sentinel",
+    "harw-probe-bpf",
+    "harw-probe-fs",
+    "harw-probe-netlink",
+    "harw-warden",
 ];
 
 /// Every placeholder an asset may contain; `install.sh` substitutes exactly

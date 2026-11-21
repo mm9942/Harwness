@@ -1,0 +1,8512 @@
+[
+  {
+    "domain": "Standalone",
+    "level": 0,
+    "summary": "Standalone Android-oriented cleanup and notification policy core. It contains neither Android framework integration nor a model runtime.",
+    "path": "harw-agentic-mobile",
+    "deps": [],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [],
+    "modules": [
+      "cleanup",
+      "notification"
+    ],
+    "source_files": 3,
+    "name": "harw-agentic-mobile"
+  },
+  {
+    "domain": "Product",
+    "level": 0,
+    "summary": "Backend-independent contracts for browser sessions, actions, observations, navigation policy, evidence, and diagnostics.",
+    "path": "harw-browser",
+    "deps": [],
+    "consumers": [
+      "harw-browser-thirtyfour",
+      "harw-registry-defaults",
+      "harw-tool-browser"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-browser-thirtyfour",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tui"
+    ],
+    "edges": [],
+    "modules": [
+      "action",
+      "artifact",
+      "capability",
+      "diagnostic",
+      "error",
+      "event",
+      "host",
+      "ids",
+      "observation",
+      "page_bridge",
+      "policy",
+      "selector",
+      "session",
+      "wait"
+    ],
+    "source_files": 15,
+    "name": "harw-browser"
+  },
+  {
+    "domain": "DoD",
+    "level": 0,
+    "summary": "Restrictive DoD system configuration with validated, no-follow, ownership-checked loading.",
+    "path": "dod/crates/harw-dod-config",
+    "deps": [],
+    "consumers": [
+      "harw-probe-bpf",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-probe-bpf",
+      "harw-sentinel"
+    ],
+    "edges": [],
+    "modules": [],
+    "source_files": 1,
+    "name": "harw-dod-config"
+  },
+  {
+    "domain": "Product",
+    "level": 0,
+    "summary": "Unix filesystem primitives for no-follow access, directory-relative containment, atomic writes, private-file checks, and bounded traversal.",
+    "path": "harw-fsutil",
+    "deps": [],
+    "consumers": [
+      "harw-config",
+      "harw-dod-sentinel",
+      "harw-home",
+      "harw-memory",
+      "harw-provider-http",
+      "harw-runtime",
+      "harw-secrets",
+      "harw-session-store",
+      "harw-tool-fs",
+      "harw-tool-web",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-catalog",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-config",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-escalate",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-extension-api",
+      "harw-home",
+      "harw-install",
+      "harw-instructions",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-mcp-server",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-secrets",
+      "harw-sentinel",
+      "harw-session-store",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [],
+    "modules": [
+      "atomic",
+      "open",
+      "perm",
+      "walk"
+    ],
+    "source_files": 5,
+    "name": "harw-fsutil"
+  },
+  {
+    "domain": "Product",
+    "level": 0,
+    "summary": "Streamable-HTTP MCP client with JSON-RPC, optional session identity, bearer authentication, and finite SSE response handling.",
+    "path": "harw-mcp-client",
+    "deps": [],
+    "consumers": [
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-cli"
+    ],
+    "edges": [],
+    "modules": [],
+    "source_files": 1,
+    "name": "harw-mcp-client"
+  },
+  {
+    "domain": "Product",
+    "level": 0,
+    "summary": "Shared identifiers, roles, principals, time, reasoning, and usage vocabulary without an asynchronous runtime or provider client.",
+    "path": "harw-types",
+    "deps": [],
+    "consumers": [
+      "harw",
+      "harw-authority",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-code-graph",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-procmon",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-warden",
+      "harw-dod-warden-proto",
+      "harw-dod-workspace",
+      "harw-extension-api",
+      "harw-instructions",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens-chunk",
+      "harw-lens-embed",
+      "harw-lens-index",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-lens-types",
+      "harw-mcp-server",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-project-discovery",
+      "harw-protocol",
+      "harw-provider",
+      "harw-provider-http",
+      "harw-research",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-session-store",
+      "harw-tool-fs",
+      "harw-tool-shell",
+      "harw-tools",
+      "harw-tui",
+      "harw-warden",
+      "harw-web"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-catalog",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-code-graph",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-netlink",
+      "harw-dod-netpolicy",
+      "harw-dod-procmon",
+      "harw-dod-readfs",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-warden",
+      "harw-dod-warden-proto",
+      "harw-dod-workspace",
+      "harw-egress",
+      "harw-extension-api",
+      "harw-install",
+      "harw-instructions",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-chunk",
+      "harw-lens-embed",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-rank",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-mcp-server",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-observe",
+      "harw-observe-file",
+      "harw-observe-otlp",
+      "harw-observe-prom",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-project-discovery",
+      "harw-protocol",
+      "harw-provider",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-research",
+      "harw-runtime",
+      "harw-sandbox",
+      "harw-secrets",
+      "harw-sentinel",
+      "harw-session-store",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-tui",
+      "harw-warden",
+      "harw-web",
+      "xtask"
+    ],
+    "edges": [],
+    "modules": [
+      "clock",
+      "confidence",
+      "digest",
+      "error",
+      "ids",
+      "impact",
+      "principal",
+      "provider_ids",
+      "reasoning",
+      "roles",
+      "usage"
+    ],
+    "source_files": 12,
+    "name": "harw-types"
+  },
+  {
+    "domain": "Product",
+    "level": 1,
+    "summary": "Permission requests, granted authority, scope algebra, and monotone narrowing. The common authority boundary for downstream execution.",
+    "path": "harw-authority",
+    "deps": [
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-channel-telegram",
+      "harw-cli",
+      "harw-context",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-cap",
+      "harw-dod-escalate",
+      "harw-dod-flow",
+      "harw-dod-netpolicy",
+      "harw-dod-rules",
+      "harw-dod-sentinel",
+      "harw-egress",
+      "harw-extension-api",
+      "harw-macros",
+      "harw-observe",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sandbox",
+      "harw-sentinel",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-agent-dsl",
+      "harw-catalog",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-code-graph",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-netlink",
+      "harw-dod-netpolicy",
+      "harw-dod-procmon",
+      "harw-dod-readfs",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-warden",
+      "harw-dod-warden-proto",
+      "harw-dod-workspace",
+      "harw-egress",
+      "harw-extension-api",
+      "harw-install",
+      "harw-instructions",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-chunk",
+      "harw-lens-embed",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-rank",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-mcp-server",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-observe",
+      "harw-observe-file",
+      "harw-observe-otlp",
+      "harw-observe-prom",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-project-discovery",
+      "harw-provider",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-research",
+      "harw-runtime",
+      "harw-sandbox",
+      "harw-secrets",
+      "harw-sentinel",
+      "harw-session-store",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-tui",
+      "harw-warden",
+      "harw-web",
+      "xtask"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [],
+    "source_files": 1,
+    "name": "harw-authority"
+  },
+  {
+    "domain": "Product",
+    "level": 1,
+    "summary": "Firefox/WebDriver BiDi adapter with pinned driver configuration, isolated launch support, origin checks, and bounded event journals.",
+    "path": "harw-browser-thirtyfour",
+    "deps": [
+      "harw-browser"
+    ],
+    "consumers": [
+      "harw-registry-defaults"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-browser",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "element_actions",
+      "wait_navigation",
+      "bidi_pump",
+      "capabilities",
+      "config",
+      "driver",
+      "error",
+      "firefox_prefs",
+      "gesture_actions",
+      "host",
+      "journal",
+      "launcher",
+      "location_guard",
+      "navigation",
+      "observe",
+      "preload_bridge",
+      "profile_archive",
+      "runtime",
+      "runtime_impl",
+      "submit_action",
+      "telemetry",
+      "wait_elements",
+      "waits",
+      "selector"
+    ],
+    "source_files": 25,
+    "name": "harw-browser-thirtyfour"
+  },
+  {
+    "domain": "Product",
+    "level": 1,
+    "summary": "Home/profile path resolution, idempotent scaffolding, configuration layer discovery, and explicit project trust.",
+    "path": "harw-home",
+    "deps": [
+      "harw-fsutil"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-dod-scanreport",
+      "harw-install",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-dod",
+      "harw-dod-scanreport",
+      "harw-install",
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-config",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "paths",
+      "project",
+      "scaffold",
+      "trust"
+    ],
+    "source_files": 6,
+    "name": "harw-home"
+  },
+  {
+    "domain": "Product",
+    "level": 1,
+    "summary": "Wire envelopes, session events, items, method vocabulary, and approval messages built on the shared types.",
+    "path": "harw-protocol",
+    "deps": [
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-core",
+      "harw-provider-http",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-provider-http",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "approvals",
+      "events",
+      "items",
+      "methods",
+      "wire"
+    ],
+    "source_files": 6,
+    "name": "harw-protocol"
+  },
+  {
+    "domain": "Product",
+    "level": 2,
+    "summary": "Procedural macros for typed errors, tools, operations, arguments, redaction, telemetry, and sensor contracts. The agent macro validates metadata; it does not itself bind a runtime.",
+    "path": "harw-macros",
+    "deps": [
+      "harw-authority"
+    ],
+    "consumers": [
+      "harw-channel",
+      "harw-code-graph",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-netlink",
+      "harw-dod-netpolicy",
+      "harw-dod-procmon",
+      "harw-dod-readfs",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-warden",
+      "harw-dod-warden-proto",
+      "harw-dod-workspace",
+      "harw-extension-api",
+      "harw-instructions",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-chunk",
+      "harw-lens-embed",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-lens-types",
+      "harw-observe",
+      "harw-observe-file",
+      "harw-observe-otlp",
+      "harw-observe-prom",
+      "harw-ops",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider",
+      "harw-research",
+      "harw-runtime",
+      "harw-secrets",
+      "harw-sentinel",
+      "harw-session-store",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-warden",
+      "harw-web"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-agent-dsl",
+      "harw-catalog",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-code-graph",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-netlink",
+      "harw-dod-netpolicy",
+      "harw-dod-procmon",
+      "harw-dod-readfs",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-warden",
+      "harw-dod-warden-proto",
+      "harw-dod-workspace",
+      "harw-extension-api",
+      "harw-install",
+      "harw-instructions",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-chunk",
+      "harw-lens-embed",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-rank",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-lens-types",
+      "harw-mcp-server",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-observe",
+      "harw-observe-file",
+      "harw-observe-otlp",
+      "harw-observe-prom",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-project-discovery",
+      "harw-provider",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-research",
+      "harw-runtime",
+      "harw-secrets",
+      "harw-sentinel",
+      "harw-session-store",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-tui",
+      "harw-warden",
+      "harw-web",
+      "xtask"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "agent",
+      "contributor",
+      "error",
+      "field",
+      "id",
+      "kebab_enum",
+      "metrics",
+      "op_args",
+      "operation",
+      "raw_args",
+      "redact",
+      "schema",
+      "sensor_source",
+      "tool",
+      "traced",
+      "util",
+      "warden_actions"
+    ],
+    "source_files": 18,
+    "name": "harw-macros"
+  },
+  {
+    "domain": "Product",
+    "level": 2,
+    "summary": "Linux process isolation and Bubblewrap launch profiles, plus explicitly governed host-process permits. Authorization vocabulary remains in harw-authority.",
+    "path": "harw-sandbox",
+    "deps": [
+      "harw-authority"
+    ],
+    "consumers": [
+      "harw",
+      "harw-channel-telegram",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod-flow",
+      "harw-dod-netpolicy",
+      "harw-egress",
+      "harw-extension-api",
+      "harw-operations",
+      "harw-ops",
+      "harw-probe-bpf",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-flow",
+      "harw-dod-netpolicy",
+      "harw-egress",
+      "harw-extension-api",
+      "harw-instructions",
+      "harw-memory",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "cargo",
+      "tmux",
+      "profile",
+      "bwrap",
+      "egress",
+      "extra_roots",
+      "process_permit",
+      "host_permit_session"
+    ],
+    "source_files": 9,
+    "name": "harw-sandbox"
+  },
+  {
+    "domain": "Product",
+    "level": 3,
+    "summary": "Read-only Cargo manifest and lockfile inspection, dependency levels, and local registry source discovery without spawning Cargo.",
+    "path": "harw-code-graph",
+    "deps": [
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-dod-rules",
+      "harw-dod-workspace",
+      "harw-ops",
+      "harw-tool-deps",
+      "xtask"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-dod",
+      "harw-dod-escalate",
+      "harw-dod-rules",
+      "harw-dod-sentinel",
+      "harw-dod-workspace",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-deps",
+      "harw-tool-lens",
+      "harw-tui",
+      "xtask"
+    ],
+    "edges": [
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "lockfile",
+      "registry_locator",
+      "workspace"
+    ],
+    "source_files": 5,
+    "name": "harw-code-graph"
+  },
+  {
+    "domain": "DoD",
+    "level": 3,
+    "summary": "Sensor capability and read-scope vocabulary with bound/unbound handles and typed errors.",
+    "path": "dod/crates/harw-dod-cap",
+    "deps": [
+      "harw-authority",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-bpf",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-netlink",
+      "harw-dod-netpolicy",
+      "harw-dod-procmon",
+      "harw-dod-readfs",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-workspace",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-bpf",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-netlink",
+      "harw-dod-netpolicy",
+      "harw-dod-procmon",
+      "harw-dod-readfs",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-workspace",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "capability",
+      "error",
+      "handle",
+      "scope"
+    ],
+    "source_files": 5,
+    "name": "harw-dod-cap"
+  },
+  {
+    "domain": "DoD",
+    "level": 3,
+    "summary": "Closed action taxonomy, canonical action content, authorization proofs, signed requests, denials, and Warden responses.",
+    "path": "dod/crates/harw-dod-warden-proto",
+    "deps": [
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod-escalate",
+      "harw-dod-warden",
+      "harw-warden"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-dod-escalate",
+      "harw-dod-warden",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-tui",
+      "harw-warden"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "action",
+      "canonical",
+      "denial",
+      "error",
+      "proof",
+      "response",
+      "signed",
+      "stage"
+    ],
+    "source_files": 9,
+    "name": "harw-dod-warden-proto"
+  },
+  {
+    "domain": "Product",
+    "level": 3,
+    "summary": "Governed outbound connections with host and address-class policy, redirect handling, and relay/proxy support.",
+    "path": "harw-egress",
+    "deps": [
+      "harw-authority",
+      "harw-sandbox"
+    ],
+    "consumers": [
+      "harw-registry-defaults",
+      "harw-tool-web"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-web",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "classify",
+      "client",
+      "error",
+      "policy",
+      "proxy",
+      "relay"
+    ],
+    "source_files": 8,
+    "name": "harw-egress"
+  },
+  {
+    "domain": "Product",
+    "level": 3,
+    "summary": "Chunk, source, byte-span, digest, manifest, locality, metric, ranking, edge, and budget vocabulary for retrieval.",
+    "path": "harw-lens-types",
+    "deps": [
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-context",
+      "harw-core",
+      "harw-extension-api",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-chunk",
+      "harw-lens-embed",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-rank",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-tools",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-agent-dsl",
+      "harw-catalog",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-extension-api",
+      "harw-install",
+      "harw-instructions",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-chunk",
+      "harw-lens-embed",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-rank",
+      "harw-lens-source",
+      "harw-lens-store",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "chunk",
+      "error",
+      "manifest",
+      "rank"
+    ],
+    "source_files": 5,
+    "name": "harw-lens-types"
+  },
+  {
+    "domain": "Product",
+    "level": 3,
+    "summary": "Backend-independent telemetry contracts, registered metric keys, redaction, trace context, null counters, and routing.",
+    "path": "harw-observe",
+    "deps": [
+      "harw-authority",
+      "harw-macros"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-core",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens-source",
+      "harw-observe-file",
+      "harw-observe-otlp",
+      "harw-observe-prom",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-secrets",
+      "harw-sentinel",
+      "harw-session-store"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-procmon",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-workspace",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-mcp-server",
+      "harw-observe-file",
+      "harw-observe-otlp",
+      "harw-observe-prom",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-secrets",
+      "harw-sentinel",
+      "harw-session-store",
+      "harw-tool-lens",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "field",
+      "metric",
+      "null_counter",
+      "redact",
+      "routing",
+      "sink",
+      "trace"
+    ],
+    "source_files": 9,
+    "name": "harw-observe"
+  },
+  {
+    "domain": "Product",
+    "level": 3,
+    "summary": "Typed goals and plan graphs, dependencies, read/write scopes, evidence, validation, execution waves, and memory/file stores.",
+    "path": "harw-plan",
+    "deps": [
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-knowledge",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "actions",
+      "admission",
+      "config",
+      "error",
+      "file_store",
+      "goal",
+      "goal_store",
+      "graph",
+      "ids",
+      "memory_store",
+      "store",
+      "testing",
+      "types",
+      "validate",
+      "mutation"
+    ],
+    "source_files": 16,
+    "name": "harw-plan"
+  },
+  {
+    "domain": "Product",
+    "level": 3,
+    "summary": "Provider identities, authentication and invocation vocabulary, model configuration, typestate markers, and derived provider chains.",
+    "path": "harw-provider",
+    "deps": [
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-ops",
+      "harw-provider-http"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-provider-http",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "auth",
+      "chain",
+      "error",
+      "invocation",
+      "marker",
+      "model",
+      "openai",
+      "provider",
+      "registry",
+      "slots"
+    ],
+    "source_files": 11,
+    "name": "harw-provider"
+  },
+  {
+    "domain": "Product",
+    "level": 3,
+    "summary": "Structured research questions, evidence-bearing findings, validation, and normalized return envelopes for bounded research work.",
+    "path": "harw-research",
+    "deps": [
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-core-bridge",
+      "harw-dod-rules",
+      "harw-ops",
+      "harw-plan-bridge"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-escalate",
+      "harw-dod-rules",
+      "harw-dod-sentinel",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "return_envelope",
+      "schema",
+      "types",
+      "validate"
+    ],
+    "source_files": 6,
+    "name": "harw-research"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Context fragments, trust classes, provenance, selectors, detail levels, ceilings, and budget vocabulary consumed by core assembly.",
+    "path": "harw-context",
+    "deps": [
+      "harw-authority",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-agent-dsl",
+      "harw-cli",
+      "harw-core",
+      "harw-extension-api",
+      "harw-knowledge",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-tools",
+      "harw-tui",
+      "harw-web"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-agent-dsl",
+      "harw-catalog",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-config",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-extension-api",
+      "harw-install",
+      "harw-instructions",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "budget",
+      "ceiling",
+      "error",
+      "fragment",
+      "reference",
+      "render",
+      "selector"
+    ],
+    "source_files": 8,
+    "name": "harw-context"
+  },
+  {
+    "domain": "DoD",
+    "level": 4,
+    "summary": "eBPF contract, loader, scope, versioned wire-event, fixture, and real-loader abstractions.",
+    "path": "dod/crates/harw-dod-bpf",
+    "deps": [
+      "harw-dod-cap",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-dod-flow",
+      "harw-dod-procmon",
+      "harw-probe-bpf"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-dod-flow",
+      "harw-dod-procmon",
+      "harw-probe-bpf"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "abi",
+      "contract",
+      "error",
+      "event",
+      "fixture",
+      "handle",
+      "loader",
+      "real",
+      "profile",
+      "spec",
+      "time"
+    ],
+    "source_files": 12,
+    "name": "harw-dod-bpf"
+  },
+  {
+    "domain": "DoD",
+    "level": 4,
+    "summary": "Audit netlink frame parsing, records, sockets, and source abstractions.",
+    "path": "dod/crates/harw-dod-netlink",
+    "deps": [
+      "harw-dod-cap",
+      "harw-macros"
+    ],
+    "consumers": [
+      "harw-dod-authlog"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-dod-authlog"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "frame",
+      "record",
+      "socket",
+      "source"
+    ],
+    "source_files": 6,
+    "name": "harw-dod-netlink"
+  },
+  {
+    "domain": "DoD",
+    "level": 4,
+    "summary": "Declarative network-policy plans derived from scoped authority; plan construction does not apply kernel rules.",
+    "path": "dod/crates/harw-dod-netpolicy",
+    "deps": [
+      "harw-authority",
+      "harw-dod-cap",
+      "harw-macros",
+      "harw-sandbox"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "backend",
+      "error",
+      "plan",
+      "rule"
+    ],
+    "source_files": 5,
+    "name": "harw-dod-netpolicy"
+  },
+  {
+    "domain": "DoD",
+    "level": 4,
+    "summary": "Scoped typed filesystem readers used by unprivileged sensors.",
+    "path": "dod/crates/harw-dod-readfs",
+    "deps": [
+      "harw-dod-cap",
+      "harw-macros"
+    ],
+    "consumers": [
+      "harw-dod-blockio",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-fixtures",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-scanreport",
+      "harw-dod-thermal"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-dod-blockio",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-fixtures",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-scanreport",
+      "harw-dod-thermal",
+      "harw-probe-fs",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "glob",
+      "read"
+    ],
+    "source_files": 4,
+    "name": "harw-dod-readfs"
+  },
+  {
+    "domain": "DoD",
+    "level": 4,
+    "summary": "Sensor traits and typed host samples, security events, actors, evidence, probe messages, and verdict vocabulary.",
+    "path": "dod/crates/harw-dod-signals",
+    "deps": [
+      "harw-dod-cap",
+      "harw-macros",
+      "harw-observe",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-procmon",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-thermal",
+      "harw-dod-workspace",
+      "harw-knowledge",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core-bridge",
+      "harw-dod",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-cgroup",
+      "harw-dod-cpu",
+      "harw-dod-escalate",
+      "harw-dod-fixtures",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-procmon",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-thermal",
+      "harw-dod-workspace",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-probe-bpf",
+      "harw-probe-fs",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "event",
+      "evidence",
+      "sample",
+      "sensor",
+      "probe",
+      "verdict"
+    ],
+    "source_files": 8,
+    "name": "harw-dod-signals"
+  },
+  {
+    "domain": "DoD",
+    "level": 4,
+    "summary": "Privileged enforcement library: verifies action-bound authorization evidence and dispatches actions through executor interfaces.",
+    "path": "dod/crates/harw-dod-warden",
+    "deps": [
+      "harw-dod-warden-proto",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-warden"
+    ],
+    "transitive_consumers": [
+      "harw-warden"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-warden-proto",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "audit",
+      "error",
+      "executor",
+      "warden"
+    ],
+    "source_files": 5,
+    "name": "harw-dod-warden"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Governed job data and arithmetic: token/tool/time budgets, leases, retries, and stored work. Live execution is composed in downstream crates.",
+    "path": "harw-job-runtime",
+    "deps": [
+      "harw-macros",
+      "harw-observe",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-core",
+      "harw-knowledge",
+      "harw-mcp-server",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-session-store"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod-escalate",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-mcp-server",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-session-store",
+      "harw-tool-lens",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "budget",
+      "error",
+      "job",
+      "lease",
+      "retry",
+      "stored"
+    ],
+    "source_files": 7,
+    "name": "harw-job-runtime"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Deterministic Markdown, Rust, and plain-text chunking, plus proposed relationships between chunks.",
+    "path": "harw-lens-chunk",
+    "deps": [
+      "harw-lens-types",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-lens-source"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "markdown",
+      "plain",
+      "relations",
+      "rust_code",
+      "util"
+    ],
+    "source_files": 6,
+    "name": "harw-lens-chunk"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Embedding catalog, descriptors, runtime policy, deterministic placeholder and remote HTTP embedding support.",
+    "path": "harw-lens-embed",
+    "deps": [
+      "harw-lens-types",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-lens-query",
+      "harw-lens-source"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "catalog",
+      "descriptor",
+      "embedder",
+      "error",
+      "http_backend",
+      "observed",
+      "remote",
+      "runtime",
+      "spec"
+    ],
+    "source_files": 10,
+    "name": "harw-lens-embed"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Pure BM25 scoring, reciprocal-rank fusion, maximal marginal relevance, duplicate collapse, and budget packing.",
+    "path": "harw-lens-rank",
+    "deps": [
+      "harw-lens-types"
+    ],
+    "consumers": [
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "bm25",
+      "collapse",
+      "fuse",
+      "mmr",
+      "pack"
+    ],
+    "source_files": 6,
+    "name": "harw-lens-rank"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Content-addressed persistence for chunks and named indices, including manifests and integrity checking.",
+    "path": "harw-lens-store",
+    "deps": [
+      "harw-home",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-source"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "store"
+    ],
+    "source_files": 3,
+    "name": "harw-lens-store"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Local JSONL telemetry sink with rotation and checksums.",
+    "path": "harw-observe-file",
+    "deps": [
+      "harw-macros",
+      "harw-observe"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-cli",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "sink"
+    ],
+    "source_files": 3,
+    "name": "harw-observe-file"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Buffered HTTP/JSON OTLP export with additional restrictions on security and Warden metric routing.",
+    "path": "harw-observe-otlp",
+    "deps": [
+      "harw-macros",
+      "harw-observe"
+    ],
+    "consumers": [
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-cli"
+    ],
+    "edges": [
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "clock",
+      "config",
+      "error",
+      "http_transport",
+      "schema",
+      "sink",
+      "transport"
+    ],
+    "source_files": 8,
+    "name": "harw-observe-otlp"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Prometheus text exposition with a minimal loopback or Unix-socket endpoint.",
+    "path": "harw-observe-prom",
+    "deps": [
+      "harw-macros",
+      "harw-observe"
+    ],
+    "consumers": [
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-cli"
+    ],
+    "edges": [
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "endpoint",
+      "error",
+      "format",
+      "sink"
+    ],
+    "source_files": 5,
+    "name": "harw-observe-prom"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Protected secret storage, hybrid KEM envelope policy through crypt_guard, seed/key handling, secret resolvers, and chained audit mechanisms.",
+    "path": "harw-secrets",
+    "deps": [
+      "harw-fsutil",
+      "harw-macros",
+      "harw-observe"
+    ],
+    "consumers": [
+      "harw-channel",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-runtime"
+    ],
+    "transitive_consumers": [
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "audit",
+      "envelope",
+      "error",
+      "id",
+      "kek",
+      "policy",
+      "record",
+      "store"
+    ],
+    "source_files": 14,
+    "name": "harw-secrets"
+  },
+  {
+    "domain": "Product",
+    "level": 4,
+    "summary": "Developer task executable consuming the workspace code graph.",
+    "path": "xtask",
+    "deps": [
+      "harw-code-graph"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-code-graph",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "gates",
+      "webui"
+    ],
+    "source_files": 7,
+    "name": "xtask"
+  },
+  {
+    "domain": "Product",
+    "level": 5,
+    "summary": "Parse layered TOML definitions, resolve roles and authority, and lower definitions into versioned, content-addressed executable agent IR.",
+    "path": "harw-agent-dsl",
+    "deps": [
+      "harw-context"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-config",
+      "harw-core",
+      "harw-knowledge",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-catalog",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-config",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-extension-api",
+      "harw-install",
+      "harw-instructions",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "authority",
+      "context_program",
+      "error",
+      "executable",
+      "family",
+      "ids",
+      "layers",
+      "merge",
+      "organization",
+      "parse",
+      "raw",
+      "resolve",
+      "resolved",
+      "roles"
+    ],
+    "source_files": 15,
+    "name": "harw-agent-dsl"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Authentication-event sensor with audit backend and fixture support.",
+    "path": "dod/crates/harw-dod-authlog",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-netlink",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod"
+    ],
+    "transitive_consumers": [
+      "harw-dod"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-netlink",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "audit_backend",
+      "backend",
+      "error",
+      "fixture_backend",
+      "record",
+      "sensor"
+    ],
+    "source_files": 7,
+    "name": "harw-dod-authlog"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Scoped block-device I/O counters from sysfs.",
+    "path": "dod/crates/harw-dod-blockio",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "sensor"
+    ],
+    "source_files": 2,
+    "name": "harw-dod-blockio"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Scoped cgroup-v2 resource counters.",
+    "path": "dod/crates/harw-dod-cgroup",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "sensor"
+    ],
+    "source_files": 2,
+    "name": "harw-dod-cgroup"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "CPU counters parsed from procfs under an explicit sensor scope.",
+    "path": "dod/crates/harw-dod-cpu",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "sensor"
+    ],
+    "source_files": 2,
+    "name": "harw-dod-cpu"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Reusable sensor contract test harness, fixture capture, and manifests.",
+    "path": "dod/crates/harw-dod-fixtures",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "capture",
+      "capture_manifest",
+      "error",
+      "harness",
+      "macros",
+      "fixture_io"
+    ],
+    "source_files": 7,
+    "name": "harw-dod-fixtures"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Versioned eBPF outbound TCP-connect events and flow reports; older raw-event paths remain for fixtures.",
+    "path": "dod/crates/harw-dod-flow",
+    "deps": [
+      "harw-authority",
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-sandbox",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-probe-bpf"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-probe-bpf"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-bpf",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "event",
+      "report",
+      "sensor"
+    ],
+    "source_files": 5,
+    "name": "harw-dod-flow"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Filesystem-event interpretation for fanotify probes, separated from privileged event collection.",
+    "path": "dod/crates/harw-dod-fsmon",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-probe-fs"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-probe-fs"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "fdpath",
+      "loginuid",
+      "mask",
+      "raw",
+      "sensor",
+      "shape"
+    ],
+    "source_files": 8,
+    "name": "harw-dod-fsmon"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "GPU state available through scoped DRM sysfs sources.",
+    "path": "dod/crates/harw-dod-gpu",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "sensor"
+    ],
+    "source_files": 2,
+    "name": "harw-dod-gpu"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Listening sockets with process/cgroup ownership correlation where available.",
+    "path": "dod/crates/harw-dod-listener",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "owner",
+      "procnet",
+      "sensor"
+    ],
+    "source_files": 4,
+    "name": "harw-dod-listener"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Memory pressure and capacity samples from scoped procfs reads.",
+    "path": "dod/crates/harw-dod-memory",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "sensor"
+    ],
+    "source_files": 2,
+    "name": "harw-dod-memory"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Network-interface counters from scoped procfs reads.",
+    "path": "dod/crates/harw-dod-netcounters",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "sensor"
+    ],
+    "source_files": 2,
+    "name": "harw-dod-netcounters"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Versioned eBPF process-exec and exit events. The v1 contract does not collect argv.",
+    "path": "dod/crates/harw-dod-procmon",
+    "deps": [
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-probe-bpf"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-probe-bpf"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-bpf",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "event",
+      "sensor"
+    ],
+    "source_files": 4,
+    "name": "harw-dod-procmon"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Rules, baselines, confidence, advisory handling, and typed Raw / RuleChecked / Triaged finding states.",
+    "path": "dod/crates/harw-dod-rules",
+    "deps": [
+      "harw-authority",
+      "harw-code-graph",
+      "harw-dod-signals",
+      "harw-research",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-dod-escalate",
+      "harw-dod-sentinel",
+      "harw-knowledge",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-dod",
+      "harw-dod-escalate",
+      "harw-dod-sentinel",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sentinel",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-research",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-code-graph",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-knowledge",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "advisory",
+      "baseline",
+      "confidence",
+      "engine",
+      "finding",
+      "rule",
+      "rules"
+    ],
+    "source_files": 11,
+    "name": "harw-dod-rules"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Read-only ingestion of existing cargo-audit and SARIF reports; it does not launch scanners.",
+    "path": "dod/crates/harw-dod-scanreport",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-home",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "cargo_audit",
+      "redact",
+      "report",
+      "sarif",
+      "sensor",
+      "invariant_test"
+    ],
+    "source_files": 7,
+    "name": "harw-dod-scanreport"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Thermal-zone temperature samples from scoped sysfs reads.",
+    "path": "dod/crates/harw-dod-thermal",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-readfs",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-readfs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "sensor"
+    ],
+    "source_files": 2,
+    "name": "harw-dod-thermal"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Cargo workspace and dependency-inventory drift as a security signal.",
+    "path": "dod/crates/harw-dod-workspace",
+    "deps": [
+      "harw-code-graph",
+      "harw-dod-cap",
+      "harw-dod-signals",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-code-graph",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fixtures",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "inventory",
+      "sensor",
+      "test_support"
+    ],
+    "source_files": 5,
+    "name": "harw-dod-workspace"
+  },
+  {
+    "domain": "Product",
+    "level": 5,
+    "summary": "Exact flat-vector and BM25 index implementations and their query contracts.",
+    "path": "harw-lens-index",
+    "deps": [
+      "harw-lens-rank",
+      "harw-lens-store",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-lens-federation",
+      "harw-lens-query",
+      "harw-lens-source"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-rank",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "bm25",
+      "error",
+      "flat",
+      "query",
+      "sort",
+      "vector_index"
+    ],
+    "source_files": 7,
+    "name": "harw-lens-index"
+  },
+  {
+    "domain": "Product",
+    "level": 5,
+    "summary": "Durable sessions, transcripts, pairing, jobs, approvals, and associated file-store state.",
+    "path": "harw-session-store",
+    "deps": [
+      "harw-fsutil",
+      "harw-job-runtime",
+      "harw-macros",
+      "harw-observe",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-channel",
+      "harw-cli",
+      "harw-core",
+      "harw-dod-escalate",
+      "harw-knowledge",
+      "harw-mcp-server",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-tui",
+      "harw-web"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-dod-escalate",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-mcp-server",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-job-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "durability",
+      "approval",
+      "child_lease",
+      "error",
+      "freeze",
+      "job_store",
+      "meta",
+      "reader",
+      "record",
+      "store"
+    ],
+    "source_files": 11,
+    "name": "harw-session-store"
+  },
+  {
+    "domain": "Product",
+    "level": 5,
+    "summary": "Tool contracts, schemas, calls, outputs, execution contexts, scoped guards, and context-loading support.",
+    "path": "harw-tools",
+    "deps": [
+      "harw-authority",
+      "harw-context",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-sandbox",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-core",
+      "harw-extension-api",
+      "harw-operations",
+      "harw-ops",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-extension-api",
+      "harw-instructions",
+      "harw-memory",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "call",
+      "context_load",
+      "error",
+      "executor",
+      "output",
+      "provider_macro",
+      "sandbox_guard",
+      "schema",
+      "spec"
+    ],
+    "source_files": 10,
+    "name": "harw-tools"
+  },
+  {
+    "domain": "DoD",
+    "level": 5,
+    "summary": "Socket-activated host-enforcement executable with peer/protocol, isolation, audit, and executor composition.",
+    "path": "dod/crates/harw-warden",
+    "deps": [
+      "harw-dod-warden",
+      "harw-dod-warden-proto",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-dod-warden",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-warden-proto",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "audit",
+      "cli",
+      "error",
+      "ipc",
+      "isolation",
+      "landlock",
+      "protocol",
+      "systemd",
+      "warden_factory"
+    ],
+    "source_files": 10,
+    "name": "harw-warden"
+  },
+  {
+    "domain": "Product",
+    "level": 6,
+    "summary": "Transport-independent ingress admission, structural session keys, pairing records, inbound dispatch, and channel contracts.",
+    "path": "harw-channel",
+    "deps": [
+      "harw-macros",
+      "harw-secrets",
+      "harw-session-store",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-cli"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-secrets",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "adapter",
+      "dispatch",
+      "error",
+      "event",
+      "ids",
+      "pairing",
+      "pairing_store"
+    ],
+    "source_files": 8,
+    "name": "harw-channel"
+  },
+  {
+    "domain": "Product",
+    "level": 6,
+    "summary": "Typed configuration schemas, layered discovery, validation, secret references, and configuration writing.",
+    "path": "harw-config",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-fsutil",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-catalog",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-core",
+      "harw-install",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-ops",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-catalog",
+      "harw-channel-telegram-transport",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-extension-api",
+      "harw-install",
+      "harw-instructions",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "agent_toml",
+      "auth_toml",
+      "browser_toml",
+      "channel_toml",
+      "discovery",
+      "dod_toml",
+      "dotenv",
+      "error",
+      "harness_config",
+      "internal_models",
+      "loader",
+      "mcp_toml",
+      "mode_toml",
+      "model_toml",
+      "network_toml",
+      "permissions_toml",
+      "plan_toml",
+      "plugin_toml",
+      "provider_toml",
+      "research_toml",
+      "scope",
+      "skill_toml",
+      "web_toml",
+      "writer"
+    ],
+    "source_files": 25,
+    "name": "harw-config"
+  },
+  {
+    "domain": "DoD",
+    "level": 6,
+    "summary": "Triage and escalation ladder separating proposed actions from authorized actions and Warden submission.",
+    "path": "dod/crates/harw-dod-escalate",
+    "deps": [
+      "harw-authority",
+      "harw-dod-rules",
+      "harw-dod-signals",
+      "harw-dod-warden-proto",
+      "harw-macros",
+      "harw-session-store",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-plan-bridge"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-rules",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-warden-proto",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-rules",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": [
+          "test-support"
+        ]
+      }
+    ],
+    "modules": [
+      "action",
+      "error",
+      "freeze_ops",
+      "ladder",
+      "submission"
+    ],
+    "source_files": 6,
+    "name": "harw-dod-escalate"
+  },
+  {
+    "domain": "DoD",
+    "level": 6,
+    "summary": "Sensor collection, health state, bounded buffers, spooling, and telemetry; source parsing remains in sensor crates.",
+    "path": "dod/crates/harw-dod-sentinel",
+    "deps": [
+      "harw-authority",
+      "harw-dod-cap",
+      "harw-dod-rules",
+      "harw-dod-signals",
+      "harw-fsutil",
+      "harw-macros",
+      "harw-observe",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "transitive_consumers": [
+      "harw-dod",
+      "harw-sentinel"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-rules",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "buffer",
+      "error",
+      "health",
+      "metrics",
+      "sentinel",
+      "spool"
+    ],
+    "source_files": 7,
+    "name": "harw-dod-sentinel"
+  },
+  {
+    "domain": "Product",
+    "level": 6,
+    "summary": "Scoped index resolution and queries with visibility, provenance, compatibility, and ranking checks.",
+    "path": "harw-lens-query",
+    "deps": [
+      "harw-home",
+      "harw-lens-embed",
+      "harw-lens-index",
+      "harw-lens-rank",
+      "harw-lens-store",
+      "harw-lens-types",
+      "harw-macros"
+    ],
+    "consumers": [
+      "harw-lens",
+      "harw-lens-federation"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-index",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-embed",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-rank",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-source",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-knowledge",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "query",
+      "resolve",
+      "selector"
+    ],
+    "source_files": 5,
+    "name": "harw-lens-query"
+  },
+  {
+    "domain": "Product",
+    "level": 6,
+    "summary": "Inbound MCP protocol/session ownership, authentication, events, HTTP transport, and explicit durable job supervision.",
+    "path": "harw-mcp-server",
+    "deps": [
+      "harw-job-runtime",
+      "harw-session-store",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-cli"
+    ],
+    "edges": [
+      {
+        "name": "harw-job-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "auth",
+      "events",
+      "session",
+      "supervisor",
+      "transport"
+    ],
+    "source_files": 6,
+    "name": "harw-mcp-server"
+  },
+  {
+    "domain": "DoD",
+    "level": 6,
+    "summary": "Privileged eBPF probe process with system configuration, scope establishment, and versioned signal delivery.",
+    "path": "dod/crates/harw-probe-bpf",
+    "deps": [
+      "harw-authority",
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-config",
+      "harw-dod-flow",
+      "harw-dod-procmon",
+      "harw-dod-signals",
+      "harw-sandbox",
+      "harw-types"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-bpf",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-procmon",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-flow",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "cli",
+      "collect",
+      "error",
+      "landlock",
+      "real_loader",
+      "sensors",
+      "sink",
+      "push_only_guard"
+    ],
+    "source_files": 9,
+    "name": "harw-probe-bpf"
+  },
+  {
+    "domain": "DoD",
+    "level": 6,
+    "summary": "Privileged filesystem probe process, separated from unprivileged interpretation and sensor consumers.",
+    "path": "dod/crates/harw-probe-fs",
+    "deps": [
+      "harw-dod-cap",
+      "harw-dod-fsmon",
+      "harw-dod-signals",
+      "harw-types"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-dod-fsmon",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "cli",
+      "collect",
+      "error",
+      "landlock",
+      "sink",
+      "source",
+      "push_only_guard"
+    ],
+    "source_files": 8,
+    "name": "harw-probe-fs"
+  },
+  {
+    "domain": "Product",
+    "level": 7,
+    "summary": "Immutable capability catalogs and safe authoring/discovery of skills and related entries. Discovery suggestions do not grant authority.",
+    "path": "harw-catalog",
+    "deps": [
+      "harw-config"
+    ],
+    "consumers": [
+      "harw-core",
+      "harw-extension-api",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-extension-api",
+      "harw-instructions",
+      "harw-memory",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [],
+    "source_files": 1,
+    "name": "harw-catalog"
+  },
+  {
+    "domain": "Product",
+    "level": 7,
+    "summary": "Pure Telegram binding policy: pinned identities, pairing, mention gates, session partitioning, approval tokens, and safe outbound rendering.",
+    "path": "harw-channel-telegram",
+    "deps": [
+      "harw-authority",
+      "harw-channel",
+      "harw-sandbox",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-channel-telegram-transport",
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-channel-telegram-transport",
+      "harw-cli"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-channel",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "approval_tokens",
+      "config",
+      "error",
+      "sandbox",
+      "telegram"
+    ],
+    "source_files": 6,
+    "name": "harw-channel-telegram"
+  },
+  {
+    "domain": "DoD",
+    "level": 7,
+    "summary": "Facade for Detect \u00b7 Orient \u00b7 Defend contracts and selected sensors; privileged sensors are feature-gated.",
+    "path": "dod/crates/harw-dod",
+    "deps": [
+      "harw-authority",
+      "harw-dod-authlog",
+      "harw-dod-blockio",
+      "harw-dod-bpf",
+      "harw-dod-cap",
+      "harw-dod-cpu",
+      "harw-dod-flow",
+      "harw-dod-fsmon",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-procmon",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-workspace"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-sentinel",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-rules",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cpu",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-thermal",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-memory",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-blockio",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-netcounters",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-gpu",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-listener",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-scanreport",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-workspace",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-authlog",
+        "kind": "dependencies",
+        "optional": true,
+        "features": []
+      },
+      {
+        "name": "harw-dod-fsmon",
+        "kind": "dependencies",
+        "optional": true,
+        "features": []
+      },
+      {
+        "name": "harw-dod-bpf",
+        "kind": "dependencies",
+        "optional": true,
+        "features": []
+      },
+      {
+        "name": "harw-dod-procmon",
+        "kind": "dependencies",
+        "optional": true,
+        "features": []
+      },
+      {
+        "name": "harw-dod-flow",
+        "kind": "dependencies",
+        "optional": true,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [],
+    "source_files": 1,
+    "name": "harw-dod"
+  },
+  {
+    "domain": "Product",
+    "level": 7,
+    "summary": "Installation lifecycle, platform detection, diagnostics, configuration migration, updates, uninstall, and service-unit management.",
+    "path": "harw-install",
+    "deps": [
+      "harw-config",
+      "harw-home"
+    ],
+    "consumers": [
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-cli"
+    ],
+    "edges": [
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "context",
+      "dod_units",
+      "doctor",
+      "error",
+      "migration",
+      "pathscope",
+      "platform",
+      "service",
+      "service_launchd",
+      "service_schtasks",
+      "service_systemd",
+      "uninstall",
+      "update"
+    ],
+    "source_files": 14,
+    "name": "harw-install"
+  },
+  {
+    "domain": "Product",
+    "level": 7,
+    "summary": "Multi-index querying, compatible-source selection, explicit skipped-source evidence, and shared budget packing.",
+    "path": "harw-lens-federation",
+    "deps": [
+      "harw-lens-embed",
+      "harw-lens-index",
+      "harw-lens-query",
+      "harw-lens-rank",
+      "harw-lens-types",
+      "harw-macros"
+    ],
+    "consumers": [
+      "harw-tool-lens"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-index",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-embed",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-rank",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-query",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-source",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-knowledge",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "federated"
+    ],
+    "source_files": 3,
+    "name": "harw-lens-federation"
+  },
+  {
+    "domain": "Product",
+    "level": 7,
+    "summary": "Embedded provider/model specifications, runtime descriptors, provenance, observed-behavior records, role routing, and optional models.dev enrichment.",
+    "path": "harw-model-catalog",
+    "deps": [
+      "harw-config",
+      "harw-context",
+      "harw-lens-types",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-knowledge",
+      "harw-ops",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-knowledge",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "context_defaults",
+      "descriptor",
+      "embedded",
+      "error",
+      "family",
+      "models_dev",
+      "observed",
+      "provenance",
+      "resolved",
+      "router",
+      "runtime",
+      "sources",
+      "spec",
+      "vendor_anthropic",
+      "vendor_meta",
+      "vendor_mistral",
+      "vendor_moonshot",
+      "vendor_openai",
+      "vendor_qwen",
+      "vendor_xai",
+      "vendor_zai"
+    ],
+    "source_files": 22,
+    "name": "harw-model-catalog"
+  },
+  {
+    "domain": "Product",
+    "level": 7,
+    "summary": "OAuth/PKCE and setup-token flows, token persistence, and Codex token refresh support.",
+    "path": "harw-oauth",
+    "deps": [
+      "harw-config"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-provider-http"
+    ],
+    "transitive_consumers": [
+      "harw-cli",
+      "harw-provider-http",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "codex_refresh",
+      "error",
+      "flow",
+      "pkce",
+      "store"
+    ],
+    "source_files": 6,
+    "name": "harw-oauth"
+  },
+  {
+    "domain": "DoD",
+    "level": 7,
+    "summary": "Running sensor collector executable that composes selected sensors, rules, configuration, and local telemetry.",
+    "path": "dod/crates/harw-sentinel",
+    "deps": [
+      "harw-authority",
+      "harw-dod-blockio",
+      "harw-dod-cap",
+      "harw-dod-cgroup",
+      "harw-dod-config",
+      "harw-dod-cpu",
+      "harw-dod-gpu",
+      "harw-dod-listener",
+      "harw-dod-memory",
+      "harw-dod-netcounters",
+      "harw-dod-rules",
+      "harw-dod-scanreport",
+      "harw-dod-sentinel",
+      "harw-dod-signals",
+      "harw-dod-thermal",
+      "harw-dod-workspace",
+      "harw-home",
+      "harw-macros",
+      "harw-observe",
+      "harw-observe-file",
+      "harw-sandbox",
+      "harw-types"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-sentinel",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cap",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe-file",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-rules",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-listener",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-workspace",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cpu",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-thermal",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-memory",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-blockio",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-netcounters",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-gpu",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-cgroup",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-scanreport",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "cli",
+      "error",
+      "findings",
+      "sandbox",
+      "sensors",
+      "ipc"
+    ],
+    "source_files": 7,
+    "name": "harw-sentinel"
+  },
+  {
+    "domain": "Product",
+    "level": 8,
+    "summary": "Token-owning Bot API HTTP transport, long-poll/webhook ingress, attachment intake, replay/dedup support, and throttled outbound delivery.",
+    "path": "harw-channel-telegram-transport",
+    "deps": [
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-config",
+      "harw-secrets",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-cli"
+    ],
+    "edges": [
+      {
+        "name": "harw-channel",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-channel-telegram",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-secrets",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "client",
+      "dedup",
+      "error",
+      "hand_off",
+      "ingress_long_poll",
+      "ingress_webhook",
+      "mapping",
+      "media",
+      "mirror",
+      "offset",
+      "render"
+    ],
+    "source_files": 12,
+    "name": "harw-channel-telegram-transport"
+  },
+  {
+    "domain": "Product",
+    "level": 8,
+    "summary": "Contributor traits, capability contracts, approval interfaces, allow rules, and the extension registry consumed by the runtime.",
+    "path": "harw-extension-api",
+    "deps": [
+      "harw-authority",
+      "harw-catalog",
+      "harw-context",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-sandbox",
+      "harw-tools",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-instructions",
+      "harw-memory",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-instructions",
+      "harw-memory",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "allow_rules",
+      "approval_mode",
+      "capabilities",
+      "contributors",
+      "error",
+      "lenient",
+      "registry",
+      "types",
+      "v1_compat"
+    ],
+    "source_files": 10,
+    "name": "harw-extension-api"
+  },
+  {
+    "domain": "Product",
+    "level": 8,
+    "summary": "Local markdown/frontmatter artifacts for memory, diary, dream, workbench, and kanban, with indexing, visibility, and proposal/promotion boundaries.",
+    "path": "harw-knowledge",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-context",
+      "harw-dod-rules",
+      "harw-dod-signals",
+      "harw-job-runtime",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-model-catalog",
+      "harw-observe",
+      "harw-plan",
+      "harw-session-store",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-lens",
+      "harw-lens-source",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-job-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-rules",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-model-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "artifact",
+      "context_proposal",
+      "context_provider",
+      "context_steward",
+      "diary",
+      "dream",
+      "error",
+      "index",
+      "kanban",
+      "memory",
+      "model_behavior_proposal",
+      "security",
+      "store",
+      "visibility",
+      "workbench"
+    ],
+    "source_files": 21,
+    "name": "harw-knowledge"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Baseline instructions exposed as extension contributors, separate from runtime authority.",
+    "path": "harw-instructions",
+    "deps": [
+      "harw-extension-api",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-core",
+      "harw-registry-defaults"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "baseline",
+      "trust_boundary"
+    ],
+    "source_files": 3,
+    "name": "harw-instructions"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Source ingestion and indexing pipeline connecting knowledge/files, chunkers, embeddings, and index storage.",
+    "path": "harw-lens-source",
+    "deps": [
+      "harw-home",
+      "harw-knowledge",
+      "harw-lens-chunk",
+      "harw-lens-embed",
+      "harw-lens-index",
+      "harw-lens-store",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-observe",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-lens"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-lens",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-chunk",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-index",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-embed",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-knowledge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "build",
+      "document",
+      "error"
+    ],
+    "source_files": 4,
+    "name": "harw-lens-source"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Local memory files, scoped facts, context providers, extraction, consolidation, workflow state, and heartbeat support.",
+    "path": "harw-memory",
+    "deps": [
+      "harw-context",
+      "harw-extension-api",
+      "harw-fsutil",
+      "harw-lens-types",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-ops",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "capture",
+      "context_policy",
+      "context_provider",
+      "context_selector",
+      "contradiction_index",
+      "detect",
+      "epistemic",
+      "error",
+      "consolidation",
+      "extraction",
+      "facts",
+      "file_index",
+      "file_store",
+      "heartbeat",
+      "learning",
+      "outcome_tracker",
+      "short_term",
+      "store",
+      "summary",
+      "types",
+      "workflow"
+    ],
+    "source_files": 22,
+    "name": "harw-memory"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Shared operation metadata, contexts, registries, policy, and adapters for commands, model tools, agent tools, and the web surface.",
+    "path": "harw-operations",
+    "deps": [
+      "harw-authority",
+      "harw-extension-api",
+      "harw-sandbox",
+      "harw-tools",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core-bridge",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-tui",
+      "harw-web"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core-bridge",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-runtime",
+      "harw-tui",
+      "harw-web"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "adapter",
+      "args",
+      "context",
+      "error",
+      "op_schema",
+      "operation",
+      "registry",
+      "service_macro",
+      "session_control"
+    ],
+    "source_files": 13,
+    "name": "harw-operations"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Marker-based project-root detection and scoped instruction/document cascades exposed as context contributors.",
+    "path": "harw-project-discovery",
+    "deps": [
+      "harw-extension-api",
+      "harw-macros",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-registry-defaults",
+      "harw-runtime"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "discovery",
+      "provider"
+    ],
+    "source_files": 3,
+    "name": "harw-project-discovery"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Model-facing browser tools with typed request preparation, explicit operator grants, validation, and governed backend dispatch.",
+    "path": "harw-tool-browser",
+    "deps": [
+      "harw-authority",
+      "harw-browser",
+      "harw-extension-api",
+      "harw-sandbox",
+      "harw-tools"
+    ],
+    "consumers": [
+      "harw-registry-defaults"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-browser",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "dispatch",
+      "harness_provider",
+      "prepare",
+      "tool_set",
+      "types"
+    ],
+    "source_files": 6,
+    "name": "harw-tool-browser"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Workspace dependency graphs, locked versions, and scoped reads/searches of local Cargo registry source.",
+    "path": "harw-tool-deps",
+    "deps": [
+      "harw-authority",
+      "harw-code-graph",
+      "harw-extension-api",
+      "harw-macros",
+      "harw-sandbox",
+      "harw-tools"
+    ],
+    "consumers": [
+      "harw-registry-defaults"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-code-graph",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "graph_tool",
+      "locked_tool",
+      "provider",
+      "source_tool"
+    ],
+    "source_files": 6,
+    "name": "harw-tool-deps"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Six filesystem tools: read, write, list, search, glob, and grep, authorized per call from the execution context.",
+    "path": "harw-tool-fs",
+    "deps": [
+      "harw-authority",
+      "harw-extension-api",
+      "harw-fsutil",
+      "harw-macros",
+      "harw-sandbox",
+      "harw-tools",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-registry-defaults"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "blocking",
+      "error",
+      "glob",
+      "grep",
+      "list",
+      "provider",
+      "read",
+      "search",
+      "test_support",
+      "tree",
+      "write"
+    ],
+    "source_files": 12,
+    "name": "harw-tool-fs"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "The shell.exec tool with process authority checks, sandbox-bound execution, output capture, and resource limits.",
+    "path": "harw-tool-shell",
+    "deps": [
+      "harw-authority",
+      "harw-extension-api",
+      "harw-sandbox",
+      "harw-tools",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "capture",
+      "exec",
+      "limits"
+    ],
+    "source_files": 4,
+    "name": "harw-tool-shell"
+  },
+  {
+    "domain": "Product",
+    "level": 9,
+    "summary": "Governed web.fetch, crates.io metadata, and docs.rs research tools, with caching and HTTP content handling.",
+    "path": "harw-tool-web",
+    "deps": [
+      "harw-authority",
+      "harw-egress",
+      "harw-extension-api",
+      "harw-fsutil",
+      "harw-macros",
+      "harw-sandbox",
+      "harw-tools"
+    ],
+    "consumers": [
+      "harw-registry-defaults"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-egress",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "cache",
+      "crates_io",
+      "docs_rs",
+      "error",
+      "fetch",
+      "hop",
+      "html",
+      "provider"
+    ],
+    "source_files": 9,
+    "name": "harw-tool-web"
+  },
+  {
+    "domain": "Product",
+    "level": 10,
+    "summary": "Provider-neutral agent sessions, state machine, turn loop, tool admission, child orchestration, compaction, history, cancellation, and durable job running.",
+    "path": "harw-core",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-catalog",
+      "harw-config",
+      "harw-context",
+      "harw-extension-api",
+      "harw-instructions",
+      "harw-job-runtime",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-observe",
+      "harw-protocol",
+      "harw-sandbox",
+      "harw-session-store",
+      "harw-tools",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core-bridge",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-provider-http",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-core-bridge",
+      "harw-ops",
+      "harw-plan-bridge",
+      "harw-provider-http",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-protocol",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-job-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-instructions",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "activation",
+      "admission",
+      "auto_compact",
+      "cancel",
+      "capture",
+      "child_controller",
+      "compaction",
+      "context_budget",
+      "delegation_visibility",
+      "durable_job_runner",
+      "envelope",
+      "error",
+      "execution_registry",
+      "guard",
+      "history",
+      "history_tail",
+      "mode",
+      "model",
+      "one_shot",
+      "pinned_model",
+      "policy",
+      "session",
+      "session_manager",
+      "state_store",
+      "testing",
+      "turn_loop"
+    ],
+    "source_files": 27,
+    "name": "harw-core"
+  },
+  {
+    "domain": "Product",
+    "level": 10,
+    "summary": "Retrieval facade exposing build and ask over the underlying Lens components.",
+    "path": "harw-lens",
+    "deps": [
+      "harw-lens-embed",
+      "harw-lens-query",
+      "harw-lens-source",
+      "harw-lens-types",
+      "harw-macros"
+    ],
+    "consumers": [
+      "harw-tool-lens"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tool-lens",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-embed",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-source",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-query",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "ask",
+      "build",
+      "error"
+    ],
+    "source_files": 4,
+    "name": "harw-lens"
+  },
+  {
+    "domain": "Product",
+    "level": 10,
+    "summary": "Local HTTP control-plane transport on a Unix socket, using peer credentials and the existing governed operations registry.",
+    "path": "harw-web",
+    "deps": [
+      "harw-context",
+      "harw-macros",
+      "harw-operations",
+      "harw-session-store",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-ops"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-operations",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "authz",
+      "error",
+      "events",
+      "peer",
+      "router",
+      "security",
+      "server"
+    ],
+    "source_files": 8,
+    "name": "harw-web"
+  },
+  {
+    "domain": "Product",
+    "level": 11,
+    "summary": "Connect core sessions to operation contexts, child-agent tools, budgets, fan-out, and typed return contracts.",
+    "path": "harw-core-bridge",
+    "deps": [
+      "harw-authority",
+      "harw-core",
+      "harw-dod-signals",
+      "harw-extension-api",
+      "harw-operations",
+      "harw-research",
+      "harw-sandbox",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-ops"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-research",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-catalog",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "agent_tool",
+      "context_ext"
+    ],
+    "source_files": 3,
+    "name": "harw-core-bridge"
+  },
+  {
+    "domain": "Product",
+    "level": 11,
+    "summary": "Reconcile goals, plans, research findings, knowledge, and jobs; attach evidence and translate plan nodes into bounded execution.",
+    "path": "harw-plan-bridge",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-context",
+      "harw-core",
+      "harw-dod-escalate",
+      "harw-dod-signals",
+      "harw-extension-api",
+      "harw-home",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-observe",
+      "harw-operations",
+      "harw-plan",
+      "harw-research",
+      "harw-session-store",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-runtime"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-research",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-job-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-knowledge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-escalate",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-signals",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-dod-rules",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "cells",
+      "context_ext",
+      "controller",
+      "error",
+      "finding_store",
+      "fragment_registry",
+      "goal_context",
+      "job_bridge",
+      "metrics",
+      "plan_context",
+      "security_bridge"
+    ],
+    "source_files": 12,
+    "name": "harw-plan-bridge"
+  },
+  {
+    "domain": "Product",
+    "level": 11,
+    "summary": "Concrete model-provider HTTP bridges for Responses, Chat Completions, Anthropic, and Codex paths, including retries, routing, rate limits, and cache strategy.",
+    "path": "harw-provider-http",
+    "deps": [
+      "harw-config",
+      "harw-core",
+      "harw-fsutil",
+      "harw-oauth",
+      "harw-protocol",
+      "harw-provider",
+      "harw-sandbox",
+      "harw-tools",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-runtime"
+    ],
+    "transitive_consumers": [
+      "harw-cli",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-oauth",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-protocol",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-provider",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "anthropic",
+      "anthropic_caps",
+      "cache_strategy",
+      "discovery",
+      "error",
+      "rate_limiter",
+      "retry",
+      "routing",
+      "tool_names",
+      "codex"
+    ],
+    "source_files": 11,
+    "name": "harw-provider-http"
+  },
+  {
+    "domain": "Product",
+    "level": 11,
+    "summary": "The lens.ask model tool; derives visibility from trusted execution context and embedding provenance from the selected embedder.",
+    "path": "harw-tool-lens",
+    "deps": [
+      "harw-authority",
+      "harw-extension-api",
+      "harw-home",
+      "harw-lens",
+      "harw-lens-federation",
+      "harw-macros",
+      "harw-tools"
+    ],
+    "consumers": [
+      "harw-registry-defaults"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-federation",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-query",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "ask_tool",
+      "provenance",
+      "provider",
+      "scope"
+    ],
+    "source_files": 5,
+    "name": "harw-tool-lens"
+  },
+  {
+    "domain": "Product",
+    "level": 12,
+    "summary": "Shared extension assembly and built-in agent definitions. Registry profiles expose bounded tool sets; optional browser tools require a separate explicit grant.",
+    "path": "harw-registry-defaults",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-browser",
+      "harw-browser-thirtyfour",
+      "harw-config",
+      "harw-egress",
+      "harw-extension-api",
+      "harw-instructions",
+      "harw-project-discovery",
+      "harw-sandbox",
+      "harw-tool-browser",
+      "harw-tool-deps",
+      "harw-tool-fs",
+      "harw-tool-lens",
+      "harw-tool-shell",
+      "harw-tool-web",
+      "harw-tools"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-ops",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-egress",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-instructions",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-project-discovery",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tool-deps",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tool-fs",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tool-lens",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tool-shell",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tool-web",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-browser",
+        "kind": "dependencies",
+        "optional": true,
+        "features": []
+      },
+      {
+        "name": "harw-browser-thirtyfour",
+        "kind": "dependencies",
+        "optional": true,
+        "features": []
+      },
+      {
+        "name": "harw-tool-browser",
+        "kind": "dependencies",
+        "optional": true,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "error",
+      "agent_definition_tools",
+      "authority",
+      "embedded_agents",
+      "profile",
+      "research_web"
+    ],
+    "source_files": 7,
+    "name": "harw-registry-defaults"
+  },
+  {
+    "domain": "Product",
+    "level": 13,
+    "summary": "Concrete operator commands and selected model tools for sessions, work, models, permissions, approvals, planning, research, and diagnostics.",
+    "path": "harw-ops",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-code-graph",
+      "harw-config",
+      "harw-core",
+      "harw-core-bridge",
+      "harw-extension-api",
+      "harw-home",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-macros",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-operations",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-provider",
+      "harw-registry-defaults",
+      "harw-research",
+      "harw-sandbox",
+      "harw-session-store",
+      "harw-tool-shell",
+      "harw-tools",
+      "harw-types",
+      "harw-web"
+    ],
+    "consumers": [
+      "harw",
+      "harw-cli",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw",
+      "harw-cli",
+      "harw-runtime",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-memory",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-model-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-provider",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-job-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tool-shell",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan-bridge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-research",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-code-graph",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-registry-defaults",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core-bridge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-knowledge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-web",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "add_workdir",
+      "agent",
+      "analyze",
+      "approval",
+      "attach",
+      "bug_report",
+      "compact",
+      "config_util",
+      "context_proposal",
+      "diff",
+      "effort",
+      "explore",
+      "export",
+      "goal",
+      "help",
+      "memory",
+      "mode",
+      "model",
+      "new",
+      "permissions",
+      "plan",
+      "plugins",
+      "provider",
+      "ps",
+      "quit",
+      "research",
+      "skills",
+      "status",
+      "stop",
+      "testutil",
+      "usage",
+      "work"
+    ],
+    "source_files": 33,
+    "name": "harw-ops"
+  },
+  {
+    "domain": "Product",
+    "level": 14,
+    "summary": "Embeddable SDK facade re-exporting canonical core, provider, extension, authority, plan, research, and operation types. Public APIs are still 0.x.",
+    "path": "harw",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-code-graph",
+      "harw-core",
+      "harw-extension-api",
+      "harw-model-catalog",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-provider",
+      "harw-registry-defaults",
+      "harw-research",
+      "harw-sandbox",
+      "harw-types"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-ops",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-provider",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-model-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-registry-defaults",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan-bridge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-research",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-code-graph",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "prelude"
+    ],
+    "source_files": 2,
+    "name": "harw"
+  },
+  {
+    "domain": "Product",
+    "level": 14,
+    "summary": "Composition root that assembles models, stores, tools, contributors, children, approvals, and state under explicit runtime entry profiles.",
+    "path": "harw-runtime",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-catalog",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-extension-api",
+      "harw-fsutil",
+      "harw-home",
+      "harw-job-runtime",
+      "harw-lens-types",
+      "harw-macros",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-observe",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-project-discovery",
+      "harw-protocol",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-sandbox",
+      "harw-secrets",
+      "harw-session-store",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli",
+      "harw-tui"
+    ],
+    "transitive_consumers": [
+      "harw-cli",
+      "harw-tui"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-job-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-macros",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-memory",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-model-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-ops",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan-bridge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-project-discovery",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-protocol",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-provider-http",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-registry-defaults",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-secrets",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "approval",
+      "assembly",
+      "budget",
+      "ceiling",
+      "children",
+      "config",
+      "contributors",
+      "error",
+      "guard_wiring",
+      "handoff",
+      "memory_wiring",
+      "model",
+      "sandbox",
+      "services",
+      "session_title",
+      "spec",
+      "trace"
+    ],
+    "source_files": 18,
+    "name": "harw-runtime"
+  },
+  {
+    "domain": "Product",
+    "level": 15,
+    "summary": "Interactive terminal client with streaming, typed history cells, command dispatch, model/session selection, approvals, and runtime integration.",
+    "path": "harw-tui",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-catalog",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-extension-api",
+      "harw-fsutil",
+      "harw-home",
+      "harw-lens-types",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan",
+      "harw-protocol",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sandbox",
+      "harw-session-store",
+      "harw-tool-shell",
+      "harw-tools",
+      "harw-types"
+    ],
+    "consumers": [
+      "harw-cli"
+    ],
+    "transitive_consumers": [
+      "harw-cli"
+    ],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-fsutil",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-registry-defaults",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-model-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-memory",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-ops",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-protocol",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tool-shell",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tools",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-provider",
+        "kind": "dev-dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "app",
+      "approval",
+      "approval_dialog",
+      "host_permit_dialog",
+      "chat_scroll",
+      "input_history",
+      "command",
+      "command_exec",
+      "command_popup",
+      "choice_dialog",
+      "clipboard",
+      "error",
+      "export",
+      "events",
+      "frame_requester",
+      "gateway",
+      "history_cell",
+      "input",
+      "input_editor",
+      "input_reader",
+      "registry",
+      "relative_time",
+      "runtime_commands",
+      "runtime_root",
+      "sanitize",
+      "session_controller",
+      "session_picker",
+      "setup",
+      "model_picker",
+      "spinner",
+      "streaming",
+      "style",
+      "tools_command",
+      "tui_event"
+    ],
+    "source_files": 35,
+    "name": "harw-tui"
+  },
+  {
+    "domain": "Product",
+    "level": 16,
+    "summary": "The harw executable: local setup, TUI and one-shot runs, analysis, gateway, MCP, web control plane, jobs, service management, and diagnostics.",
+    "path": "harw-cli",
+    "deps": [
+      "harw-agent-dsl",
+      "harw-authority",
+      "harw-channel",
+      "harw-channel-telegram",
+      "harw-channel-telegram-transport",
+      "harw-config",
+      "harw-context",
+      "harw-core",
+      "harw-extension-api",
+      "harw-home",
+      "harw-install",
+      "harw-job-runtime",
+      "harw-knowledge",
+      "harw-lens-types",
+      "harw-mcp-client",
+      "harw-mcp-server",
+      "harw-memory",
+      "harw-model-catalog",
+      "harw-oauth",
+      "harw-observe",
+      "harw-observe-file",
+      "harw-observe-otlp",
+      "harw-observe-prom",
+      "harw-operations",
+      "harw-ops",
+      "harw-plan",
+      "harw-plan-bridge",
+      "harw-protocol",
+      "harw-provider-http",
+      "harw-registry-defaults",
+      "harw-runtime",
+      "harw-sandbox",
+      "harw-secrets",
+      "harw-session-store",
+      "harw-tui",
+      "harw-types",
+      "harw-web"
+    ],
+    "consumers": [],
+    "transitive_consumers": [],
+    "edges": [
+      {
+        "name": "harw-authority",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-config",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-agent-dsl",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-channel",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-channel-telegram",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-channel-telegram-transport",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-core",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-context",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-lens-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-operations",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-ops",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-sandbox",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-tui",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-memory",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-types",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-extension-api",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-registry-defaults",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-mcp-server",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-mcp-client",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-session-store",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-secrets",
+        "kind": "dependencies",
+        "optional": false,
+        "features": [
+          "keyring"
+        ]
+      },
+      {
+        "name": "harw-job-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-plan-bridge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-home",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-provider-http",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-oauth",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-knowledge",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-install",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-model-catalog",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-web",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe-file",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe-prom",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-observe-otlp",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-runtime",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      },
+      {
+        "name": "harw-protocol",
+        "kind": "dependencies",
+        "optional": false,
+        "features": []
+      }
+    ],
+    "modules": [
+      "auth",
+      "chat",
+      "cli",
+      "completion",
+      "connect",
+      "gateway",
+      "home",
+      "job_worker",
+      "lifecycle",
+      "mcp",
+      "mcp_auth",
+      "models",
+      "observe",
+      "onboarding",
+      "project_trust",
+      "resume",
+      "runtime_entry",
+      "runtime_gateway",
+      "runtime_jobs",
+      "runtime_web",
+      "sandbox_cmd",
+      "secret_store",
+      "settings",
+      "uia_bootstrap",
+      "web",
+      "worker_cancellation"
+    ],
+    "source_files": 27,
+    "name": "harw-cli"
+  }
+]

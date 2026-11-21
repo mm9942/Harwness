@@ -985,7 +985,8 @@ docs/
     │   └── HARW_LINUX_JOB_RUNTIME_FOUNDATION.md
     │
     ├── 30-crypto-infrastructure/
-    │   └── Harwness_Crypto_Infrastructure_Masterplan_v2.md
+    │   ├── Harwness_Crypto_Infrastructure_Masterplan_v2.md
+    │   └── kms-user-crypto-contract.md
     │
     ├── 40-cryptguard-service/
     │   └── crypt_guard_service_hyper_tower_plan.md
@@ -1027,6 +1028,20 @@ docs/
     │
     ├── 97-harw-dod-mission-control-chain/
     │   └── README.md            (Harw-DoD suite, triggers, Mission Control TUI, execution chain)
+    │
+    ├── 98-root-orchestrator-stability/
+    │   └── README.md            (continuation/replay fixes, error codes, open decisions)
+    │
+    ├── 99-cloud-hub-mtls-tor/
+    │   ├── README.md            (bottom-up analysis, cloud hub, PQ-mTLS hardening, arti/Tor, phases T0–T7)
+    │   └── THREAT-MODEL.md      (assets, attackers, threats B1–B21, residual risks)
+    │
+    ├── 100-dod-ai-integration/
+    │   ├── README.md            (DoD × AI: anomaly routing, triage agents, polkit/TUI approval, phases 0–4)
+    │   ├── INVENTORY.md         (sensors, findings model, actions, agent wiring, plan status, ranked gaps)
+    │   ├── THREAT-MODEL.md      (assets, attackers, threats B1–B24, invariants)
+    │   ├── TRACE-MATRIX.md      (every open plan item → work package)
+    │   └── OPEN-FINDINGS.md     (open PR #168 review findings: location, proposed fix)
     │
     └── 90-migration-ledger/
         └── MIGRATION_LEDGER.md
@@ -1260,6 +1275,8 @@ harw-cli/Cargo.toml
 ```
 
 ## Registered planning references
+
+- [PL-101-ONION-EDGE-ADAPTER](101-onion-edge-adapter/README.md) — proposed Onion and mTLS edge adapter for Rust services.
 
 ```text
 docs/planning/10-ecosystem-workspace/HARW_ECOSYSTEM_WORKSPACE_ARCHITECTURE.md

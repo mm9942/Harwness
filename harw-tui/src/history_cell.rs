@@ -3012,7 +3012,12 @@ impl ToolCell {
             push_header_line(
                 &mut lines,
                 HeaderPart {
-                    text: dot_glyph,
+                    // Fehlschlag nicht nur farblich, sondern per Textmarke zeigen.
+                    text: if self.state == ToolState::Failed {
+                        "✗ "
+                    } else {
+                        dot_glyph
+                    },
                     style: glyph_style,
                 },
                 HeaderPart {
@@ -6036,7 +6041,7 @@ mod tests {
             style::Theme::Dark,
             ToolVerbosity::Activity,
         ));
-        assert_eq!(activity, vec!["● Shell(ls) · exit 2 · 2ms"]);
+        assert_eq!(activity, vec!["✗ Shell(ls) · exit 2 · 2ms"]);
 
         // Ausgeklappt zeigt `Activity` die Details wie `Compact`, ohne rohe
         // Argumente (die bleiben `Verbose` vorbehalten).

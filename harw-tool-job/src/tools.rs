@@ -1,5 +1,6 @@
 //! Die Modell-Werkzeuge `job.start`, `job.status`, `job.logs`, `job.stop`,
-//! `job.list` ([`JobToolProvider`]). There is deliberately no blocking wait tool:
+//! `job.list`, `job.suspend` und `job.resume` ([`JobToolProvider`]).
+//! There is deliberately no blocking wait tool:
 //! job-managed work is background-only (the `transfer_to_*` handoff; inline agent tools are tracked as TODO(PL-90)) and its progress and end arrive as
 //! notifications.
 //!
@@ -12,6 +13,23 @@
 //!   Jobs, die der Aufrufer oder einer seiner Nachfahren gestartet hat
 //!   (Orchestratoren ohne Shell dürfen die Jobs ihrer Worker stoppen). Die
 //!   Freigabe regelt die Politik der Montage (nie auto-freigegeben).
+//! - `job.suspend` / `job.resume` (PL-100 WP 3.5): wie `job.stop` kein
+//!   eigenes Recht und dieselbe Besitzprüfung; die Montage fragt nach
+//!   (`ALWAYS_ASK_TOOLS`), außer die Sitzung läuft mit vollem Zugriff
+//!   (`ApprovalMode::FullAccess`). Eingefroren bzw. aufgetaut wird
+//!   ausschließlich die von der Runtime bewiesene eigene cgroup des Jobs
+//!   ([`crate::JobManager::suspend`]); ohne sie, und bei einem Freeze, den
+//!   harw nicht vermerkt hat, wird typisiert abgelehnt. `job.resume` taut
+//!   nur auf, wenn `meta.json` dauerhaft belegt, dass der Freeze harws
+//!   eigener ist (`suspend_phase` = `applied`); ein ungeklärtes Anhalten
+//!   (`intent`, auch ältere Einträge ohne Phase) lehnt es ab
+//!   ([`crate::JobError::SuspensionUnresolved`]), ohne die cgroup
+//!   anzufassen. `job.status` zeigt die Phase. `job.stop` taut einen
+//!   angehaltenen Job nie auf (SIGKILL eingefroren).
+//!   Eine optionale `finding_id` (UUIDv4, streng geprüft, nur kleine
+//!   Hex-Ziffern zurückgegeben) landet nur im Log und im Ergebnis und wählt
+//!   nie das Ziel. Wiederholtes Anhalten bzw. Fortsetzen ist idempotent
+//!   (`"changed": false`).
 //! - Alle Werkzeuge außer `job.list` nehmen eine `job_id`; unbekannte und
 //!   fremde Jobs bekommen **dieselbe** Meldung. Steuern dürfen nur der
 //!   Erzeuger und seine Vorfahren ([`crate::JobOwner::may_control`]); die
@@ -31,12 +49,12 @@
 //!
 //! # Nebenläufigkeit
 //! `job.status`, `job.logs` und `job.list` sind `parallel_safe`
-//! (lesend), `job.start` und `job.stop` nicht.
+//! (lesend), `job.start`, `job.stop`, `job.suspend` und `job.resume` nicht.
 
 use crate::launcher::JobLauncher;
 use crate::logs::{LogQuery, LogSlice, read_log};
-use crate::manager::{Caller, JobError, JobManager, JobOrigin, StartRequest};
-use crate::model::{JobEndReason, JobId, JobOwner, JobStatus, STDERR_LOG, STDOUT_LOG};
+use crate::manager::{Caller, JobError, JobManager, JobOrigin, StartRequest, SuspendOutcome};
+use crate::model::{JobEndReason, JobId, JobOwner, JobState, JobStatus, STDERR_LOG, STDOUT_LOG};
 use crate::procfs::JobSignal;
 use harw_authority::Permission;
 use harw_tools::{
@@ -45,6 +63,7 @@ use harw_tools::{
     spec::{FunctionToolSpec, ToolName, ToolSpec},
 };
 use harw_types::SessionId;
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -63,21 +82,38 @@ pub const JOB_LOGS_TOOL: &str = "job.logs";
 pub const JOB_STOP_TOOL: &str = "job.stop";
 /// Name des Listenwerkzeugs.
 pub const JOB_LIST_TOOL: &str = "job.list";
+/// Name des Werkzeugs, das einen eigenen Job anhält (einfriert; PL-100
+/// WP 3.5). Gehört in `ALWAYS_ASK_TOOLS` der Montage.
+pub const JOB_SUSPEND_TOOL: &str = "job.suspend";
+/// Name des Werkzeugs, das einen angehaltenen Job fortsetzt (auftaut;
+/// PL-100 WP 3.5). Gehört in `ALWAYS_ASK_TOOLS` der Montage.
+pub const JOB_RESUME_TOOL: &str = "job.resume";
 
-/// Alle Job-Werkzeuge in Registrierungsreihenfolge.
-pub const JOB_TOOL_NAMES: [&str; 5] = [
+/// Hinweis im Ergebnis von `job.stop`, wenn ein angehaltener Job statt mit
+/// dem verlangten Signal eingefroren mit SIGKILL beendet wurde.
+const SUSPENDED_STOP_NOTE: &str = "the job was suspended: it was killed while frozen \
+     (SIGKILL) instead of being resumed for the requested signal; job.resume it first for a \
+     graceful stop (refused while its suspension is unresolved)";
+
+/// Alle Job-Werkzeuge in Registrierungsreihenfolge (`job.suspend` und
+/// `job.resume` hinten, damit die Positionen der älteren gleich bleiben).
+pub const JOB_TOOL_NAMES: [&str; 7] = [
     JOB_START_TOOL,
     JOB_STATUS_TOOL,
     JOB_LOGS_TOOL,
     JOB_STOP_TOOL,
     JOB_LIST_TOOL,
+    JOB_SUSPEND_TOOL,
+    JOB_RESUME_TOOL,
 ];
 
 /// Die rein lesenden Job-Werkzeuge (Kandidaten für `AUTO_APPROVED_TOOLS`).
 pub const JOB_READ_TOOLS: [&str; 3] = [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL];
 
 /// Die Werkzeuge, die Orchestratoren ohne Shell tragen: lesen und stoppen —
-/// kein `job.start`, kein blockierendes Warten.
+/// kein `job.start`, kein blockierendes Warten. `job.suspend`/`job.resume`
+/// gehören (noch) nicht dazu: ob Orchestratoren Jobs ihrer Worker anhalten
+/// dürfen, entscheidet die Montage (PL-100 WP 3.5, offen).
 pub const JOB_CONTROL_TOOLS: [&str; 4] =
     [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_STOP_TOOL, JOB_LIST_TOOL];
 
@@ -183,7 +219,7 @@ struct Shared {
     lineage: Arc<dyn JobLineage>,
 }
 
-/// Registriert die sechs Job-Werkzeuge.
+/// Registriert die sieben Job-Werkzeuge.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -195,7 +231,7 @@ struct Shared {
 /// # fn main() -> std::io::Result<()> {
 /// let manager = JobManager::new(JobManagerConfig::new("/tmp/harw-state"), Arc::new(NoopNotifier))?;
 /// let provider = JobToolProvider::new(manager, Arc::new(ShellJobLauncher::new(ShellToolProvider::new())));
-/// assert_eq!(provider.tools().len(), 6);
+/// assert_eq!(provider.tools().len(), 7);
 /// # Ok(())
 /// # }
 /// ```
@@ -253,6 +289,8 @@ enum Kind {
     Logs,
     Stop,
     List,
+    Suspend,
+    Resume,
 }
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -380,8 +418,8 @@ fn job_start_spec() -> ToolSpec {
 fn job_status_spec() -> ToolSpec {
     spec(
         JOB_STATUS_TOOL,
-        "Status of one of your jobs: state (queued/running/succeeded/failed/stopped/\
-         detached/unknown), pid, runtime, exit code, recognised progress, warning/error \
+        "Status of one of your jobs: state (queued/running/suspended/succeeded/failed/\
+         stopped/detached/unknown), pid, runtime, exit code, recognised progress, warning/error \
          counts, the last output lines, sandbox profile (host/bwrap), end reason \
          (exited/signal/stopped/timeout/launch-error/unknown), whether leftover processes \
          were reaped, whether a log hit its size budget, launch warnings.",
@@ -443,7 +481,10 @@ fn job_stop_spec() -> ToolSpec {
         JOB_STOP_TOOL,
         "Stop one of your jobs: sends `signal` (TERM default; INT, HUP or KILL) to the \
          whole process group, then SIGKILL after a grace period. Also kills processes the \
-         job left behind in its process group.",
+         job left behind in its process group. A suspended job is never resumed by a stop: \
+         it gets KILL at once and ends while frozen (`signal_sent` says SIGKILL); for a \
+         graceful stop, job.resume it first (refused while its suspension is unresolved, \
+         `suspend_phase: \"intent\"`).",
         object(
             vec![
                 ("job_id", job_id_prop()),
@@ -463,6 +504,57 @@ fn job_stop_spec() -> ToolSpec {
                     },
                 ),
             ],
+            &["job_id"],
+        ),
+    )
+}
+
+/// Optionales `finding_id`-Argument von `job.suspend`/`job.resume`.
+fn finding_id_prop() -> JsonSchema {
+    prop(
+        JsonSchemaType::String,
+        "Optional id of the DoD finding (UUIDv4) this action responds to. Only recorded \
+         in the log and echoed back; it never selects the job.",
+    )
+}
+
+/// Spezifikation von `job.suspend` (PL-100 WP 3.5).
+fn job_suspend_spec() -> ToolSpec {
+    spec(
+        JOB_SUSPEND_TOOL,
+        "Suspend (freeze) one of your running jobs: its own cgroup is frozen, so all of its \
+         processes stop at once without being killed and keep their state; job.resume \
+         continues them. Only for jobs that run in their own cgroup (delegated cgroup \
+         root); refused otherwise, and refused when someone else (an operator, the Warden) \
+         already froze it. Needs approval unless the session runs with full access. \
+         Freezing is asynchronous: `frozen: false` right after a suspend means the \
+         processes are still stopping. Suspended time does not count as active runtime \
+         and uses no CPU budget; the job keeps its running slot. Suspending an already \
+         suspended job only re-applies the freeze. If harw could not record that its \
+         freeze took effect (`suspend_phase: \"intent\"`, an unresolved suspension), a \
+         new suspend freezes the job again only while its cgroup is not frozen. \
+         job.stop kills a suspended job without resuming it.",
+        object(
+            vec![("job_id", job_id_prop()), ("finding_id", finding_id_prop())],
+            &["job_id"],
+        ),
+    )
+}
+
+/// Spezifikation von `job.resume` (PL-100 WP 3.5).
+fn job_resume_spec() -> ToolSpec {
+    spec(
+        JOB_RESUME_TOOL,
+        "Resume (thaw) one of your jobs suspended by job.suspend: its processes continue \
+         where they stopped and the remaining runtime budget continues. Needs approval \
+         unless the session runs with full access. Never lifts a freeze someone else set \
+         (refused); `frozen: true` after a resume means such a freeze (e.g. of a parent \
+         cgroup) still holds the job. Only a suspension recorded as harw's own \
+         (`suspend_phase: \"applied\"`) is resumed; an unresolved one (`\"intent\"`) is \
+         refused without touching the job (job.stop still kills it). Resuming a job that \
+         is not suspended changes nothing.",
+        object(
+            vec![("job_id", job_id_prop()), ("finding_id", finding_id_prop())],
             &["job_id"],
         ),
     )
@@ -548,6 +640,15 @@ struct StopArgs {
     signal: Option<String>,
 }
 
+/// Argumente von `job.suspend` und `job.resume`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuspendArgs {
+    job_id: String,
+    #[serde(default)]
+    finding_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListArgs {
@@ -596,6 +697,40 @@ fn parse_args<T: DeserializeOwned>(tool: &str, call: &ToolCall) -> Result<T, Too
 
 fn parse_job_id(tool: &str, raw: &str) -> Result<JobId, ToolsError> {
     JobId::parse(raw).ok_or_else(|| invalid(tool, format!("invalid job_id `{raw}`")))
+}
+
+/// Ob `raw` eine UUIDv4 in kanonischer Schreibweise ist
+/// (`xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx`, Hex in beliebiger
+/// Groß-/Kleinschreibung). Eine Null-UUID ist nie v4.
+fn is_uuid_v4(raw: &str) -> bool {
+    raw.len() == 36
+        && raw.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => byte == b'4',
+            19 => matches!(byte.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+/// Prüft die optionale `finding_id` von `job.suspend`/`job.resume`.
+///
+/// # Returns
+/// `None` ohne (oder mit leerer) Angabe, sonst die UUIDv4 in Kleinbuchstaben
+/// — danach enthält sie nur `[0-9a-f-]` und darf unverändert in Log und
+/// Ergebnis. Eine ungültige Angabe wird nie zurückgegeben (auch nicht in der
+/// Fehlermeldung).
+fn parse_finding_id(tool: &str, raw: Option<&str>) -> Result<Option<String>, ToolsError> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    if is_uuid_v4(raw) {
+        Ok(Some(raw.to_ascii_lowercase()))
+    } else {
+        Err(invalid(
+            tool,
+            "finding_id must be a UUIDv4 (xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx)",
+        ))
+    }
 }
 
 /// Quotet ein Wort für `/bin/sh` (einfache Anführungszeichen).
@@ -746,8 +881,13 @@ fn compose(args: &StartArgs, workspace_root: &Path) -> Result<Composed, String> 
 // ── Ausgaben ──────────────────────────────────────────────────────────────────
 
 fn status_json(status: &JobStatus) -> Value {
+    status_json_at(status, Timestamp::now())
+}
+
+/// [`status_json`] zum Zeitpunkt `now` (Haltezeit und aktive Laufzeit).
+fn status_json_at(status: &JobStatus, now: Timestamp) -> Value {
     let meta = &status.meta;
-    json!({
+    let mut value = json!({
         "job_id": meta.job_id.as_str(),
         "name": meta.name,
         "state": meta.state.as_str(),
@@ -781,15 +921,86 @@ fn status_json(status: &JobStatus) -> Value {
         "detached": meta.detached,
         "launch_error": meta.launch_error,
         "log_dir": status.log_dir.display().to_string(),
-    })
+    });
+    // PL-100 WP 3.5: suspension and active runtime (suspended time never
+    // counts as active time). Inserted separately to keep `json!` shallow.
+    insert_fields(
+        &mut value,
+        [
+            ("suspended", json!(meta.is_suspended())),
+            // `applied`: harw's own freeze, job.resume thaws it; `intent`:
+            // unresolved, job.resume refuses it; `null`: not suspended.
+            ("suspend_phase", json!(meta.suspension_phase())),
+            (
+                "suspended_at",
+                json!(meta.suspended_at.map(|ts| ts.to_string())),
+            ),
+            ("suspended_secs", json!(meta.suspended_secs_at(now))),
+            ("active_secs", json!(meta.active_secs_at(now))),
+        ],
+    );
+    value
 }
 
+/// Fügt `fields` in das JSON-Objekt `value` ein (ohne Indexzugriff).
+fn insert_fields<const N: usize>(value: &mut Value, fields: [(&str, Value); N]) {
+    if let Some(object) = value.as_object_mut() {
+        for (key, field) in fields {
+            object.insert(key.to_owned(), field);
+        }
+    }
+}
+
+/// Ergebnis von `job.suspend`/`job.resume`: der Status wie bei `job.status`
+/// plus `transition`, `changed`, `frozen` (Kernel-Sicht, `null` ohne
+/// Änderung) und die geprüfte `finding_id` (`null` ohne).
+fn suspend_json(outcome: &SuspendOutcome, finding_id: Option<&str>) -> Value {
+    let mut value = status_json(&outcome.status);
+    insert_fields(
+        &mut value,
+        [
+            ("transition", json!(outcome.transition.as_str())),
+            ("changed", json!(outcome.transition.changed())),
+            ("frozen", json!(outcome.frozen)),
+            ("finding_id", json!(finding_id)),
+        ],
+    );
+    value
+}
+
+/// Ergebnis von `job.stop`: der Status wie bei `job.status` plus
+/// `signal_sent` (das tatsächlich gesendete Signal) und, wenn das nicht das
+/// verlangte war (angehaltener Job, eingefroren mit KILL beendet), ein
+/// `note`.
+fn stop_json(status: &JobStatus, requested: JobSignal, sent: JobSignal) -> Value {
+    let mut value = status_json(status);
+    insert_fields(&mut value, [("signal_sent", json!(sent.name()))]);
+    if sent != requested {
+        insert_fields(&mut value, [("note", json!(SUSPENDED_STOP_NOTE))]);
+    }
+    value
+}
+
+/// Schlüssel in `by_state` von `job.list` für abgelöste Jobs, die noch
+/// angehalten sind (eingefroren abgelöst bzw. aus einer früheren Sitzung).
+const SUSPENDED_DETACHED: &str = "suspended_detached";
+
 /// Standardansicht von `job.list`: Zahlen je Kategorie und Zustand, keine
-/// Zeilen. `count` oben bleibt die Zahl der sichtbaren Prozess-Jobs.
+/// Zeilen. `count` oben bleibt die Zahl der sichtbaren Prozess-Jobs. Ein
+/// abgelöster, noch angehaltener Job zählt unter
+/// [`SUSPENDED_DETACHED`], damit ein eingefrorener Job nie als bloß
+/// `detached` verschwindet (B13).
 fn list_summary_json(jobs: &[JobStatus], limit: usize, running: usize) -> Value {
     let mut by_state: BTreeMap<&str, u64> = BTreeMap::new();
     for status in jobs {
-        *by_state.entry(status.meta.state.as_str()).or_insert(0) += 1;
+        let meta = &status.meta;
+        let key = if meta.state == JobState::Detached && meta.is_suspended() {
+            SUSPENDED_DETACHED
+        } else {
+            meta.state.as_str()
+        };
+        let count = by_state.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
     }
     json!({
         "view": "summary",
@@ -839,6 +1050,7 @@ fn list_entry_json(status: &JobStatus) -> Value {
         "job_id": meta.job_id.as_str(),
         "name": meta.name,
         "state": meta.state.as_str(),
+        "suspended": meta.is_suspended(),
         "owner": meta.owner.session,
         "sandbox_profile": meta.sandbox_profile(),
         "end_reason": meta.end_reason().map(JobEndReason::as_str),
@@ -1031,14 +1243,91 @@ impl JobToolExecutor {
         // Manager). So können Orchestratoren ohne Shell Jobs ihrer Worker
         // stoppen; im Plan-/Explore-Modus ist das Werkzeug nicht aktiv.
         let caller = Caller::Agent(context.session_id().as_str());
-        match self.shared.manager.stop(&id, caller, signal).await {
-            Ok(status) => {
-                info!(job_id = %id, signal = signal.name(), "job.stop");
-                let mut value = status_json(&status);
-                value["signal_sent"] = json!(signal.name());
-                Ok(ToolOutput::json(value))
+        // A suspended job is killed while frozen, never thawed (PL-100
+        // WP 3.5): `signal_sent` reports the signal that actually went out.
+        match self
+            .shared
+            .manager
+            .stop_reporting_signal(&id, caller, signal)
+            .await
+        {
+            Ok((status, sent)) => {
+                info!(job_id = %id, signal = sent.name(), "job.stop");
+                Ok(ToolOutput::json(stop_json(&status, signal, sent)))
             }
             Err(err) => Ok(job_error(JOB_STOP_TOOL, &err)),
+        }
+    }
+
+    /// `job.suspend` bzw. `job.resume` (PL-100 WP 3.5).
+    ///
+    /// # Concurrency
+    /// [`JobManager::suspend`] und [`JobManager::resume`] blockieren
+    /// (`fsync` von `meta.json` und, beim Anhalten, des Job-Verzeichnisses;
+    /// bis zu etwa 100 ms Warten auf die Sperre
+    /// des Eindämmungsindex, nacheinander hinter anderen Aufrufen); sie
+    /// laufen deshalb über `spawn_blocking` und halten keinen
+    /// tokio-Worker an.
+    ///
+    /// # Errors
+    /// [`ToolsError`] für ungültige Argumente oder eine nicht zu Ende
+    /// gelaufene Hintergrundaufgabe.
+    async fn suspend_or_resume(
+        &self,
+        context: &ToolExecutionContext,
+        call: &ToolCall,
+        resume: bool,
+    ) -> Result<ToolOutput, ToolsError> {
+        let tool = if resume {
+            JOB_RESUME_TOOL
+        } else {
+            JOB_SUSPEND_TOOL
+        };
+        let args: SuspendArgs = parse_args(tool, call)?;
+        let id = parse_job_id(tool, &args.job_id)?;
+        let finding_id = parse_finding_id(tool, args.finding_id.as_deref())?;
+        // Kein `ExecuteProcess`: wie `job.stop` wirkt es nur auf Jobs des
+        // Aufrufers bzw. seiner Nachfahren (Besitzprüfung im Manager); die
+        // Nachfrage regelt `ALWAYS_ASK_TOOLS` der Montage. Die `finding_id`
+        // wird nur protokolliert und zurückgegeben, nie zur Zielwahl benutzt.
+        let session = context.session_id().as_str().to_owned();
+        let manager = Arc::clone(&self.shared.manager);
+        let job = id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let caller = Caller::Agent(&session);
+            if resume {
+                manager.resume(&job, caller)
+            } else {
+                manager.suspend(&job, caller)
+            }
+        })
+        .await
+        .map_err(|err| ToolsError::ExecutionFailed(err.to_string()))?;
+        let finding = finding_id.as_deref().unwrap_or("-");
+        match result {
+            Ok(outcome) => {
+                info!(
+                    tool,
+                    job_id = %id,
+                    finding_id = finding,
+                    transition = outcome.transition.as_str(),
+                    "job suspend/resume"
+                );
+                Ok(ToolOutput::json(suspend_json(
+                    &outcome,
+                    finding_id.as_deref(),
+                )))
+            }
+            Err(err) => {
+                info!(
+                    tool,
+                    job_id = %id,
+                    finding_id = finding,
+                    error = %err,
+                    "job suspend/resume refused"
+                );
+                Ok(job_error(tool, &err))
+            }
         }
     }
 
@@ -1089,14 +1378,17 @@ impl ToolExecutor for JobToolExecutor {
                 Kind::Logs => self.logs(context, call).await,
                 Kind::Stop => self.stop(context, call).await,
                 Kind::List => self.list(context, call),
+                Kind::Suspend => self.suspend_or_resume(context, call, false).await,
+                Kind::Resume => self.suspend_or_resume(context, call, true).await,
             }
         })
     }
 }
 
-// Die fünf Job-Werkzeuge. Alle teilen den Zustand [`Shared`] (Verwaltung,
+// Die sieben Job-Werkzeuge. Alle teilen den Zustand [`Shared`] (Verwaltung,
 // Launcher, Elternkette); nur die drei lesenden sind parallelsicher
-// (`JOB_READ_TOOLS`), `job.start` und `job.stop` nie.
+// (`JOB_READ_TOOLS`), `job.start`, `job.stop`, `job.suspend` und
+// `job.resume` nie.
 harw_tools::tool_provider! {
     impl for JobToolProvider as provider,
     parallel_safe: [JOB_STATUS_TOOL, JOB_LOGS_TOOL, JOB_LIST_TOOL] {
@@ -1119,6 +1411,14 @@ harw_tools::tool_provider! {
         JOB_LIST_TOOL => {
             spec: job_list_spec(),
             executor: JobToolExecutor { kind: Kind::List, shared: Arc::clone(&provider.shared) },
+        },
+        JOB_SUSPEND_TOOL => {
+            spec: job_suspend_spec(),
+            executor: JobToolExecutor { kind: Kind::Suspend, shared: Arc::clone(&provider.shared) },
+        },
+        JOB_RESUME_TOOL => {
+            spec: job_resume_spec(),
+            executor: JobToolExecutor { kind: Kind::Resume, shared: Arc::clone(&provider.shared) },
         },
     }
 }
@@ -1294,6 +1594,152 @@ mod list_view_tests {
         assert_eq!(old["stragglers_reaped"], json!(false));
         assert_eq!(old["log_truncated"], json!(false));
         assert_eq!(old["launch_warnings"], json!([]));
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: a suspended job shows its state, the open suspension
+    /// and the active runtime without suspended time in `job.status`, and
+    /// counts as `suspended` in `job.list`.
+    #[test]
+    fn test_suspended_job_renders_in_status_and_list() -> TestResult {
+        let status = status_of(
+            "job-frozen",
+            "suspended",
+            json!({
+                "started_at": "2026-01-01T00:00:00Z",
+                "suspended_at": "2026-01-01T00:00:10Z",
+                "suspended_secs": 5,
+            }),
+        )?;
+        let now: Timestamp = "2026-01-01T00:01:10Z".parse().map_err(ctx("now"))?;
+        let value = status_json_at(&status, now);
+        assert_eq!(value.get("state"), Some(&json!("suspended")));
+        assert_eq!(value.get("suspended"), Some(&json!(true)));
+        assert_eq!(
+            value.get("suspended_at"),
+            Some(&json!("2026-01-01T00:00:10Z"))
+        );
+        // 5 s of an earlier suspension plus 60 s of the open one.
+        assert_eq!(value.get("suspended_secs"), Some(&json!(65)));
+        assert_eq!(value.get("active_secs"), Some(&json!(5)));
+        assert_eq!(value.get("end_reason"), Some(&Value::Null));
+        // Review thread 4505015304: a record without a phase is an
+        // unresolved intent (fail closed); a recorded effect is `applied`.
+        assert_eq!(value.get("suspend_phase"), Some(&json!("intent")));
+        let applied = status_of(
+            "job-frozen-applied",
+            "suspended",
+            json!({
+                "suspended_at": "2026-01-01T00:00:10Z",
+                "suspend_phase": "applied",
+            }),
+        )?;
+        assert_eq!(
+            status_json_at(&applied, now).get("suspend_phase"),
+            Some(&json!("applied"))
+        );
+
+        // A job that was detached (or loaded after a restart) while
+        // suspended stays visible as suspended in both list views (B13).
+        let detached = status_of(
+            "job-frozen-detached",
+            "detached",
+            json!({"suspended_at": "2026-01-01T00:00:10Z", "detached": true}),
+        )?;
+        let jobs = vec![
+            status.clone(),
+            status_of("job-run", "running", json!({}))?,
+            detached.clone(),
+            status_of("job-away", "detached", json!({"detached": true}))?,
+        ];
+        let summary = list_summary_json(&jobs, 4, 2);
+        assert_eq!(
+            summary.pointer("/categories/process/by_state"),
+            Some(&json!({
+                "detached": 1,
+                "running": 1,
+                "suspended": 1,
+                "suspended_detached": 1,
+            }))
+        );
+        assert_eq!(
+            summary.pointer("/categories/process/count"),
+            Some(&json!(4))
+        );
+        let rows = list_process_rows_json(&[status, detached]);
+        assert_eq!(rows.pointer("/jobs/0/state"), Some(&json!("suspended")));
+        assert_eq!(rows.pointer("/jobs/0/suspended"), Some(&json!(true)));
+        assert_eq!(rows.pointer("/jobs/1/state"), Some(&json!("detached")));
+        assert_eq!(rows.pointer("/jobs/1/suspended"), Some(&json!(true)));
+        let plain_rows = list_process_rows_json(&[status_of("job-run", "running", json!({}))?]);
+        assert_eq!(plain_rows.pointer("/jobs/0/suspended"), Some(&json!(false)));
+
+        // A job that was never suspended: nothing suspended, all time active.
+        let plain = status_json_at(
+            &status_of(
+                "job-plain",
+                "running",
+                json!({"started_at": "2026-01-01T00:00:00Z"}),
+            )?,
+            now,
+        );
+        assert_eq!(plain.get("suspended"), Some(&json!(false)));
+        assert_eq!(plain.get("suspend_phase"), Some(&Value::Null));
+        assert_eq!(plain.get("suspended_at"), Some(&Value::Null));
+        assert_eq!(plain.get("suspended_secs"), Some(&json!(0)));
+        assert_eq!(plain.get("active_secs"), Some(&json!(70)));
+        Ok(())
+    }
+
+    /// `finding_id` is a strict UUIDv4; it comes back in lower case, and an
+    /// invalid value is never echoed (not even in the error).
+    #[test]
+    fn test_finding_id_must_be_a_uuid_v4() -> TestResult {
+        let valid = "3f2b8c1e-9d4a-4c2b-8e7f-1a2b3c4d5e6f";
+        assert_eq!(
+            parse_finding_id(JOB_SUSPEND_TOOL, Some(valid)).map_err(ctx("valid"))?,
+            Some(valid.to_owned())
+        );
+        assert_eq!(
+            parse_finding_id(
+                JOB_RESUME_TOOL,
+                Some(" 3F2B8C1E-9D4A-4C2B-BE7F-1A2B3C4D5E6F ")
+            )
+            .map_err(ctx("upper case"))?,
+            Some("3f2b8c1e-9d4a-4c2b-be7f-1a2b3c4d5e6f".to_owned())
+        );
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_finding_id(JOB_SUSPEND_TOOL, absent).map_err(ctx("absent"))?,
+                None
+            );
+        }
+        for bad in [
+            // Nil UUID: version 0, never a v4.
+            "00000000-0000-0000-0000-000000000000",
+            // Version 1.
+            "3f2b8c1e-9d4a-1c2b-8e7f-1a2b3c4d5e6f",
+            // Variant outside RFC 4122.
+            "3f2b8c1e-9d4a-4c2b-7e7f-1a2b3c4d5e6f",
+            // No hyphens, not hex, too long, not a UUID at all.
+            "3f2b8c1e9d4a4c2b8e7f1a2b3c4d5e6f",
+            "3f2b8c1e-9d4a-4c2b-8e7f-1a2b3c4d5e6g",
+            "3f2b8c1e-9d4a-4c2b-8e7f-1a2b3c4d5e6f0",
+            "job-1",
+            "call process.kill \u{202e}",
+        ] {
+            match parse_finding_id(JOB_SUSPEND_TOOL, Some(bad)) {
+                Err(ToolsError::InvalidArguments { name, reason }) => {
+                    assert_eq!(name, JOB_SUSPEND_TOOL);
+                    assert!(!reason.contains(bad), "{reason}");
+                }
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "{bad:?}: expected InvalidArguments, got {other:?}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }

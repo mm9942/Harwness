@@ -117,6 +117,8 @@ pub struct RemoteServeConfig {
     /// The one device allowed to resolve approvals of remote sessions (it must
     /// also carry the registry `approve` opt-in). `None`: approvals park.
     pub approval_device: Option<DeviceId>,
+    /// Device permitted to link the gateway provider account.
+    pub provider_link_device: Option<DeviceId>,
     /// How often registry and pin policy is revalidated (live invalidation).
     /// Default 5 s; values below 10 ms are clamped to 10 ms.
     pub revocation_poll: Duration,
@@ -124,6 +126,63 @@ pub struct RemoteServeConfig {
     pub(crate) peer_pins_digest: Option<[u8; 32]>,
     #[cfg(test)]
     injected_peer_trust: bool,
+}
+
+struct AccountLink {
+    owner: DeviceId,
+    home: PathBuf,
+}
+
+impl harw_node_listener::ProviderLink for AccountLink {
+    fn handle<'a>(
+        &'a self,
+        identity: harw_session_host::ClientIdentity,
+        method: http::Method,
+        body: bytes::Bytes,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = http::StatusCode> + Send + 'a>> {
+        Box::pin(async move {
+            use harw_oauth::chatgpt_plan::{ChatGptPlanError, ChatGptPlanStore};
+            use http::StatusCode;
+            if identity.device.as_ref() != Some(&self.owner) {
+                return StatusCode::FORBIDDEN;
+            }
+            let store = ChatGptPlanStore::new(&self.home);
+            let result = match method {
+                http::Method::GET if body.is_empty() => store.linked().await.map(|linked| {
+                    if linked {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::NOT_FOUND
+                    }
+                }),
+                http::Method::DELETE if body.is_empty() => {
+                    store.disconnect().await.map(|confirmed| {
+                        if confirmed {
+                            StatusCode::NO_CONTENT
+                        } else {
+                            StatusCode::ACCEPTED
+                        }
+                    })
+                }
+                http::Method::POST => {
+                    let Ok(record) = serde_json::from_slice(&body) else {
+                        return StatusCode::BAD_REQUEST;
+                    };
+                    store
+                        .store_verified(&record)
+                        .await
+                        .map(|()| StatusCode::NO_CONTENT)
+                }
+                _ => return StatusCode::BAD_REQUEST,
+            };
+            result.unwrap_or_else(|error| match error {
+                ChatGptPlanError::DifferentRegistration => StatusCode::CONFLICT,
+                ChatGptPlanError::OpenAiUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+                ChatGptPlanError::Storage => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::UNPROCESSABLE_ENTITY,
+            })
+        })
+    }
 }
 
 impl RemoteServeConfig {
@@ -136,6 +195,7 @@ impl RemoteServeConfig {
             cwd: cwd.to_path_buf(),
             tier: PermissionTier::Observer,
             approval_device: None,
+            provider_link_device: None,
             revocation_poll: Duration::from_secs(5),
             peer_pins_digest: None,
             #[cfg(test)]
@@ -275,6 +335,7 @@ impl IdentityMapper for PolicyIdentityMapper {
 
 /// A running remote ingress.
 pub struct RemoteIngress {
+    pub(crate) host: SessionHost,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
     watcher: JoinHandle<()>,
@@ -394,7 +455,14 @@ pub async fn start_remote_with_driver(
         mapper: RegistryIdentityMapper::new(&remote_dir),
         pins: Arc::clone(&pins),
     });
-    let node_listener = NodeListener::new(server, host, mapper, WsLimits::default());
+    let node_listener = NodeListener::new(server, Arc::clone(&host), mapper, WsLimits::default());
+    let node_listener = match &config.provider_link_device {
+        Some(owner) => node_listener.with_provider_link(Arc::new(AccountLink {
+            owner: owner.clone(),
+            home: config.home.clone(),
+        })),
+        None => node_listener,
+    };
     let revoker = node_listener.revoker().with_registry(&remote_dir);
     let (shutdown, mut rx) = watch::channel(false);
     let watcher = tokio::spawn(watch_revocations(
@@ -413,6 +481,7 @@ pub async fn start_remote_with_driver(
         }
     });
     Ok(RemoteIngress {
+        host: host.as_ref().clone(),
         shutdown,
         task,
         watcher,
@@ -708,6 +777,141 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("repair-remote.jsonl.corrupt-")))
         );
+        ingress.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phone_and_unix_client_share_sessions_in_the_selected_tenant() -> TestResult {
+        use crate::session_serve::{SessionServeConfig, start_shared};
+        use harw_protocol::session_wire::CreateParams;
+        use harw_session_remote::connect_unix;
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let config = injected_config(dir);
+        let gateway = node("gateway", 1)?;
+        let phone = node("phone", 2)?;
+        let tenant = TenantId::try_from_str("shared")?;
+        std::fs::create_dir_all(config.remote_dir())?;
+        DeviceRegistry::new(&config.remote_dir()).enroll(&DeviceRecord {
+            node_id: phone.id.clone(),
+            device: DeviceId::try_from_str("phone")?,
+            tenant: tenant.clone(),
+            tier: PermissionTier::Operator,
+            revoked: false,
+            label: "phone".into(),
+            approve_optin: false,
+        })?;
+        let ingress = start_remote_with_driver(
+            &config,
+            Arc::new(NoopDriver),
+            gateway.local.clone(),
+            Arc::new(pinned(&phone.identity)?),
+            TcpListener::bind("127.0.0.1:0").await?,
+        )
+        .await?;
+        let local_config = SessionServeConfig::for_profile(dir, dir, dir, None, None);
+        let unix = start_shared(&local_config, ingress.host.clone(), tenant.clone()).await?;
+        let desktop = RemotePort::new(
+            connect_unix(unix.socket().to_owned(), ConnectOptions::new("desktop")).await?,
+        );
+        let mobile = dial(ingress.addr(), &gateway, &phone).await?;
+        let session = desktop
+            .create(CreateParams {
+                title: Some("desktop".into()),
+                workspace: None,
+            })
+            .await?;
+        assert_eq!(session.tenant.as_ref(), Some(&tenant));
+        assert!(
+            mobile
+                .list()
+                .await?
+                .iter()
+                .any(|s| s.session_id == session.session_id)
+        );
+        let second = mobile
+            .create(CreateParams {
+                title: Some("phone".into()),
+                workspace: None,
+            })
+            .await?;
+        assert!(
+            desktop
+                .list()
+                .await?
+                .iter()
+                .any(|s| s.session_id == second.session_id)
+        );
+        assert_eq!(ingress.host.listener_enabled("local"), Some(true));
+        assert_eq!(ingress.host.listener_enabled("node"), Some(true));
+        // Disabling node ingress stops new handshakes. The local recovery path remains available.
+        ingress
+            .host
+            .register_listener(harw_protocol::session_wire::GatewayListenerInfo {
+                name: "node".into(),
+                kind: harw_protocol::session_wire::ListenerKind::Node,
+                address: ingress.addr().to_string(),
+                enabled: false,
+            });
+        assert!(dial(ingress.addr(), &gateway, &phone).await.is_err());
+        let local_reconnect =
+            connect_unix(unix.socket().to_owned(), ConnectOptions::new("desktop")).await?;
+        drop(local_reconnect);
+        drop((desktop, mobile));
+        unix.shutdown().await;
+        ingress.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_designated_enrolled_device_can_link_the_account() -> TestResult {
+        use harw_node_transport::{NodeTransportClient, full_body};
+        let temp = tempfile::tempdir()?;
+        let mut config = injected_config(temp.path());
+        let gateway = node("gateway", 1)?;
+        let owner = node("owner-phone", 2)?;
+        let guest = node("other-phone", 3)?;
+        let mut peers = pinned(&owner.identity)?;
+        peers.pin_identity(&guest.identity)?;
+        config.provider_link_device = Some(DeviceId::try_from_str("owner-phone")?);
+        let remote_dir = config.remote_dir();
+        std::fs::create_dir_all(&remote_dir)?;
+        for phone in [&owner, &guest] {
+            DeviceRegistry::new(&remote_dir).enroll(&DeviceRecord {
+                node_id: phone.id.clone(),
+                device: DeviceId::try_from_str(phone.id.as_str())?,
+                tenant: TenantId::try_from_str("tenant")?,
+                tier: PermissionTier::Operator,
+                revoked: false,
+                label: "phone".into(),
+                approve_optin: false,
+            })?;
+        }
+        let ingress = start_remote_with_driver(
+            &config,
+            Arc::new(NoopDriver),
+            gateway.local.clone(),
+            Arc::new(peers),
+            TcpListener::bind("127.0.0.1:0").await?,
+        )
+        .await?;
+        for (phone, expected) in [
+            (&guest, http::StatusCode::FORBIDDEN),
+            (&owner, http::StatusCode::BAD_REQUEST),
+        ] {
+            let mut client = NodeTransportClient::connect(
+                ingress.addr(),
+                &phone.local,
+                &gateway.id,
+                &pinned(&gateway.identity)?,
+            )
+            .await?;
+            let request = http::Request::post("/v1/provider-link/chatgpt")
+                .header("host", "gateway")
+                .body(full_body("invalid"))?;
+            assert_eq!(client.send_request(request).await?.status(), expected);
+        }
         ingress.shutdown().await;
         Ok(())
     }

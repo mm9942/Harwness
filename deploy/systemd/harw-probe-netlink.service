@@ -1,0 +1,80 @@
+# harw-probe-netlink.service -- DoD audit netlink probe, class CAP_AUDIT_READ.
+#
+# Canonical source: deploy/systemd/ (Crypto Masterplan v2 §22, H10). Rendered
+# by harw-dod/scripts/install.sh (LIBEXECDIR).
+#
+# PL-100 WP1.8 (decision O11): joins the read-only kernel audit multicast
+# group (AUDIT_NLGRP_READLOG) and forwards login records (USER_AUTH,
+# USER_LOGIN) as AuthEvent to the sentinel. It never becomes the audit
+# daemon, never changes audit rules and never writes audit records:
+# CAP_AUDIT_READ only, no CAP_AUDIT_CONTROL, no CAP_AUDIT_WRITE. Auditing must
+# be enabled in the kernel (audit=1 or auditctl -e 1) for records to flow.
+# Without CAP_AUDIT_CONTROL the probe cannot query that state; it reports
+# SensorDegraded instead when it sees auditing switched off (CONFIG_CHANGE
+# audit_enabled=0) and after one hour without any audit record. With the boot
+# parameter audit=0 the kernel has no audit netlink family and the probe fails
+# at start. Login events are rate limited per 5 s window (24 failures, 8
+# successes); the excess is counted and reported as SensorDegraded.
+#
+# Installed, but NOT pulled in by harw-dod.target: the sentinel must first
+# accept this probe's uid as an IPC peer. Enable it explicitly with
+# `systemctl enable --now harw-probe-netlink.service`.
+#
+# Landlock: hard start failure without full enforcement
+# (harw-probe-netlink/src/landlock.rs). The binary opens the audit socket and
+# connects to the sentinel socket FIRST, then denies itself every file system
+# access (no allowed root at all).
+
+[Unit]
+Description=Harw-DoD audit netlink probe (push-only)
+Documentation=man:harw-probe-netlink(1)
+PartOf=harw-dod.target
+After=harw-sentinel.service
+Wants=harw-sentinel.service
+# Same reasoning as harw-probe-bpf.service: Wants=+After=, not Requires=.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=harw-probe-netlink
+Group=harw-probe-netlink
+SupplementaryGroups=harw-ipc
+ExecStart=@LIBEXECDIR@/harw-probe-netlink --log info --sentinel-socket /run/harw/sentinel.sock
+Restart=on-failure
+RestartSec=5
+
+# -- Hardening --
+NoNewPrivileges=yes
+ProtectSystem=strict
+# Reads no file after start; a connect() to the sentinel socket needs no
+# writable mount.
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# AF_NETLINK for the NETLINK_AUDIT read socket, AF_UNIX for the push-only
+# SOCK_SEQPACKET socket to the sentinel. Nothing else. No PrivateNetwork=:
+# the kernel serves the audit netlink family only in the initial network
+# namespace.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=CAP_AUDIT_READ
+AmbientCapabilities=CAP_AUDIT_READ
+# The only capability that permits binding to the audit read multicast group.
+
+[Install]
+WantedBy=harw-dod.target

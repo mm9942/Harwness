@@ -494,6 +494,7 @@ mod tests {
         let mut config = ResolvedConfig::default();
         config.network.allow_hosts.clear();
         config.network.researcher_web_hosts.clear();
+        config.network.research_web = harw_config::ResearchWebMode::Allowlist;
         config.harness.research.network_allow_hosts.clear();
         config
     }

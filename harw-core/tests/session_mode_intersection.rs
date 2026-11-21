@@ -268,6 +268,34 @@ fn sandbox_after_explore_then_work_equals_the_base_sandbox() -> TestResult {
 }
 
 #[test]
+fn a_mode_keeps_the_base_network_scope_when_it_allows_network() -> TestResult {
+    let plain = test_sandbox(&[Permission::ReadWorkspace, Permission::NetworkAccess])?;
+    let scope = harw_authority::NetworkScope::from_hosts(["docs.rs".to_owned()]);
+    let base_sandbox = SandboxSpec::from_resolved_with_network(
+        plain.workspace().clone(),
+        plain.permissions().clone(),
+        scope.clone(),
+    );
+    let mut session = plain_session().with_spawn_context(spawn_context(base_sandbox));
+
+    // Feldbericht F8: Plan erlaubt NetworkAccess, leerte aber die Ziele —
+    // jeder `web.*`-Aufruf wurde abgelehnt.
+    session.set_mode(InteractionMode::Plan);
+    let sandbox = sandbox_of(&session)?;
+    assert!(sandbox.permissions().contains(Permission::NetworkAccess));
+    assert_eq!(sandbox.network_scope(), &scope);
+
+    session.set_mode(InteractionMode::Explore);
+    assert!(
+        !sandbox_of(&session)?
+            .permissions()
+            .contains(Permission::NetworkAccess),
+        "Explore bleibt ohne Netz, auch mit Reichweite in der Basis"
+    );
+    Ok(())
+}
+
+#[test]
 fn no_mode_ever_exceeds_the_base_sandbox() -> TestResult {
     let base_sandbox = test_sandbox(&[Permission::ReadWorkspace])?;
     let mut session = plain_session().with_spawn_context(spawn_context(base_sandbox.clone()));

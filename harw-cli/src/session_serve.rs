@@ -32,12 +32,9 @@
 //!   (`harw_session_com::local::local_identity`), so the durable approval
 //!   record binds the actor that may resolve it (a `Principal` of surface
 //!   Tui would otherwise yield `local-tui`, which never matches).
-//! - Known limitation: `RuntimeAssembly::build` reads config/trust files
-//!   synchronously; the driver's factory trait is synchronous, so this happens
-//!   on the gateway runtime thread once per newly created hosted session.
-//! - TODO(node listener): `harw-node-listener::NodeListener` is not composed
-//!   because `harw-config` has no node-transport section yet; no config is
-//!   invented here.
+//! - The driver runs synchronous factory assembly on a blocking worker and
+//!   rechecks execution admission after hydrating the durable transcript.
+//! - The node transport listener is composed in `session_serve_remote`.
 //!
 //! # Jobs rule
 //! Everything on the serve path is async (`Daemon::run` on the gateway's
@@ -334,6 +331,29 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
         .mode(0o700)
         .create(dir)
         .map_err(|error| format!("{}: {error}", dir.display()))
+}
+
+/// Attach an owner-only Unix socket to the same host and tenant as the phone.
+pub(crate) async fn start_shared(
+    config: &SessionServeConfig,
+    host: harw_session_host::SessionHost,
+    tenant: harw_types::TenantId,
+) -> Result<SessionIngress, String> {
+    if let Some(parent) = config.socket.parent() {
+        private_dir(parent)?;
+    }
+    let mut uds = UdsConfig::new(&config.socket, own_uid());
+    uds.tenant = Some(tenant);
+    let server = harw_session_daemon::UdsServer::bind(uds)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (shutdown, rx) = watch::channel(false);
+    let task = tokio::spawn(server.run(host, rx));
+    Ok(SessionIngress {
+        shutdown,
+        task,
+        socket: config.socket.clone(),
+    })
 }
 
 /// Compose and start the ingress with the production driver over `model`.

@@ -131,14 +131,12 @@ fn fresh_ledger() -> (Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>) 
     )
 }
 
-// Referenziert `HostApprovalScope`, damit die Importe erklärt
-// bleiben, falls ein künftiger Patch hier tatsächlich Leases ausstellt
-// (z. B. sobald eine IPC-Anbindung an eine laufende Sitzung existiert).
+// Tests stellen Lease-Permits wie die Produktion aus: über
+// `covering_binding` + `issue_for_lease` + `remember_lease_permit`.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::ctx;
-    use harw_sandbox::HostApprovalScope;
 
     #[test]
     fn test_run_status_action_succeeds() {
@@ -185,10 +183,12 @@ mod tests {
             std::path::Path::new("/workspace"),
             harw_sandbox::ProcessEnvironment::LocalHost,
         );
+        let binding =
+            crate::test_support::some_or(registry.covering_binding("s1"), "covering binding")?;
         let id = ledger
-            .issue_after_local_approval(request.clone(), HostApprovalScope::SessionLease, None)
+            .issue_for_lease(request.clone(), binding.window())
             .map_err(ctx("issuing a valid request must succeed"))?;
-        registry.remember_permit(request, id);
+        assert!(registry.remember_lease_permit(request, id, binding));
 
         // Ein *anderer* frischer Ledger (wie ihn `print_revoke` tatsächlich
         // baut) kennt diese Sitzung nicht — genau das demonstriert dieser

@@ -1,0 +1,31 @@
+[package]
+name = "harw-dod-warden-types"
+description = "Signing-free warden vocabulary: actions, escalation stages, cgroup targets, denials and outcomes"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# PL-100 WP 3.0 (Leitprinzip I8): der signierfreie Teil des früheren
+# `harw-dod-warden-proto`. Prozesse, die mit Modellen sprechen, dürfen dieses
+# Vokabular linken, nie den Signierteil (MAC, Schlüssel, Nonce-Ledger).
+# Bewusst KEIN `blake3`, kein `serde_json`: der einzige Digest hier
+# (`WardenAction::binding_digest`) läuft über `harw_types::ContentDigest`.
+[dependencies]
+# Vokabular-Grundlage: `CgroupId`, `ContentDigest`.
+harw-types = { path = "../../../harw-types" }
+# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+harw-macros = { path = "../../../harw-macros" }
+serde = { workspace = true }
+# `CgroupTarget::first_seen` und die kanonische Zeitkodierung.
+jiff = { workspace = true }
+
+[dev-dependencies]
+harw-test-support = { path = "../../../harw-test-support" }
+# Nur für Tests und Doctests: Wire-Rundläufe der serde-Formen.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

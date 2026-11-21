@@ -105,6 +105,19 @@ pub fn parse_cmdline(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Pfad der cgroup-v2-Zeile `0::<pfad>` aus dem Text einer `cgroup`-Datei.
+///
+/// `None` bei cgroup v1 (keine `0::`-Zeile) oder wenn der Pfad nicht mit `/`
+/// beginnt.
+#[must_use]
+pub fn parse_cgroup_v2(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::trim)
+        .filter(|path| path.starts_with('/'))
+        .map(str::to_owned)
+}
+
 /// `/proc/meminfo` als Schlüssel → KiB.
 #[must_use]
 pub fn parse_meminfo(text: &str) -> BTreeMap<String, u64> {
@@ -397,6 +410,30 @@ impl ProcFs {
         }
     }
 
+    /// cgroup-v2-Pfad eines Prozesses; `None`, wenn nicht lesbar oder kein v2.
+    #[must_use]
+    pub fn cgroup_of(&self, pid: i32) -> Option<String> {
+        self.read_file(&format!("{pid}/cgroup"))
+            .and_then(|text| parse_cgroup_v2(&text))
+    }
+
+    /// cgroup-v2-Pfad des aufrufenden Prozesses (`self/cgroup`).
+    #[must_use]
+    pub fn own_cgroup(&self) -> Option<String> {
+        self.read_file("self/cgroup")
+            .and_then(|text| parse_cgroup_v2(&text))
+    }
+
+    /// PID des aufrufenden Prozesses aus `self/stat` (im echten `/proc` die
+    /// Thread-Gruppe, also `std::process::id()`); `None`, wenn nicht lesbar.
+    #[must_use]
+    pub fn own_pid(&self) -> Option<i32> {
+        self.read_file("self/stat")
+            .as_deref()
+            .and_then(parse_stat)
+            .map(|stat| stat.pid)
+    }
+
     /// Eine Datei eines Prozesses als Text (für `lsof`, `ss`).
     #[must_use]
     pub fn read_file(&self, relative: &str) -> Option<String> {
@@ -409,6 +446,39 @@ mod tests {
     use super::*;
     use crate::test_support::TestResult;
     use std::fs;
+
+    #[test]
+    fn own_pid_comes_from_self_stat() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let procfs = ProcFs::at(dir.path());
+        assert_eq!(procfs.own_pid(), None);
+        fs::create_dir_all(dir.path().join("self"))?;
+        fs::write(
+            dir.path().join("self/stat"),
+            "4242 (harw) S 1 1 1 0 -1 0 0 0 0 0 1 1 0 0 20 0 1 0 1 4096 1 0",
+        )?;
+        assert_eq!(procfs.own_pid(), Some(4242));
+        assert_eq!(
+            ProcFs::real().own_pid(),
+            i32::try_from(std::process::id()).ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_cgroup_v2_line() {
+        assert_eq!(
+            parse_cgroup_v2("0::/user.slice/s1.scope\n").as_deref(),
+            Some("/user.slice/s1.scope")
+        );
+        assert_eq!(
+            parse_cgroup_v2("12:cpu:/x\n0::/a/b\n").as_deref(),
+            Some("/a/b")
+        );
+        assert_eq!(parse_cgroup_v2("12:cpu:/x\n"), None);
+        assert_eq!(parse_cgroup_v2("0::relative\n"), None);
+        assert_eq!(parse_cgroup_v2(""), None);
+    }
 
     const STAT: &str = "1234 (my (weird) proc) S 1 1234 1234 0 -1 4194560 100 0 0 0 150 50 0 0 20 0 3 0 5000 104857600 2560 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
 

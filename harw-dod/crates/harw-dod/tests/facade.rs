@@ -73,6 +73,8 @@ fn test_facade_evaluates_a_finding_end_to_end() -> TestResult {
         events: &events,
         baselines: &[],
         network_scope: &scope,
+        listener_history: None,
+        rule_config: None,
     };
     let fired: Vec<_> = run_rules(&ctx)
         .into_iter()
