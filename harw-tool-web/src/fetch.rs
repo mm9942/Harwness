@@ -2248,6 +2248,40 @@ mod tests {
         Ok(())
     }
 
+    /// Open-Web-Modus (Default `research_web = "open"`) bleibt strikt
+    /// lesend: auf der Leitung geht ausschließlich `GET` raus, ohne Body,
+    /// Cookies oder Authorization-Header.
+    #[tokio::test]
+    async fn test_fetch_sends_only_get_without_body_or_credentials() -> TestResult {
+        let server = TestServer::spawn(vec![http_response(
+            "200 OK",
+            &[("Content-Type", "text/plain")],
+            "ok",
+        )])?;
+        let dir = TempDir::new().map_err(ctx("Tempdir"))?;
+        let fetcher = fetcher_for(dir.path(), &["127.0.0.1"], true, loopback_options())?;
+        fetcher
+            .fetch(&format!("{}/doc", server.base), OutputFormat::Raw)
+            .await
+            .map_err(ctx("fetch"))?;
+        let requests = server.requests()?;
+        assert_eq!(requests.len(), 1);
+        let head = requests[0].to_ascii_lowercase();
+        assert!(head.starts_with("get /doc "), "{head}");
+        for forbidden in [
+            "post ",
+            "put ",
+            "delete ",
+            "patch ",
+            "cookie:",
+            "authorization:",
+            "content-length:",
+        ] {
+            assert!(!head.contains(forbidden), "{forbidden}: {head}");
+        }
+        Ok(())
+    }
+
     /// Conditional-GET: `304` erneuert den Zeitstempel und bedient den Eintrag.
     #[tokio::test]
     async fn test_fetch_conditional_get_refreshes_cache_on_304() -> TestResult {

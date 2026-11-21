@@ -33,10 +33,10 @@
 //! # Regeln
 //! - Quelle ist **nur** `researcher_web_hosts`; `allow_hosts` (die allgemeine
 //!   Harness-Liste) fließt nicht ein.
-//! - Leere Liste = kein Netz: die Policy lässt dann kein Ziel zu
-//!   (`EgressPolicy` mit leerer Allowlist, fail-closed) — außer im
-//!   **offenen Recherche-Netz** (`[network].research_web = "open"`, Plan R9):
-//!   dann zusätzlich jeder öffentliche DNS-Host
+//! - Im Modus `research_web = "allowlist"` heißt eine leere Liste kein Netz:
+//!   die Policy lässt dann kein Ziel zu (`EgressPolicy` mit leerer Allowlist,
+//!   fail-closed). Der Default ist jedoch das **offene Recherche-Netz**
+//!   (`[network].research_web = "open"`, Plan R9): dann zusätzlich jeder öffentliche DNS-Host
 //!   (`EgressPolicy::with_open_public`, Scope-Ziel
 //!   `harw_authority::EgressTarget::PublicDns`), nur lesend. Die erste Anfrage
 //!   je Domain fragt unter `ask`/`auto` die Nutzerin
@@ -58,11 +58,13 @@
 //!
 //! # Beispiele
 //! ```rust
-//! use harw_config::NetworkSection;
+//! use harw_config::{NetworkSection, ResearchWebMode};
 //! use harw_registry_defaults::research_web::researcher_web_policy;
 //!
+//! // Allowlist-Modus ist Opt-in; der Default ist `open`.
 //! let network = NetworkSection {
 //!     researcher_web_hosts: vec!["docs.rs".to_owned()],
+//!     research_web: ResearchWebMode::Allowlist,
 //!     ..NetworkSection::default()
 //! };
 //! let policy = researcher_web_policy(&network)?;
@@ -97,7 +99,9 @@ use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
 ///   geliehen.
 ///
 /// # Rückgabe
-/// `Ok(Arc<EgressPolicy>)` — bei leerer Liste eine Policy, die kein Ziel zulässt.
+/// `Ok(Arc<EgressPolicy>)` — im Allowlist-Modus bei leerer Liste eine Policy,
+/// die kein Ziel zulässt; im Default-Modus `open` zusätzlich jeder öffentliche
+/// DNS-Host.
 ///
 /// # Fehler
 /// - [`RegistryDefaultsError::ResearcherWebPolicy`]: ein Eintrag ist kein reiner
@@ -108,10 +112,15 @@ use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
 ///
 /// # Beispiele
 /// ```rust
-/// use harw_config::NetworkSection;
+/// use harw_config::{NetworkSection, ResearchWebMode};
 /// use harw_registry_defaults::research_web::researcher_web_policy;
 ///
-/// let policy = researcher_web_policy(&NetworkSection::default())?;
+/// // Opt-in Allowlist-Modus: leere Liste = kein Ziel.
+/// let network = NetworkSection {
+///     research_web: ResearchWebMode::Allowlist,
+///     ..NetworkSection::default()
+/// };
+/// let policy = researcher_web_policy(&network)?;
 /// assert!(policy.allow_hosts().is_empty());
 /// assert!(policy.check_url("https://docs.rs/").is_err());
 /// # Ok::<(), harw_registry_defaults::RegistryDefaultsError>(())
@@ -408,6 +417,8 @@ mod tests {
             allow_hosts: allow_hosts.iter().map(|host| (*host).to_owned()).collect(),
             allow_private,
             researcher_web_hosts: researcher.iter().map(|host| (*host).to_owned()).collect(),
+            // Der Default ist `open`; diese Hilfe pinnt den Allowlist-Modus.
+            research_web: harw_config::ResearchWebMode::Allowlist,
             ..NetworkSection::default()
         }
     }
@@ -461,6 +472,24 @@ mod tests {
         assert!(scope.allows("www.destatis.de"));
         assert!(!scope.allows("127.0.0.1"));
         assert!(!scope.allows("printer.local"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_network_section_is_open_and_stays_get_only_public() -> TestResult {
+        let policy = researcher_web_policy(&NetworkSection::default()).map_err(ctx("default"))?;
+        assert!(
+            policy.open_public(),
+            "Default ist das offene öffentliche Web"
+        );
+        assert!(policy.check_url("https://www.destatis.de/").is_ok());
+        for url in [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/",
+            "http://printer.local/",
+        ] {
+            assert!(policy.check_url(url).is_err(), "{url}");
+        }
         Ok(())
     }
 

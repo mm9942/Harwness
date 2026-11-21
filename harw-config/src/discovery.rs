@@ -796,7 +796,13 @@ fn discover_config_inner(
             // present — a later trusted layer (e.g. the active profile) that
             // omits the section keeps the previous trusted layer's value
             // instead of resetting to defaults ("Home-Layer setzt").
-            if let Some(section) = extract_section::<NetworkSection>(&fields, "network")? {
+            if let Some(mut section) = extract_section::<NetworkSection>(&fields, "network")? {
+                // `research_web` is sticky across trusted layers: a `[network]`
+                // table without the key must not reset an earlier explicit
+                // choice (e.g. home `allowlist`) to the serde default `open`.
+                if !field_present(&fields, &["network", "research_web"]) {
+                    section.research_web = resolved.network.research_web;
+                }
                 resolved.network = section;
             }
             if let Some(section) = extract_section::<BrowserSection>(&fields, "browser")? {
@@ -3228,6 +3234,24 @@ token_ttl_secs = 60
 
         std::fs::remove_dir_all(home).map_err(ctx("Home-Verzeichnis entfernen"))?;
         std::fs::remove_dir_all(profile).map_err(ctx("Profilverzeichnis entfernen"))?;
+        Ok(())
+    }
+
+    /// `[network].research_web` ist über vertraute Layer hinweg klebrig: ein
+    /// Profil mit `[network]` ohne den Schlüssel setzt `allowlist` nicht zurück.
+    #[test]
+    fn trusted_network_table_without_research_web_keeps_allowlist() -> TestResult {
+        use crate::network_toml::ResearchWebMode;
+        let home = test_directory("research-web-sticky-home")?;
+        let profile = test_directory("research-web-sticky-profile")?;
+        write_layer_file(&home, "config.toml", "[network]\nresearch_web = \"allowlist\"\n")?;
+        write_layer_file(&profile, "config.toml", "[network]\nallow_hosts = [\"docs.rs\"]\n")?;
+        let config = discover_config(&[home.clone(), profile.clone()])
+            .map_err(ctx("Konfiguration entdecken"))?;
+        assert_eq!(config.network.research_web, ResearchWebMode::Allowlist);
+        assert_eq!(config.network.allow_hosts, ["docs.rs"]);
+        std::fs::remove_dir_all(home).map_err(ctx("Home entfernen"))?;
+        std::fs::remove_dir_all(profile).map_err(ctx("Profil entfernen"))?;
         Ok(())
     }
 

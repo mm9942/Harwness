@@ -16,7 +16,8 @@
 //! Landlock/netns) liegt beim Consumer; dieses Modul beschreibt nur die
 //! Konfiguration und deren Invarianten ([`NetworkSection::validate`]).
 //!
-//! Defaults sind bewusst restriktiv (`Default = sicher/aus`): leere
+//! Defaults sind restriktiv, ausgenommen das offene Recherche-Web (Default
+//! `research_web = "open"`, nur `GET`, nur öffentliche Hosts): leere
 //! Allowlists, `allow_private = false`. Ein nicht vertrauter Repo-Layer darf
 //! diese Sektion nur verengen
 //! (Schnittmenge der Hostlisten, `allow_private` nur Richtung `false`); die
@@ -40,8 +41,11 @@ use serde::{Deserialize, Serialize};
 
 /// `[network]` — Host-Allowlists und Grundsatzentscheidung zu privaten
 /// Adressbereichen für egress-fähige Werkzeuge. Alle Felder haben
-/// hart-codierte, restriktive Defaults, sodass eine `config.toml` ohne
-/// `[network]` weiterhin gültig ist und keinerlei Netzzugriff freischaltet.
+/// hart-codierte Defaults, sodass eine `config.toml` ohne `[network]` gültig
+/// bleibt. Die Hostlisten sind leer und private Ziele gesperrt; für die
+/// Recherche-Rollen gilt jedoch der Default `research_web = "open"` (nur
+/// öffentliche Hosts, nur lesend, Domain-Freigabe unter `ask`/`auto`).
+/// `research_web = "allowlist"` ist das fail-closed Opt-in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSection {
@@ -64,13 +68,13 @@ pub struct NetworkSection {
     /// Netz-Modus der Recherche-Rollen (`researcher-web`, `researcher`,
     /// `dependency-researcher` und davon abgeleitete Agenten wie
     /// `intel-web-researcher`):
-    /// - [`ResearchWebMode::Allowlist`] (Default, bisheriges Verhalten): nur
-    ///   die Hosts aus den Allowlists; leere Listen heißen kein Netz.
-    /// - [`ResearchWebMode::Open`]: zusätzlich jeder **öffentliche**
+    /// - [`ResearchWebMode::Open`] (Default): zusätzlich zu den Allowlists jeder **öffentliche**
     ///   DNS-Host, nur lesend (`GET`, ohne Zugangsdaten und Cookies).
     ///   Private, Loopback- und Link-Local-Ziele bleiben immer gesperrt; unter
     ///   `ask`/`auto` fragt der erste Abruf je Domain die Nutzerin (für die
     ///   Sitzung gemerkt), unter `full` nicht.
+    /// - [`ResearchWebMode::Allowlist`]: nur die Hosts aus den Allowlists;
+    ///   leere Listen heißen kein Netz (`research_web = "allowlist"`).
     #[serde(default)]
     pub research_web: ResearchWebMode,
 }
@@ -83,15 +87,16 @@ pub struct NetworkSection {
 ///
 /// let section: NetworkSection = toml::from_str("research_web = \"open\"").unwrap();
 /// assert_eq!(section.research_web, ResearchWebMode::Open);
-/// assert_eq!(NetworkSection::default().research_web, ResearchWebMode::Allowlist);
+/// assert_eq!(NetworkSection::default().research_web, ResearchWebMode::Open);
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResearchWebMode {
-    /// Nur die konfigurierten Allowlists (Default).
-    #[default]
+    /// Nur die konfigurierten Allowlists.
     Allowlist,
-    /// Öffentliches Web für Recherche-Rollen, mit Domain-Freigabe.
+    /// Öffentliches Web für Recherche-Rollen (nur `GET`), mit Domain-Freigabe
+    /// (Default).
+    #[default]
     Open,
 }
 
@@ -155,7 +160,7 @@ mod tests {
         assert!(section.allow_hosts.is_empty());
         assert!(!section.allow_private);
         assert!(section.researcher_web_hosts.is_empty());
-        assert_eq!(section.research_web, ResearchWebMode::Allowlist);
+        assert_eq!(section.research_web, ResearchWebMode::Open);
         assert_eq!(section, NetworkSection::default());
         Ok(())
     }

@@ -500,7 +500,10 @@ fn role_for_caller(ctx: &OpContext, worker_role: &'static str) -> &'static str {
 /// # Nebenläufigkeit
 /// Reine Funktion.
 fn child_reducer(role: &str) -> &'static str {
-    if role == role_names::RESEARCHER || role == role_names::DEPENDENCY_RESEARCHER {
+    if role == role_names::RESEARCHER
+        || role == role_names::DEPENDENCY_RESEARCHER
+        || role == role_names::RESEARCHER_WEB
+    {
         authority_reducer_for_role(role).map_or(READ_ONLY_REDUCER, |reducer| reducer.id())
     } else {
         reducer_for_role(role)
@@ -520,6 +523,7 @@ fn child_reducer(role: &str) -> &'static str {
 async fn run_research_child(
     ctx: &OpContext,
     role: &str,
+    reducer: &str,
     payload: serde_json::Value,
 ) -> Result<ResearchFinding, OpError> {
     let budget = parse_budget_hint(SINGLE_CHILD_BUDGET)?;
@@ -527,7 +531,7 @@ async fn run_research_child(
         ctx,
         role,
         std::slice::from_ref(&payload),
-        child_reducer(role),
+        reducer,
         budget,
         1,
         JoinSemantics::AllTerminal,
@@ -564,6 +568,8 @@ fn reject_deps_routing(args: &ResearchArgs, command: &str) -> Result<(), OpError
 struct ResearchProfile {
     /// Rollenname des Kindes.
     role: &'static str,
+    /// Reducer für die Berechtigungsobergrenze; unabhängig von der Spawn-Identität.
+    reducer: &'static str,
     /// Namensraum des abgeleiteten Frage-Slugs.
     slug_prefix: &'static str,
     /// Akteur-Kennung für Plan-Mutationen.
@@ -640,7 +646,7 @@ async fn run_research(
     };
 
     let payload = child_payload(&research_question)?;
-    let finding = run_research_child(ctx, profile.role, payload).await?;
+    let finding = run_research_child(ctx, profile.role, profile.reducer, payload).await?;
     let locator = persist_finding(ctx, task.as_deref(), &finding, profile.actor)?;
     finding_output(&finding, locator.as_deref())
 }
@@ -706,6 +712,7 @@ async fn research(ctx: &OpContext, args: ResearchArgs) -> Result<OpOutput, OpErr
         args,
         ResearchProfile {
             role: role_for_caller(ctx, role_names::RESEARCHER),
+            reducer: child_reducer(role_names::RESEARCHER),
             slug_prefix: "research",
             actor: ACTOR_RESEARCH,
             expected_output: GENERAL_EXPECTED_OUTPUT.to_owned(),
@@ -780,6 +787,7 @@ async fn research_deps(ctx: &OpContext, args: ResearchArgs) -> Result<OpOutput, 
     let profile = if role == role_names::DEPENDENCY_RESEARCHER {
         ResearchProfile {
             role,
+            reducer: child_reducer(role),
             slug_prefix: "research-deps",
             actor: ACTOR_RESEARCH_DEPS,
             expected_output: generic_deps_expected_output(ecosystem.as_deref()),
@@ -789,6 +797,7 @@ async fn research_deps(ctx: &OpContext, args: ResearchArgs) -> Result<OpOutput, 
     } else {
         ResearchProfile {
             role,
+            reducer: child_reducer(role),
             slug_prefix: "research-deps",
             actor: ACTOR_RESEARCH_DEPS,
             expected_output: DEPS_EXPECTED_OUTPUT.to_owned(),
@@ -855,6 +864,7 @@ async fn research_web(ctx: &OpContext, args: ResearchArgs) -> Result<OpOutput, O
         args,
         ResearchProfile {
             role: role_for_caller(ctx, role_names::RESEARCHER_WEB),
+            reducer: child_reducer(role_names::RESEARCHER_WEB),
             slug_prefix: "research-web",
             actor: ACTOR_RESEARCH_WEB,
             expected_output: WEB_EXPECTED_OUTPUT.to_owned(),
@@ -1117,14 +1127,19 @@ mod tests {
     }
 
     #[test]
-    fn test_child_reducer_keeps_existing_choice_for_other_roles() {
-        for role in [
-            role_names::RESEARCHER_DEPS,
-            role_names::RESEARCHER_WEB,
-            role_names::UIA_EXPLORER,
-        ] {
-            assert_eq!(child_reducer(role), reducer_for_role(role), "{role}");
-        }
+    fn test_child_reducer_uses_role_reducer() {
+        assert_eq!(
+            child_reducer(role_names::RESEARCHER_DEPS),
+            reducer_for_role(role_names::RESEARCHER_DEPS)
+        );
+        assert_eq!(
+            child_reducer(role_names::RESEARCHER_WEB),
+            "reduce_to_read_network"
+        );
+        assert_eq!(
+            child_reducer(role_names::UIA_EXPLORER),
+            reducer_for_role(role_names::UIA_EXPLORER)
+        );
     }
 
     #[test]
