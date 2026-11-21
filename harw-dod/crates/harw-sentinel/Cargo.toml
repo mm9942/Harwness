@@ -87,6 +87,11 @@ harw-dod-cgroup = { path = "../harw-dod-cgroup" }
 # `src/container_plan.rs`. Zieht `harw-container-model` (nur `serde`) mit.
 harw-dod-container = { path = "../harw-dod-container" }
 harw-dod-scanreport = { path = "../harw-dod-scanreport" }
+# Offline-RustSec-Sensor (PL-100 WP1.8, O11 „Advisory"): unprivilegiert
+# (`Capability::ReadWorkspaceGraph`), nur mit `--advisory-db` und
+# `--advisory-lockfile` registriert (PR #168 Review, `harw-dod-advisory`
+# war ohne Konsumenten).
+harw-dod-advisory = { path = "../harw-dod-advisory" }
 # Bewusst NICHT aufgenommen: `harw-dod-authlog`. Sein einziges produktives
 # Backend (`AuditBackend`) trägt `Capability::ReadAuditNetlink`, Klasse
 # `CapabilityClass::Netlink` — nicht unprivilegiert. Ein Journal-Backend

@@ -1,6 +1,6 @@
 # PL-98 — Root-Orchestrator: Stabilität und Verdrahtung
 
-> **Status:** umgesetzt (Branch `ccr-859b52e5-uecpa8`), offene Entscheidungen unten
+> **Status:** umgesetzt über [PR #169](https://github.com/mm9942/Harwness/pull/169) (Präfix von PR #168), gemergt auf `consolidate/2026-11`; offene Entscheidungen unten
 > **Anlass:** häufige „Continuation“-Fehler und viele Werkzeugfehler im
 > Root-Orchestrator (Modelle: OpenAI, Anthropic, GLM‑5.3)
 > **Quellen:** Code bei `78b22408`, Feldbericht
@@ -19,7 +19,7 @@ gegenseitig verstärkten:
 | 3 | `MaxTokens`-Fortsetzung im Turn-Loop | Turn endet als `Truncated`, Modell liest dauernd „setze exakt an der letzten Stelle fort“ | Zähler nie zurückgesetzt, Anweisung klebte an jeder Folgerunde. |
 | 4 | Verdrahtung Root ↔ Kinder | „außerhalb der Rolle“, Netz verboten, Lesebudget erschöpft, Ergebnisse kommen nie an, Wellen abgelehnt | Feldbericht F6/F8/F10; Profile fielen für GLM‑5.3/GPT‑6/Claude‑5.x auf `max_child_fanout = 2`; nur 2 Sub-Orchestratoren; Hintergrund-Meldungen nur für die UIA. |
 
-## 2. Umsetzung (Commits auf dem Branch)
+## 2. Umsetzung (Commits aus PR #169)
 
 1. **Replay degradiert statt abzubrechen** — `harw-provider-http/src/replay_bounds.rs`
    (Kontingent je Identität, Politik `degrade|strict`),

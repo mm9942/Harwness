@@ -910,7 +910,7 @@ fn record_unsupported_container_layouts(
 /// vertrauenswürdigen oder ungültigen DoD-Konfiguration oder einem
 /// [`error::SentinelBinError`].
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse().and_then(Cli::validate) {
         Ok(cli) => cli,
         Err(err) => {
             if matches!(
@@ -1193,17 +1193,7 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
         health = health.map(|health| health.with_spool(spool.stats()));
     }
 
-    let sensor_roots = SensorRoots {
-        proc_root: cli.proc_root.clone(),
-        thermal_root: cli.thermal_root.clone(),
-        // PL-100 WP0.7: nur mit ausdrücklichem `--workspace-root`.
-        workspace_root: cli.workspace_root.clone(),
-        blockio_root: cli.blockio_root.clone(),
-        gpu_root: cli.gpu_root.clone(),
-        cgroup_root: cli.cgroup_root.clone(),
-        home: home.clone(),
-        containers: containers.layouts.clone(),
-    };
+    let sensor_roots = sensor_roots(&cli, &home, containers.layouts.clone());
     // Keiner der hier registrierten Sensoren hat heute ein Rückschaufenster
     // (`with_lookback`); sobald `harw-dod-authlog` o. Ä. hier gebaut wird,
     // erhält er `timing.lookback_for(<Vorgabe>)` — siehe `PollTiming`.
@@ -1249,6 +1239,38 @@ fn run(cli: Cli, settings: DodSettings) -> SentinelBinResult<()> {
             return Ok(());
         }
         std::thread::sleep(timing.interval());
+    }
+}
+
+/// Die Sensorwurzeln dieses Laufs aus der Kommandozeile, genau so, wie
+/// [`run`] sie an [`sensors::build_sensors`] übergibt.
+///
+/// # Arguments
+/// - `cli` (`&Cli`): die geparste Kommandozeile.
+/// - `home` (`&Path`): der aufgelöste Root-Space.
+/// - `containers` (`Vec<container_plan::PlannedLayout>`): die geplanten
+///   Container-Anordnungen ([`plan_container_sensors`]).
+///
+/// # Returns
+/// [`SensorRoots`]; der Workspace-Sensor nur mit `--workspace-root`
+/// (PL-100 WP0.7), der Advisory-Sensor nur mit `--advisory-db` und
+/// `--advisory-lockfile` ([`Cli::advisory_config`]).
+fn sensor_roots(
+    cli: &Cli,
+    home: &Path,
+    containers: Vec<container_plan::PlannedLayout>,
+) -> SensorRoots {
+    SensorRoots {
+        proc_root: cli.proc_root.clone(),
+        thermal_root: cli.thermal_root.clone(),
+        // PL-100 WP0.7: nur mit ausdrücklichem `--workspace-root`.
+        workspace_root: cli.workspace_root.clone(),
+        blockio_root: cli.blockio_root.clone(),
+        gpu_root: cli.gpu_root.clone(),
+        cgroup_root: cli.cgroup_root.clone(),
+        home: home.to_path_buf(),
+        containers,
+        advisory: cli.advisory_config(),
     }
 }
 
@@ -1470,6 +1492,17 @@ fn landlock_roots(
         .into_iter()
         .map(sandbox::SandboxRoot::read_only),
     );
+    // PL-100 WP1.8: der Advisory-Sensor liest nur seine Lockfiles (je eine
+    // Datei-Regel, nie das Projektverzeichnis) und den Datenbank-Checkout.
+    if let Some(advisory) = cli.advisory_config() {
+        roots.extend(
+            advisory
+                .lockfiles
+                .into_iter()
+                .map(sandbox::SandboxRoot::read_only),
+        );
+        roots.push(sandbox::SandboxRoot::read_only(advisory.db_path));
+    }
     if let Some(dir) = findings_dir {
         roots.push(sandbox::SandboxRoot::read_write(dir.to_path_buf()));
     }
@@ -1581,6 +1614,8 @@ fn run_print_sandbox(
 ///
 /// # Errors
 /// Jeder Schreibfehler von `out`.
+// Die Doku zeigt die Ausgabe wörtlich, und deren Feldtrenner ist ein Tab.
+#[allow(clippy::tabs_in_doc_comments)]
 fn write_container_report(
     out: &mut dyn std::io::Write,
     plan: &container_plan::ContainerPlan,
@@ -2423,6 +2458,130 @@ mod tests {
                     .ok_or(TestError::Missing("a line harw-dod-client accepts"))
             })
             .collect()
+    }
+
+    /// PR #168 review (`harw-dod-advisory/src/lib.rs:5`), composition
+    /// level: `--advisory-db`/`--advisory-lockfile` register the advisory
+    /// sensor through the production builders ([`sensor_roots`],
+    /// [`sensors::build_sensors`]), its Landlock rules cover exactly the
+    /// lockfile and the database read-only, and a vulnerable locked version
+    /// reaches the real rule cycle and the findings export as one
+    /// `structure-drift` finding.
+    #[test]
+    fn test_advisory_flags_wire_a_vulnerable_lockfile_into_the_rule_cycle() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let base = home.path();
+        let empty = base.join("empty");
+        std::fs::create_dir(&empty).map_err(ctx("empty sensor root"))?;
+        let export_dir = base.join("export");
+        std::fs::create_dir(&export_dir).map_err(ctx("export dir"))?;
+        let findings = export_dir.join("findings.jsonl");
+
+        // Miniature advisory-db: one RustSec advisory for tokio (shortened
+        // from the real database), patched from 1.8.4.
+        let db = base.join("advisory-db");
+        let tokio_dir = db.join("crates").join("tokio");
+        std::fs::create_dir_all(&tokio_dir).map_err(ctx("advisory crate dir"))?;
+        std::fs::write(
+            tokio_dir.join("RUSTSEC-2021-0124.md"),
+            "```toml\n[advisory]\nid = \"RUSTSEC-2021-0124\"\npackage = \"tokio\"\n\
+             date = \"2021-11-16\"\ncvss = \"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H\"\n\n\
+             [versions]\npatched = [\">= 1.8.4, < 1.9.0\", \">= 1.13.1\"]\n\
+             unaffected = [\"< 0.1.14\"]\n```\n\n# Data race when sending and receiving after \
+             closing a oneshot channel\n",
+        )
+        .map_err(ctx("write advisory"))?;
+        let project = base.join("project");
+        std::fs::create_dir(&project).map_err(ctx("project dir"))?;
+        let lockfile = project.join("Cargo.lock");
+        std::fs::write(
+            &lockfile,
+            "version = 4\n\n[[package]]\nname = \"tokio\"\nversion = \"1.8.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        )
+        .map_err(ctx("write lockfile"))?;
+
+        let cli = Cli::try_parse_from([
+            "harw-sentinel",
+            "--home",
+            utf8(base)?,
+            "--findings-export",
+            utf8(&findings)?,
+            "--findings-host",
+            "host-a",
+            "--proc-root",
+            utf8(&empty)?,
+            "--thermal-root",
+            utf8(&empty)?,
+            "--blockio-root",
+            utf8(&empty)?,
+            "--gpu-root",
+            utf8(&empty)?,
+            "--cgroup-root",
+            utf8(&empty)?,
+            "--advisory-db",
+            utf8(&db)?,
+            "--advisory-lockfile",
+            utf8(&lockfile)?,
+        ])
+        .and_then(Cli::validate)
+        .map_err(ctx("valid cli"))?;
+
+        let roots = landlock_roots(&cli, base, Some(&export_dir), None);
+        let read_only = |path: &Path| roots.iter().any(|root| root.path == path && !root.writable);
+        assert!(read_only(&lockfile), "the lockfile is a read-only rule");
+        assert!(read_only(&db), "the database is a read-only rule");
+        assert!(
+            roots.iter().all(|root| root.path != project),
+            "never the project directory"
+        );
+
+        let sensor_list = sensors::build_sensors(&sensor_roots(&cli, base, Vec::new()));
+        assert!(sensors::all_unprivileged(&sensor_list));
+        assert_eq!(
+            sensor_list
+                .iter()
+                .filter(|sensor| sensor.handle().id().as_str() == sensors::ADVISORY_SENSOR_ID)
+                .count(),
+            1
+        );
+
+        let mut exporter = build_findings_exporter(&cli, &harw_observe::NullSink)
+            .ok_or(TestError::Missing("findings exporter"))?;
+        let mut rules = build_rule_cycle(
+            &cli,
+            &DodSettings::builtin_defaults(),
+            base,
+            harw_dod_rules::RuleConfig::new(),
+            None,
+        );
+        let mut sentinel = Sentinel::new(
+            sensor_list,
+            Arc::new(harw_observe::NullSink),
+            SentinelConfig::default(),
+        );
+        poll_once(
+            &mut sentinel,
+            None,
+            &harw_observe::NullSink,
+            &mut rules,
+            Some(&mut exporter),
+            None,
+            None,
+        );
+
+        let lines = client_lines(&findings)?;
+        let advisory: Vec<_> = lines
+            .iter()
+            .filter(|line| line.summary.contains("RUSTSEC-2021-0124"))
+            .collect();
+        assert_eq!(advisory.len(), 1, "{lines:?}");
+        let line = advisory
+            .first()
+            .ok_or(TestError::Missing("advisory finding"))?;
+        assert_eq!(line.rule_id, "structure-drift");
+        assert!(line.summary.contains("tokio@1.8.0"), "{}", line.summary);
+        Ok(())
     }
 
     /// Die `occurrences` des einzigen Schlüssels der Throttle-Zustandsdatei.
@@ -3444,6 +3603,7 @@ egress_allow_cidrs = []
                 cgroup_root: self.cgroup.path().to_path_buf(),
                 home: self.home.path().to_path_buf(),
                 containers: plan.layouts.clone(),
+                advisory: None,
             };
             let containers: Vec<Arc<dyn harw_dod_signals::Sensor>> = sensors::build_sensors(&roots)
                 .into_iter()
