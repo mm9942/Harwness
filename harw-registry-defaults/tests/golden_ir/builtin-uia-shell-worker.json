@@ -22,6 +22,8 @@
       "job.status",
       "job.logs",
       "job.stop",
+      "job.suspend",
+      "job.resume",
       "job.list",
       "fs.read",
       "fs.view_image",
@@ -129,9 +131,11 @@
       "host.sudo_exec",
       "job.list",
       "job.logs",
+      "job.resume",
       "job.start",
       "job.status",
       "job.stop",
+      "job.suspend",
       "parent.message",
       "shell.exec",
       "skills.load",
@@ -231,6 +235,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "21c6c4f23417258529a8210ad13e3c3a9f24b7fa4859008f8dfa951c9677451a"
+    "digest": "4fd655a0e88e8f83eea14b4c17e49818dd76e6568a37af6c0457eb7e6fb4ab5c"
   }
 }

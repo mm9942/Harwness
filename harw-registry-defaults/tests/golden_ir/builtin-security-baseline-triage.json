@@ -19,7 +19,10 @@
     "admitted": [
       "dod.status",
       "dod.findings",
-      "dod.sensors"
+      "dod.sensors",
+      "dod.finding",
+      "dod.related",
+      "dod.labels"
     ],
     "forbidden": [
       "fs.write",
@@ -51,9 +54,9 @@
     "max_attempts": 4
   },
   "context": {
-    "program": "triage",
-    "program_id": "harwness.context.triage@1",
-    "policy": "harwness.context.triage@1",
+    "program": "security-triage",
+    "program_id": "harwness.context.security-triage@1",
+    "policy": "harwness.context.security-triage@1",
     "sections": [
       {
         "name": "task.objective",
@@ -64,20 +67,8 @@
       {
         "name": "history.tail",
         "strength": "must-include",
-        "detail": "full",
+        "detail": "summary",
         "trust": "evidence"
-      },
-      {
-        "name": "error.trace",
-        "strength": "must-include",
-        "detail": "full",
-        "trust": "evidence"
-      },
-      {
-        "name": "task.read_scope",
-        "strength": "must-include",
-        "detail": "full",
-        "trust": "data"
       }
     ],
     "must_include": [
@@ -91,11 +82,14 @@
       "secret.*",
       "sibling_transcripts",
       "full_parent_transcript",
-      "plan.*"
+      "plan.*",
+      "diff.*",
+      "error.*",
+      "child.returns",
+      "knowledge.*",
+      "memory.*"
     ],
-    "deferred": [
-      "error.trace"
-    ]
+    "deferred": []
   },
   "return": {
     "contract": "harwness.security-verdict/v1",
@@ -129,7 +123,10 @@
   },
   "permissions": {
     "tools": [
+      "dod.finding",
       "dod.findings",
+      "dod.labels",
+      "dod.related",
       "dod.sensors",
       "dod.status"
     ],
@@ -211,23 +208,10 @@
         "applied_at": "1970-01-01T00:00:00Z"
       }
     ],
-    "diagnostics": [
-      {
-        "code": "HARW-CTX-003",
-        "severity": "note",
-        "message": "program `triage` requires sections outside the context ceiling; deferred: error.trace",
-        "help": "these sections stay named by the program but are not required at child start",
-        "span": {
-          "file": "builtin/security-baseline-triage.toml",
-          "line": 135,
-          "column": 11
-        },
-        "path": "context.program"
-      }
-    ]
+    "diagnostics": []
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "1b4314e47706734bb00254bd00770672a3f121431e94dde0948e8105d3d4c14f"
+    "digest": "cf15a47b1f847cf18e9ff4f182b4fe0e93348f3a9f1ef6213ed8e7f1821de9cb"
   }
 }
