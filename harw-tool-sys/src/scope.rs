@@ -226,7 +226,7 @@ impl ScopePolicy {
 fn normalize_root(root: &str) -> Result<String, InvalidCgroupRoot> {
     let trimmed = root.trim_end_matches('/');
     let relative = match trimmed.strip_prefix(CGROUP2_MOUNT) {
-        Some(rest) if rest.is_empty() => return Err(InvalidCgroupRoot::RootCgroup),
+        Some("") => return Err(InvalidCgroupRoot::RootCgroup),
         Some(rest) if rest.starts_with('/') => rest,
         Some(_) => return Err(InvalidCgroupRoot::NotNormalized),
         None if trimmed.is_empty() && root.starts_with('/') => {

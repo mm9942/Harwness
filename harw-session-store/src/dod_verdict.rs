@@ -2913,7 +2913,7 @@ fn repair_torn_tail(file: &mut File, segment_seq: u64) -> VerdictStoreResult<()>
     let Some(last_index) = len.checked_sub(1) else {
         return Ok(());
     };
-    if read_window(file, last_index, 1)? == [b'\n'] {
+    if read_window(file, last_index, 1)? == *b"\n" {
         return Ok(());
     }
     let window = len.min(record_window());
@@ -3119,7 +3119,9 @@ mod tests {
     // mtime, Rechte). Gleich vor und nach einem Aufruf heißt: er hat in `dir`
     // nichts angelegt, entfernt, umbenannt, beschrieben oder per `fchmod`
     // geändert.
-    fn directory_state(dir: &Path) -> TestResult<Vec<(String, SystemTime, u32, Vec<u8>)>> {
+    type DirEntryState = (String, SystemTime, u32, Vec<u8>);
+
+    fn directory_state(dir: &Path) -> TestResult<Vec<DirEntryState>> {
         let own = std::fs::metadata(dir)?;
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(dir)? {
@@ -4936,7 +4938,7 @@ mod tests {
             Err(VerdictStoreError::LockContended)
         ));
         assert_eq!(std::fs::read(&segment)?, before);
-        assert_eq!(segment_paths(&store)?, [segment.clone()]);
+        assert_eq!(segment_paths(&store)?, std::slice::from_ref(&segment));
         // … und die Retention verankert und löscht nichts, obwohl das Segment
         // aus ihrer Sicht abgelaufen ist.
         let far = now

@@ -2939,9 +2939,7 @@ fn triage_model_check(settings: &TriageSettings) -> DoctorCheck {
 // `None` without a model.
 fn triage_provider_check(settings: &TriageSettings) -> Option<DoctorCheck> {
     const ID: &str = "triage-provider";
-    if settings.model.is_none() {
-        return None;
-    }
+    settings.model.as_ref()?;
     let provider = settings.provider.as_deref().unwrap_or("-");
     let locality = settings.locality.unwrap_or(TriageLocality::Unknown);
     let label = locality.label();

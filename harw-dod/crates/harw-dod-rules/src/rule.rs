@@ -419,7 +419,7 @@ impl RuleConfig {
     /// # Errors
     /// - [`RuleConfigError::HomeDirNotUtf8`]: kein UTF-8.
     /// - [`RuleConfigError::HomeDirNotAbsolute`]: relativer Pfad.
-    /// - [`RuleConfigError::HomeDirIsFilesystemRoot`]: `/`.
+    /// - [`RuleConfigError::HomeDirIsFilesystemRoot`][]: `/`.
     /// - [`RuleConfigError::HomeDirIsSystemDir`]: unter einem
     ///   Systemverzeichnis wie `/bin` oder `/usr`.
     ///

@@ -353,7 +353,7 @@ impl ZeroSeries {
                     .labels
                     .iter()
                     .zip(set.iter())
-                    .map(|(name, label_value)| (*name, FieldValue::Str(*label_value)))
+                    .map(|(name, label_value)| (*name, FieldValue::Str(label_value)))
                     .collect(),
             })
             .collect()

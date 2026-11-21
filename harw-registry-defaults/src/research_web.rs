@@ -419,7 +419,6 @@ mod tests {
             researcher_web_hosts: researcher.iter().map(|host| (*host).to_owned()).collect(),
             // Der Default ist `open`; diese Hilfe pinnt den Allowlist-Modus.
             research_web: harw_config::ResearchWebMode::Allowlist,
-            ..NetworkSection::default()
         }
     }
 

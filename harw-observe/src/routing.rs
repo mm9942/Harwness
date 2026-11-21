@@ -1543,10 +1543,11 @@ mod tests {
     fn test_emit_zero_registry_keeps_partition_labels_for_route_sink() -> TestResult {
         let registry = crate::zero_registry::dod_zero_registry()
             .map_err(crate::test_support::ctx("dod registry"))?;
-        let labels_seen: Arc<Mutex<Vec<Vec<(FieldName, FieldValue)>>>> = Arc::default();
+        type SeenLabels = Arc<Mutex<Vec<Vec<(FieldName, FieldValue)>>>>;
+        let labels_seen: SeenLabels = Arc::default();
 
         #[derive(Debug)]
-        struct LabelSink(Arc<Mutex<Vec<Vec<(FieldName, FieldValue)>>>>);
+        struct LabelSink(SeenLabels);
         impl TelemetrySink for LabelSink {
             fn record(&self, key: &MetricKey, _v: MetricValue, labels: &[(FieldName, FieldValue)]) {
                 if key.name == "breaker_trips_total" {
