@@ -240,6 +240,10 @@ fn test_every_deploy_file_is_embedded_byte_identically() -> TestResult {
     let root = repo_root();
     let mut on_disk = BTreeSet::new();
     walk(&root, &root.join("deploy"), &mut on_disk)?;
+    // deploy/site/ holds website-gateway reference files (nginx, service unit,
+    // policy), not installer assets: AssetKind and the systemd/ placement
+    // rules would reject them, so they are intentionally not embedded.
+    on_disk.retain(|p| !p.starts_with("deploy/site/"));
 
     let embedded: BTreeSet<String> = DEPLOYMENT_ASSETS
         .iter()
