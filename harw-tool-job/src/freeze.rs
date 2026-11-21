@@ -992,7 +992,6 @@ mod tests {
         use crate::test_support::{TestError, TestResult, ctx};
         use harw_job_linux::LinuxProcess;
         use harw_job_linux::cgroup::{CgroupHandle, CgroupSpec, CgroupStats};
-        use std::os::unix::fs::MetadataExt as _;
         use std::path::PathBuf;
 
         /// Whether `result` is an untrusted-index error.
