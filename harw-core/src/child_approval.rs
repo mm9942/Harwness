@@ -321,7 +321,7 @@ impl ManagedAgentSpawner {
 /// lehnte das Relay ihre Freigabe als „außerhalb der Rolle" ab (Feldbericht
 /// F6): ein Root-Orchestrator-Kind mit mehr als acht Zielen sah nur
 /// `agents.delegate` und konnte je nach Freigabemodus nicht delegieren.
-fn is_generated_delegation_tool(name: &harw_tools::ToolName) -> bool {
+pub(crate) fn is_generated_delegation_tool(name: &harw_tools::ToolName) -> bool {
     crate::turn_loop::handoff_role(name).is_some()
         || name.as_str() == crate::turn_loop::AGENTS_DELEGATE_TOOL
         || name.as_str() == crate::turn_loop::AGENTS_CATALOG_TOOL
