@@ -934,6 +934,8 @@ A crash of the Harw process must not automatically imply that every job becomes 
 
 # 15. Recovery semantics
 
+> Status (2026-11-21): Detached-Job-Recovery ist implementiert (`DetachedWatch`/`JobManager::finalize_detached` in `harw-tool-job/src/manager.rs`; ursprünglich Commit 2452732a auf work/feat/job-status-notifications, portiert nach consolidate/2026-11): das Ende eines abgelösten Jobs geht genau einmal als `Finished` an den Besitzer (`unknown` ohne Exit-Status, nach `job.stop` `stopped`). Ein angehaltener (eingefrorener) abgelöster Job gilt erst als beendet, wenn sein Prozess nachweislich fort ist; eine nicht prüfbare Identität genügt nicht. Weitere Recovery-Pfade wie beschrieben.
+
 Recovery is a first-class requirement.
 
 Persist enough metadata to reason about a previously running job:
@@ -1213,6 +1215,8 @@ Do not fake successful enforcement if the environment cannot provide it.
 
 ## 21.4 Recovery tests
 
+> Status (2026-11-21): Tests für Detached-Recovery vorhanden und grün (`cargo test -p harw-tool-job`): `manager/tests.rs` (Ende nach Neustart, Stop eines abgelösten Jobs) und `manager/suspend_tests.rs` (angehaltener abgelöster Job wird nie als beendet gemeldet, solange sein Prozess leben kann).
+
 Mandatory scenarios:
 
 ```text
@@ -1323,6 +1327,8 @@ A later specialized executor may solve that limitation.
 ---
 
 # 25. What not to do
+
+> Status: normative Richtlinie — wird per Code-Review durchgesetzt, nicht mechanisch geprüft.
 
 Do not:
 
