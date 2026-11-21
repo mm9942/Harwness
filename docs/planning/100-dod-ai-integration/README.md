@@ -1,10 +1,15 @@
 # PL-100 — Harw-DoD × KI: Anomalien → Agenten → Freigabe → Abwehr
 
-> **Status:** Contract-Draft (Konzept, nichts davon umgesetzt). Stand: Code bei `2c131382`.
+> **Status:** In Umsetzung. Der Code aus [PR #168](https://github.com/mm9942/Harwness/pull/168) (Head `86ff17c5`) ist vollständig
+> auf `consolidate/2026-11` gemergt: Phase 0 und Phase 1 weitgehend, Phase 2 nur als Bibliothek ohne Konsumenten (`harw-dod-dispatch`),
+> Phase 3.1 (Warden v2, seccomp) teilweise. Der Escalator (WP 3.2) fehlt, O10 ist offen (der Warden ruft weiter den `nft`-Subprozess).
+> Kein CI-Nachweis (GitHub Actions gesperrt), nur lokale crate-weise Tests. Offene Review-Befunde: [OPEN-FINDINGS.md](OPEN-FINDINGS.md).
+> Die Befundzeilen in §1 und [INVENTORY.md](INVENTORY.md) beschreiben den Stand vor der Umsetzung (Code bei `2c131382`).
 > **Begleitdokumente:**
 > - [INVENTORY.md](INVENTORY.md): Ist-Zustand mit Belegen
 > - [THREAT-MODEL.md](THREAT-MODEL.md)
 > - [TRACE-MATRIX.md](TRACE-MATRIX.md): offene Planpunkte → Arbeitspakete
+> - [OPEN-FINDINGS.md](OPEN-FINDINGS.md): offene Review-Befunde aus PR #168 mit Ort und Fix-Vorschlag
 >
 > **Abhängigkeiten:** PL-96 W01 (v2-Autorisierung, P0), PL-97 (DoD-Suite/Mission Control), PL-99 (Cloud Hub, Uplink).
 
