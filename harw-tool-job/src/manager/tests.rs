@@ -875,6 +875,50 @@ mod recovery {
         Ok(())
     }
 
+    /// harw ended in the middle of a `job.stop` (its `stop_requested` is
+    /// already in `meta.json`, the job still running): after the restart
+    /// that stale mark must not hide the end. The detached watch itself (no
+    /// query) reports it once as `unknown`.
+    #[tokio::test]
+    async fn test_stale_stop_mark_does_not_hide_the_end_after_restart() -> TestResult {
+        let env = Env::new()?;
+        let sleeper = Sleeper::spawn()?;
+        let mut meta = v2_meta("job-stale-stop", sleeper.pid(), sleeper.identity()?)?;
+        meta.stop_requested = true;
+        write_previous(&env, &meta)?;
+
+        let (manager, recorder) = restart(&env)?;
+        let id = meta.job_id.clone();
+        let entry = lock(&manager.jobs)
+            .get(&id)
+            .cloned()
+            .ok_or(TestError::Missing("entry"))?;
+        assert_eq!(entry.state(), JobState::Detached);
+        drop(sleeper);
+        let seen = eventually(LIMIT, || entry.state() == JobState::Unknown).await;
+        assert!(seen, "the end behind a stale stop mark was not reported");
+        let finished: Vec<JobEvent> = recorder
+            .notifications()
+            .into_iter()
+            .map(|notification| notification.event)
+            .filter(|event| event.job_id() == &id && event.is_finished())
+            .collect();
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        assert!(
+            matches!(
+                &finished[0],
+                JobEvent::Finished {
+                    state: JobState::Unknown,
+                    exit_code: None,
+                    signal: None,
+                    ..
+                }
+            ),
+            "{finished:?}"
+        );
+        Ok(())
+    }
+
     fn job_id(raw: &str) -> TestResult<JobId> {
         JobId::parse(raw).ok_or(TestError::Missing("job id"))
     }

@@ -837,6 +837,12 @@ struct EntryState {
     milestones: u64,
     /// Ein Überwachungs-Task dieser Sitzung beaufsichtigt den Prozess.
     monitored: bool,
+    /// Ein `job.stop` dieser Sitzung auf den abgelösten Job läuft
+    /// ([`JobManager::stop_detached`]): bis er das Ende verzeichnet, meldet
+    /// [`JobManager::finalize_detached`] nichts. Nur im Speicher, anders als
+    /// `meta.stop_requested`: ein Neustart beendet jeden Stop, ein
+    /// verwaister Vermerk in `meta.json` sperrt die Meldung also nie.
+    stopping: bool,
 }
 
 /// Ein Job im Register.
@@ -876,6 +882,7 @@ impl JobEntry {
                 tail: VecDeque::new(),
                 milestones: 0,
                 monitored,
+                stopping: false,
             }),
             persist_lock: Mutex::new(()),
             #[cfg(test)]
@@ -1961,7 +1968,7 @@ impl JobManager {
     /// offenes Anhalten wird dabei geschlossen und gebucht. Watch
     /// ([`DetachedWatch`]) und Abfragen entscheiden über denselben gesperrten
     /// Übergang — das Ende wird höchstens einmal gemeldet, ein laufendes
-    /// `job.stop` (`stop_requested`) hat Vorrang.
+    /// `job.stop` dieser Sitzung (`EntryState::stopping`) hat Vorrang.
     ///
     /// # Description
     /// Ein angehaltener abgelöster Job (eingefroren, [`JobMeta::is_suspended`])
@@ -1973,10 +1980,7 @@ impl JobManager {
     fn finalize_detached(&self, entry: &Arc<JobEntry>) {
         let notification = {
             let mut state = lock(&entry.state);
-            if state.monitored
-                || state.meta.state != JobState::Detached
-                || state.meta.stop_requested
-            {
+            if state.monitored || state.meta.state != JobState::Detached || state.stopping {
                 return;
             }
             if !detached_ended(entry, &state.meta, self.liveness) {
@@ -2731,12 +2735,12 @@ impl JobManager {
     /// auch einen ungeklärt angehaltenen.
     ///
     /// # Concurrency
-    /// `stop_requested` wird gesetzt und geschrieben, BEVOR signalisiert
-    /// wird, und nur solange der Job noch `Detached` ist: sonst könnte die
-    /// Watch das Signal-Ende als unbekanntes Ende melden, bevor dieser Pfad
-    /// den Stop verzeichnet (`stop_requested` sperrt
-    /// [`JobManager::finalize_detached`]). Haben Watch oder Abfrage das Ende
-    /// schon gemeldet, wird nichts mehr signalisiert.
+    /// Der Stop wird verzeichnet, BEVOR signalisiert wird, und nur solange
+    /// der Job noch `Detached` ist: `EntryState::stopping` (im Speicher)
+    /// sperrt [`JobManager::finalize_detached`], sonst könnte die Watch das
+    /// Signal-Ende als unbekanntes Ende melden, bevor dieser Pfad den Stop
+    /// verzeichnet; `stop_requested` steht ebenso in `meta.json`. Haben Watch
+    /// oder Abfrage das Ende schon gemeldet, wird nichts mehr signalisiert.
     async fn stop_detached(
         &self,
         entry: &Arc<JobEntry>,
@@ -2750,6 +2754,7 @@ impl JobManager {
             if state.meta.state != JobState::Detached {
                 return;
             }
+            state.stopping = true;
             state.meta.stop_requested = true;
         }
         entry.persist();
@@ -2777,6 +2782,7 @@ impl JobManager {
         }
         let reported = {
             let mut state = lock(&entry.state);
+            state.stopping = false;
             if state.meta.state != JobState::Detached {
                 // A concurrent stop already recorded and reported the end.
                 None
