@@ -20,6 +20,53 @@ The workspace also contains Detect · Orient · Defend (DoD), an optional host-s
 
 [Get started](#installation) · [CLI reference](docs/cli.md) · [Documentation](docs/README.md) · [Contribute](CONTRIBUTING.md) · [Security policy](SECURITY.md)
 
+## What you can do with it
+
+### For coding
+
+- **Delegate real work to an agent team.** Describe the goal in the interactive session. The root agent hands it to a background orchestrator that plans, fans out read-only explorers and writing workers, and reports back while you keep talking.
+- **Plan first, then build.** Plan mode (`Shift+Tab` or `/mode`) lets the agent explore and ask structured questions without changing files; you approve the plan before any edit is applied.
+- **Stay in control of side effects.** Edits, shell commands, network access and host operations go through approvals and sandboxing. Shell commands run in a Bubblewrap sandbox on supported Linux systems; privileged host operations use a separate approval boundary and never acquire authority from the model context.
+- **Research and review.** Dependency research against crates.io and docs.rs (`/research-deps`), read-only research with a typed finding contract (`/research`), and bundled Rust skills for ownership, error design, typestate and more.
+- **Run your own commands.** The `!` operator runs a shell command on the host from the interactive prompt, with its output returned to the conversation.
+
+### For business and analysis
+
+- **Strategic matrix games.** Ask for a matrix game about a strategic question, for example launching a product. The `matrix-game-master` drafts a scenario with actors, goals and rules, asks for your approval, and plays it through with isolated agents in the seats. Dice are rolled by the Rust engine (`harw-matrix-game`), not by the model, and the run ends with an after-action review.
+- **Papers and reports as PDF.** The LaTeX skills write structured documents with German or English typography (KOMA-Script, BibLaTeX), build them with XeLaTeX, and check the log for errors and overfull lines.
+- **Research with sources.** Questions are handed to a read-only researcher whose answer is validated against a typed finding contract before it is used.
+
+### Every day
+
+- **Knowledge that stays yours:** a workbench for the current task, a kanban board, per-agent diaries, a long-term memory palace and optional idle-time dream reflections, all stored locally and reviewable.
+- **Talk to it from your phone** through a paired Telegram bot, with approvals for writes.
+- **Use the models you want:** Anthropic, OpenAI, OpenRouter and others, or local models via vLLM, LM Studio and Ollama. Mix them per role, for example local explorers with a cloud orchestrator ([docs/setup/local-models.md](docs/setup/local-models.md)).
+- **Extend it:** MCP connectors, your own agent definitions and skills, or embed the runtime with the `harwness-sdk` crate.
+
+## What a session looks like
+
+```text
+# illustrative
+> Analyse this workspace and harden the key-file permissions, with tests.
+
+  harw  I'll hand this to an orchestrator in the background.
+  - root-orchestrator · running · 3 tool calls
+    |- explorer   "map key handling in src/key_control"      done
+    `- worker     "write 0600 permissions + regression test"  waiting for approval
+
+  Approval · fs.edit · src/key_control/file.rs
+  +  permissions.set_mode(0o600);
+  [once] [session] [deny]
+
+> ! cargo test -p key_control
+  ! cargo test -p key_control  -> exit 0, ran on the host
+
+  harw  Done: permissions are now 0600, one new test, all tests pass.
+        Changed: src/key_control/file.rs, tests/key_permissions.rs
+```
+
+`/export` writes the session, including tool calls, command output and background activity, to Markdown or JSON.
+
 ## Architecture
 
 ```text
