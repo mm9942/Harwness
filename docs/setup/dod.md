@@ -239,9 +239,12 @@ more.
   for `harw-probe-bpf` (the loader refuses to attach tracepoint/FEntry
   programs without both); `CAP_SYS_ADMIN` for `harw-probe-fs` (the only
   capability that permits `fanotify_mark` with `FAN_MARK_FILESYSTEM` and
-  the `FAN_UNLIMITED_MARKS` flag it needs); `CAP_DAC_OVERRIDE CAP_NET_ADMIN`
-  for `harw-warden` (writing the root-owned `cgroup.freeze`/`cgroup.kill`
-  files, and running `nft` for network isolation).
+  the `FAN_UNLIMITED_MARKS` flag it needs); `CAP_DAC_OVERRIDE` for
+  `harw-warden` (writing the root-owned `cgroup.freeze`/`cgroup.kill`
+  files). `CAP_NET_ADMIN` (running `nft` for network isolation) is not in
+  the shipped unit; it is added only by a `harw-warden.service.d/isolation.conf`
+  drop-in when `warden.toml` allows `isolate-network`/`lift-isolation`,
+  and without it the warden then refuses to start (`NetAdminMissing`).
 - **Root-owned files and FHS directories** (default prefix `/usr/local`;
   `PREFIX=/usr` for a distribution package):
   - programs: `/usr/local/libexec/harw-dod`
