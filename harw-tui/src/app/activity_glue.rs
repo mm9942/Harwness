@@ -1012,6 +1012,31 @@ mod tests {
         Ok(())
     }
 
+    /// B8: im Standardmodus (`Activity`) ist ein fehlgeschlagener Aufruf
+    /// nicht nur farblich, sondern per Textmarke sichtbar.
+    #[test]
+    fn a_failed_edit_is_marked_in_the_default_activity_view() -> TestResult {
+        let mut app = test_chat_app()?;
+        assert_eq!(
+            app.tool_verbosity,
+            crate::history_cell::ToolVerbosity::Activity
+        );
+        let mut state = TurnEventState::default();
+        let turn = TurnId::new();
+        run_tool(
+            &mut app,
+            &mut state,
+            &turn,
+            "fs.edit",
+            json!({ "path": "A", "old": "a", "new": "b" }),
+            ToolCallResult::error("old string not found"),
+        );
+        let cell = rendered(&app).last().cloned().unwrap_or_default();
+        let header = cell.lines().next().unwrap_or_default();
+        assert!(header.starts_with("✗ "), "war: {cell:?}");
+        Ok(())
+    }
+
     /// PL-97 M3: aufeinanderfolgende Lesezugriffe auf verschiedene Pfade
     /// bleiben eine Sammelzeile wie bisher (byte-gleich).
     #[test]

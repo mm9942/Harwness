@@ -14507,6 +14507,64 @@ forbidden = [{forbidden}]
         Ok(())
     }
 
+    /// B8: the production default comes from `with_verbose_tools`, not
+    /// `ChatApp::new`; `/verbose` toggles Activity <-> Verbose.
+    #[test]
+    fn with_verbose_tools_sets_activity_default_and_verbose() -> TestResult {
+        let app = test_chat_app()?.with_verbose_tools(false);
+        assert_eq!(app.tool_verbosity, ToolVerbosity::Activity);
+        let app = test_chat_app()?.with_verbose_tools(true);
+        assert_eq!(app.tool_verbosity, ToolVerbosity::Verbose);
+        Ok(())
+    }
+
+    /// B8: in the default Activity view a resumed orphan error result and an
+    /// interrupted open call are still visibly marked as failed.
+    #[test]
+    fn resume_hydration_marks_failures_in_default_activity_view() -> TestResult {
+        use harw_protocol::items::{ResultTrust, ToolCallItem, ToolCallResult, ToolResultItem};
+        use harw_types::{ItemId, ToolCallId};
+
+        let mut history = ConversationHistory::new();
+        history.push(TurnItem::ToolResult(ToolResultItem {
+            id: ItemId::new(),
+            call_id: ToolCallId::new(),
+            result: ToolCallResult::error("orphan result"),
+            duration_ms: 9,
+            trust: ResultTrust::Runtime,
+        }));
+        history.push(TurnItem::ToolCall(ToolCallItem {
+            id: ItemId::new(),
+            call_id: ToolCallId::new(),
+            tool_name: "shell.exec".to_owned(),
+            arguments: json!({ "command": "echo pending" }),
+        }));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = AgentSession::new_with_id(
+            SessionId::from_str("resume-tool-pairs-activity"),
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistry::builder().build(),
+            event_tx,
+        );
+        let mut app = test_chat_app()?.with_verbose_tools(false);
+        install_loaded_history(&mut session, &mut app, history);
+        let lines = app
+            .cells
+            .iter()
+            .flat_map(|cell| cell.display_lines(200, style::Theme::Dark))
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let failed = lines.iter().filter(|line| line.starts_with("✗ ")).count();
+        assert_eq!(failed, 2, "war: {lines:?}");
+        Ok(())
+    }
+
     #[test]
     fn incident_hint_is_small_and_only_suggests_bug_report_on_known_signals() -> TestResult {
         assert!(
