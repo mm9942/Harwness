@@ -408,6 +408,8 @@ mod tests {
             allow_hosts: allow_hosts.iter().map(|host| (*host).to_owned()).collect(),
             allow_private,
             researcher_web_hosts: researcher.iter().map(|host| (*host).to_owned()).collect(),
+            // Der Default ist `open`; diese Hilfe pinnt den Allowlist-Modus.
+            research_web: harw_config::ResearchWebMode::Allowlist,
             ..NetworkSection::default()
         }
     }
@@ -461,6 +463,24 @@ mod tests {
         assert!(scope.allows("www.destatis.de"));
         assert!(!scope.allows("127.0.0.1"));
         assert!(!scope.allows("printer.local"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_default_network_section_is_open_and_stays_get_only_public() -> TestResult {
+        let policy = researcher_web_policy(&NetworkSection::default()).map_err(ctx("default"))?;
+        assert!(
+            policy.open_public(),
+            "Default ist das offene öffentliche Web"
+        );
+        assert!(policy.check_url("https://www.destatis.de/").is_ok());
+        for url in [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/",
+            "http://printer.local/",
+        ] {
+            assert!(policy.check_url(url).is_err(), "{url}");
+        }
         Ok(())
     }
 
