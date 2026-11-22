@@ -42,7 +42,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.outlined.CallSplit
 import androidx.compose.material.icons.outlined.Construction
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.StopCircle
 import androidx.compose.material.icons.outlined.Terminal
@@ -398,6 +400,11 @@ internal fun SessionConversation(
                     val currentHead = snapshot?.head
                     if (generation != null && currentHead != null) window.regenerate(connection, sessionId, generation, currentHead, text, images)
                 },
+                onFork = { text, images ->
+                    val open = { id: String -> window.prefillDraft(id, text, images); window.select(id) }
+                    val project = window.projectKey
+                    if (project != null) connection.createInProject(project, open) else connection.createSession(null, open)
+                },
                 liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
                 jumpToLatest = transcriptJump,
                 emptyMessage = when {
@@ -449,6 +456,7 @@ private fun ConversationFeed(
     sentImages: (String, Int) -> List<uniffi.harw_mobile_ffi.PromptImage>?,
     fetchMedia: suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?,
     onRegenerate: ((String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
+    onFork: ((String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
     liveText: String?,
     jumpToLatest: Int,
     emptyMessage: String,
@@ -499,10 +507,15 @@ private fun ConversationFeed(
                         label, clean, entry.kind, imageCount = count, thumbs = thumbs,
                         imageRefs = entry.images, fetchMedia = fetchMedia,
                         onRegenerate = onRegenerate?.let { cb -> { cb(clean, thumbs.orEmpty()) } },
+                        onFork = onFork?.let { cb -> { cb(forkText(entries, entry, clean), thumbs.orEmpty()) } },
                     )
                     return@items
                 }
-                MessageBlock(label, entry.text, entry.kind, onRegenerate = onRegenerate?.let { cb -> { cb(entry.text, emptyList()) } })
+                MessageBlock(
+                    label, entry.text, entry.kind,
+                    onRegenerate = onRegenerate?.let { cb -> { cb(entry.text, emptyList()) } },
+                    onFork = onFork?.let { cb -> { cb(forkText(entries, entry, entry.text), emptyList()) } },
+                )
                 return@items
             }
             MessageBlock(label, entry.text, entry.kind)
@@ -520,6 +533,7 @@ private fun MessageBlock(
     imageRefs: List<String> = emptyList(),
     fetchMedia: (suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?)? = null,
     onRegenerate: (() -> Unit)? = null,
+    onFork: (() -> Unit)? = null,
 ) {
     val colors = MaterialTheme.colorScheme
     val user = kind == TranscriptKind.USER
@@ -552,16 +566,46 @@ private fun MessageBlock(
                         )
                     }
                 }
-                if (user && onRegenerate != null) {
+                if (user && (onRegenerate != null || onFork != null)) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = onRegenerate, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
-                            Text("\u21BB Neu generieren", style = MaterialTheme.typography.labelSmall)
+                        if (onFork != null) {
+                            IconButton(onClick = onFork, modifier = Modifier.size(36.dp)) {
+                                Icon(Icons.Outlined.CallSplit, contentDescription = "Ab hier in neuem Chat fortsetzen (Fork)", modifier = Modifier.size(20.dp))
+                            }
+                        }
+                        if (onRegenerate != null) {
+                            IconButton(onClick = onRegenerate, modifier = Modifier.size(36.dp)) {
+                                Icon(Icons.Outlined.Refresh, contentDescription = "Neu generieren", modifier = Modifier.size(20.dp))
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+/**
+ * Text für den Fork: der Verlauf vor der gewählten Nachricht als Kontext, dann die Nachricht selbst.
+ * Der ursprüngliche Chat bleibt unverändert; der neue Chat bekommt den Text als unversendeten Entwurf.
+ */
+internal fun forkText(entries: List<TranscriptEntry>, selected: TranscriptEntry, selectedText: String): String {
+    val at = entries.indexOfFirst { it.id == selected.id }.let { if (it < 0) entries.size else it }
+    val lines = entries.take(at).mapNotNull { entry ->
+        val who = when (entry.kind) {
+            TranscriptKind.USER -> "Du"
+            TranscriptKind.ASSISTANT -> "Harw"
+            else -> return@mapNotNull null
+        }
+        val (clean, _) = if (entry.kind == TranscriptKind.USER) splitImagePlaceholders(entry.text) else entry.text to 0
+        clean.trim().takeIf { it.isNotEmpty() }?.let { "$who: $it" }
+    }
+    var context = lines.joinToString("\n\n")
+    val limit = 12_000
+    if (context.length > limit) context = "…" + context.takeLast(limit)
+    if (context.isEmpty()) return selectedText
+    return "[Fortsetzung eines früheren Chats. Der folgende Verlauf ist nur Kontext, beantworte ihn nicht noch einmal.]\n\n" +
+        context + "\n\n---\n\n" + selectedText
 }
 
 /** Was der Nutzer in dieser Unterhaltung gerade darf. */

@@ -700,6 +700,14 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
         return true
     }
 
+    /** Legt Text und Bilder als unversendeten Entwurf einer (neuen) Session ab, z. B. nach einem Fork. */
+    fun prefillDraft(id: String, text: String, images: List<uniffi.harw_mobile_ffi.PromptImage>) {
+        drafts = drafts + (id to SessionDraft(
+            text,
+            images = images.mapIndexed { i, image -> DraftImage("Bild ${i + 1}", image, image.dataB64.length) },
+        ))
+    }
+
     fun select(id: String?) {
         sessionId = id
         savedState[SelectedSessionKey] = id
