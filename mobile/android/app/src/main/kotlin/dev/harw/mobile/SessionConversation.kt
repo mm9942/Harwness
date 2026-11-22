@@ -114,6 +114,14 @@ internal fun localModelLabel(provider: String?, model: String?): String = when {
     else -> "$provider/$model"
 }
 
+/** Whether the vision projector of the on-device model is on the phone, so it reads images. */
+internal fun localModelSeesImages(context: android.content.Context, modelId: String?): Boolean {
+    if (modelId.isNullOrBlank()) return false
+    val addon = uniffi.harw_mobile_ffi.visionCatalog().firstOrNull { modelId in it.modelIds } ?: return false
+    return uniffi.harw_mobile_ffi.visionModels(ModelStore(context.applicationContext).modelsDir().path)
+        .any { it.id == addon.file.id && it.state == uniffi.harw_mobile_ffi.ModelFileState.COMPLETE }
+}
+
 internal fun modelChipBlock(support: ManageSupport?, active: Boolean): String? = when {
     !active -> "Session nicht live"
     support == null || !support.manage -> NO_MANAGE_TEXT
@@ -952,7 +960,12 @@ internal fun LocalModelChip() {
         value = withContext(Dispatchers.IO) {
             try {
                 val info = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
-                localModelLabel(info.activeProvider, info.activeModel)
+                val base = localModelLabel(info.activeProvider, info.activeModel)
+                if (info.activeProvider == "local-gguf" && localModelSeesImages(context, info.activeModel)) {
+                    "$base · Bilder"
+                } else {
+                    base
+                }
             } catch (_: Exception) {
                 "Modell"
             }

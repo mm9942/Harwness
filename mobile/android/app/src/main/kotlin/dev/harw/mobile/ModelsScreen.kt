@@ -52,6 +52,7 @@ import uniffi.harw_mobile_ffi.MobileException
 import uniffi.harw_mobile_ffi.ModelFileState
 import uniffi.harw_mobile_ffi.ModelOrigin
 import uniffi.harw_mobile_ffi.ModelVerification
+import uniffi.harw_mobile_ffi.VisionAddon
 
 private const val BytesPerGb = 1_000_000_000.0
 private const val BytesPerMb = 1_000_000L
@@ -136,6 +137,75 @@ private fun needsNotificationPermission(context: Context): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
         PackageManager.PERMISSION_GRANTED
 
+/** Optional image-understanding file of a model: state, download and removal. */
+@Composable
+private fun VisionAddonRow(
+    addon: VisionAddon,
+    local: LocalModel?,
+    current: ModelDownloadState,
+    busy: Boolean,
+    importing: Boolean,
+    onDownload: () -> Unit,
+    onPause: () -> Unit,
+    onDelete: (LocalModel) -> Unit,
+) {
+    val file = addon.file
+    val state = local?.state ?: ModelFileState.MISSING
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Bildverständnis (${gb(file.sizeBytes.toLong())})", style = MaterialTheme.typography.titleSmall)
+        when {
+            current is ModelDownloadState.Running && current.modelId == file.id -> {
+                if (current.phase == DownloadPhase.Verifying) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Text("Prüfe …", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    LinearProgressIndicator(
+                        progress = { downloadFraction(current.done, current.total) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text("Lade herunter ${downloadPercent(current.done, current.total)}%", style = MaterialTheme.typography.bodySmall)
+                }
+                OutlinedButton(onClick = onPause) { Text("Pausieren") }
+            }
+            current is ModelDownloadState.WaitingForNetwork && current.modelId == file.id -> {
+                Text("Warte auf WLAN", style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(enabled = !importing, onClick = onDownload) { Text("Fortsetzen") }
+                    OutlinedButton(onClick = onPause) { Text("Pausieren") }
+                }
+            }
+            current is ModelDownloadState.Paused && current.modelId == file.id -> {
+                Text("Pausiert", style = MaterialTheme.typography.bodySmall)
+                Button(enabled = !busy, onClick = onDownload) { Text("Fortsetzen") }
+            }
+            state == ModelFileState.COMPLETE -> {
+                Text(
+                    "Bereit: das Modell versteht Bilder (gilt ab der nächsten Sitzung)",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (local != null) {
+                    OutlinedButton(enabled = !busy, onClick = { onDelete(local) }) { Text("Löschen") }
+                }
+            }
+            else -> {
+                Text(
+                    "Nicht geladen: das Modell liest nur Text und ignoriert Bilder",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(enabled = !busy, onClick = onDownload) {
+                        Text(if (state == ModelFileState.PARTIAL) "Fortsetzen" else "Herunterladen")
+                    }
+                    if (state != ModelFileState.MISSING && local != null) {
+                        OutlinedButton(enabled = !busy, onClick = { onDelete(local) }) { Text("Löschen") }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
     val context = LocalContext.current
@@ -152,9 +222,12 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
 
     var ready by remember { mutableStateOf(false) }
     var locals by remember { mutableStateOf<List<LocalModel>>(emptyList()) }
+    var visions by remember { mutableStateOf<List<LocalModel>>(emptyList()) }
+    val addons = remember(manager) { manager.visionAddons() }
     var message by remember { mutableStateOf<String?>(null) }
     var messageIsError by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<LocalModel?>(null) }
+    var pendingDeleteVision by remember { mutableStateOf<LocalModel?>(null) }
     var importJob by remember { mutableStateOf<Job?>(null) }
     var importProgress by remember { mutableStateOf<ImportProgress?>(null) }
     var pendingStartId by remember { mutableStateOf<String?>(null) }
@@ -172,6 +245,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
         if (!ready) return
         try {
             locals = manager.local()
+            visions = manager.localVision()
             activeLocalId = manager.activeLocal(context.filesDir.path)
         } catch (e: MobileException) {
             show(e.message ?: "Modelle konnten nicht gelesen werden", error = true)
@@ -337,6 +411,29 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
         )
     }
 
+    pendingDeleteVision?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteVision = null },
+            title = { Text("Bildverständnis löschen?") },
+            text = { Text("${target.label} wird entfernt. Das Modell liest danach nur noch Text.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDeleteVision = null
+                    scope.launch {
+                        try {
+                            manager.delete(target.id)
+                            show(null)
+                        } catch (e: MobileException) {
+                            show(e.message ?: "Datei konnte nicht gelöscht werden", error = true)
+                        }
+                        reload()
+                    }
+                }) { Text("Löschen") }
+            },
+            dismissButton = { TextButton(onClick = { pendingDeleteVision = null }) { Text("Behalten") } },
+        )
+    }
+
     val downloadRunning = downloads is ModelDownloadState.Running
     val downloadActive = downloadRunning || downloads is ModelDownloadState.WaitingForNetwork
     val importing = importJob != null
@@ -445,6 +542,18 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                                 MaterialTheme.colorScheme.onSurfaceVariant
                             },
                         )
+                        addons.firstOrNull { model.id in it.modelIds }?.let { addon ->
+                            VisionAddonRow(
+                                addon = addon,
+                                local = visions.firstOrNull { it.id == addon.file.id },
+                                current = current,
+                                busy = busy,
+                                importing = importing,
+                                onDownload = { requestDownload(addon.file.id) },
+                                onPause = { ModelDownloads.pause(context) },
+                                onDelete = { pendingDeleteVision = it },
+                            )
+                        }
                         when {
                             current is ModelDownloadState.Running && current.modelId == model.id -> {
                                 if (current.phase == DownloadPhase.Verifying) {

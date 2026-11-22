@@ -1,6 +1,6 @@
 //! [`harw_core::ModelProvider`] over a local GGUF model.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +16,10 @@ use harw_types::{ReasoningEffort, TokenUsage, ToolCallId};
 use serde_json::{Value, json};
 
 use crate::DEFAULT_N_CTX;
-use crate::engine::{Engine, EngineConfig, FinishReason, SamplingParams};
+use crate::engine::{
+    DEFAULT_IMAGE_MAX_TOKENS, DEFAULT_IMAGE_MIN_TOKENS, Engine, EngineConfig, FinishReason,
+    MEDIA_MARKER, SamplingParams,
+};
 use crate::error::LlamaError;
 use crate::stream::{OutputSplitter, Piece, SplitOutput};
 use crate::template::{
@@ -42,6 +45,11 @@ pub struct LocalGgufConfig {
     /// full prompt and tool catalogue run to tens of thousands of tokens,
     /// which a phone-sized context cannot hold.
     pub lean: bool,
+    /// Vision projector (`mmproj` GGUF) of the model. When it loads, images of
+    /// the last user message are shown to the model.
+    pub mmproj: Option<PathBuf>,
+    /// Tokens one image may cost at most (smaller is faster on a phone).
+    pub image_max_tokens: i32,
 }
 
 impl Default for LocalGgufConfig {
@@ -52,6 +60,8 @@ impl Default for LocalGgufConfig {
             max_new_tokens: 4096,
             thinking_default: false,
             lean: true,
+            mmproj: None,
+            image_max_tokens: DEFAULT_IMAGE_MAX_TOKENS,
         }
     }
 }
@@ -86,6 +96,9 @@ impl LocalGgufProvider {
             &EngineConfig {
                 n_ctx: config.n_ctx,
                 n_threads: config.n_threads,
+                mmproj: config.mmproj.clone(),
+                image_min_tokens: DEFAULT_IMAGE_MIN_TOKENS.min(config.image_max_tokens),
+                image_max_tokens: config.image_max_tokens,
                 ..EngineConfig::default()
             },
         )?;
@@ -99,9 +112,18 @@ impl LocalGgufProvider {
     }
 }
 
+impl LocalGgufProvider {
+    /// Whether the loaded model can read images (its projector is loaded).
+    #[must_use]
+    pub fn supports_vision(&self) -> bool {
+        self.engine.supports_vision()
+    }
+}
+
 /// Everything a generation needs, owned so it can move to a blocking thread.
 struct Job {
     prompt: String,
+    images: Vec<Arc<[u8]>>,
     tools: Vec<Value>,
     sampling: SamplingParams,
     start_in_think: bool,
@@ -149,7 +171,8 @@ fn run_job(
     };
     let mut splitter = OutputSplitter::new(job.start_in_think);
     let mut pieces = Vec::new();
-    let stats = engine.generate(&job.prompt, &job.sampling, &should_stop, &mut |chunk| {
+    let images: Vec<&[u8]> = job.images.iter().map(|image| &image[..]).collect();
+    let stats = engine.generate(&job.prompt, &images, &job.sampling, &should_stop, &mut |chunk| {
         splitter.push(chunk, &mut pieces);
         emit(job.stream.as_ref(), &mut pieces);
     })?;
@@ -216,8 +239,19 @@ fn tools_json(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-/// Chat messages for the template; the second value is a `/think` override.
-fn chat_messages(request: &ModelRequest, lean: bool) -> (Vec<ChatMessage>, Option<bool>) {
+/// What `chat_messages` prepared.
+struct Chat {
+    messages: Vec<ChatMessage>,
+    /// A `/think` override typed by the user.
+    switch: Option<bool>,
+    /// Images of the last user message, in marker order (vision models only).
+    images: Vec<Arc<[u8]>>,
+}
+
+/// Chat messages for the template. With `vision`, the images of the last user
+/// message are shown to the model (one media marker each); every other image is
+/// replaced by a short note.
+fn chat_messages(request: &ModelRequest, lean: bool, vision: bool) -> Chat {
     let mut system = if lean {
         LEAN_SYSTEM_PROMPT.to_owned()
     } else {
@@ -236,16 +270,43 @@ fn chat_messages(request: &ModelRequest, lean: bool) -> (Vec<ChatMessage>, Optio
         messages.push(ChatMessage::new("system", system));
     }
     let history: &ConversationHistory = &request.history;
-    for item in history.to_model_messages() {
+    let items = history.to_model_messages();
+    let last_user = items
+        .iter()
+        .rposition(|item| matches!(item, ModelMessage::User { .. }));
+    let mut shown: Vec<Arc<[u8]>> = Vec::new();
+    for (index, item) in items.into_iter().enumerate() {
         match item {
             ModelMessage::User { mut text, images } => {
-                if !images.is_empty() {
-                    text.push_str(&format!(
-                        "\n[{} image(s) omitted: this on-device model reads text only]",
-                        images.len()
-                    ));
+                let mut omitted = 0_usize;
+                let mut markers = String::new();
+                for image in &images {
+                    match image.data.as_ref() {
+                        Some(data) if vision && Some(index) == last_user => {
+                            markers.push_str(MEDIA_MARKER);
+                            markers.push('\n');
+                            shown.push(Arc::clone(data));
+                        }
+                        Some(_) => omitted += 1,
+                        None => {
+                            text.push('\n');
+                            text.push_str(&image.placeholder("the image data is not available"));
+                        }
+                    }
                 }
-                messages.push(ChatMessage::new("user", text));
+                if omitted > 0 {
+                    let why = if vision {
+                        "only the newest message's images are shown"
+                    } else {
+                        "this on-device model reads text only"
+                    };
+                    text.push_str(&format!("\n[{omitted} image(s) omitted: {why}]"));
+                }
+                if markers.is_empty() {
+                    messages.push(ChatMessage::new("user", text));
+                } else {
+                    messages.push(ChatMessage::new("user", format!("{markers}{text}")));
+                }
             }
             ModelMessage::Assistant { text } => messages.push(ChatMessage::new("assistant", text)),
             ModelMessage::ToolCall { name, arguments, .. } => {
@@ -272,7 +333,7 @@ fn chat_messages(request: &ModelRequest, lean: bool) -> (Vec<ChatMessage>, Optio
         .rev()
         .find(|m| m.role == "user")
         .and_then(|m| take_switch(&mut m.content));
-    (messages, switch)
+    Chat { messages, switch, images: shown }
 }
 
 fn thinking_for(request: &ModelRequest, switch: Option<bool>, default: bool) -> bool {
@@ -302,7 +363,8 @@ impl LocalGgufProvider {
     }
 
     fn prepare(&self, request: &ModelRequest) -> Result<Job, ModelError> {
-        let (messages, switch) = chat_messages(request, self.config.lean);
+        let Chat { messages, switch, images } =
+            chat_messages(request, self.config.lean, self.engine.supports_vision());
         let thinking = thinking_for(request, switch, self.config.thinking_default);
         let tools = if self.config.lean { Vec::new() } else { tools_json(&request.tools) };
         let prompt = render_prompt(
@@ -326,6 +388,7 @@ impl LocalGgufProvider {
         Ok(Job {
             start_in_think: prompt_opens_think(&prompt),
             prompt,
+            images,
             tools,
             sampling: SamplingParams::for_mode(thinking, max_new, seed),
             cancel: request.cancel.clone(),

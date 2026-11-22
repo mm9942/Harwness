@@ -18,7 +18,10 @@ mod stream;
 mod template;
 mod toolcall;
 
-pub use engine::{Engine, EngineConfig, FinishReason, GenerateStats, SamplingParams};
+pub use engine::{
+    DEFAULT_IMAGE_MAX_TOKENS, DEFAULT_IMAGE_MIN_TOKENS, Engine, EngineConfig, FinishReason,
+    GenerateStats, MEDIA_MARKER, SamplingParams,
+};
 pub use error::LlamaError;
 pub use provider::{LOCAL_PROVIDER_ID, LocalGgufConfig, LocalGgufProvider};
 

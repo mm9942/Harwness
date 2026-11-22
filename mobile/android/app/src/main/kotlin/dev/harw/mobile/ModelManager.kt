@@ -16,12 +16,15 @@ import uniffi.harw_mobile_ffi.CatalogModel
 import uniffi.harw_mobile_ffi.LocalModel
 import uniffi.harw_mobile_ffi.MobileException
 import uniffi.harw_mobile_ffi.ModelProgress
+import uniffi.harw_mobile_ffi.VisionAddon
 import uniffi.harw_mobile_ffi.activateLocalModel
 import uniffi.harw_mobile_ffi.activeLocalModel
 import uniffi.harw_mobile_ffi.deleteModel
 import uniffi.harw_mobile_ffi.finalizeModel
 import uniffi.harw_mobile_ffi.localModels
 import uniffi.harw_mobile_ffi.modelCatalog
+import uniffi.harw_mobile_ffi.visionCatalog
+import uniffi.harw_mobile_ffi.visionModels
 
 internal const val StorageMarginBytes = 100L * 1024 * 1024
 internal const val MaxRedirects = 5
@@ -114,6 +117,16 @@ internal class ModelManager(private val store: ModelStore) {
     fun modelsDir(): File = store.modelsDir()
 
     fun catalog(): List<CatalogModel> = modelCatalog()
+
+    /** Optional image-understanding files (vision projectors) of catalog models. */
+    fun visionAddons(): List<VisionAddon> = visionCatalog()
+
+    /** Everything the downloader accepts: models and their vision projectors. */
+    fun downloadable(): List<CatalogModel> = modelCatalog() + visionCatalog().map { it.file }
+
+    suspend fun localVision(): List<LocalModel> = withContext(Dispatchers.IO) {
+        visionModels(store.modelsDir().path)
+    }
 
     suspend fun local(): List<LocalModel> = withContext(Dispatchers.IO) {
         localModels(store.modelsDir().path)

@@ -248,6 +248,123 @@ const CATALOG: &[CatalogRow] = &[
     },
 ];
 
+/// Vision add-on of one or more catalog models: the `mmproj` projector that lets
+/// the language model read images.
+struct VisionRow {
+    id: &'static str,
+    label: &'static str,
+    /// Catalog models this projector belongs to.
+    model_ids: &'static [&'static str],
+    repo: &'static str,
+    revision: &'static str,
+    /// Name in the repository.
+    remote_name: &'static str,
+    /// Name on the phone; unique, because repositories all call theirs `mmproj-F16.gguf`.
+    file_name: &'static str,
+    size_bytes: u64,
+    sha256: &'static str,
+    min_ram_bytes: u64,
+}
+
+/// F16 projectors (BF16 is slower on phone CPUs, F32 twice as big).
+const VISION_CATALOG: &[VisionRow] = &[
+    VisionRow {
+        id: "qwen3.5-9b-vision",
+        label: "Qwen3.5 9B \u{b7} Bildverst\u{e4}ndnis",
+        model_ids: &[
+            "qwen3.5-9b-iq4xs",
+            "qwen3.5-9b-iq4nl",
+            "qwen3.5-9b-q4km",
+            "qwen3.5-9b-ud-q4kxl",
+        ],
+        repo: "unsloth/Qwen3.5-9B-GGUF",
+        revision: "3885219b6810b007914f3a7950a8d1b469d598a5",
+        remote_name: "mmproj-F16.gguf",
+        file_name: "Qwen3.5-9B-mmproj-F16.gguf",
+        size_bytes: 918_166_080,
+        sha256: "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f",
+        min_ram_bytes: 9 * GIB,
+    },
+    VisionRow {
+        id: "qwen3.5-4b-vision",
+        label: "Qwen3.5 4B \u{b7} Bildverst\u{e4}ndnis",
+        model_ids: &["qwen3.5-4b-q6k"],
+        repo: "unsloth/Qwen3.5-4B-GGUF",
+        revision: "e87f176479d0855a907a41277aca2f8ee7a09523",
+        remote_name: "mmproj-F16.gguf",
+        file_name: "Qwen3.5-4B-mmproj-F16.gguf",
+        size_bytes: 672_423_616,
+        sha256: "cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864",
+        min_ram_bytes: 6 * GIB,
+    },
+    VisionRow {
+        id: "qwen3.5-4b-twoody-vision",
+        label: "Qwen3.5 4B (Q4_K_M) \u{b7} Bildverst\u{e4}ndnis",
+        model_ids: &["qwen3.5-4b-q4km"],
+        repo: "twoody/Qwen3.5-4B-GGUF",
+        revision: "7e234459682a77fdae11b46591a6e6c37a45a495",
+        remote_name: "mmproj-F16.gguf",
+        file_name: "Qwen3.5-4B-Q4_K_M-mmproj-F16.gguf",
+        size_bytes: 672_423_488,
+        sha256: "d293cd66fd524937c9bd5f37e802d5cdab553eae3d53979a1c02eb6d9e81b6ea",
+        min_ram_bytes: 6 * GIB,
+    },
+];
+
+/// A projector file offered for models of the catalog.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct VisionAddon {
+    /// Catalog models that can use this projector.
+    pub model_ids: Vec<String>,
+    /// Download description; `file.id` is accepted by `finalize_model`,
+    /// `delete_model` and `model_path`.
+    pub file: CatalogModel,
+}
+
+fn vision_entries() -> Vec<VisionAddon> {
+    VISION_CATALOG
+        .iter()
+        .map(|row| VisionAddon {
+            model_ids: row.model_ids.iter().map(|id| (*id).to_owned()).collect(),
+            file: CatalogModel {
+                id: row.id.to_owned(),
+                label: row.label.to_owned(),
+                repo: row.repo.to_owned(),
+                revision: row.revision.to_owned(),
+                file_name: row.file_name.to_owned(),
+                url: format!(
+                    "https://huggingface.co/{}/resolve/{}/{}",
+                    row.repo, row.revision, row.remote_name
+                ),
+                size_bytes: row.size_bytes,
+                sha256: row.sha256.to_owned(),
+                min_ram_bytes: row.min_ram_bytes,
+                recommended: false,
+                default_n_ctx: DEFAULT_N_CTX,
+                note: "Zus\u{e4}tzlich zum Modell; ohne diese Datei liest es nur Text".to_owned(),
+            },
+        })
+        .collect()
+}
+
+/// Models plus projectors: what downloading, verifying and deleting accept.
+fn file_entries() -> Vec<CatalogModel> {
+    let mut all = catalog_entries();
+    all.extend(vision_entries().into_iter().map(|addon| addon.file));
+    all
+}
+
+/// Path of the complete, verified projector of `model_id`, if it is on disk.
+pub(crate) fn vision_path_in(dir: &Path, model_id: &str) -> Option<String> {
+    let addon = vision_entries()
+        .into_iter()
+        .find(|a| a.model_ids.iter().any(|id| id == model_id))?;
+    let local = find_local(dir, std::slice::from_ref(&addon.file), &addon.file.id)?;
+    (local.state == ModelFileState::Complete
+        && local.verification == ModelVerification::Verified)
+        .then_some(local.path)
+}
+
 fn catalog_entries() -> Vec<CatalogModel> {
     CATALOG
         .iter()
@@ -962,14 +1079,14 @@ pub fn finalize_model(
     progress: Arc<dyn ModelProgress>,
 ) -> Result<LocalModel, MobileError> {
     let dir = checked_dir(&models_dir)?;
-    finalize_in(&dir, &catalog_entries(), &model_id, progress.as_ref())
+    finalize_in(&dir, &file_entries(), &model_id, progress.as_ref())
 }
 
 /// Removes the files of a catalog or own model; missing files are fine.
 #[uniffi::export]
 pub fn delete_model(models_dir: String, model_id: String) -> Result<(), MobileError> {
     let dir = checked_dir(&models_dir)?;
-    delete_in(&dir, &catalog_entries(), &model_id)
+    delete_in(&dir, &file_entries(), &model_id)
 }
 
 /// Checks a staged import copy in one pass and writes its staging sidecar.
@@ -1012,7 +1129,23 @@ pub fn discard_import(models_dir: String, staged_name: String) -> Result<(), Mob
 #[uniffi::export]
 pub fn model_path(models_dir: String, model_id: String) -> Result<String, MobileError> {
     let dir = checked_dir(&models_dir)?;
-    model_path_in(&dir, &catalog_entries(), &model_id)
+    model_path_in(&dir, &file_entries(), &model_id)
+}
+
+/// The vision add-ons the app offers (projector files), in display order.
+#[uniffi::export]
+pub fn vision_catalog() -> Vec<VisionAddon> {
+    vision_entries()
+}
+
+/// State of each projector in `models_dir`, in the order of [`vision_catalog`].
+#[uniffi::export]
+pub fn vision_models(models_dir: String) -> Result<Vec<LocalModel>, MobileError> {
+    let dir = checked_dir(&models_dir)?;
+    let files: Vec<CatalogModel> = vision_entries().into_iter().map(|a| a.file).collect();
+    let mut local = local_models_in(&dir, &files);
+    local.truncate(files.len());
+    Ok(local)
 }
 
 #[cfg(test)]

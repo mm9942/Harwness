@@ -35,11 +35,11 @@ tracing = { workspace = true }
 # llama.cpp binding, pinned exactly. 0.1.161 bundles a llama.cpp with the
 # `qwen35` architecture and the GATED_DELTA_NET op (checked in the crate source).
 # No default features: `openmp` is a no-op on Android and `common` is not needed.
-llama-cpp-2 = { version = "=0.1.161", default-features = false, optional = true }
+llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["mtmd"], optional = true }
 
 # Android: link libc++ statically so the APK needs no libc++_shared.so.
 [target.'cfg(target_os = "android")'.dependencies]
-llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["android-static-stdcxx"], optional = true }
+llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["android-static-stdcxx", "mtmd"], optional = true }
 
 [lints]
 workspace = true

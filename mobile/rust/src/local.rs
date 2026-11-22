@@ -184,7 +184,9 @@ fn build_active_model(
 }
 
 /// Settings of the on-device model: `HARW_LOCAL_N_CTX` sets the context
-/// window (default 16384), `HARW_LOCAL_LEAN=0` brings back the full host
+/// window (default 16384), `HARW_LOCAL_IMAGE_TOKENS` the most tokens one image
+/// may cost (default 256; larger reads small text better but is slower),
+/// `HARW_LOCAL_LEAN=0` brings back the full host
 /// prompt and tool specs (text-only by default).
 #[cfg(feature = "local-host")]
 fn local_gguf_config() -> harw_llama::LocalGgufConfig {
@@ -195,6 +197,13 @@ fn local_gguf_config() -> harw_llama::LocalGgufConfig {
         .filter(|n| *n >= 1024)
     {
         config.n_ctx = n;
+    }
+    if let Some(n) = std::env::var("HARW_LOCAL_IMAGE_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|n| (16..=4096).contains(n))
+    {
+        config.image_max_tokens = n;
     }
     if std::env::var("HARW_LOCAL_LEAN").is_ok_and(|v| v.trim() == "0") {
         config.lean = false;
@@ -218,11 +227,14 @@ fn build_local_gguf(
         session("the on-device model folder is unknown; choose the model again".to_owned())
     })?;
     // Fails unless the file is complete and readable (e.g. deleted since selecting).
+    let vision = crate::models::vision_path_in(std::path::Path::new(&models_dir), model_id);
     let path = crate::models::model_path(models_dir, model_id.to_owned())?;
+    let mut config = local_gguf_config();
+    config.mmproj = vision.map(Into::into);
     let provider = harw_llama::LocalGgufProvider::open(
         std::path::Path::new(&path),
         model_id,
-        local_gguf_config(),
+        config,
     )
     .map_err(|e| session(e.to_string()))?;
     Ok(Arc::new(provider))

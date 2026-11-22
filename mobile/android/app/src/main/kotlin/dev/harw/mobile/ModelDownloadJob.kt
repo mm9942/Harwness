@@ -108,7 +108,7 @@ internal object ModelDownloads {
     fun start(context: Context, modelId: String): StartResult {
         val ctx = context.applicationContext
         val store = ModelStore(ctx)
-        val model = ModelManager(store).catalog().firstOrNull { it.id == modelId } ?: return StartResult.UnknownModel
+        val model = ModelManager(store).downloadable().firstOrNull { it.id == modelId } ?: return StartResult.UnknownModel
         if (!active.compareAndSet(false, true)) return StartResult.AlreadyRunning
         userPaused = false
         val wifiOnly = store.wifiOnly()
@@ -274,7 +274,7 @@ private class DownloadRun(
 }
 
 private fun findModel(context: Context, modelId: String?): CatalogModel? =
-    ModelManager(ModelStore(context)).catalog().firstOrNull { it.id == modelId }
+    ModelManager(ModelStore(context)).downloadable().firstOrNull { it.id == modelId }
 
 // ---- API 34+: user-initiated job ----
 

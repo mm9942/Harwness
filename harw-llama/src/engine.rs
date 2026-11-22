@@ -18,6 +18,13 @@ pub struct EngineConfig {
     pub n_threads: i32,
     /// Prompt-processing batch size in tokens.
     pub n_batch: u32,
+    /// Vision projector (`mmproj` GGUF) that lets the model read images.
+    pub mmproj: Option<std::path::PathBuf>,
+    /// Lower bound of the tokens one image costs (`-1`: the projector's default).
+    pub image_min_tokens: i32,
+    /// Upper bound of the tokens one image costs; mtmd scales larger images down
+    /// to fit (`-1`: the projector's default, up to 4096 tokens).
+    pub image_max_tokens: i32,
 }
 
 impl Default for EngineConfig {
@@ -26,9 +33,21 @@ impl Default for EngineConfig {
             n_ctx: DEFAULT_N_CTX,
             n_threads: 0,
             n_batch: 512,
+            mmproj: None,
+            image_min_tokens: DEFAULT_IMAGE_MIN_TOKENS,
+            image_max_tokens: DEFAULT_IMAGE_MAX_TOKENS,
         }
     }
 }
+
+/// Text that stands for one image in a prompt (libmtmd's default marker).
+pub const MEDIA_MARKER: &str = "<__media__>";
+
+/// Image token budget on a phone CPU: about 64..256 tokens, i.e. images are scaled
+/// to roughly 512x512 pixels (Qwen3.5: one token covers 32x32 pixels).
+pub const DEFAULT_IMAGE_MIN_TOKENS: i32 = 64;
+/// See [`DEFAULT_IMAGE_MIN_TOKENS`].
+pub const DEFAULT_IMAGE_MAX_TOKENS: i32 = 256;
 
 /// Sampling and length limits of one generation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -135,10 +154,17 @@ mod stub {
             0
         }
 
+        /// Whether a vision projector is loaded.
+        #[must_use]
+        pub fn supports_vision(&self) -> bool {
+            false
+        }
+
         /// Always [`LlamaError::Unavailable`] in this build.
         pub fn generate(
             &self,
             _prompt: &str,
+            _images: &[&[u8]],
             _sampling: &SamplingParams,
             _should_stop: &dyn Fn() -> bool,
             _on_text: &mut dyn FnMut(&str),
@@ -152,13 +178,16 @@ mod stub {
 mod real {
     use std::num::NonZeroU32;
     use std::path::Path;
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock, PoisonError};
 
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::LlamaModel;
     use llama_cpp_2::model::params::LlamaModelParams;
+    use llama_cpp_2::mtmd::{
+        MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
+    };
     use llama_cpp_2::sampling::LlamaSampler;
 
     use super::{EngineConfig, FinishReason, GenerateStats, SamplingParams, default_threads};
@@ -189,6 +218,9 @@ mod real {
     pub struct Engine {
         backend: &'static LlamaBackend,
         model: LlamaModel,
+        /// The vision projector; encoding needs `&mut`, and generations are
+        /// serialised by the provider anyway.
+        vision: Option<Mutex<MtmdContext>>,
         template: Option<String>,
         bos: String,
         eos: String,
@@ -199,12 +231,17 @@ mod real {
 
     impl std::fmt::Debug for Engine {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("Engine").field("n_ctx", &self.n_ctx).finish_non_exhaustive()
+            f.debug_struct("Engine")
+                .field("n_ctx", &self.n_ctx)
+                .field("vision", &self.vision.is_some())
+                .finish_non_exhaustive()
         }
     }
 
     impl Engine {
         /// Memory-maps the GGUF at `path` and prepares it for generation.
+        ///
+        /// A projector that fails to load is not fatal: the engine then reads text only.
         pub fn load(path: &Path, config: &EngineConfig) -> Result<Self, LlamaError> {
             if !path.is_file() {
                 return Err(LlamaError::MissingModel(path.display().to_string()));
@@ -240,9 +277,14 @@ mod real {
             } else {
                 default_threads()
             };
+            let vision = config
+                .mmproj
+                .as_deref()
+                .and_then(|mmproj| load_vision(mmproj, &model, config, n_threads));
             Ok(Self {
                 backend,
                 model,
+                vision,
                 template,
                 bos,
                 eos,
@@ -276,61 +318,123 @@ mod real {
             self.n_ctx
         }
 
+        /// Whether a vision projector is loaded.
+        #[must_use]
+        pub fn supports_vision(&self) -> bool {
+            self.vision.is_some()
+        }
+
         /// Generates a reply to `prompt`, calling `on_text` with each decoded chunk.
         ///
+        /// With `images`, `prompt` holds one media marker ([`MEDIA_MARKER`]) per
+        /// image, in order; the images are encoded by the vision projector.
         /// `should_stop` is polled between tokens and prompt batches.
         pub fn generate(
             &self,
             prompt: &str,
+            images: &[&[u8]],
             sampling: &SamplingParams,
             should_stop: &dyn Fn() -> bool,
             on_text: &mut dyn FnMut(&str),
         ) -> Result<GenerateStats, LlamaError> {
             let vocab = self.model.vocab();
-            // The template already wrote every special token; parse them as such.
-            let tokens = vocab.tokenize(prompt.as_bytes(), false, true);
             let n_ctx = self.n_ctx as usize;
-            if tokens.is_empty() || tokens.len() + REPLY_HEADROOM > n_ctx {
-                return Err(LlamaError::ContextLength {
-                    needed: tokens.len() + REPLY_HEADROOM,
-                    available: n_ctx,
-                });
-            }
-            let prompt_tokens = tokens.len() as u64;
-            let stats = |completion: u64, finish| GenerateStats {
-                prompt_tokens,
-                completion_tokens: completion,
-                finish,
-            };
-
             let ctx_params = LlamaContextParams::default()
                 .with_n_ctx(NonZeroU32::new(self.n_ctx))
                 .with_n_batch(self.n_batch)
                 .with_n_ubatch(self.n_batch)
                 .with_n_threads(self.n_threads)
                 .with_n_threads_batch(self.n_threads);
-            let mut ctx = self
-                .model
-                .new_context(self.backend, ctx_params)
-                .map_err(generate_error)?;
             let mut batch = LlamaBatch::new(self.n_batch as usize, 1);
 
-            // Prompt prefill in batches; only the very last token needs logits.
-            let last = tokens.len() - 1;
-            let mut pos: i32 = 0;
-            for chunk in tokens.chunks(self.n_batch as usize) {
+            let (mut ctx, mut pos, mut logits_index, prompt_tokens);
+            if images.is_empty() {
+                // The template already wrote every special token; parse them as such.
+                let tokens = vocab.tokenize(prompt.as_bytes(), false, true);
+                if tokens.is_empty() || tokens.len() + REPLY_HEADROOM > n_ctx {
+                    return Err(LlamaError::ContextLength {
+                        needed: tokens.len() + REPLY_HEADROOM,
+                        available: n_ctx,
+                    });
+                }
+                prompt_tokens = tokens.len() as u64;
+                ctx = self
+                    .model
+                    .new_context(self.backend, ctx_params)
+                    .map_err(generate_error)?;
+                // Prompt prefill in batches; only the very last token needs logits.
+                let last = tokens.len() - 1;
+                pos = 0_i32;
+                for chunk in tokens.chunks(self.n_batch as usize) {
+                    if should_stop() {
+                        return Ok(GenerateStats {
+                            prompt_tokens: tokens.len() as u64,
+                            completion_tokens: 0,
+                            finish: FinishReason::Cancelled,
+                        });
+                    }
+                    batch.clear();
+                    for token in chunk {
+                        let index = pos as usize;
+                        batch
+                            .add(*token, pos, &[0], index == last)
+                            .map_err(generate_error)?;
+                        pos += 1;
+                    }
+                    ctx.decode(&mut batch).map_err(generate_error)?;
+                }
+                logits_index = batch.n_tokens() - 1;
+            } else {
+                let vision = self.vision.as_ref().ok_or_else(|| {
+                    LlamaError::Generate("this model has no vision projector loaded".to_owned())
+                })?;
+                let mut vision = vision.lock().unwrap_or_else(PoisonError::into_inner);
+                let marker = super::MEDIA_MARKER;
+                if prompt.matches(marker).count() != images.len() {
+                    return Err(LlamaError::Generate(
+                        "the prompt has a different number of image markers than images".to_owned(),
+                    ));
+                }
+                let bitmaps = images
+                    .iter()
+                    .map(|data| {
+                        MtmdBitmap::from_buffer(&vision, data, false)
+                            .map_err(|e| LlamaError::Generate(format!("could not read the image: {e}")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+                let chunks = vision
+                    .tokenize(
+                        MtmdInputText {
+                            text: prompt.to_owned(),
+                            add_special: false,
+                            parse_special: true,
+                        },
+                        &refs,
+                    )
+                    .map_err(|e| LlamaError::Generate(format!("could not encode the image: {e}")))?;
+                let needed = chunks.total_tokens() + REPLY_HEADROOM;
+                if chunks.is_empty() || needed > n_ctx {
+                    return Err(LlamaError::ContextLength { needed, available: n_ctx });
+                }
+                prompt_tokens = chunks.total_tokens() as u64;
                 if should_stop() {
-                    return Ok(stats(0, FinishReason::Cancelled));
+                    return Ok(GenerateStats {
+                        prompt_tokens,
+                        completion_tokens: 0,
+                        finish: FinishReason::Cancelled,
+                    });
                 }
-                batch.clear();
-                for token in chunk {
-                    let index = pos as usize;
-                    batch
-                        .add(*token, pos, &[0], index == last)
-                        .map_err(generate_error)?;
-                    pos += 1;
-                }
-                ctx.decode(&mut batch).map_err(generate_error)?;
+                ctx = self
+                    .model
+                    .new_context(self.backend, ctx_params)
+                    .map_err(generate_error)?;
+                // Encodes the images and decodes text and image chunks in order;
+                // the logits of the last token are kept (index -1).
+                pos = chunks
+                    .eval_chunks(&mut vision, &mut ctx, 0, 0, self.n_batch as i32, true)
+                    .map_err(|e| LlamaError::Generate(format!("image prefill failed: {e}")))?;
+                logits_index = -1;
             }
 
             let mut sampler = if sampling.temperature <= 0.0 {
@@ -353,7 +457,6 @@ mod real {
 
             let mut decoder = Utf8Stream::default();
             let mut generated: u64 = 0;
-            let mut logits_index = batch.n_tokens() - 1;
             let finish = loop {
                 if should_stop() {
                     break FinishReason::Cancelled;
@@ -380,7 +483,35 @@ mod real {
                 logits_index = 0;
                 ctx.decode(&mut batch).map_err(generate_error)?;
             };
-            Ok(stats(generated, finish))
+            Ok(GenerateStats { prompt_tokens, completion_tokens: generated, finish })
+        }
+    }
+
+    /// Loads the projector; `None` (and a warning) when it cannot be used.
+    fn load_vision(
+        mmproj: &Path,
+        model: &LlamaModel,
+        config: &EngineConfig,
+        n_threads: i32,
+    ) -> Option<Mutex<MtmdContext>> {
+        let params = MtmdContextParams {
+            use_gpu: false,
+            print_timings: false,
+            n_threads,
+            media_marker: std::ffi::CString::new(super::MEDIA_MARKER).ok()?,
+            image_min_tokens: config.image_min_tokens,
+            image_max_tokens: config.image_max_tokens,
+        };
+        match MtmdContext::init_from_file(mmproj.to_str()?, model, &params) {
+            Ok(context) if context.support_vision() => Some(Mutex::new(context)),
+            Ok(_) => {
+                tracing::warn!("the projector {} has no vision encoder", mmproj.display());
+                None
+            }
+            Err(error) => {
+                tracing::warn!("could not load the projector {}: {error}", mmproj.display());
+                None
+            }
         }
     }
 }
