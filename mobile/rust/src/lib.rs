@@ -21,9 +21,15 @@ pub use provider::{ChatgptProviderCredential, ChatgptProviderStatus};
 pub use providers::ProviderStore;
 pub use secrets::{KeystoreError, KeystoreSecretResolver, PlatformKeystore};
 pub use types::*;
-pub use device::{DeviceError, DeviceLimits, FileAccess, SafEntry, SafRoot, ShellExecutor, ShellOutput, ShellRequest, check_shell_request, device_limits, normalize_device_path};
+pub use device::{
+    DeviceError, DeviceLimits, FileAccess, SafEntry, SafRoot, ShellExecutor, ShellOutput,
+    ShellRequest, check_shell_request, device_limits, normalize_device_path,
+};
 pub use listener::CoreListener;
-pub use models::{CatalogModel, LocalModel, ModelFileState, delete_model, finalize_model, local_models, model_catalog};
+pub use models::{
+    CatalogModel, LocalModel, ModelFileState, delete_model, finalize_model, local_models,
+    model_catalog,
+};
 
 uniffi::setup_scaffolding!();
 

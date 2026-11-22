@@ -1281,7 +1281,9 @@ async fn monitor_connection(
             () = tokio::time::sleep(PROBE_INTERVAL) => {
                 // The remote port owns the socket, so a read-only
                 // probe also detects disconnects with no session attached.
-                if let Err(MobileError::Session { detail }) = link.request(link.backend.port().list()).await {
+                if let Err(MobileError::Session { detail }) =
+                    link.request(link.backend.port().list()).await
+                {
                     link.fail(LinkIssue::protocol(detail));
                 }
             }
@@ -1413,9 +1415,7 @@ async fn drive_attachment(
             }
         };
         drop(permit);
-        ack.granted = ack
-            .granted
-            .intersect(link.backend.granted());
+        ack.granted = ack.granted.intersect(link.backend.granted());
         if with_session(&shared, &id, &link, |session| {
             session.attached(&ack, from.is_none())
         })

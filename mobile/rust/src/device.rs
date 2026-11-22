@@ -290,9 +290,9 @@ mod tests {
         assert_eq!(detail(request(&["ls", "a\0b"])), "invalid argument");
         let long = "x".repeat(4097);
         assert_eq!(detail(request(&["ls", &long])), "invalid argument");
-        let many = vec!["a"; 65];
+        let many = ["a"; 65];
         assert_eq!(detail(request(&many)), "too many arguments");
-        assert!(check_shell_request(request(&vec!["a"; 64])).is_ok());
+        assert!(check_shell_request(request(&["a"; 64])).is_ok());
     }
 
     #[test]

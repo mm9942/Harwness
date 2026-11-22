@@ -184,7 +184,7 @@ internal class TermuxBridge(
             } catch (_: IllegalStateException) {
                 throw DeviceException.Unavailable("Termux could not start")
             }
-            if (!latch.await(clampTimeout(request.timeoutMs), TimeUnit.MILLISECONDS)) {
+            if (!latch.await(clampTimeout(request.timeoutMs.toLong().coerceAtLeast(0L)), TimeUnit.MILLISECONDS)) {
                 return ShellOutput(
                     exitCode = null,
                     stdout = "",
@@ -193,7 +193,7 @@ internal class TermuxBridge(
                     timedOut = true,
                 )
             }
-            return parse(result.get() ?: Bundle.EMPTY, clampOutput(request.maxOutputBytes))
+            return parse(result.get() ?: Bundle.EMPTY, clampOutput(request.maxOutputBytes.toInt().coerceAtLeast(0)))
         } finally {
             try {
                 context.unregisterReceiver(receiver)
