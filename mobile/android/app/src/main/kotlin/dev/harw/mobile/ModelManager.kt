@@ -16,7 +16,14 @@ import uniffi.harw_mobile_ffi.CatalogModel
 import uniffi.harw_mobile_ffi.LocalModel
 import uniffi.harw_mobile_ffi.MobileException
 import uniffi.harw_mobile_ffi.ModelProgress
+import uniffi.harw_mobile_ffi.ProjectorAttach
+import uniffi.harw_mobile_ffi.ProjectorInfo
 import uniffi.harw_mobile_ffi.VisionAddon
+import uniffi.harw_mobile_ffi.attachProjector
+import uniffi.harw_mobile_ffi.defaultProjectorFor
+import uniffi.harw_mobile_ffi.detachProjector
+import uniffi.harw_mobile_ffi.modelProjector
+import uniffi.harw_mobile_ffi.suggestProjectors
 import uniffi.harw_mobile_ffi.activateLocalModel
 import uniffi.harw_mobile_ffi.activeLocalModel
 import uniffi.harw_mobile_ffi.deleteModel
@@ -126,6 +133,26 @@ internal class ModelManager(private val store: ModelStore) {
 
     suspend fun localVision(): List<LocalModel> = withContext(Dispatchers.IO) {
         visionModels(store.modelsDir().path)
+    }
+
+    suspend fun projector(modelId: String): ProjectorInfo? = withContext(Dispatchers.IO) {
+        modelProjector(store.modelsDir().path, modelId)
+    }
+
+    suspend fun projectorSuggestions(modelId: String): List<ProjectorInfo> = withContext(Dispatchers.IO) {
+        suggestProjectors(store.modelsDir().path, modelId)
+    }
+
+    suspend fun defaultProjector(modelId: String): VisionAddon? = withContext(Dispatchers.IO) {
+        defaultProjectorFor(store.modelsDir().path, modelId)
+    }
+
+    suspend fun attachProjectorFile(modelId: String, fileName: String): ProjectorAttach = withContext(Dispatchers.IO) {
+        ModelDirLock.mutex.withLock { attachProjector(store.modelsDir().path, modelId, fileName) }
+    }
+
+    suspend fun detachProjectorOf(modelId: String) = withContext(Dispatchers.IO) {
+        ModelDirLock.mutex.withLock { detachProjector(store.modelsDir().path, modelId) }
     }
 
     suspend fun local(): List<LocalModel> = withContext(Dispatchers.IO) {

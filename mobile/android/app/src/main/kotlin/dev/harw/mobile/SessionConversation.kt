@@ -120,9 +120,12 @@ internal fun localModelLabel(provider: String?, model: String?): String = when {
 internal fun localModelSeesImages(context: android.content.Context, modelId: String?): Boolean {
     if (modelId.isNullOrBlank()) return false
     if (localVisionFailure(modelId) != null) return false
-    val addon = uniffi.harw_mobile_ffi.visionCatalog().firstOrNull { modelId in it.modelIds } ?: return false
-    return uniffi.harw_mobile_ffi.visionModels(ModelStore(context.applicationContext).modelsDir().path)
-        .any { it.id == addon.file.id && it.state == uniffi.harw_mobile_ffi.ModelFileState.COMPLETE }
+    return try {
+        uniffi.harw_mobile_ffi.modelProjector(ModelStore(context.applicationContext).modelsDir().path, modelId)
+            ?.compatible == true
+    } catch (_: Exception) {
+        false
+    }
 }
 
 /** Ob der Provider beim letzten Laden wirklich Bilder lesen kann (Status der Engine, nicht Dateiexistenz). */
@@ -1012,6 +1015,57 @@ internal fun LocalModelChip(hasImages: Boolean = false) {
     }
 }
 
+private class VisionOffer(val modelId: String, val addon: uniffi.harw_mobile_ffi.VisionAddon?)
+
+/** Importiertes Modell ohne Projektor: "Projektor wählen" (Dateiauswahl, Prüfung, Neuaktivierung). */
+@Composable
+private fun ImportedProjectorHint(modelId: String, hasImages: Boolean, onActivated: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var error by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val failure = localVisionFailure(modelId)
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        busy = true
+        error = null
+        scope.launch {
+            try {
+                val result = ModelImport(context.applicationContext, ModelStore(context.applicationContext))
+                    .attachProjector(modelId, uri) {}
+                if (result.info == null) {
+                    error = result.message
+                } else {
+                    ModelManager(ModelStore(context.applicationContext)).useLocal(context.filesDir.path, modelId)
+                    onActivated()
+                }
+            } catch (e: Exception) {
+                error = e.message ?: "Projektor konnte nicht übernommen werden"
+            } finally {
+                busy = false
+            }
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (failure != null) {
+            Text(
+                "Die Projektor-Datei ließ sich nicht laden ($failure). Bilder werden ignoriert.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        if (hasImages) {
+            Text(
+                "Dieses Modell ignoriert Bilder, bis ein Projektor gewählt ist.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        OutlinedButton(enabled = !busy, onClick = { picker.launch(arrayOf("*/*")) }) { Text("Projektor wählen") }
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
+    }
+}
+
 /** Button "Bildverständnis laden" für das aktive On-Device-Modell ohne Projektor; lädt, zeigt Fortschritt, aktiviert neu. */
 @Composable
 private fun LocalVisionHint(hasImages: Boolean, refresh: Int, onActivated: () -> Unit) {
@@ -1021,7 +1075,7 @@ private fun LocalVisionHint(hasImages: Boolean, refresh: Int, onActivated: () ->
     var error by remember { mutableStateOf<String?>(null) }
     val download by ModelDownloads.state.collectAsState()
     // Aktives Modell + Add-on; `null` = nichts anzubieten (kein Gerätemodell, kein Add-on, schon geladen).
-    val addon by produceState<uniffi.harw_mobile_ffi.VisionAddon?>(null, refresh, tick, download) {
+    val offer by produceState<VisionOffer?>(null, refresh, tick, download) {
         value = withContext(Dispatchers.IO) {
             try {
                 val info = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
@@ -1029,14 +1083,20 @@ private fun LocalVisionHint(hasImages: Boolean, refresh: Int, onActivated: () ->
                 if (info.activeProvider != "local-gguf" || id.isNullOrBlank() || localModelSeesImages(context, id)) {
                     null
                 } else {
-                    uniffi.harw_mobile_ffi.visionCatalog().firstOrNull { id in it.modelIds }
+                    val catalogAddon = uniffi.harw_mobile_ffi.visionCatalog().firstOrNull { id in it.modelIds }
+                    if (catalogAddon != null || id.startsWith("own-")) VisionOffer(id, catalogAddon) else null
                 }
             } catch (_: Exception) {
                 null
             }
         }
     }
-    val current = addon ?: return
+    val offered = offer ?: return
+    val current = offered.addon
+    if (current == null) {
+        ImportedProjectorHint(offered.modelId, hasImages, onActivated)
+        return
+    }
     val fileId = current.file.id
     var lastFinished by remember { mutableStateOf<ModelDownloadState?>(null) }
     LaunchedEffect(download) {

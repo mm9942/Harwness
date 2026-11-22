@@ -1,5 +1,7 @@
 //! [`harw_core::ModelProvider`] over a local GGUF model.
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -74,6 +76,8 @@ pub struct LocalGgufProvider {
     /// One generation at a time: a second context would double the memory use.
     gate: Arc<Mutex<()>>,
     counter: AtomicU64,
+    /// Image descriptions by (image bytes, question) hash.
+    descriptions: Mutex<HashMap<u64, String>>,
 }
 
 impl std::fmt::Debug for LocalGgufProvider {
@@ -108,6 +112,7 @@ impl LocalGgufProvider {
             config,
             gate: Arc::new(Mutex::new(())),
             counter: AtomicU64::new(0),
+            descriptions: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -286,6 +291,42 @@ fn tools_json(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
+/// Prompt of the per-image vision pass.
+const DESCRIBE_PROMPT: &str =
+    "Beschreibe das Bild genau und sachlich, mit allem, was f\u{fc}r die Frage wichtig ist.";
+
+/// Tokens one image description may take.
+const DESCRIBE_MAX_TOKENS: u32 = 220;
+
+/// Newest images of a chat that are described (older ones stay a bare marker).
+const MAX_DESCRIBED_IMAGES: usize = 10;
+
+fn description_key(data: &[u8], question: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    question.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `(image number, question of its message, bytes)` for the images with data,
+/// numbered like `chat_messages` does.
+fn images_to_describe(request: &ModelRequest) -> Vec<(usize, String, Arc<[u8]>)> {
+    let mut found = Vec::new();
+    let mut number = 0_usize;
+    for item in request.history.to_model_messages() {
+        if let ModelMessage::User { text, images } = item {
+            for image in images {
+                number += 1;
+                if let Some(data) = image.data {
+                    found.push((number, text.clone(), data));
+                }
+            }
+        }
+    }
+    let skip = found.len().saturating_sub(MAX_DESCRIBED_IMAGES);
+    found.split_off(skip)
+}
+
 /// Most images shown to the model at once (each costs up to `image_max_tokens`).
 const MAX_SHOWN_IMAGES: usize = 3;
 
@@ -344,6 +385,7 @@ fn chat_messages(
     vision: bool,
     projector_failure: Option<&str>,
     extra_refs: &[usize],
+    described: &HashMap<usize, String>,
 ) -> Chat {
     let mut system = if lean && vision {
         LEAN_VISION_SYSTEM_PROMPT.to_owned()
@@ -352,6 +394,11 @@ fn chat_messages(
     } else {
         request.system_prompt.clone()
     };
+    if !described.is_empty() {
+        system.push_str(
+            "\nImages arrive as text descriptions marked [Bild N]; treat them as what you see.",
+        );
+    }
     for fragment in request.instruction_fragments.iter().filter(|_| !lean) {
         if !fragment.trim().is_empty() {
             if !system.is_empty() {
@@ -423,6 +470,11 @@ fn chat_messages(
                             markers.push_str(MEDIA_MARKER);
                             markers.push('\n');
                             shown.push(Arc::clone(data));
+                        }
+                        Some(_) if described.contains_key(&number_of(index, n)) => {
+                            let number = number_of(index, n);
+                            let description = described.get(&number).map_or("", String::as_str);
+                            text.push_str(&format!("\n[Bild {number}] {description}"));
                         }
                         Some(_) => {
                             omitted += 1;
@@ -504,18 +556,27 @@ impl LocalGgufProvider {
         ToolCallId::from_str(format!("call_local_{millis:x}_{n}"))
     }
 
-    fn prepare(&self, request: &ModelRequest, forced: &[usize]) -> Result<Job, ModelError> {
+    fn prepare(
+        &self,
+        request: &ModelRequest,
+        forced: &[usize],
+        described: &HashMap<usize, String>,
+    ) -> Result<Job, ModelError> {
+        // With a projector every image is described in its own short pass first;
+        // the answering run only sees the descriptions as text.
+        let describe_mode = self.config.lean && self.engine.supports_vision();
         let Chat { messages, switch, images } =
             chat_messages(
                 request,
                 self.config.lean,
-                self.engine.supports_vision(),
+                self.engine.supports_vision() && !describe_mode,
                 self.engine.vision_error(),
                 forced,
+                described,
             );
         let thinking = thinking_for(request, switch, self.config.thinking_default);
         let tools = if self.config.lean {
-            if self.engine.supports_vision() { vec![view_image_tool()] } else { Vec::new() }
+            if self.engine.supports_vision() && !describe_mode { vec![view_image_tool()] } else { Vec::new() }
         } else {
             tools_json(&request.tools)
         };
@@ -546,6 +607,88 @@ impl LocalGgufProvider {
             cancel: request.cancel.clone(),
             stream: request.stream.clone(),
         })
+    }
+
+    fn describe_job(&self, request: &ModelRequest, question: &str, data: Arc<[u8]>) -> Result<Job, ModelError> {
+        let question = question.trim();
+        let question = if question.is_empty() { "(keine Frage)" } else { question };
+        let messages = vec![ChatMessage::new(
+            "user",
+            format!("{MEDIA_MARKER}\nFrage des Nutzers: {question}\n\n{DESCRIBE_PROMPT}"),
+        )];
+        let no_tools: Vec<Value> = Vec::new();
+        let prompt = render_prompt(
+            self.engine.chat_template(),
+            &RenderInput {
+                messages: &messages,
+                tools: &no_tools,
+                enable_thinking: false,
+                bos_token: self.engine.bos_token(),
+                eos_token: self.engine.eos_token(),
+            },
+        )
+        .map_err(map_error)?;
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        Ok(Job {
+            start_in_think: prompt_opens_think(&prompt),
+            prompt,
+            images: vec![data],
+            tools: no_tools,
+            sampling: SamplingParams::for_mode(false, DESCRIBE_MAX_TOKENS, seed),
+            cancel: request.cancel.clone(),
+            stream: None,
+        })
+    }
+
+    /// Describes every image of the chat in its own short vision pass (cached).
+    async fn describe_images(&self, request: &ModelRequest) -> Result<HashMap<usize, String>, ModelError> {
+        let mut result = HashMap::new();
+        let todo = images_to_describe(request);
+        let total = todo.len();
+        for (i, (number, question, data)) in todo.into_iter().enumerate() {
+            let key = description_key(&data, &question);
+            let cached = self
+                .descriptions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&key)
+                .cloned();
+            let text = if let Some(text) = cached {
+                text
+            } else {
+                if let Some(sink) = request.stream.as_ref() {
+                    sink.emit(ModelStreamEvent::ReasoningDelta(format!(
+                        "Bild {} von {total} wird angesehen \u{2026}\n",
+                        i + 1
+                    )));
+                }
+                let job = self.describe_job(request, &question, data)?;
+                let abort = Arc::new(AtomicBool::new(false));
+                let _abort_on_drop = AbortOnDrop(Arc::clone(&abort));
+                let engine = Arc::clone(&self.engine);
+                let gate = Arc::clone(&self.gate);
+                let worker_abort = Arc::clone(&abort);
+                let generated = tokio::task::spawn_blocking(move || {
+                    run_job(&engine, &gate, &job, &worker_abort)
+                })
+                .await
+                .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
+                .map_err(map_error)?;
+                if generated.finish == FinishReason::Cancelled {
+                    return Err(ModelError::Cancelled);
+                }
+                let text = generated.output.text.trim().to_owned();
+                self.descriptions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key, text.clone());
+                text
+            };
+            result.insert(number, text);
+        }
+        Ok(result)
     }
 
     fn into_response(&self, generated: Generated, tools: &[Value]) -> Result<ModelResponse, ModelError> {
@@ -593,8 +736,13 @@ impl ModelProvider for LocalGgufProvider {
         Box::pin(async move {
             let mut forced: Vec<usize> = Vec::new();
             let mut round = 0;
+            let described = if self.config.lean && self.engine.supports_vision() {
+                self.describe_images(&request).await?
+            } else {
+                HashMap::new()
+            };
             let (generated, tools, stream) = loop {
-                let job = self.prepare(&request, &forced)?;
+                let job = self.prepare(&request, &forced, &described)?;
                 let tools = job.tools.clone();
                 let stream = job.stream.clone();
                 let abort = Arc::new(AtomicBool::new(false));

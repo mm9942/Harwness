@@ -19,6 +19,8 @@ import uniffi.harw_mobile_ffi.ImportVerdict
 import uniffi.harw_mobile_ffi.LocalModel
 import uniffi.harw_mobile_ffi.MobileException
 import uniffi.harw_mobile_ffi.ModelProgress
+import uniffi.harw_mobile_ffi.ProjectorAttach
+import uniffi.harw_mobile_ffi.attachProjectorImport
 import uniffi.harw_mobile_ffi.commitImport
 import uniffi.harw_mobile_ffi.discardImport
 import uniffi.harw_mobile_ffi.importModel
@@ -192,6 +194,43 @@ internal class ModelImport(context: Context, private val store: ModelStore) {
         val (name, size) = withContext(Dispatchers.IO) { queryNameAndSize(uri) }
         if (name == null) return ImportResult.Failed("file name unavailable")
         return runImport(uri, name, size, null, onProgress)
+    }
+
+    /** Copies a picked projector file next to the models and maps it to [modelId]; German message on failure. */
+    suspend fun attachProjector(
+        modelId: String,
+        uri: Uri,
+        onProgress: (ImportProgress) -> Unit,
+    ): ProjectorAttach {
+        val (name, size) = withContext(Dispatchers.IO) { queryNameAndSize(uri) }
+        if (name == null) return ProjectorAttach(null, "Dateiname nicht lesbar.")
+        if (!ModelDirLock.mutex.tryLock()) return ProjectorAttach(null, "Ein Download oder Import läuft noch.")
+        try {
+            return withContext(Dispatchers.IO) {
+                val dir = store.modelsDir()
+                if (size > 0) {
+                    val free = store.freeBytes()
+                    if (free < size + StorageMarginBytes) return@withContext ProjectorAttach(null, "Nicht genug freier Speicher.")
+                }
+                val staged = stagingName(ByteArray(StagingRandomBytes).also { random.nextBytes(it) })
+                try {
+                    copyToStaging(uri, File(dir, staged), size, onProgress)
+                    onProgress(ImportProgress(ImportPhase.Verifying, 0, 1))
+                    attachProjectorImport(dir.path, modelId, staged, name)
+                } catch (e: CopyCancelled) {
+                    File(dir, staged).delete()
+                    ProjectorAttach(null, "Abgebrochen.")
+                } catch (e: CancellationException) {
+                    File(dir, staged).delete()
+                    throw e
+                } catch (e: Exception) {
+                    File(dir, staged).delete()
+                    ProjectorAttach(null, "Projektor konnte nicht übernommen werden: ${e.message ?: "Fehler"}")
+                }
+            }
+        } finally {
+            ModelDirLock.mutex.unlock()
+        }
     }
 
     private fun queryNameAndSize(uri: Uri): Pair<String?, Long> {

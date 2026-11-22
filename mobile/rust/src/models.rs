@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::MobileError;
 
+mod projector;
+pub(crate) use projector::mapped_projector_in;
+
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const PROGRESS_STEP_BYTES: u64 = 32 * 1024 * 1024;
 const PART_SUFFIX: &str = ".part";
@@ -356,6 +359,9 @@ fn file_entries() -> Vec<CatalogModel> {
 
 /// Path of the complete, verified projector of `model_id`, if it is on disk.
 pub(crate) fn vision_path_in(dir: &Path, model_id: &str) -> Option<String> {
+    if let Some(mapped) = mapped_projector_in(dir, model_id) {
+        return Some(mapped.to_string_lossy().into_owned());
+    }
     let addon = vision_entries()
         .into_iter()
         .find(|a| a.model_ids.iter().any(|id| id == model_id))?;
@@ -1042,6 +1048,7 @@ fn delete_in(dir: &Path, catalog: &[CatalogModel], model_id: &str) -> Result<(),
             .iter()
             .find(|(_, s)| s.id == model_id && s.origin == SidecarOrigin::Imported);
         if let Some((name, _)) = hit {
+            projector::forget_in(dir, model_id)?;
             remove_if_present(&dir.join(name))?;
             return remove_if_present(&dir.join(sidecar_name(name)));
         }
