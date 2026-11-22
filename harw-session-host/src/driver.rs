@@ -39,6 +39,14 @@ pub enum DriverEvent {
         role: String,
         event: TurnEvent,
     },
+    /// State change of an agent job (a background child agent) of this
+    /// session. Live-only: never written to the transcript.
+    Job {
+        work_id: String,
+        kind: String,
+        state: String,
+        summary: Option<String>,
+    },
     /// The turn parked on an approval.
     ApprovalRequested(ApprovalRequest),
     /// The durable transcript advanced; the host re-reads the head.

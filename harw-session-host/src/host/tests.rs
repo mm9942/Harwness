@@ -49,6 +49,8 @@ struct FakeDriver {
     admissions: std::sync::Mutex<Vec<crate::driver::ExecutionAdmission>>,
     /// Results returned (in order) instead of running a normal turn.
     failures: std::sync::Mutex<std::collections::VecDeque<Result<TurnOutcome, HostError>>>,
+    /// Sink of the most recent turn, kept to emit live events between legs.
+    last_sink: std::sync::Mutex<Option<Arc<dyn EventSink>>>,
 }
 
 impl FakeDriver {
@@ -64,7 +66,12 @@ impl FakeDriver {
             settings: std::sync::Mutex::new(Vec::new()),
             admissions: std::sync::Mutex::new(Vec::new()),
             failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            last_sink: std::sync::Mutex::new(None),
         }
+    }
+
+    fn sink(&self) -> Option<Arc<dyn EventSink>> {
+        self.last_sink.lock().ok().and_then(|sink| sink.clone())
     }
 
     fn script_failure(&self, result: Result<TurnOutcome, HostError>) {
@@ -128,6 +135,9 @@ impl TurnDriver for FakeDriver {
         sink: Arc<dyn EventSink>,
     ) -> DriverFuture<'_, TurnOutcome> {
         Box::pin(async move {
+            if let Ok(mut last) = self.last_sink.lock() {
+                *last = Some(Arc::clone(&sink));
+            }
             self.turns.fetch_add(1, Ordering::SeqCst);
             let scripted = self.failures.lock().ok().and_then(|mut f| f.pop_front());
             if let Some(result) = scripted {
@@ -1205,5 +1215,136 @@ async fn policy_invalidation_expires_detached_device_facts_and_allows_fresh_narr
         .ok_or("missing admission")?;
     assert_eq!(admission.maximum_tier(), PermissionTier::Observer);
     drop(fresh);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hello_grants_compact_reasoning_and_job_frames() -> TestResult {
+    let fx = fixture()?;
+    let connection = fx.host.connect(local(1, PermissionTier::Operator))?;
+    let ack = connection
+        .hello(HelloParams {
+            client_label: "phone".into(),
+            wire_minor: 2,
+            features: vec![
+                "compact_reasoning".into(),
+                "job_frames".into(),
+                "child_frames".into(),
+            ],
+            requested_caps: None,
+        })
+        .await?;
+    assert_eq!(
+        ack.features,
+        vec![
+            "compact_reasoning".to_owned(),
+            "job_frames".to_owned(),
+            "child_frames".to_owned()
+        ]
+    );
+    Ok(())
+}
+
+fn child_reasoning(session: &SessionId, text: &str) -> DriverEvent {
+    DriverEvent::Child {
+        agent: SessionId::new(),
+        parent: Some(session.clone()),
+        role: "explorer".into(),
+        event: TurnEvent::ReasoningDelta {
+            turn_id: TurnId::new(),
+            text: text.into(),
+        },
+    }
+}
+
+fn job_event(work_id: &str) -> DriverEvent {
+    DriverEvent::Job {
+        work_id: work_id.into(),
+        kind: "agent".into(),
+        state: "completed".into(),
+        summary: Some("explorer".into()),
+    }
+}
+
+#[tokio::test]
+async fn background_child_and_job_frames_reach_clients_after_the_turn() -> TestResult {
+    let fx = fixture()?;
+    let connection = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let session = connection.create(CreateParams::default()).await?.session_id;
+    let (_, mut frames) = connection.attach(attach(&session, None)).await?;
+    connection
+        .submit(submit(&session, "hi", "m1", Cursor::default()))
+        .await?;
+    wait_idle(&connection, &session).await?;
+
+    let sink = fx.driver.sink().ok_or("no sink captured")?;
+    sink.emit(child_reasoning(&session, "thinking"));
+    sink.emit(job_event("w-1"));
+
+    wait_for(&mut frames, |frame| {
+        matches!(frame, SessionFrame::Child { role, event: TurnEvent::ReasoningDelta { text, .. }, .. }
+            if text == "thinking" && role == "explorer")
+    })
+    .await?;
+    wait_for(&mut frames, |frame| {
+        matches!(frame, SessionFrame::Job { work_id, state, .. }
+            if work_id == "w-1" && state == "completed")
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_drops_child_reasoning_but_compact_reasoning_keeps_it() -> TestResult {
+    let fx = fixture()?;
+    let owner = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let viewer = connect(&fx.host, local(2, PermissionTier::Operator)).await?;
+    let session = owner.create(CreateParams::default()).await?.session_id;
+    owner
+        .submit(submit(&session, "hi", "m1", Cursor::default()))
+        .await?;
+    wait_idle(&owner, &session).await?;
+
+    let (_, mut compact) = owner
+        .attach(AttachParams {
+            profile: StreamProfile::Compact,
+            ..attach(&session, None)
+        })
+        .await?;
+    let (_, mut reasoning) = viewer
+        .attach(AttachParams {
+            profile: StreamProfile::CompactReasoning,
+            ..attach(&session, None)
+        })
+        .await?;
+
+    let sink = fx.driver.sink().ok_or("no sink captured")?;
+    sink.emit(child_reasoning(&session, "r"));
+    sink.emit(job_event("w-2"));
+
+    wait_for(&mut reasoning, |frame| {
+        matches!(frame, SessionFrame::Child { event: TurnEvent::ReasoningDelta { text, .. }, .. } if text == "r")
+    })
+    .await?;
+    wait_for(&mut reasoning, |frame| {
+        matches!(frame, SessionFrame::Job { work_id, .. } if work_id == "w-2")
+    })
+    .await?;
+
+    let saw_reasoning = std::cell::Cell::new(false);
+    wait_for(&mut compact, |frame| {
+        if matches!(
+            frame,
+            SessionFrame::Child {
+                event: TurnEvent::ReasoningDelta { .. },
+                ..
+            }
+        ) {
+            saw_reasoning.set(true);
+        }
+        matches!(frame, SessionFrame::Job { work_id, .. } if work_id == "w-2")
+    })
+    .await?;
+    assert!(!saw_reasoning.get(), "compact must drop child reasoning");
     Ok(())
 }

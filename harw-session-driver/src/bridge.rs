@@ -40,11 +40,11 @@ use harw_core::dod_taint::pending_ask_reason;
 use harw_core::mode::InteractionMode;
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
-    AgentSession, ApprovalResolution, ModelProvider, StateStore, TurnInput as CoreTurnInput,
+    AgentEvent, AgentEventKind, AgentSession, ApprovalResolution, ModelProvider, StateStore, TurnInput as CoreTurnInput,
     TurnOutcome as CoreOutcome, resume_after_approval, run_turn_durable,
 };
 use harw_protocol::approvals::ApprovalKind;
-use harw_protocol::{ApprovalRequest, SessionEvent, TurnEvent};
+use harw_protocol::{AgentOrchestrationStatus, ApprovalRequest, SessionEvent, TurnEvent};
 use harw_session_host::HostError;
 use harw_session_host::driver::{
     CancelSignal, DriverEvent, DriverFuture, EventSink, ExecutionAdmission, Setting, TurnDriver,
@@ -172,6 +172,12 @@ pub trait CoreRuntime: Send + Sync + 'static {
 
     /// Model name for summaries, when known.
     fn model_name(&self, session_id: &SessionId) -> Option<String>;
+
+    /// Destination for live events of the session's child agents and agent
+    /// jobs, also between legs. The driver calls it at the start of every leg
+    /// with that leg's sink; the runtime keeps using the most recent sink
+    /// until the next call. Default: ignored.
+    fn bind_live_sink(&self, _session_id: &SessionId, _sink: Arc<dyn EventSink>) {}
 }
 
 /// Runtime of a driver built by [`CoreTurnDriver::new`]: nothing composed
@@ -507,6 +513,76 @@ fn forward(sink: &Arc<dyn EventSink>, event: CoreEvent) {
     });
 }
 
+/// Shared cell holding the sink of the most recent leg of one session.
+type LiveSink = Arc<Mutex<Option<Arc<dyn EventSink>>>>;
+
+/// Aborts the per-slot forwarder when its slot is dropped.
+struct LiveForwarder(tokio::task::AbortHandle);
+
+impl Drop for LiveForwarder {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Wire state name of an orchestration status; `None` for pure progress.
+fn job_state(status: AgentOrchestrationStatus) -> Option<&'static str> {
+    match status {
+        AgentOrchestrationStatus::Progress => None,
+        AgentOrchestrationStatus::Admitted => Some("admitted"),
+        AgentOrchestrationStatus::Running => Some("running"),
+        AgentOrchestrationStatus::Paused => Some("paused"),
+        AgentOrchestrationStatus::Completed => Some("completed"),
+        AgentOrchestrationStatus::Failed => Some("failed"),
+        AgentOrchestrationStatus::Cancelled => Some("cancelled"),
+    }
+}
+
+/// Maps a hub event of the session tree rooted at `root` to a live driver
+/// event. Root turn events already arrive through the leg's channel.
+fn live_driver_event(root: &SessionId, event: AgentEvent) -> Option<DriverEvent> {
+    match event.kind {
+        AgentEventKind::Turn(ev) if event.agent != *root => Some(DriverEvent::Child {
+            agent: event.agent,
+            parent: event.parent,
+            role: event.role,
+            event: ev,
+        }),
+        AgentEventKind::Turn(_) => None,
+        AgentEventKind::Orchestration(o) => job_state(o.status).map(|state| DriverEvent::Job {
+            work_id: o.child_session_id.as_str().to_owned(),
+            kind: "agent".to_owned(),
+            state: state.to_owned(),
+            summary: Some(o.role),
+        }),
+        _ => None,
+    }
+}
+
+/// Forwards hub events into the currently bound sink (dropped while none).
+async fn forward_live(
+    mut rx: tokio::sync::broadcast::Receiver<AgentEvent>,
+    root: SessionId,
+    sink: LiveSink,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if let Some(mapped) = live_driver_event(&root, event) {
+                    let bound = sink.lock().ok().and_then(|cell| cell.clone());
+                    if let Some(bound) = bound {
+                        bound.emit(mapped);
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::debug!(skipped, "session driver: live agent events lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Human-readable summary of a parked tool approval.
 ///
 /// # Description
@@ -594,6 +670,8 @@ impl TurnDriver for CoreTurnDriver {
             self.remember_control(&input.session_id, control.clone())?;
             let (tx, rx) = mpsc::unbounded_channel();
             let core_input = CoreTurnInput::user(input.text).with_control(control);
+            self.runtime
+                .bind_live_sink(&input.session_id, Arc::clone(&sink));
             let leg = self.runtime.run_turn(&input.session_id, core_input, tx);
             let result = Self::pump(leg, rx, &mut cancel, &token, &sink).await;
             self.settle(&input.session_id, &sink, result)
@@ -625,6 +703,8 @@ impl TurnDriver for CoreTurnDriver {
                 None => record.actor,
             };
             let (tx, rx) = mpsc::unbounded_channel();
+            self.runtime
+                .bind_live_sink(&session_id, Arc::clone(&sink));
             let leg = self
                 .runtime
                 .resume_after_approval(&session_id, bound, resolution, tx);
@@ -712,6 +792,7 @@ struct Slot {
     core: CoreSession,
     session_events: mpsc::UnboundedReceiver<SessionEvent>,
     turn_events: mpsc::UnboundedReceiver<TurnEvent>,
+    _live: Option<LiveForwarder>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -728,6 +809,7 @@ pub struct HarwCoreRuntime {
     approvals: ApprovalStore,
     slots: Mutex<SlotMap>,
     models: Mutex<HashMap<SessionId, String>>,
+    live_sinks: Mutex<HashMap<SessionId, LiveSink>>,
 }
 
 impl std::fmt::Debug for HarwCoreRuntime {
@@ -746,6 +828,16 @@ impl HarwCoreRuntime {
             approvals: ApprovalStore::new(sessions_root),
             slots: Mutex::new(HashMap::new()),
             models: Mutex::new(HashMap::new()),
+            live_sinks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The shared live-sink cell of `session` (fresh and unshared when the
+    /// table is poisoned).
+    fn live_sink(&self, session: &SessionId) -> LiveSink {
+        match self.live_sinks.lock() {
+            Ok(mut table) => Arc::clone(table.entry(session.clone()).or_default()),
+            Err(_) => LiveSink::default(),
         }
     }
 
@@ -811,10 +903,21 @@ impl HarwCoreRuntime {
             .await
             .map_err(|error| DriverBridgeError::Core(format!("hydrate: {error}")))?;
         self.note_model(session_id, core.session.active_model());
+        let live = core.session.agent_events().map(|hub| {
+            LiveForwarder(
+                tokio::spawn(forward_live(
+                    hub.subscribe(),
+                    session_id.clone(),
+                    self.live_sink(session_id),
+                ))
+                .abort_handle(),
+            )
+        });
         let slot = Arc::new(tokio::sync::Mutex::new(Slot {
             core,
             session_events,
             turn_events,
+            _live: live,
         }));
         // Hydration awaits external storage. Admission may have changed while
         // it ran; never publish a legacy/wider core under a newer admission.
@@ -942,6 +1045,9 @@ impl CoreRuntime for HarwCoreRuntime {
             .lock()
             .map_err(|_| DriverBridgeError::Runtime("model table poisoned".into()))?
             .remove(session_id);
+        if let Ok(mut sinks) = self.live_sinks.lock() {
+            sinks.remove(session_id);
+        }
         Ok(())
     }
 
@@ -966,6 +1072,7 @@ impl CoreRuntime for HarwCoreRuntime {
                 core,
                 session_events,
                 turn_events,
+                ..
             } = &mut *guard;
             let leg = run_turn_durable(
                 &mut core.session,
@@ -994,6 +1101,7 @@ impl CoreRuntime for HarwCoreRuntime {
                 core,
                 session_events,
                 turn_events,
+                ..
             } = &mut *guard;
             // Non-consuming entry point: the host's backend already resolved
             // the durable request (see the module docs).
@@ -1083,6 +1191,13 @@ impl CoreRuntime for HarwCoreRuntime {
 
     fn model_name(&self, session_id: &SessionId) -> Option<String> {
         self.models.lock().ok()?.get(session_id).cloned()
+    }
+
+    fn bind_live_sink(&self, session_id: &SessionId, sink: Arc<dyn EventSink>) {
+        let cell = self.live_sink(session_id);
+        if let Ok(mut bound) = cell.lock() {
+            *bound = Some(sink);
+        }
     }
 }
 
@@ -1212,6 +1327,315 @@ mod admission_races {
             .await?
             .is_err()
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod live_events {
+    use super::*;
+    use harw_core::{AgentEventHub, ConversationHistory};
+    use harw_core::state_store::StateStoreResult;
+    use harw_protocol::AgentOrchestrationEvent;
+    use harw_protocol::items::TurnItem;
+    use harw_session_host::identity::ConnectionId;
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<DriverEvent>>);
+
+    impl RecordingSink {
+        fn count(&self) -> usize {
+            self.0.lock().map_or(0, |events| events.len())
+        }
+
+        fn child_agents(&self) -> Vec<SessionId> {
+            self.0.lock().map_or_else(
+                |_| Vec::new(),
+                |events| {
+                    events
+                        .iter()
+                        .filter_map(|event| match event {
+                            DriverEvent::Child { agent, .. } => Some(agent.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                },
+            )
+        }
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: DriverEvent) {
+            if let Ok(mut events) = self.0.lock() {
+                events.push(event);
+            }
+        }
+    }
+
+    fn reasoning(agent: &SessionId, parent: Option<&SessionId>) -> AgentEvent {
+        AgentEvent {
+            agent: agent.clone(),
+            parent: parent.cloned(),
+            role: "explorer".to_owned(),
+            kind: AgentEventKind::Turn(TurnEvent::ReasoningDelta {
+                turn_id: TurnId::new(),
+                text: "thinking".to_owned(),
+            }),
+        }
+    }
+
+    fn orchestration(child: &SessionId, status: AgentOrchestrationStatus) -> AgentEvent {
+        AgentEvent {
+            agent: child.clone(),
+            parent: None,
+            role: "explorer".to_owned(),
+            kind: AgentEventKind::Orchestration(AgentOrchestrationEvent {
+                schema_version: AgentOrchestrationEvent::CURRENT_SCHEMA_VERSION,
+                event_id: "evt-1".to_owned(),
+                root_session_id: SessionId::new(),
+                parent_session_id: SessionId::new(),
+                child_session_id: child.clone(),
+                turn_id: None,
+                role: "explorer".to_owned(),
+                depth: 1,
+                task: None,
+                status,
+                usage: None,
+                duration_ms: None,
+                progress: None,
+                detail: None,
+                tool_calls: None,
+                model: None,
+                provider: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn child_turn_events_map_to_child_frames_and_root_events_are_skipped() -> TestResult {
+        let root = SessionId::new();
+        let child = SessionId::new();
+        let mapped = live_driver_event(&root, reasoning(&child, Some(&root)));
+        match mapped {
+            Some(DriverEvent::Child {
+                agent,
+                parent,
+                role,
+                event: TurnEvent::ReasoningDelta { text, .. },
+            }) => {
+                assert_eq!(agent, child);
+                assert_eq!(parent, Some(root.clone()));
+                assert_eq!(role, "explorer");
+                assert_eq!(text, "thinking");
+            }
+            other => return Err(format!("unexpected mapping: {other:?}").into()),
+        }
+        assert!(live_driver_event(&root, reasoning(&root, None)).is_none());
+        let knowledge = AgentEvent {
+            agent: child,
+            parent: None,
+            role: "knowledge".to_owned(),
+            kind: AgentEventKind::Knowledge {
+                area: "jobs".into(),
+                id: None,
+            },
+        };
+        assert!(live_driver_event(&root, knowledge).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn orchestration_maps_to_job_states_without_progress() -> TestResult {
+        let root = SessionId::new();
+        let child = SessionId::new();
+        match live_driver_event(&root, orchestration(&child, AgentOrchestrationStatus::Completed))
+        {
+            Some(DriverEvent::Job {
+                work_id,
+                kind,
+                state,
+                summary,
+            }) => {
+                assert_eq!(work_id, child.as_str());
+                assert_eq!(kind, "agent");
+                assert_eq!(state, "completed");
+                assert_eq!(summary.as_deref(), Some("explorer"));
+            }
+            other => return Err(format!("unexpected mapping: {other:?}").into()),
+        }
+        assert!(
+            live_driver_event(&root, orchestration(&child, AgentOrchestrationStatus::Progress))
+                .is_none()
+        );
+        Ok(())
+    }
+
+    struct InstantStore;
+
+    impl StateStore for InstantStore {
+        fn save_turn<'a>(
+            &'a self,
+            _: &'a SessionId,
+            _: &'a TurnItem,
+        ) -> Pin<Box<dyn Future<Output = StateStoreResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn load_history<'a>(
+            &'a self,
+            _: &'a SessionId,
+        ) -> Pin<Box<dyn Future<Output = StateStoreResult<ConversationHistory>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(ConversationHistory::new()) })
+        }
+    }
+
+    struct HubFactory {
+        hub: AgentEventHub,
+    }
+
+    impl CoreSessionFactory for HubFactory {
+        fn build(
+            &self,
+            session_id: &SessionId,
+            _: Option<&str>,
+            wiring: SessionWiring,
+        ) -> Result<CoreSession, DriverBridgeError> {
+            Ok(CoreSession {
+                session: AgentSession::new_with_id(
+                    session_id.clone(),
+                    harw_types::roles::AgentRole::Assistant,
+                    None,
+                    harw_extension_api::ExtensionRegistryBuilder::default().build(),
+                    wiring.event_tx,
+                )
+                .with_agent_events(self.hub.clone()),
+                model: Arc::new(harw_core::EchoModelProvider::new("unused")),
+                store: Arc::new(InstantStore),
+            })
+        }
+    }
+
+    async fn wait_for(sink: &RecordingSink, count: usize) -> TestResult {
+        for _ in 0..200 {
+            if sink.count() >= count {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Err("timed out waiting for live events".into())
+    }
+
+    #[tokio::test]
+    async fn child_events_reach_the_bound_sink_between_legs() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let hub = AgentEventHub::default();
+        let runtime = HarwCoreRuntime::new(Arc::new(HubFactory { hub: hub.clone() }), dir.path());
+        let sid = SessionId::new();
+        let sink_a = Arc::new(RecordingSink::default());
+        let sink_b = Arc::new(RecordingSink::default());
+        runtime.bind_live_sink(&sid, Arc::clone(&sink_a) as Arc<dyn EventSink>);
+        runtime.open_session(&sid, None).await?;
+
+        let child_one = SessionId::new();
+        hub.publish(reasoning(&child_one, Some(&sid)));
+        wait_for(&sink_a, 1).await?;
+        assert_eq!(sink_a.child_agents(), vec![child_one]);
+
+        // Root events never show up; the ordered child event after it proves
+        // the forwarder already processed the root one.
+        hub.publish(reasoning(&sid, None));
+        let child_two = SessionId::new();
+        hub.publish(reasoning(&child_two, Some(&sid)));
+        wait_for(&sink_a, 2).await?;
+        assert_eq!(sink_a.count(), 2);
+        assert!(!sink_a.child_agents().contains(&sid));
+
+        runtime.bind_live_sink(&sid, Arc::clone(&sink_b) as Arc<dyn EventSink>);
+        let child_three = SessionId::new();
+        hub.publish(reasoning(&child_three, Some(&sid)));
+        wait_for(&sink_b, 1).await?;
+        assert_eq!(sink_b.child_agents(), vec![child_three]);
+        assert_eq!(sink_a.count(), 2);
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct BindRecorder(Mutex<Vec<SessionId>>);
+
+    impl CoreRuntime for BindRecorder {
+        fn open_session<'a>(&'a self, _: &'a SessionId, _: Option<&'a str>) -> CoreFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn run_turn<'a>(
+            &'a self,
+            _: &'a SessionId,
+            _: CoreTurnInput,
+            _: CoreEvents,
+        ) -> CoreFuture<'a, CoreOutcome> {
+            Box::pin(async { Ok(CoreOutcome::Completed) })
+        }
+
+        fn resume_after_approval<'a>(
+            &'a self,
+            _: &'a SessionId,
+            _: ApprovalActor,
+            _: ApprovalResolution,
+            _: CoreEvents,
+        ) -> CoreFuture<'a, CoreOutcome> {
+            Box::pin(async { Ok(CoreOutcome::Completed) })
+        }
+
+        fn parked_approval<'a>(
+            &'a self,
+            _: &'a SessionId,
+        ) -> CoreFuture<'a, Option<ParkedApproval>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn apply_setting<'a>(&'a self, _: &'a SessionId, _: Setting) -> CoreFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn model_name(&self, _: &SessionId) -> Option<String> {
+            None
+        }
+
+        fn bind_live_sink(&self, session_id: &SessionId, _: Arc<dyn EventSink>) {
+            if let Ok(mut bound) = self.0.lock() {
+                bound.push(session_id.clone());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_binds_the_leg_sink() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let runtime = Arc::new(BindRecorder::default());
+        let driver = CoreTurnDriver::with_runtime(
+            CoreDriverConfig::new(dir.path().to_path_buf()),
+            Arc::clone(&runtime) as Arc<dyn CoreRuntime>,
+        )?;
+        let session = SessionId::new();
+        let input = TurnInput {
+            session_id: session.clone(),
+            text: "hello".to_owned(),
+            client_msg_id: "msg-1".to_owned(),
+            submitted_by: "tester".to_owned(),
+            actor: ApprovalActor::Operator {
+                id: "op".to_owned(),
+            },
+            origin: ConnectionId::next(),
+        };
+        let cancel = tokio::sync::watch::channel(false).1;
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+        let outcome = TurnDriver::run_turn(&driver, input, cancel, sink).await?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        let bound = runtime.0.lock().map_err(|_| "poisoned")?.clone();
+        assert_eq!(bound, vec![session]);
         Ok(())
     }
 }
