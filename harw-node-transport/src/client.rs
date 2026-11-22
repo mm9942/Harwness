@@ -105,24 +105,69 @@ impl NodeTransportClient {
         let work = async {
             let tcp = TcpStream::connect(addr).await?;
             let _ = tcp.set_nodelay(true);
-            let connector = TlsConnector::from(tls::client_config()?);
-            let mut stream = connector.connect(tls::server_name()?, tcp).await?;
-            let binding = tls::client_channel_binding(stream.get_ref().1)?;
-            let peer = client_handshake(
-                &mut stream,
-                binding,
-                local,
-                expected_peer,
-                verifier,
-                &options.policy,
-            )
-            .await?;
-            Ok::<_, TransportError>((peer, stream))
+            Self::secure(tcp, local, expected_peer, verifier, &options.policy).await
         };
         let (peer, stream) = tokio::time::timeout(options.handshake_timeout, work)
             .await
             .map_err(|_| TransportError::HandshakeTimeout)??;
+        Self::finish(peer, stream).await
+    }
 
+    /// Authenticates over an already established byte stream `io`, expecting
+    /// the node `expected_peer` on the other end.
+    ///
+    /// The stream is only a byte transport (for example a Tor onion
+    /// stream): it carries no identity. The peer is accepted solely through
+    /// the pinned node handshake (TLS 1.3 plus the signed node handshake)
+    /// against the key `verifier` pins for `expected_peer`. The TLS and
+    /// handshake phase is bounded by `options.handshake_timeout`.
+    ///
+    /// # Errors
+    /// TLS, handshake or timeout failures.
+    pub async fn connect_over<I>(
+        io: I,
+        local: &LocalNode,
+        expected_peer: &harw_types::NodeId,
+        verifier: &dyn NodeVerifier,
+        options: &ClientOptions,
+    ) -> Result<Self, TransportError>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (peer, stream) = tokio::time::timeout(
+            options.handshake_timeout,
+            Self::secure(io, local, expected_peer, verifier, &options.policy),
+        )
+        .await
+        .map_err(|_| TransportError::HandshakeTimeout)??;
+        Self::finish(peer, stream).await
+    }
+
+    async fn secure<I>(
+        io: I,
+        local: &LocalNode,
+        expected_peer: &harw_types::NodeId,
+        verifier: &dyn NodeVerifier,
+        policy: &HandshakePolicy,
+    ) -> Result<(AuthenticatedPeer, tokio_rustls::client::TlsStream<I>), TransportError>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let connector = TlsConnector::from(tls::client_config()?);
+        let mut stream = connector.connect(tls::server_name()?, io).await?;
+        let binding = tls::client_channel_binding(stream.get_ref().1)?;
+        let peer =
+            client_handshake(&mut stream, binding, local, expected_peer, verifier, policy).await?;
+        Ok((peer, stream))
+    }
+
+    async fn finish<I>(
+        peer: AuthenticatedPeer,
+        stream: tokio_rustls::client::TlsStream<I>,
+    ) -> Result<Self, TransportError>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (sender, connection) =
             hyper::client::conn::http1::handshake::<_, NodeBody>(TokioIo::new(stream)).await?;
         let connection = tokio::spawn(async move {

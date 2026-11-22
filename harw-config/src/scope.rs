@@ -270,8 +270,8 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 219 Einträge (Kontrollsumme
-/// wie in `merge_rule_tests` geprüft: `ProfileReplaces` 114 · `GlobalOnly` 21 ·
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 223 Einträge (Kontrollsumme
+/// wie in `merge_rule_tests` geprüft: `ProfileReplaces` 114 · `GlobalOnly` 25 ·
 /// `MinBound` 58 · `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 ·
 /// `Union` 2 · `AndBool` 2 · `StricterOf` 3 · `PerFileValidated` 1).
 /// Die Abschnitt-6.3-Tabelle der Spezifikation deckt nur die Felder bis zur
@@ -380,6 +380,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "session_listener.approval_device", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.provider_link_device", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.shared_socket_tenant", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.onion", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.onion_dir", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     // 1.9 [mode] (1)
     FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.10 [research] (5)
@@ -590,7 +592,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_219_entries() {
+    fn test_field_table_has_exactly_223_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -607,7 +609,7 @@ mod merge_rule_tests {
         // [retention]: +50 für `retention.<klasse>.*` (10 Klassen x 5 Schlüssel).
         // [memory]: +2 für `memory.security_signals`, `memory.llm_extraction`.
         // [tools.container]: +4 (`enabled`, `engine`, `connection`, `images`), alle GlobalOnly.
-        // [session_listener]: +6, alle GlobalOnly.
+        // [session_listener]: +10, alle GlobalOnly.
         // h7/h9: +2 für `tui.status_expiry`, `tui.goal_mode`.
         // +1 for explicit trusted single-agent task topology.
         // +1 for `internal_models.image_understanding`.
@@ -621,7 +623,10 @@ mod merge_rule_tests {
         // PL-100 Phase 4: +1 für `sandbox.host_lease_ttl_secs`.
         // PL-100 WP0.12: +10 für `retention.dod_verdicts.*`, `retention.dod_labels.*`
         // (12 Klassen x 5 Schlüssel).
-        assert_eq!(FIELD_TABLE.len(), 219);
+        // Cloud-Sessions fürs Handy: +2 für `session_listener.provider_link_device`,
+        // `session_listener.shared_socket_tenant`.
+        // Onion-Connector: +2 für `session_listener.onion`, `session_listener.onion_dir`.
+        assert_eq!(FIELD_TABLE.len(), 223);
     }
 
     #[test]
@@ -658,7 +663,9 @@ mod merge_rule_tests {
         // Interface localization: +1 for `tui.language`.
         // PL-100 Phase 4: +1 (`sandbox.host_lease_ttl_secs`).
         assert_eq!(count(MergeRule::ProfileReplaces), 114);
-        assert_eq!(count(MergeRule::GlobalOnly), 21);
+        // +2 (`session_listener.provider_link_device`, `session_listener.shared_socket_tenant`).
+        // +2 (`session_listener.onion`, `session_listener.onion_dir`).
+        assert_eq!(count(MergeRule::GlobalOnly), 25);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1
         // (`permissions.auto_classifier_timeout_secs`).

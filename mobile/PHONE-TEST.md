@@ -23,6 +23,8 @@ cargo build --locked --manifest-path mobile/rust/Cargo.toml \
 BOOTSTRAP="$PWD/mobile/rust/target/debug/mobile-bootstrap"
 ```
 
+The launcher builds the onion dialer by default, so the phone's Tor (.onion) route needs no extra launcher feature. The gateway it starts still needs the `onion` build described in [Connect over Tor](#connect-over-tor-onion).
+
 If you set `CARGO_TARGET_DIR`, use the executable in that target directory. You can run the connection and reply check on the server without a phone. It starts a fresh test gateway, verifies that a wrong pin blocks session access, then connects with the correct pin and verifies replies in two independently attached sessions.
 
 ```sh
@@ -117,6 +119,33 @@ If the computer has a scanner that prints the phone’s enrollment QR as text, p
 
 Connect the phone and server to the same Tailscale network, then add `--tailnet` to the server’s `mobile-bootstrap serve` command. The launcher reads this server’s assigned address from the running Tailscale daemon and binds the authenticated gateway there. Its public profile includes that address and the gateway key. Import the profile or scan its QR code on the phone, then tap **Connect**. The phone must be enrolled on the gateway even if it can reach the server over Tailscale. For this mode the USB cable is only needed if you use it to install the APK or transfer the enrollment. Your tailnet policy must allow the phone to reach the selected gateway port.
 
+### Connect over Tor (.onion)
+
+Use this route when the phone should reach the gateway without an open port or Tailscale. The gateway publishes a Tor onion service and keeps listening on `127.0.0.1`. Build the gateway with onion support first. The first build compiles arti and takes a long time.
+
+```sh
+cargo build --release -p harw-cli --features onion --bin harw
+HARW_BIN="$PWD/target/release/harw"
+```
+
+If you set `CARGO_TARGET_DIR`, use `$CARGO_TARGET_DIR/release/harw` instead. Then start the launcher with the onion flags. Keep the onion directory between runs, because it holds the onion identity and the `.onion` address stays the same only while it is kept.
+
+```sh
+STATE="/tmp/harw-phone-onion-$(date +%s)"
+"$BOOTSTRAP" serve --onion --onion-dir "$HOME/.local/state/harw-phone-onion" \
+  --enrollment /path/to/harw-device-enrollment.json \
+  --state "$STATE" --harw "$HARW_BIN" --auth-hub "$PWD/target/debug/harw-auth-hub"
+```
+
+Wait for the gateway to print `session onion  : reachable`. Before that it prints Tor bootstrap progress lines, and the first start can take several minutes. If it prints `not confirmed reachable after 180 s; continuing`, the gateway still runs, but check the phone connection before trusting it. The launcher writes the public profile with the `.onion` locator to `$STATE/harw-server-profile.json`. Render the QR with `./mobile/scripts/phone-qr profile`, which emits a v2 code when the profile has an onion route, or import the profile file as described for USB. No USB reverse or SSH forward is needed for this route.
+
+On the phone, open **Connection**, choose **Auto** or **Tor (.onion)** as the route, and tap **Connect**. The first Tor bootstrap on the phone can take one to two minutes and shows its progress in the app. When the link is up, the status chip shows `Live · onion`.
+
+Keep these limits in mind:
+
+- Tor gives no identity. The phone still needs its enrollment on the gateway and the pinned server key from the profile. A reachable `.onion` address proves nothing about who is answering.
+- Tor may require a newer protocol than this build's arti 0.48. If the gateway or app exits with an outdated-software error, rebuild the gateway and the app with a newer harw.
+
 ### USB with the gateway on the same PC
 
 Run the following on the PC while its gateway is active.
@@ -160,4 +189,4 @@ On the gateway host, open a second terminal and run `harw attach --socket "$STAT
 
 Disconnect on the phone, run `./mobile/scripts/phone-adb remove-reverse 7443` on the PC, then stop the SSH forward if one was used. Stop the bootstrap process with Ctrl+C. The test home remains at the path you selected. The same debug APK can be reinstalled with its app data intact.
 
-This test covers the current hosted-session protocol. Onion routing, file replication, local-agent relay, and the later compute-plane phases require separate delivery. The host smoke test exercises the gateway and Rust client. Signing and packaging checks exercise the APK artifact. USB, Android Keystore, multiwindow, notification, and physical-phone behavior are checked on the phone.
+This test covers the current hosted-session protocol. File replication, local-agent relay, and the later compute-plane phases require separate delivery. The host smoke test exercises the gateway and Rust client. Signing and packaging checks exercise the APK artifact. USB, Android Keystore, multiwindow, notification, and physical-phone behavior are checked on the phone.

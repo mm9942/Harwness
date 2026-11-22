@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use harw_protocol::session_wire::{
     InterruptParams, RespondResult, StreamProfile, SubmitParams, SubmitResult, features,
 };
 use harw_protocol::{PortError, SessionPort};
-use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError, RemotePort, connect_node};
+use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError, RemotePort};
 use harw_types::{ApprovalId, SessionId, TurnId};
 use http::Method;
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -22,9 +23,14 @@ use crate::projection::{FrameAction, SessionState, SessionWorker};
 use crate::provider::request_provider;
 use crate::{
     ApprovalDecision, ApprovalOutcome, ApprovalReceipt, ChatgptProviderCredential,
-    ChatgptProviderStatus, ConnectionPhase, ConnectionStatus, DeviceEnrollment, MobileError,
-    MobileSession, ServerProfile, SessionCursor, SessionSnapshot, SubmitOutcome, SubmitReceipt,
+    ChatgptProviderStatus, ConnectionPhase, ConnectionRoute, ConnectionStatus, DeviceEnrollment,
+    MobileError, MobileSession, RoutePreference, ServerProfile, SessionCursor, SessionSnapshot,
+    SubmitOutcome, SubmitReceipt,
 };
+
+pub(crate) mod route;
+
+use route::{Dialer, available_routes, route_label, route_plan};
 
 const MAX_ATTACHMENTS: usize = 32;
 const MAX_SUBMISSION_BYTES: usize = 256 * 1024;
@@ -44,6 +50,7 @@ pub struct MobileCore {
 #[derive(Default)]
 struct Shared {
     state: Mutex<CoreState>,
+    dialer: Dialer,
 }
 
 impl Shared {
@@ -62,6 +69,8 @@ struct CoreState {
     sessions: HashMap<SessionId, SessionState>,
     detaching: HashSet<SessionId>,
     submissions: HashMap<(SessionId, String), Submission>,
+    route_preference: RoutePreference,
+    route: Option<ConnectionRoute>,
 }
 
 impl Default for CoreState {
@@ -76,6 +85,8 @@ impl Default for CoreState {
             sessions: HashMap::new(),
             detaching: HashSet::new(),
             submissions: HashMap::new(),
+            route_preference: RoutePreference::Auto,
+            route: None,
         }
     }
 }
@@ -121,6 +132,7 @@ impl CoreState {
         if let Some(run) = self.run.take() {
             run.cancel();
         }
+        self.route = None;
         self.clear_link(detail);
     }
 
@@ -313,7 +325,26 @@ impl MobileCore {
         state.detail = None;
     }
 
+    /// Sets the absolute Tor state and cache directories (before the first onion dial).
+    pub fn set_tor_directories(
+        &self,
+        state_dir: String,
+        cache_dir: String,
+    ) -> Result<(), MobileError> {
+        self.shared
+            .dialer
+            .set_tor_directories(PathBuf::from(state_dir), PathBuf::from(cache_dir))
+    }
+
+    /// Selects the route preference used by the next connect or reconnect.
+    pub fn set_route_preference(&self, preference: RoutePreference) {
+        self.shared.state().route_preference = preference;
+    }
+
     pub fn status(&self) -> ConnectionStatus {
+        // Read Tor progress before the state lock: the Tor client lock can be
+        // held while Tor starts, which must never stall state operations.
+        let tor = self.shared.dialer.tor_status();
         let mut state = self.shared.state();
         state.apply_pending_revocation();
         let profile = state.profile.as_ref().map(|profile| &profile.profile);
@@ -326,6 +357,14 @@ impl MobileCore {
         } else {
             state.phase
         };
+        let route = matches!(
+            phase,
+            ConnectionPhase::Connecting
+                | ConnectionPhase::Connected
+                | ConnectionPhase::Reconnecting
+        )
+        .then_some(state.route)
+        .flatten();
         ConnectionStatus {
             phase,
             node_id: profile.map(|profile| profile.server_node_id.clone()),
@@ -335,6 +374,14 @@ impl MobileCore {
             can_create: active_caps.is_some_and(|caps| caps.steer),
             can_submit: active_caps.is_some_and(|caps| caps.steer),
             can_approve: active_caps.is_some_and(|caps| caps.approve),
+            route,
+            route_preference: state.route_preference,
+            available_routes: state
+                .profile
+                .as_ref()
+                .map(available_routes)
+                .unwrap_or_default(),
+            tor,
         }
     }
 
@@ -546,7 +593,7 @@ impl MobileCore {
         body: NodeBody,
     ) -> Result<ChatgptProviderStatus, MobileError> {
         let consent = ValidatedProfile::new(profile)?;
-        let stop = {
+        let (stop, route, selected) = {
             let state = self.shared.state();
             let link = state.active()?;
             if !state
@@ -558,11 +605,23 @@ impl MobileCore {
                     detail: "The selected server changed after ChatGPT authorization".into(),
                 });
             }
-            link.stop.clone()
+            let selected = state
+                .profile
+                .clone()
+                .ok_or_else(|| MobileError::InvalidProfile {
+                    detail: "The selected server changed after ChatGPT authorization".into(),
+                })?;
+            (
+                link.stop.clone(),
+                state.route.unwrap_or(ConnectionRoute::Direct),
+                selected,
+            )
         };
         self.run(request_provider(
+            self.shared.dialer.clone(),
+            route,
             self.local.clone(),
-            consent,
+            selected,
             stop,
             method,
             body,
@@ -588,6 +647,7 @@ impl MobileCore {
                         detail: "Server and phone must have different node identities".into(),
                     });
                 }
+                route_plan(state.route_preference, &profile)?;
                 let same_profile = state
                     .profile
                     .as_ref()
@@ -673,24 +733,68 @@ async fn drive_connection(
         let mut options = ConnectOptions::new(&label);
         options.requested_caps = Some(ClientCaps::OPERATE);
         options.features = requested_features();
-        let connected = run
-            .run_until_cancelled(connect_node(
-                profile.endpoint.clone(),
-                &local,
-                &profile.verifier,
-                options,
-            ))
-            .await;
-        let connection = match connected {
-            Some(Ok(connection)) => connection,
-            Some(Err(error)) => {
-                let kind = dial_failure(&error);
-                let detail = match &error {
-                    RemoteError::Connect(detail) if detail == "upgrade: peer did not switch protocols (status 403)" => {
-                        "The server refused this device (status 403). Check the enrollment and server device registry.".into()
-                    }
-                    _ => error.to_string(),
+        let plan = {
+            let preference = shared.state().route_preference;
+            route_plan(preference, &profile)
+        };
+        let routes = match plan {
+            Ok(routes) => routes,
+            Err(error) => {
+                let detail = match error {
+                    MobileError::InvalidProfile { detail } => detail,
+                    other => other.to_string(),
                 };
+                let mut state = shared.state();
+                if run.is_cancelled() {
+                    break;
+                }
+                state.detail = Some(detail.clone());
+                state.phase = ConnectionPhase::Failed;
+                if let Some(first) = first.take() {
+                    let _ = first.send(Err(MobileError::Connect { detail }));
+                }
+                return;
+            }
+        };
+        let mut failures: Vec<(ConnectionRoute, RemoteError)> = Vec::new();
+        let mut connected = None;
+        let mut cancelled = false;
+        for route in routes {
+            shared.state().route = Some(route);
+            let attempt = run
+                .run_until_cancelled(shared.dialer.connect_session(
+                    route,
+                    &profile,
+                    &local,
+                    options.clone(),
+                ))
+                .await;
+            match attempt {
+                Some(Ok(connection)) => {
+                    connected = Some(connection);
+                    break;
+                }
+                Some(Err(error)) => {
+                    let stop = dial_failure(&error) == DialFailure::Final;
+                    failures.push((route, error));
+                    if stop {
+                        break;
+                    }
+                }
+                None => {
+                    cancelled = true;
+                    break;
+                }
+            }
+        }
+        if cancelled {
+            break;
+        }
+        let connection = match connected {
+            Some(connection) => connection,
+            None => {
+                let detail = failure_detail(&failures);
+                let kind = attempt_failure(&failures);
                 let mut state = shared.state();
                 if run.is_cancelled() {
                     break;
@@ -708,7 +812,6 @@ async fn drive_connection(
                 retry = retry.saturating_add(1);
                 continue;
             }
-            None => break,
         };
         let (failure, failure_rx) = watch::channel(None);
         let link = Arc::new(Link {
@@ -724,7 +827,7 @@ async fn drive_connection(
                 break;
             }
             state.phase = ConnectionPhase::Connected;
-            state.detail = None;
+            state.detail = fallback_note(&failures, state.route);
             state.link = Some(Arc::clone(&link));
             for (id, session) in &mut state.sessions {
                 start_attachment(&shared, session, id.clone(), Arc::clone(&link));
@@ -764,11 +867,89 @@ async fn drive_connection(
     }
 }
 
-#[derive(PartialEq, Eq)]
+fn dial_detail(error: &RemoteError) -> String {
+    match error {
+        RemoteError::Connect(detail)
+            if detail == "upgrade: peer did not switch protocols (status 403)" =>
+        {
+            "The server refused this device (status 403). Check the enrollment and server device registry.".into()
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// Joins every route failure of one dial attempt into a user-facing detail.
+fn failure_detail(failures: &[(ConnectionRoute, RemoteError)]) -> String {
+    failures
+        .iter()
+        .map(|(route, error)| format!("{}: {}", route_label(*route), dial_detail(error)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Visible note for a link that only came up after earlier routes failed.
+fn fallback_note(
+    failures: &[(ConnectionRoute, RemoteError)],
+    route: Option<ConnectionRoute>,
+) -> Option<String> {
+    let route = route?;
+    if failures.is_empty() {
+        return None;
+    }
+    let via = match route {
+        ConnectionRoute::Direct => "directly".to_owned(),
+        ConnectionRoute::Onion => format!("via {}", route_label(route)),
+    };
+    Some(format!(
+        "{} unavailable, connected {via} ({})",
+        failures
+            .iter()
+            .map(|(failed, _)| route_label(*failed))
+            .collect::<Vec<_>>()
+            .join(", "),
+        failure_detail(failures)
+    ))
+}
+
+/// Whether a dial attempt whose every route failed is worth retrying later.
+fn attempt_failure(failures: &[(ConnectionRoute, RemoteError)]) -> DialFailure {
+    let mut retry = false;
+    for (_, error) in failures {
+        match dial_failure(error) {
+            DialFailure::Final => return DialFailure::Final,
+            DialFailure::Retry => retry = true,
+            DialFailure::Unavailable => {}
+        }
+    }
+    if retry {
+        DialFailure::Retry
+    } else {
+        DialFailure::Final
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum DialFailure {
+    /// Transient; a later attempt over this route may succeed.
     Retry,
+    /// This route cannot work in the current setup; try the next route but
+    /// do not schedule a retry for it.
+    Unavailable,
+    /// The server refused this device (node handshake, TLS configuration,
+    /// hello denied, HTTP 4xx); stop trying further routes. Tor setup errors
+    /// are never `Final` for a route: they are `Unavailable`, so Auto still
+    /// falls back to the direct route.
     Final,
 }
+
+/// Tor setup failures that no retry can fix without user or build changes.
+const TOR_SETUP_FAILURES: [&str; 5] = [
+    "tor: Tor storage is not configured",
+    "tor: tor configuration:",
+    "tor: no rustls crypto provider",
+    "tor: invalid onion locator:",
+    "tor: this build's Tor",
+];
 
 fn dial_failure(error: &RemoteError) -> DialFailure {
     // The transport authenticates the host before upgrade. Its current
@@ -776,6 +957,12 @@ fn dial_failure(error: &RemoteError) -> DialFailure {
     let RemoteError::Connect(detail) = error else {
         return DialFailure::Final;
     };
+    if TOR_SETUP_FAILURES
+        .iter()
+        .any(|prefix| detail.starts_with(prefix))
+    {
+        return DialFailure::Unavailable;
+    }
     // An upgrade refusal is terminal for this dial. HTTP 403 can also
     // represent a missing/invalid registry; it is not a revocation signal.
     if detail.starts_with("node transport: node handshake:")
@@ -1176,5 +1363,62 @@ mod profile_tests {
                 .any(|feature| feature == "compact_reasoning")
         );
         assert!(requested.iter().any(|feature| feature == "job_frames"));
+    }
+}
+
+#[cfg(test)]
+mod route_failure_tests {
+    use super::*;
+
+    fn connect(detail: &str) -> RemoteError {
+        RemoteError::Connect(detail.into())
+    }
+
+    #[test]
+    fn tor_setup_errors_skip_to_the_next_route_without_retrying() {
+        for detail in [
+            "tor: Tor storage is not configured",
+            "tor: tor configuration: bad state dir",
+            "tor: this build's Tor (arti 0.48) is too old for the current Tor network; update harw",
+        ] {
+            assert_eq!(dial_failure(&connect(detail)), DialFailure::Unavailable);
+        }
+        assert_eq!(
+            dial_failure(&connect("tor: onion connect did not finish within 120s")),
+            DialFailure::Retry
+        );
+        let unconfigured = || connect("tor: Tor storage is not configured");
+        let onion_only = [(ConnectionRoute::Onion, unconfigured())];
+        assert_eq!(attempt_failure(&onion_only), DialFailure::Final);
+        let auto = [
+            (ConnectionRoute::Onion, unconfigured()),
+            (ConnectionRoute::Direct, connect("tcp connect: refused")),
+        ];
+        assert_eq!(attempt_failure(&auto), DialFailure::Retry);
+        let refused = [
+            (
+                ConnectionRoute::Onion,
+                connect("tor: tor bootstrap failed: x"),
+            ),
+            (
+                ConnectionRoute::Direct,
+                connect("upgrade: peer did not switch protocols (status 403)"),
+            ),
+        ];
+        assert_eq!(attempt_failure(&refused), DialFailure::Final);
+        assert_eq!(attempt_failure(&[]), DialFailure::Final);
+    }
+
+    #[test]
+    fn direct_fallback_keeps_a_visible_note() {
+        let failures = [(
+            ConnectionRoute::Onion,
+            connect("tor: Tor storage is not configured"),
+        )];
+        let text = fallback_note(&failures, Some(ConnectionRoute::Direct)).unwrap_or_default();
+        assert!(text.starts_with("Tor (.onion) unavailable, connected directly (Tor (.onion): "));
+        assert!(text.contains("Tor storage is not configured"));
+        assert_eq!(fallback_note(&[], Some(ConnectionRoute::Direct)), None);
+        assert_eq!(fallback_note(&failures, None), None);
     }
 }

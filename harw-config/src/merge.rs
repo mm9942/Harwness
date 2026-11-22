@@ -1318,7 +1318,7 @@ fn merge_tools_doc(
     }
 }
 
-// `[session_listener]` — alle sechs Felder `GlobalOnly` und
+// `[session_listener]` — alle zehn Felder `GlobalOnly` und
 // sicherheitskritisch: nur die Baseline (Home) setzt sie.
 fn merge_session_listener(
     trusted: &mut HarnessConfig,
@@ -1398,6 +1398,24 @@ fn merge_session_listener(
         present("shared_socket_tenant"),
         role,
         "session_listener.shared_socket_tenant",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.onion,
+        incoming.onion,
+        present("onion"),
+        role,
+        "session_listener.onion",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.onion_dir,
+        incoming.onion_dir,
+        present("onion_dir"),
+        role,
+        "session_listener.onion_dir",
         layer_path,
         out,
     );
@@ -2939,6 +2957,47 @@ mod tests {
                 Some("gw"),
                 "{role:?}"
             );
+        }
+        Ok(())
+    }
+
+    // [session_listener] onion/onion_dir: Profil und nicht vertrautes Projekt
+    // können den Onion-Dienst weder aktivieren noch sein Verzeichnis ändern;
+    // jede Abweichung erzeugt eine Diagnose.
+    #[test]
+    fn test_session_listener_onion_fields_reject_non_baseline_override() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.session_listener.onion);
+        assert_eq!(trusted.session_listener.onion_dir, None);
+        let home = "[session_listener]\nonion_dir = \"/srv/onion\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack = "[session_listener]\nonion = true\nonion_dir = \"/x\"";
+            let diagnostics = merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert!(!trusted.session_listener.onion, "{role:?}");
+            assert_eq!(
+                trusted.session_listener.onion_dir.as_deref(),
+                Some("/srv/onion"),
+                "{role:?}"
+            );
+            for field in ["session_listener.onion", "session_listener.onion_dir"] {
+                assert!(
+                    diagnostics.iter().any(|d| d.field == field),
+                    "{role:?} {field}"
+                );
+            }
         }
         Ok(())
     }

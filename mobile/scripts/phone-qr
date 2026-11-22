@@ -36,8 +36,13 @@ def decode(encoded):
 def profile_text(path):
     profile = read_profile(path)
     fields = [profile[name].encode("utf-8") for name in ("label", "server_node_id", "endpoint")]
+    onion = profile.get("onion")
+    if not onion:
+        raw = bytes(map(len, fields)) + b"".join(fields) + bytes.fromhex(profile["server_public_key_hex"])
+        return "HARW:PROFILE:1:" + encode(raw)
+    fields.append(onion.encode("ascii"))
     raw = bytes(map(len, fields)) + b"".join(fields) + bytes.fromhex(profile["server_public_key_hex"])
-    return "HARW:PROFILE:1:" + encode(raw)
+    return "HARW:PROFILE:2:" + encode(raw)
 
 
 def read_enrollment():

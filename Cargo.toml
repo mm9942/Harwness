@@ -77,6 +77,8 @@ members = [
     "harw-infra-client",
     "harw-netsec",
     "harw-node-transport",
+    # Tor onion transport (embedded arti, exact pin =0.48.0) for the session listener and the phone; arti code only behind its features client/service.
+    "harw-onion",
     "harw-session-daemon",
     "harw-session-com",
     "harw-security-hub",

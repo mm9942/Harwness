@@ -26,12 +26,27 @@
 //! Marking a device `revoked` in `node-devices.conf` revokes it live (the
 //! gateway scans the file; see `session_serve_remote`).
 //!
+//! # Onion ingress (`onion = true`, needs the `onion` cargo feature)
+//! After the TCP ingress is up, `harw-onion` publishes a Tor v3 onion service
+//! whose accepted streams feed the SAME node listener (`StreamIntake`): TLS 1.3
+//! plus the node handshake and the device registry still authenticate every
+//! peer. Tor is a transport only and provides no identity.
+//! ```text
+//! <onion_dir>/state    # arti state incl. keystore (stable .onion), 0700
+//! <onion_dir>/cache    # arti cache, 0700
+//! <onion_dir>/locator  # canonical `<host>.onion:<port>` + newline, 0600
+//! ```
+//! `onion_dir` defaults to `<profile>/session-host/onion`. The full address is
+//! only written to the locator file; it is never printed or logged.
+//!
 //! Failure to start is a hard error of `harw gateway` (the option is explicit
 //! and global-only), never a silent fallback.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "onion")]
+use std::time::Duration;
 
 use harw_config::SessionListenerSection;
 use harw_core::ModelProvider;
@@ -49,6 +64,16 @@ use crate::session_serve_remote::{RemoteIngress, RemoteServeConfig, start_remote
 pub const PEERS_FILE: &str = "node-peers.conf";
 /// AuthHub namespace of node identity keys.
 const NODE_IDENTITY_NAMESPACE: &str = "harw.node-identity";
+/// Directory name of the onion state below the session-host state directory.
+pub const ONION_DIR: &str = "onion";
+/// File name of the canonical locator inside the onion directory.
+pub const ONION_LOCATOR_FILE: &str = "locator";
+/// How long to wait for the onion service to become reachable.
+#[cfg(feature = "onion")]
+const ONION_REACHABLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Node-handshake bound for connections arriving over Tor.
+#[cfg(feature = "onion")]
+const ONION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// [`AuthHubSign`] over the AuthHub client (the orphan rule forbids a direct
 /// impl in this crate on the client type).
@@ -199,6 +224,10 @@ pub struct ListenerPlan {
     pub approval_device: Option<DeviceId>,
     /// Device permitted to link the gateway provider account.
     pub provider_link_device: Option<DeviceId>,
+    /// Whether to publish an onion service for the same listener.
+    pub onion: bool,
+    /// Absolute onion directory override (`None`: `<state>/onion`).
+    pub onion_dir: Option<PathBuf>,
 }
 
 /// Validates `[session_listener]`.
@@ -223,6 +252,34 @@ pub fn plan(section: &SessionListenerSection) -> Result<ListenerPlan, String> {
                 .map_err(|error| format!("[session_listener] approval_device: {error}"))
         })
         .transpose()?;
+    let onion_dir = match section.onion_dir.as_deref() {
+        None => None,
+        Some(_) if !section.onion => {
+            return Err("[session_listener] onion_dir requires onion = true".to_owned());
+        }
+        Some(raw) => {
+            let dir = PathBuf::from(raw);
+            if !dir.is_absolute() {
+                return Err("[session_listener] onion_dir must be an absolute path".to_owned());
+            }
+            if dir
+                .components()
+                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+            {
+                return Err(
+                    "[session_listener] onion_dir must not contain `.` or `..` components"
+                        .to_owned(),
+                );
+            }
+            Some(dir)
+        }
+    };
+    if section.onion && !cfg!(feature = "onion") {
+        return Err(
+            "[session_listener] onion = true needs a harw build with the `onion` cargo feature"
+                .to_owned(),
+        );
+    }
     Ok(ListenerPlan {
         addr,
         node,
@@ -234,6 +291,8 @@ pub fn plan(section: &SessionListenerSection) -> Result<ListenerPlan, String> {
             .map(DeviceId::try_from_str)
             .transpose()
             .map_err(|error| format!("[session_listener] provider_link_device: {error}"))?,
+        onion: section.onion,
+        onion_dir,
     })
 }
 
@@ -292,7 +351,110 @@ pub async fn start_from_config(
     let listener = TcpListener::bind(plan.addr)
         .await
         .map_err(|error| format!("session listener bind {}: {error}", plan.addr))?;
-    start_remote(&config, model, local, verifier, listener).await
+    let mut ingress = start_remote(&config, model, local, verifier, listener).await?;
+    if plan.onion {
+        let dir = plan
+            .onion_dir
+            .clone()
+            .unwrap_or_else(|| state_dir.join(ONION_DIR));
+        match start_onion(&dir, ingress.intake()).await {
+            Ok(server) => ingress.attach(Box::new(server)),
+            Err(error) => {
+                ingress.shutdown().await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(ingress)
+}
+
+/// Unreachable in builds without the `onion` feature: `plan` rejects onion.
+#[cfg(not(feature = "onion"))]
+async fn start_onion(
+    _dir: &Path,
+    _intake: harw_node_listener::StreamIntake,
+) -> Result<std::convert::Infallible, String> {
+    Err(
+        "[session_listener] onion = true needs a harw build with the `onion` cargo feature"
+            .to_owned(),
+    )
+}
+
+/// Launches the onion service and feeds its streams into `intake`.
+#[cfg(feature = "onion")]
+async fn start_onion(
+    dir: &Path,
+    intake: harw_node_listener::StreamIntake,
+) -> Result<harw_onion::OnionServer, String> {
+    use harw_onion::{BootstrapProgress, OnionServer, OnionServerConfig};
+
+    crate::session_serve::private_dir(dir)?;
+    let state = dir.join("state");
+    let cache = dir.join("cache");
+    crate::session_serve::private_dir(&state)?;
+    crate::session_serve::private_dir(&cache)?;
+    eprintln!("  session onion  : starting Tor (the first start can take several minutes)");
+    let mut last_bucket: Option<u8> = None;
+    let mut last_blocked: Option<String> = None;
+    let on_progress = move |progress: &BootstrapProgress| {
+        let bucket = progress.percent / 10;
+        if last_bucket != Some(bucket) {
+            last_bucket = Some(bucket);
+            eprintln!("  session onion  : tor bootstrap {}%", progress.percent);
+        }
+        if progress.blocked != last_blocked {
+            last_blocked.clone_from(&progress.blocked);
+            if let Some(blocked) = &progress.blocked {
+                eprintln!("  session onion  : tor blocked: {blocked}");
+            }
+        }
+    };
+    let handler = move |stream: harw_onion::OnionStream| {
+        let intake = intake.clone();
+        async move {
+            if let Err(error) = intake.serve(stream, ONION_HANDSHAKE_TIMEOUT).await {
+                tracing::debug!(%error, "onion session connection ended");
+            }
+        }
+    };
+    let server = OnionServer::launch(OnionServerConfig::new(state, cache), on_progress, handler)
+        .await
+        .map_err(|error| format!("[session_listener] onion: {error}"))?;
+    write_locator(&dir.join(ONION_LOCATOR_FILE), server.locator())?;
+    if server.wait_reachable(ONION_REACHABLE_TIMEOUT).await {
+        eprintln!("  session onion  : reachable");
+    } else {
+        eprintln!("  session onion  : not confirmed reachable after 180 s; continuing");
+    }
+    tracing::info!(onion = %server.locator().redacted(), "session listener onion service up");
+    Ok(server)
+}
+
+/// Writes `<locator>\n` atomically (tmp file, mode 0600, rename).
+#[cfg(feature = "onion")]
+fn write_locator(path: &Path, locator: &harw_onion::OnionLocator) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let tmp = path.with_extension("tmp");
+    let fail = |error: std::io::Error| format!("[session_listener] onion locator file: {error}");
+    // A stale tmp (maybe with loose permissions) is removed; `create_new`
+    // (O_EXCL) never follows a symlink and guarantees the 0600 mode applies.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(fail(error)),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(fail)?;
+    file.write_all(format!("{locator}\n").as_bytes())
+        .map_err(fail)?;
+    file.sync_all().map_err(fail)?;
+    std::fs::rename(&tmp, path).map_err(fail)
 }
 
 #[cfg(test)]
@@ -345,6 +507,98 @@ mod tests {
                 .map(|d| d.as_str().to_owned()),
             Some("dev-1".to_owned())
         );
+    }
+
+    #[test]
+    fn onion_dir_requires_onion_and_an_absolute_path() {
+        let mut dir_only = section();
+        dir_only.onion_dir = Some("/var/onion".to_owned());
+        assert!(plan(&dir_only).is_err(), "onion_dir without onion");
+        let mut relative = section();
+        relative.onion = true;
+        relative.onion_dir = Some("onion".to_owned());
+        assert!(
+            plan(&relative).is_err_and(|e| e.contains("absolute")),
+            "relative onion_dir"
+        );
+        for raw in ["/var/onion/../x", "/var/./onion"] {
+            let mut dotted = section();
+            dotted.onion = true;
+            dotted.onion_dir = Some(raw.to_owned());
+            assert!(
+                plan(&dotted).is_err_and(|e| e.contains("components")),
+                "{raw}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "onion"))]
+    #[test]
+    fn onion_without_the_feature_is_a_plan_error() {
+        let mut onion = section();
+        onion.onion = true;
+        assert!(plan(&onion).is_err());
+    }
+
+    #[cfg(feature = "onion")]
+    #[test]
+    fn onion_with_the_feature_plans() -> Result<(), String> {
+        let mut onion = section();
+        onion.onion = true;
+        onion.onion_dir = Some("/var/onion".to_owned());
+        let plan = plan(&onion)?;
+        assert!(plan.onion);
+        assert_eq!(plan.onion_dir, Some(PathBuf::from("/var/onion")));
+        Ok(())
+    }
+
+    #[cfg(feature = "onion")]
+    #[test]
+    fn write_locator_is_owner_only_and_canonical() -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let locator: harw_onion::OnionLocator =
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443"
+                .parse()
+                .map_err(|e: harw_onion::OnionError| e.to_string())?;
+        let path = temp.path().join(ONION_LOCATOR_FILE);
+        write_locator(&path, &locator)?;
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        assert_eq!(
+            text,
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443\n"
+        );
+        let mode = std::fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[cfg(feature = "onion")]
+    #[test]
+    fn write_locator_replaces_a_loose_stale_tmp() -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let locator: harw_onion::OnionLocator =
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443"
+                .parse()
+                .map_err(|e: harw_onion::OnionError| e.to_string())?;
+        let path = temp.path().join(ONION_LOCATOR_FILE);
+        let stale = path.with_extension("tmp");
+        std::fs::write(&stale, "old").map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| e.to_string())?;
+        write_locator(&path, &locator)?;
+        let mode = std::fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        Ok(())
     }
 
     #[test]

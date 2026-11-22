@@ -204,6 +204,7 @@ internal open class MainActivity : ComponentActivity() {
                     }
                 },
                 onDisconnect = connection::disconnect,
+                onSelectRoute = { connection.selectRoute(it) },
                 onForgetSetup = connection::forgetSetup,
                 onRetryCleanup = connection::retryCleanup,
                 onCheckChatgpt = connection::refreshChatgptAccount,

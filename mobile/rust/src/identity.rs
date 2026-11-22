@@ -118,6 +118,7 @@ pub(crate) struct ValidatedProfile {
     pub profile: ServerProfile,
     pub endpoint: NodeEndpoint,
     pub verifier: TranscriptWrappedVerifier<PinnedPeers>,
+    pub onion: Option<harw_onion::OnionLocator>,
 }
 
 impl ValidatedProfile {
@@ -144,6 +145,16 @@ impl ValidatedProfile {
         let key = decode_public_key(&profile.server_public_key_hex).map_err(invalid_profile)?;
         profile.endpoint = addr.to_string();
         profile.server_public_key_hex = hex::encode(&key);
+        let onion = match profile.onion.as_deref() {
+            Some(text) => {
+                let locator = text.parse::<harw_onion::OnionLocator>().map_err(|_| {
+                    invalid_profile("onion must be a v3 address like <56 characters>.onion:<port>")
+                })?;
+                profile.onion = Some(locator.to_string());
+                Some(locator)
+            }
+            None => None,
+        };
         let mut pins = PinnedPeers::new();
         pins.pin(expected_node.clone(), key)
             .map_err(|_| invalid_profile("invalid pinned ML-DSA-65 public key"))?;
@@ -154,6 +165,7 @@ impl ValidatedProfile {
                 expected_node,
             },
             verifier: TranscriptWrappedVerifier::new(pins),
+            onion,
         })
     }
 }

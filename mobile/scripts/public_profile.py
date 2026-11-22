@@ -1,3 +1,6 @@
+import base64
+import binascii
+import hashlib
 import ipaddress
 import json
 import os
@@ -32,6 +35,20 @@ def valid_endpoint(endpoint):
     return not address.is_unspecified and not address.is_multicast
 
 
+def valid_onion(onion):
+    match = re.fullmatch(r"([a-z2-7]{56})\.onion:([1-9][0-9]{0,4})", onion)
+    if not match or int(match.group(2)) > 65535 or len(onion) > 68:
+        return False
+    try:
+        raw = base64.b32decode(match.group(1).upper())
+    except (binascii.Error, ValueError):
+        return False
+    if len(raw) != 35 or raw[34] != 3:
+        return False
+    checksum = hashlib.sha3_256(b".onion checksum" + raw[:32] + b"\x03").digest()[:2]
+    return checksum == raw[32:34]
+
+
 def read_profile(path):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     directory, filename = os.path.split(path)
@@ -57,13 +74,17 @@ def read_profile(path):
         if len(contents) > maximum:
             raise ValueError("file too large")
     fields = {"version", "label", "endpoint", "server_node_id", "server_public_key_hex"}
+    allowed = fields | {"onion"}
     profile = json.loads(contents.decode("utf-8"), object_pairs_hook=unique_fields)
     if (
         not isinstance(profile, dict)
-        or profile.keys() != fields
+        or not fields <= profile.keys() <= allowed
         or type(profile["version"]) is not int
         or profile["version"] != 1
-        or any(not isinstance(profile[field], str) for field in fields - {"version"})
+        or any(
+            not isinstance(profile[field], str)
+            for field in profile.keys() - {"version"}
+        )
     ):
         raise ValueError("invalid public profile schema")
     label = profile["label"]
@@ -74,6 +95,7 @@ def read_profile(path):
         or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", profile["server_node_id"])
         or not re.fullmatch(r"[A-Fa-f0-9]{3904}", profile["server_public_key_hex"])
         or not valid_endpoint(profile["endpoint"])
+        or ("onion" in profile and not valid_onion(profile["onion"]))
     ):
         raise ValueError("invalid public profile fields")
     return profile
@@ -83,4 +105,4 @@ if __name__ == "__main__":
     try:
         print(json.dumps(read_profile(sys.argv[1]), ensure_ascii=False))
     except (OSError, ValueError, RecursionError):
-        sys.exit("expected a valid v1 public server profile in a trusted regular file")
+        sys.exit("expected a valid version 1 public server profile in a trusted regular file")

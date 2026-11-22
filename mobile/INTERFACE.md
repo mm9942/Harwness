@@ -27,6 +27,8 @@ class MobileCore(privateKey: ByteArray, label: String) {
                clientMessageId: String): SubmitReceipt
     fun interrupt(sessionId: String, turnId: String)
     fun decide(sessionId: String, approvalId: String, decision: ApprovalDecision): ApprovalReceipt
+    fun setTorDirectories(stateDir: String, cacheDir: String)
+    fun setRoutePreference(preference: RoutePreference)
 }
 ```
 
@@ -42,6 +44,12 @@ Capture the displayed `head` and a fresh UUID when the user submits a draft. Reu
 
 `decide` requires a live attachment, the host's approval grant and a current pending request that offers the selected decision. The server decides among racing responses. The app must call `interrupt` only for the currently displayed running turn. The current server treats the wire interrupt as session-wide.
 
+`setTorDirectories(stateDir, cacheDir)` takes absolute app-private directories. Call it once after constructing `MobileCore`, before any onion dial. The Android app uses `noBackupFilesDir/tor/state` and `cacheDir/tor`. The core creates them with mode 0700. Changing them after Tor has started throws `MobileException.Internal`. If they are unset, an onion dial fails with `Connect` detail `tor: Tor storage is not configured`. Tor starts lazily on the first onion dial, not at construction. Its first connection can take up to about two minutes while the network bootstraps. `status().tor` reports the bootstrap progress while it runs.
+
+`setRoutePreference(preference)` selects how `connect` and provider requests choose a route. `AUTO` tries the `.onion` route first when the profile has one, then the direct TCP endpoint. `ONION` uses only the `.onion` route and fails with `InvalidProfile` for a profile without one. `DIRECT` uses only the endpoint. Within one dial, routes are tried in order. A final failure, such as a node handshake, TLS or hello rejection, or a 4xx response, stops the attempt. Any other failure, including every `tor:` error, moves to the next route. `status().route` shows the route being dialed while connecting or reconnecting, and the link's route while connected. It is `null` otherwise. `status().availableRoutes` lists the routes the selected profile offers.
+
+Tor is only a transport. The pinned ML-DSA-65 handshake, `session.hello` and device enrollment still decide access. Reaching a `.onion` address grants nothing. Onion dial timeouts are 120 s for Tor including cold bootstrap, 30 s for the node handshake, and 60 s for upgrade plus hello. The arti library may terminate the app process when the Tor network starts requiring protocol features that this build lacks. This is a known limit of the MVP. Update the app when that happens. On the next start, the onion route fails with an outdated-build error, and the user should update the app.
+
 ## Sign in with ChatGPT
 
 Android completes browser authorization and verifies the ID token, including the nonce for the current attempt. After the user approves the transfer, pass the same immutable server profile used for consent. The Rust bridge checks the active profile and proves the server key again before sending a bounded request to `/v1/provider-link/chatgpt`. The server manages later refreshes. [OpenAI guidance for self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
@@ -54,8 +62,9 @@ Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` respo
 | --- | --- |
 | `IdentityMaterial` | `privateKey: ByteArray`, `enrollment: DeviceEnrollment` |
 | `DeviceEnrollment` | `version: UInt`, `nodeId: String`, `publicKeyHex: String`, `label: String` |
-| `ServerProfile` | `version: UInt`, `label: String`, `endpoint: String`, `serverNodeId: String`, `serverPublicKeyHex: String` |
-| `ConnectionStatus` | `phase: ConnectionPhase`, `nodeId: String?`, `endpoint: String?`, `label: String?`, `detail: String?`, `canCreate: Boolean`, `canSubmit: Boolean`, `canApprove: Boolean` |
+| `ServerProfile` | `version: UInt`, `label: String`, `endpoint: String`, `serverNodeId: String`, `serverPublicKeyHex: String`, `onion: String?` |
+| `ConnectionStatus` | `phase: ConnectionPhase`, `nodeId: String?`, `endpoint: String?`, `label: String?`, `detail: String?`, `canCreate: Boolean`, `canSubmit: Boolean`, `canApprove: Boolean`, `route: ConnectionRoute?`, `routePreference: RoutePreference`, `availableRoutes: List<ConnectionRoute>`, `tor: TorBootstrap?` |
+| `TorBootstrap` | `percent: UInt`, `ready: Boolean`, `blocked: String?`, `summary: String` |
 | `MobileSession` | `sessionId: String`, `title: String?`, `state: MobileSessionState`, `attached: UInt`, `updatedAt: String`, `model: String?` |
 | `SessionCursor` | `generation: UInt`, `durable: ULong`, `live: UInt` |
 | `SessionSnapshot` | `sessionId: String`, `head: SessionCursor?`, `online: Boolean`, `canSubmit: Boolean`, `canApprove: Boolean`, `canInterrupt: Boolean`, `runningTurnId: String?`, `transcript: List<TranscriptEntry>`, `liveText: String?`, `approvals: List<MobileApproval>`, `lastFailure: String?`, `lastSyncMillis: Long?`, `detail: String?` |
@@ -76,6 +85,8 @@ Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` respo
 | `ApprovalDecision` | `APPROVED`, `REJECTED`, `APPROVED_ONCE` |
 | `SubmitOutcome` | `ACCEPTED`, `STALE`, `QUEUE_FULL`, `DENIED`, `IN_FLIGHT` |
 | `ApprovalOutcome` | `RESOLVED`, `ALREADY_RESOLVED`, `EXPIRED`, `DENIED` |
+| `RoutePreference` | `AUTO`, `ONION`, `DIRECT` |
+| `ConnectionRoute` | `DIRECT`, `ONION` |
 
 Fallible methods throw `MobileException`. Variants with `detail: String` are `InvalidIdentity`, `InvalidProfile`, `Connect`, `Session`, `Denied`, `Transport`, `Ambiguous`, and `Internal`. `Disconnected` and `Revoked` carry no fields.
 
@@ -84,5 +95,9 @@ Fallible methods throw `MobileException`. Variants with `detail: String` are `In
 Enrollment JSON has required fields `version` (integer `1`), `node_id`, `public_key_hex`, and `label`. The public key is raw 1,952-byte ML-DSA-65 material encoded as 3,904 hex digits. The export contains only these public fields.
 
 Connection profile JSON has required fields `version` (integer `1`), `label`, `endpoint`, `server_node_id`, and `server_public_key_hex`. `endpoint` is an explicit IP socket address such as `127.0.0.1:7410` or `[::1]:7410`. The pinned key has the same public encoding as enrollment. Obtain the profile from the server operator over a trusted channel.
+
+The profile may carry an optional `onion` field, `<56 base32 chars>.onion:<port>`, for example `2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443`. The 56 characters use lowercase `a-z2-7` and must form a valid v3 onion address with a correct SHA3-256 checksum. The port is 1 to 65535 with no leading zeros. The profile version stays `1`. Old apps reject a profile that contains `onion` because it is an unknown field. `endpoint` remains required for the direct route. Validated profiles hold the canonical lowercase locator.
+
+QR codes encode profiles without `onion` as `HARW:PROFILE:1:` followed by the existing payload. Profiles with `onion` use `HARW:PROFILE:2:` followed by base45 of the bytes `[labelLen, nodeLen, endpointLen, onionLen]`, then the label (UTF-8, 1 to 128 bytes), the node ID (printable ASCII, 1 to 128), the endpoint (printable ASCII, 1 to 63), the onion locator (printable ASCII, 62 to 68), and the 1,952 raw public-key bytes. Kotlin decodes both versions to the same JSON, where v2 adds `onion`. The maximum base45 text length is 3600 characters.
 
 The only private value at this boundary is the opaque `IdentityMaterial.privateKey` byte array. Encrypt it with Android Keystore before storing it. Use decrypted bytes to construct the core and zero the Kotlin arrays after storage or construction. Persist the label alongside the wrapped identity to reproduce its enrollment. Provider credentials remain on the server.

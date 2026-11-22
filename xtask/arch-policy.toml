@@ -255,6 +255,10 @@ layer = "A"
 [packages."harw-node-transport"]
 layer = "A"
 
+# Tor-Onion-Transport (eingebettetes arti =0.48.0 hinter den Features client/service): Onion-Service-Annahme für den Session-Listener (harw-cli) und Onion-Dialer für das Handy. Keine internen Kanten; arti erreicht nie ein TCB-Paket.
+[packages."harw-onion"]
+layer = "A"
+
 [packages."harw-security-hub"]
 layer = "A"
 

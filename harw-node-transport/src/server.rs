@@ -187,11 +187,13 @@ impl NodeTransportServer {
                 drop(tcp);
                 continue;
             };
+            let _ = tcp.set_nodelay(true);
             let inner = Arc::clone(&self.inner);
             let service = service.clone();
+            let timeout = inner.options.handshake_timeout;
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(err) = handle_connection(inner, tcp, service, upgrades).await {
+                if let Err(err) = handle_connection(inner, tcp, service, upgrades, timeout).await {
                     // `remote` is logged for operators only; it is never
                     // used as identity.
                     tracing::debug!(%remote, error = %err, "node transport connection ended");
@@ -210,7 +212,50 @@ impl NodeTransportServer {
         &self,
         tcp: TcpStream,
     ) -> Result<(AuthenticatedPeer, ServerTlsStream), TransportError> {
-        accept_node(&self.inner, tcp).await
+        let _ = tcp.set_nodelay(true);
+        accept_node(&self.inner, tcp, self.inner.options.handshake_timeout).await
+    }
+
+    /// Serves one already-connected byte stream (e.g. an accepted onion
+    /// stream) through the identical TLS + node handshake, replay cache,
+    /// connection limit and [`AuthenticatedPeer`] injection as TCP
+    /// connections, with HTTP/1 upgrades enabled. The stream's origin is
+    /// never identity: only the node handshake authenticates the peer.
+    ///
+    /// When the connection limit is reached the stream is dropped and
+    /// `Ok(())` is returned. Otherwise this returns when the connection ends.
+    ///
+    /// # Errors
+    /// Handshake, timeout or HTTP failures ([`UpgradeError::Transport`]).
+    ///
+    /// [`UpgradeError::Transport`]: crate::upgrade::UpgradeError::Transport
+    pub async fn serve_upgradable_io<I, S, B>(
+        &self,
+        io: I,
+        service: S,
+        handshake_timeout: Duration,
+    ) -> Result<(), crate::upgrade::UpgradeError>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: tower_service::Service<Request<Incoming>, Response = Response<B>>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let Ok(permit) = Arc::clone(&self.inner.slots).try_acquire_owned() else {
+            tracing::warn!("node transport connection limit reached");
+            drop(io);
+            return Ok(());
+        };
+        let inner = Arc::clone(&self.inner);
+        let result = handle_connection(inner, io, service, true, handshake_timeout).await;
+        drop(permit);
+        result.map_err(crate::upgrade::UpgradeError::Transport)
     }
 }
 
@@ -224,21 +269,27 @@ fn is_per_connection(err: &std::io::Error) -> bool {
     )
 }
 
-async fn accept_node(
+async fn accept_node<I>(
     inner: &ServerInner,
-    tcp: TcpStream,
-) -> Result<(AuthenticatedPeer, ServerTlsStream), TransportError> {
-    tokio::time::timeout(inner.options.handshake_timeout, accept_untimed(inner, tcp))
+    io: I,
+    timeout: Duration,
+) -> Result<(AuthenticatedPeer, tokio_rustls::server::TlsStream<I>), TransportError>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::time::timeout(timeout, accept_untimed(inner, io))
         .await
         .map_err(|_| TransportError::HandshakeTimeout)?
 }
 
-async fn accept_untimed(
+async fn accept_untimed<I>(
     inner: &ServerInner,
-    tcp: TcpStream,
-) -> Result<(AuthenticatedPeer, ServerTlsStream), TransportError> {
-    let _ = tcp.set_nodelay(true);
-    let mut stream = inner.acceptor.accept(tcp).await?;
+    io: I,
+) -> Result<(AuthenticatedPeer, tokio_rustls::server::TlsStream<I>), TransportError>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut stream = inner.acceptor.accept(io).await?;
     let binding = tls::server_channel_binding(stream.get_ref().1)?;
     match server_handshake(inner, &mut stream, binding).await {
         Ok(peer) => Ok((peer, stream)),
@@ -284,13 +335,15 @@ where
     Ok(peer)
 }
 
-async fn handle_connection<S, B>(
+async fn handle_connection<I, S, B>(
     inner: Arc<ServerInner>,
-    tcp: TcpStream,
+    io: I,
     service: S,
     upgrades: bool,
+    handshake_timeout: Duration,
 ) -> Result<(), TransportError>
 where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: tower_service::Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
@@ -298,7 +351,7 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let (peer, stream) = accept_node(&inner, tcp).await?;
+    let (peer, stream) = accept_node(&inner, io, handshake_timeout).await?;
     tracing::debug!(peer = %peer.node_id, "node transport peer authenticated");
     let service = TowerToHyperService::new(InjectPeer {
         inner: service,

@@ -352,7 +352,7 @@ fn test_field_table_exhaustive_tools_section() {
 }
 
 // [tools.doc] (Abschnitt 1.8a, 1 Feld)
-// [session_listener] (8 Felder, alle global-only)
+// [session_listener] (10 Felder, alle global-only)
 #[test]
 fn test_field_table_exhaustive_session_listener_section() {
     let harw_config::SessionListenerSection {
@@ -364,6 +364,8 @@ fn test_field_table_exhaustive_session_listener_section() {
         approval_device,
         provider_link_device,
         shared_socket_tenant,
+        onion,
+        onion_dir,
     } = harw_config::SessionListenerSection::default();
     let _ = (
         enabled,
@@ -374,6 +376,8 @@ fn test_field_table_exhaustive_session_listener_section() {
         approval_device,
         provider_link_device,
         shared_socket_tenant,
+        onion,
+        onion_dir,
     );
     for field in [
         "enabled",
@@ -384,6 +388,8 @@ fn test_field_table_exhaustive_session_listener_section() {
         "approval_device",
         "provider_link_device",
         "shared_socket_tenant",
+        "onion",
+        "onion_dir",
     ] {
         assert_path_in_field_table_exactly_once(&format!("session_listener.{field}"));
     }
