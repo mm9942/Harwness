@@ -163,6 +163,7 @@ internal fun ProjectsScreen(
     onNewSession: (String) -> Unit,
     onRefresh: () -> Unit,
     modifier: Modifier = Modifier,
+    onNewProject: (() -> Unit)? = null,
     nowMillis: Long = System.currentTimeMillis(),
 ) {
     var query by rememberSaveable { mutableStateOf("") }
@@ -181,6 +182,9 @@ internal fun ProjectsScreen(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (onNewProject != null) {
+                TextButton(onClick = onNewProject, enabled = online) { Text("Neues Projekt") }
+            }
             IconButton(onClick = onRefresh, enabled = online) { Icon(Icons.Outlined.Refresh, "Projekte aktualisieren") }
         }
         OutlinedTextField(

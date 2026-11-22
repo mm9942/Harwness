@@ -75,6 +75,7 @@ internal fun WorkspaceScreen(
     onNewWindow: (String) -> Unit,
     projectView: ProjectSessionsState? = null,
     projectActions: ProjectSessionsActions? = null,
+    onSwitchBackend: (Boolean) -> Unit = {},
 ) {
     val sessionId = window.sessionId
     val session = state.sessions.firstOrNull { it.sessionId == sessionId }
@@ -115,6 +116,7 @@ internal fun WorkspaceScreen(
                         actions = projectActions,
                         selected = sessionId,
                         online = state.online,
+                        showNew = split,
                         onSelect = window::select,
                         modifier = when {
                             split -> Modifier.width(if (roomy) 245.dp else 205.dp)
@@ -126,6 +128,7 @@ internal fun WorkspaceScreen(
                         state = state,
                         selected = sessionId,
                         narrow = split,
+                        onSwitchBackend = onSwitchBackend,
                         onNew = { creating = true },
                         onRefresh = connection::refreshSessions,
                         onSelect = window::select,
@@ -173,6 +176,7 @@ private fun SessionDirectory(
     state: WorkspaceState,
     selected: String?,
     narrow: Boolean,
+    onSwitchBackend: (Boolean) -> Unit,
     onNew: () -> Unit,
     onRefresh: () -> Unit,
     onSelect: (String) -> Unit,
@@ -181,13 +185,14 @@ private fun SessionDirectory(
 ) {
     val inset = if (narrow) 12.dp else 18.dp
     Column(modifier.fillMaxHeight().padding(top = 9.dp)) {
+        if (!narrow) BackendSwitch(local = state.local, enabled = !state.stopping, onSelect = onSwitchBackend)
         Row(
             Modifier.fillMaxWidth().padding(horizontal = inset),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                if (narrow) "Sessions" else state.profile?.label ?: "Sessions",
+                if (narrow) "Sessions" else if (state.local) "Lokal" else state.profile?.label ?: "Sessions",
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
@@ -203,14 +208,7 @@ private fun SessionDirectory(
                     Icon(Icons.Outlined.Add, contentDescription = if (narrow) "Neue Session" else null, Modifier.size(18.dp))
                 }
             }
-            if (narrow) {
-                FilledIconButton(onClick = onNew, enabled = canCreate, content = newIcon)
-            } else {
-                Button(onClick = onNew, enabled = canCreate) {
-                    newIcon()
-                    Text("Neu", Modifier.padding(start = 4.dp))
-                }
-            }
+            if (narrow) FilledIconButton(onClick = onNew, enabled = canCreate, content = newIcon)
         }
         if (state.sessions.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(inset), contentAlignment = Alignment.Center) {
@@ -468,6 +466,7 @@ private fun ProjectSessionList(
     actions: ProjectSessionsActions,
     selected: String?,
     online: Boolean,
+    showNew: Boolean,
     onSelect: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -506,7 +505,7 @@ private fun ProjectSessionList(
                 }
             }
             IconButton(onClick = actions.onRefresh, enabled = online) { Icon(Icons.Outlined.Refresh, "Aktualisieren") }
-            FilledIconButton(onClick = actions.onNew, enabled = canWrite) { Icon(Icons.Outlined.Add, "Neue Session", Modifier.size(18.dp)) }
+            if (showNew) FilledIconButton(onClick = actions.onNew, enabled = canWrite) { Icon(Icons.Outlined.Add, "Neue Session", Modifier.size(18.dp)) }
         }
         val empty = projectEmptyText(view, canWrite)
         when {

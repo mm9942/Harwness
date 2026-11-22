@@ -17,6 +17,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawing
@@ -141,6 +144,8 @@ internal open class MainActivity : ComponentActivity() {
             markFirstRunDone(this@MainActivity)
         }
         var notificationDenied by rememberSaveable { mutableStateOf(false) }
+        var newChatOpen by rememberSaveable { mutableStateOf(false) }
+        var newProjectOpen by rememberSaveable { mutableStateOf(false) }
         val profilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
             if (it != null) connection.importProfile(it)
         }
@@ -321,8 +326,9 @@ internal open class MainActivity : ComponentActivity() {
                 onDismissPlanNotice = connection::dismissChatgptPlanNotice,
                 onManageChatgpt = ::openChatgptUsage,
             )
-        } else if (projectKey == null && sessionId == null) {
+        } else if (projectKey == null && sessionId == null && !state.local) {
             LaunchedEffect(state.online, state.generation) { if (state.online) connection.refreshProjects() }
+            Box(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize()) {
                 HarwHeader(title = "Projekte") {
                     ConnectionBadge(state)
@@ -330,7 +336,9 @@ internal open class MainActivity : ComponentActivity() {
                         Icon(Icons.Outlined.Settings, "Einstellungen")
                     }
                 }
+                BackendSwitch(local = false, enabled = !state.stopping, onSelect = connection::switchBackend)
                 ProjectsScreen(
+                    onNewProject = { newProjectOpen = true },
                     projects = state.projects,
                     loaded = state.projectsLoaded,
                     online = state.online,
@@ -340,6 +348,12 @@ internal open class MainActivity : ComponentActivity() {
                     onNewSession = { key -> connection.createInProject(key) { id -> window.openLink(DeepLink(key, id)) } },
                     onRefresh = connection::refreshProjects,
                 )
+            }
+            NewChatFab(
+                enabled = state.online && state.canCreate && !state.creating,
+                onClick = { newChatOpen = true },
+                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+            )
             }
         } else {
             val key = projectKey
@@ -351,7 +365,9 @@ internal open class MainActivity : ComponentActivity() {
             val actions = if (key == null) null else remember(key) {
                 connection.projectActions { id -> window.openLink(DeepLink(key, id)) }
             }
+            Box(Modifier.fillMaxSize()) {
             WorkspaceScreen(
+                onSwitchBackend = connection::switchBackend,
                 state = state,
                 window = window,
                 connection = connection,
@@ -361,6 +377,50 @@ internal open class MainActivity : ComponentActivity() {
                 onNewWindow = ::openWindow,
                 projectView = view,
                 projectActions = if (view != null) actions else null,
+            )
+            if (sessionId == null) {
+                NewChatFab(
+                    enabled = state.online && state.canCreate && !state.creating,
+                    onClick = { newChatOpen = true },
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                )
+            }
+            }
+        }
+        if (newChatOpen) {
+            NewChatSheet(
+                local = state.local,
+                projects = state.projects,
+                initialProjectKey = projectKey?.takeIf { it.isNotEmpty() },
+                canStart = state.online && state.canCreate && !state.creating,
+                busy = state.creating,
+                onSwitch = connection::switchBackend,
+                onDismiss = { newChatOpen = false },
+                onStart = { key, message ->
+                    connection.startChat(
+                        projectKey = key,
+                        firstMessage = message,
+                        opened = { id, assigned ->
+                            newChatOpen = false
+                            if (message.isNotBlank()) window.queueFirstMessage(id, message)
+                            window.openLink(DeepLink(assigned, id))
+                        },
+                        notice = { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() },
+                    )
+                },
+            )
+        }
+        if (newProjectOpen) {
+            NewProjectDialog(
+                busy = state.creating,
+                onDismiss = { newProjectOpen = false },
+                onCreate = { name, done ->
+                    connection.createProject(
+                        name,
+                        result = done,
+                        opened = { id, key -> window.openLink(DeepLink(key, id)) },
+                    )
+                },
             )
         }
     }
@@ -423,6 +483,20 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
     var projectKey by mutableStateOf(savedState.get<String>(SelectedProjectKey))
         private set
     private var drafts by mutableStateOf<Map<String, SessionDraft>>(emptyMap())
+    private var firstMessages by mutableStateOf<Map<String, String>>(emptyMap())
+
+    /** Erste Nachricht eines neuen Chats; die Unterhaltung sendet sie, sobald die Session bereit ist. */
+    fun queueFirstMessage(id: String, text: String) {
+        firstMessages = firstMessages + (id to text)
+    }
+
+    fun firstMessage(id: String): String? = firstMessages[id]
+
+    fun takeFirstMessage(id: String): String? {
+        val text = firstMessages[id] ?: return null
+        firstMessages = firstMessages - id
+        return text
+    }
     private var sessionResetEpoch = 0L
 
     fun useProfile(key: String?) {

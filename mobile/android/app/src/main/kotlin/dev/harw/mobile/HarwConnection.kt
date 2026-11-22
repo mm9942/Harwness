@@ -158,7 +158,12 @@ internal data class WorkspaceState(
     /** Open project view; `null` while the project list is shown. */
     val projectView: ProjectSessionsState? = null,
     val manage: ManageState = ManageState(),
+    /** True while the on-device host is the active backend (the core serves exactly one backend at a time). */
+    val local: Boolean = false,
 ) {
+    /** Backend switch: drops everything the previous backend showed and marks the new one. */
+    fun switched(toLocal: Boolean) = clearSessions().copy(local = toLocal)
+
     val online: Boolean get() = phase == ConnectionPhase.CONNECTED && !stopping
     val canSetUp: Boolean get() = !setupPending && !forgetRequired && cleanupError == null
     val canForget: Boolean get() = canSetUp && !hasConnection && !stopping && hasSavedSetup
@@ -475,13 +480,15 @@ internal class HarwConnection(private val context: Context) {
         change { it.copy(setupError = "Start connection: ${error.displayMessage()}") }
     }
 
-    fun connect(): Boolean {
+    fun connect(force: Boolean = false): Boolean {
         val start = state.value
         val profile = start.profile ?: return false
-        if (start.hasConnection || start.stopping || !start.canSetUp) return start.hasConnection
+        if (start.stopping || !start.canSetUp) return start.hasConnection
+        if (start.hasConnection && !force) return true
         val request = ++lifecycle
         change {
             it.copy(
+                local = false,
                 phase = ConnectionPhase.CONNECTING, detail = null, listError = null,
                 setupError = null, setupNotice = null,
             )
@@ -525,12 +532,14 @@ internal class HarwConnection(private val context: Context) {
         return true
     }
 
-    fun connectLocal(): Boolean {
+    fun connectLocal(force: Boolean = false): Boolean {
         val start = state.value
-        if (start.hasConnection || start.stopping || !start.canSetUp) return start.hasConnection
+        if (start.stopping || !start.canSetUp) return start.hasConnection
+        if (start.hasConnection && !force) return true
         val request = ++lifecycle
         change {
             it.copy(
+                local = true,
                 phase = ConnectionPhase.CONNECTING, detail = null, listError = null,
                 setupError = null, setupNotice = null,
             )
@@ -556,6 +565,127 @@ internal class HarwConnection(private val context: Context) {
             }
         }
         return true
+    }
+
+    /**
+     * Wechselt zwischen On-Device-Host (Lokal) und Gateway (Cloud). Der Core haelt genau ein Backend:
+     * das andere wird beendet, die Liste zeigt danach nur das aktive Backend.
+     */
+    fun switchBackend(toLocal: Boolean) {
+        val current = state.value
+        if (current.stopping || !current.canSetUp) return
+        if (current.local == toLocal && current.hasConnection) return
+        if (!toLocal && current.profile == null) {
+            change { it.copy(setupError = "Für Cloud ist noch kein Server-Profil eingerichtet.") }
+            return
+        }
+        clearSessionActions()
+        change { it.switched(toLocal) }
+        if (toLocal) connectLocal(force = true) else connect(force = true)
+    }
+
+    /**
+     * Startet einen Chat im aktiven Backend. Mit Projekt wird dort angelegt; ohne Projekt wird aus der ersten
+     * Nachricht ein Projektname abgeleitet und die Session zugewiesen, soweit das Backend Projekte kennt.
+     * [opened] bekommt Session und (falls zugewiesen) Projektschluessel, [notice] Hinweise fuer den Nutzer.
+     */
+    fun startChat(
+        projectKey: String?,
+        firstMessage: String,
+        opened: (String, String?) -> Unit,
+        notice: (String) -> Unit,
+    ) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        val current = state.value
+        if (!current.canCreate || current.creating) return
+        change { it.copy(creating = true, listError = null) }
+        commands.launch {
+            try {
+                val existing = projectKey?.takeIf { it.isNotEmpty() }
+                val topic = topicTitle(firstMessage)
+                var assigned: String? = null
+                var note: String? = null
+                val session = withContext(Dispatchers.IO) {
+                    val supported = native.projectsSupported()
+                    val created = if (existing != null && supported) {
+                        assigned = existing
+                        native.createInProject(existing, null)
+                    } else {
+                        native.createSession(null)
+                    }
+                    if (existing != null && !supported) note = LocalNoProjectsText
+                    if (existing == null && topic.isNotBlank()) {
+                        val slug = slugify(topic)
+                        if (!supported) {
+                            note = LocalNoProjectsText
+                        } else {
+                            try {
+                                native.setProject(created.sessionId, slug)
+                                assigned = slug
+                            } catch (error: Exception) {
+                                if (error is CancellationException) throw error
+                                note = "Projekt „$slug“ konnte nicht angelegt werden: ${error.displayMessage()}. " + ServerCreatesNoProjectsText
+                            }
+                            try {
+                                native.renameSession(created.sessionId, topic)
+                            } catch (error: Exception) {
+                                if (error is CancellationException) throw error
+                            }
+                        }
+                    }
+                    created
+                }
+                if (generation == gate.generation) {
+                    change { it.copy(sessions = listOf(session) + it.sessions.filterNot { s -> s.sessionId == session.sessionId }) }
+                    opened(session.sessionId, assigned)
+                    note?.let(notice)
+                    refreshSessions()
+                    refreshProjectsQuietly()
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) notice("Neuer Chat: ${error.displayMessage()}")
+            } finally {
+                change { it.copy(creating = false) }
+            }
+        }
+    }
+
+    /**
+     * Legt ein Projekt mit [name] an (Wire: `session.create_in` mit dem Namen als Projektschluessel).
+     * [result] bekommt `null` bei Erfolg, sonst eine Erklaerung.
+     */
+    fun createProject(name: String, result: (String?) -> Unit, opened: (String, String) -> Unit) {
+        val slug = slugify(name)
+        if (slug.isBlank()) {
+            result("Bitte einen Namen eingeben.")
+            return
+        }
+        val generation = gate.generation
+        val native = core
+        val current = state.value
+        if (generation == null || native == null || !current.canCreate) {
+            result("Keine Verbindung oder keine Berechtigung zum Anlegen.")
+            return
+        }
+        if (current.local || !current.projectsSupported) {
+            result(LocalNoProjectsText)
+            return
+        }
+        commands.launch {
+            try {
+                val session = withContext(Dispatchers.IO) { native.createInProject(slug, null) }
+                if (generation == gate.generation) {
+                    opened(session.sessionId, slug)
+                    refreshProjectsQuietly()
+                    result(null)
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                result("Projekt „$slug“ konnte nicht angelegt werden: ${error.displayMessage()}. $ServerCreatesNoProjectsText")
+            }
+        }
     }
 
     fun disconnect() {

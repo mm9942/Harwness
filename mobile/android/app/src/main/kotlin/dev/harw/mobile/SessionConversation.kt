@@ -333,6 +333,14 @@ internal fun SessionConversation(
             )
             val head = snapshot?.head
             val composerEnabled = access == ConversationAccess.Writable && head != null && !sendPending
+            val queuedFirst = window.firstMessage(sessionId)
+            LaunchedEffect(sessionId, queuedFirst, composerEnabled, generation) {
+                if (queuedFirst != null && composerEnabled && generation != null && head != null) {
+                    window.takeFirstMessage(sessionId)
+                    window.edit(sessionId, queuedFirst)
+                    window.submit(connection, sessionId, generation, head)
+                }
+            }
             val imagesSupported by produceState(false, state.online, state.generation) {
                 value = state.online && connection.supportsImages()
             }
