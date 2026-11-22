@@ -48,8 +48,8 @@ pub use handshake::{
     AuthenticatedPeer, HandshakePolicy, PROTOCOL_VERSION, ReplayCache, TRANSCRIPT_DOMAIN,
 };
 pub use identity::{
-    LocalNode, ML_DSA_65_PUBLIC_KEY_LEN, ML_DSA_65_SIGNATURE_LEN, NodeIdentity, NodeSigner,
-    NodeVerifier, PinnedPeers, SignFuture,
+    ENROLLMENT_PROOF_DOMAIN, LocalNode, ML_DSA_65_PUBLIC_KEY_LEN, ML_DSA_65_SIGNATURE_LEN, NodeIdentity, NodeSigner,
+    NodeVerifier, PinnedPeers, SignFuture, enrollment_proof_message,
 };
 pub use server::{NodeTransportServer, ServerOptions, ServerTlsStream};
 pub use tls::TLS_EXPORTER_LABEL;

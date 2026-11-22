@@ -98,6 +98,8 @@ fn test_field_table_exhaustive_harness_config() {
         retention: _,
         // `[session_listener]`, eigener Abschnittstest unten.
         session_listener: _,
+        // `[admin]`, eigener Abschnittstest unten.
+        admin: _,
         // #22 Welle 2B: `[agent_compiler]`, eigener Abschnittstest unten.
         agent_compiler: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
@@ -1330,4 +1332,28 @@ fn test_invalid_dod_section_in_any_layer_fails_discovery() -> TestResult {
         );
     }
     Ok(())
+}
+
+// [admin] (6 Felder, alle global-only)
+#[test]
+fn test_field_table_exhaustive_admin_section() {
+    let harw_config::AdminSection {
+        listen,
+        public_url,
+        public_endpoint,
+        tenant,
+        restart_gateway,
+        gateway_unit,
+    } = harw_config::AdminSection::default();
+    let _ = (listen, public_url, public_endpoint, tenant, restart_gateway, gateway_unit);
+    for field in [
+        "listen",
+        "public_url",
+        "public_endpoint",
+        "tenant",
+        "restart_gateway",
+        "gateway_unit",
+    ] {
+        assert_path_in_field_table_exactly_once(&format!("admin.{field}"));
+    }
 }

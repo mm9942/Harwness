@@ -333,6 +333,7 @@ async fn serve(args: Serve) -> Result<()> {
         server_node_id: SERVER_NODE.to_owned(),
         server_public_key_hex: hex::encode(public_key),
         onion: None,
+        admin_url: None,
     };
     // With onion the profile can only be completed once the gateway has
     // published its locator, so it is built at the readiness line instead.

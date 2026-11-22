@@ -54,6 +54,7 @@ import uniffi.harw_mobile_ffi.SessionSnapshot
 import uniffi.harw_mobile_ffi.SubmitOutcome
 import uniffi.harw_mobile_ffi.TorBootstrap
 import uniffi.harw_mobile_ffi.generateIdentity
+import uniffi.harw_mobile_ffi.signAdminEnrollment
 import uniffi.harw_mobile_ffi.parseServerProfile
 
 /** ONION needs an onion route; without one the preference falls back to AUTO. */
@@ -429,27 +430,104 @@ internal class HarwConnection(private val context: Context, private val localBac
     private fun importProfileDocument(operation: String, read: () -> String): Boolean {
         val current = state.value
         if (current.hasConnection || current.stopping || !current.canSetUp) return false
-        setup(operation) {
-            val (document, profile) = withContext(Dispatchers.IO) { read().let { it to parseServerProfile(it) } }
-            withContext(Dispatchers.IO) { storageLock.withLock { store.saveProfile(document) } }
-            val replaced = profile.windowKey() != state.value.profile?.windowKey()
-            if (replaced) opened.clear()
-            change {
-                it.copy(
-                    profile = profile,
-                    routePreference = normalizedPreference(it.routePreference, profile.onion != null),
-                    hasSavedSetup = true,
-                    setupNotice = "Profile imported.",
-                    phase = ConnectionPhase.DISCONNECTED,
-                    detail = null,
-                    sessions = if (replaced) emptyList() else it.sessions,
-                    sessionsLoaded = if (replaced) false else it.sessionsLoaded,
-                    windows = if (replaced) emptyMap() else it.windows,
-                    listError = null,
-                )
+        setup(operation) { applyProfileDocument(withContext(Dispatchers.IO) { read() }, "Profile imported.") }
+        return true
+    }
+
+    private suspend fun applyProfileDocument(document: String, notice: String) {
+        val profile = withContext(Dispatchers.IO) { parseServerProfile(document) }
+        withContext(Dispatchers.IO) { storageLock.withLock { store.saveProfile(document) } }
+        val replaced = profile.windowKey() != state.value.profile?.windowKey()
+        if (replaced) opened.clear()
+        change {
+            it.copy(
+                profile = profile,
+                routePreference = normalizedPreference(it.routePreference, profile.onion != null),
+                hasSavedSetup = true,
+                setupNotice = notice,
+                phase = ConnectionPhase.DISCONNECTED,
+                detail = null,
+                sessions = if (replaced) emptyList() else it.sessions,
+                sessionsLoaded = if (replaced) false else it.sessionsLoaded,
+                windows = if (replaced) emptyMap() else it.windows,
+                listError = null,
+            )
+        }
+    }
+
+    private val adminPrefs by lazy { context.getSharedPreferences(AdminPrefsName, Context.MODE_PRIVATE) }
+
+    /** Zuletzt benutzte Admin-Adresse (Vorschlag im Dialog), falls vorhanden. */
+    fun lastAdminUrl(): String? = adminPrefs.getString(AdminPrefBase, null)
+
+    /**
+     * Selbstbedienungs-Einrichtung: holt ein Nonce vom Admin-Dienst, sendet die öffentlichen
+     * Anmeldefelder samt Besitznachweis (Signatur über das Nonce) und öffnet danach die
+     * Freigabeseite im Browser. Der private Schlüssel verlässt die App nie.
+     */
+    fun startAdminEnrollment(input: String, openBrowser: (android.net.Uri) -> Unit) = setup("Admin-Einrichtung") {
+        val base = normalizeAdminUrl(input)
+            ?: error("Die Admin-Adresse muss mit https:// beginnen und darf keine Zugangsdaten enthalten.")
+        val request = withContext(Dispatchers.IO) {
+            val seed = storageLock.withLock {
+                store.loadOrGenerateIdentity { generateIdentity(DeviceLabel).privateKey }
+            }
+            try {
+                val nonce = adminJsonCall("$base/api/enroll/nonce", null).getString("nonce")
+                val proof = signAdminEnrollment(seed, DeviceLabel, nonce)
+                val body = org.json.JSONObject()
+                    .put("nonce", nonce)
+                    .put("node_id", proof.nodeId)
+                    .put("public_key_hex", proof.publicKeyHex)
+                    .put("label", proof.label)
+                    .put("signature_hex", proof.signatureHex)
+                    .toString()
+                val reply = adminJsonCall("$base/api/enroll", body)
+                AdminRequest(reply.getString("req"), reply.optString("fingerprint"), base)
+            } finally {
+                seed.fill(0)
             }
         }
-        return true
+        check(AdminRequestPattern.matches(request.id)) { "Der Admin-Dienst hat eine ungültige Anfrage-ID geliefert." }
+        adminPrefs.edit()
+            .putString(AdminPrefReq, request.id)
+            .putLong(AdminPrefAt, System.currentTimeMillis())
+            .putString(AdminPrefBase, request.base)
+            .apply()
+        change {
+            it.copy(setupNotice = "Anfrage gesendet. Prüfcode ${request.fingerprint}: melde dich im Browser an und gib dieses Telefon frei.")
+        }
+        withContext(Dispatchers.Main) { openBrowser(android.net.Uri.parse("${request.base}/enroll?req=${request.id}")) }
+    }
+
+    /**
+     * Nimmt den Rückweg `harw://profile?req=<id>&data=<base64url>` an. Der Link ist unvertraute
+     * Eingabe: er wird nur akzeptiert, wenn die Anfrage-ID zur offenen, höchstens 15 Minuten alten
+     * Anfrage dieses Telefons passt; das Profil läuft danach durch denselben Parser wie jeder Import.
+     */
+    fun installAdminProfile(req: String?, data: String?, onInstalled: () -> Unit) {
+        val pending = adminPrefs.getString(AdminPrefReq, null)
+        val started = adminPrefs.getLong(AdminPrefAt, 0L)
+        val fresh = System.currentTimeMillis() - started in 0..AdminRequestMaxAgeMs
+        if (req == null || data == null || pending == null || req != pending || !fresh ||
+            !AdminRequestPattern.matches(req) || data.length > 20_000
+        ) {
+            change { it.copy(setupError = "Der Einrichtungslink passt zu keiner offenen Anfrage dieses Telefons und wurde verworfen.") }
+            return
+        }
+        val current = state.value
+        if (current.hasConnection || current.stopping || !current.canSetUp) {
+            change { it.copy(setupError = "Trenne zuerst die bestehende Verbindung, bevor du ein neues Profil einrichtest.") }
+            return
+        }
+        setup("Admin-Profil") {
+            val document = withContext(Dispatchers.IO) {
+                String(android.util.Base64.decode(data, android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP), Charsets.UTF_8)
+            }
+            applyProfileDocument(document, "Profil vom Admin-Dienst eingerichtet.")
+            adminPrefs.edit().remove(AdminPrefReq).remove(AdminPrefAt).apply()
+            onInstalled()
+        }
     }
 
     fun selectRoute(preference: RoutePreference) {
@@ -1941,6 +2019,10 @@ internal class HarwConnection(private val context: Context, private val localBac
     private companion object {
         // This fixed label is part of the persisted enrollment format.
         const val DeviceLabel = "Harw Android"
+        const val AdminPrefsName = "harw_admin_enroll"
+        const val AdminPrefReq = "req"
+        const val AdminPrefAt = "started_at_ms"
+        const val AdminPrefBase = "base_url"
         const val LogTag = "HarwConnection"
         const val OnionLocatorKey = "gateway.onion_locator"
         const val RoutePrefsName = "harw_connection"

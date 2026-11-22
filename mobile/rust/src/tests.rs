@@ -29,6 +29,7 @@ fn profile_checks_version_endpoint_and_public_pin() -> Result<(), MobileError> {
         server_node_id: enrollment.node_id,
         server_public_key_hex: enrollment.public_key_hex,
         onion: None,
+        admin_url: None,
     };
     assert_eq!(parse_server_profile(profile_json(&profile))?, profile);
     profile.server_public_key_hex.pop();
@@ -290,6 +291,7 @@ impl HostFixture {
             server_node_id: server.node_id,
             server_public_key_hex: server.public_key_hex,
             onion: None,
+            admin_url: None,
         };
         let listener = tokio::spawn(async move {
             let _ = node_listener.serve(socket, std::future::pending()).await;
@@ -696,6 +698,7 @@ fn host_profile(onion: Option<&str>) -> Result<ServerProfile, MobileError> {
         server_node_id: enrollment.node_id,
         server_public_key_hex: enrollment.public_key_hex,
         onion: onion.map(str::to_owned),
+        admin_url: None,
     })
 }
 

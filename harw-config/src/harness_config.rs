@@ -8,6 +8,7 @@ use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 use crate::retention_toml::RetentionSection;
+use crate::admin_toml::AdminSection;
 use crate::session_listener_toml::SessionListenerSection;
 use crate::skills_toml::SkillsSection;
 use crate::uia_worker_models::UiaWorkerModelsToml;
@@ -92,6 +93,10 @@ pub struct HarnessConfig {
     /// (nur global). Siehe `session_listener_toml.rs`.
     #[serde(default)]
     pub session_listener: SessionListenerSection,
+    /// `[admin]` — Geräte-Enrollment-Webdienst `harw admin serve` (nur global).
+    /// Siehe `admin_toml.rs`.
+    #[serde(default)]
+    pub admin: AdminSection,
     /// `[retention]` — Aufbewahrungsgrenzen je Datenklasse (Logs, Caches,
     /// Spools); sicherheitsrelevante Klassen sind opt-in. Siehe
     /// `retention_toml.rs`.

@@ -63,3 +63,22 @@ pub enum NodeAction {
     /// Liest und erzeugt keinen Schlüssel im Auth-Hub.
     Status,
 }
+
+/// Aktionen des `harw admin`-Subcommands (Admin-Konto und Enrollment-Webdienst).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum AdminAction {
+    /// Legt das Admin-Konto an (Benutzername, E-Mail, Passwort zweimal, optional TOTP).
+    Init,
+    /// Setzt das Passwort neu und löscht Fehlversuchszähler und Sperre.
+    Passwd,
+    /// Richtet TOTP ein (zeigt otpauth-URI und QR) oder schaltet es mit `--disable` ab.
+    Totp {
+        /// TOTP abschalten und das versiegelte Geheimnis vergessen.
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Zeigt Konto, TOTP, Sperrstatus, Adressen und Dateirechte (nie Geheimnisse).
+    Status,
+    /// Startet den Webdienst (nur Loopback, Adresse aus `[admin] listen`).
+    Serve,
+}

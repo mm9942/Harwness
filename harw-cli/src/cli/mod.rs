@@ -362,6 +362,12 @@ pub enum Command {
         #[command(subcommand)]
         action: DeviceAction,
     },
+    /// Verwaltet das Admin-Konto und den Geräte-Enrollment-Webdienst (`harw admin serve`).
+    Admin {
+        /// Auszuführende Admin-Aktion.
+        #[command(subcommand)]
+        action: AdminAction,
+    },
     /// Zeigt den Zustand des Own-Cloud-Listeners dieses Knotens.
     Node {
         /// Auszuführende Knoten-Aktion.

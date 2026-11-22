@@ -33,6 +33,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -70,6 +71,8 @@ internal fun ConnectionScreen(
     onExport: () -> Unit,
     onShowEnrollmentQr: () -> Unit,
     scanning: Boolean,
+    adminUrlSuggestion: String,
+    onAdminSetup: (String) -> Unit,
     onScanProfile: () -> Unit,
     onConnect: () -> Unit,
     onConnectLocal: () -> Unit,
@@ -85,6 +88,49 @@ internal fun ConnectionScreen(
     onManageChatgpt: () -> Unit,
 ) {
     var confirmForget by rememberSaveable { mutableStateOf(false) }
+    var adminDialog by rememberSaveable { mutableStateOf(false) }
+    var adminUrl by rememberSaveable(adminUrlSuggestion) { mutableStateOf(adminUrlSuggestion) }
+    if (adminDialog) {
+        val valid = normalizeAdminUrl(adminUrl) != null
+        AlertDialog(
+            onDismissRequest = { adminDialog = false },
+            title = { Text("Mit Admin-Konto einrichten") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Gib die Adresse des Admin-Dienstes deines Harw-Servers ein. Das Telefon sendet seinen öffentlichen Schlüssel, danach meldest du dich im Browser an und gibst es frei.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OutlinedTextField(
+                        value = adminUrl,
+                        onValueChange = { adminUrl = it },
+                        label = { Text("Admin-Adresse (https://…)") },
+                        placeholder = { Text("https://admin.beispiel.de") },
+                        singleLine = true,
+                        isError = adminUrl.isNotBlank() && !valid,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (adminUrlSuggestion.isBlank()) {
+                        Text(
+                            "Der Server hat noch keine öffentliche Adresse mitgeteilt (in der config.toml des Servers: [admin] public_url).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            },
+            dismissButton = { TextButton(onClick = { adminDialog = false }) { Text("Abbrechen") } },
+            confirmButton = {
+                Button(
+                    enabled = valid,
+                    onClick = {
+                        adminDialog = false
+                        onAdminSetup(adminUrl)
+                    },
+                ) { Text("Weiter zum Browser") }
+            },
+        )
+    }
     if (confirmForget) {
         AlertDialog(
             onDismissRequest = { confirmForget = false },
@@ -213,6 +259,10 @@ internal fun ConnectionScreen(
                         }
                     }
                 }
+                Button(
+                    enabled = state.canSetUp && !state.hasConnection && !state.stopping,
+                    onClick = { adminDialog = true },
+                ) { Text("Mit Admin-Konto einrichten") }
                 OutlinedButton(
                     enabled = state.canSetUp && !state.hasConnection && !state.stopping,
                     onClick = onConnectLocal,

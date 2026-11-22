@@ -28,6 +28,7 @@
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod admin;
 mod agent_cmd;
 mod attach_cmd;
 mod auth;
@@ -727,6 +728,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Update { .. } => "update",
             Command::Device { .. } => "device",
             Command::Node { .. } => "node",
+            Command::Admin { .. } => "admin",
             Command::Tailscale { .. } => "tailscale",
             Command::Install { .. } => "install",
             Command::Dod { .. } => "dod",
@@ -1044,6 +1046,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Tailscale { action }) => tailscale_cmd::run(action),
         Some(Command::Device { action }) => device_cmd::run(&global, action),
         Some(Command::Node { action }) => node_cmd::run(&global, action),
+        Some(Command::Admin { action }) => admin::run(&global, action),
         Some(Command::Update {
             check,
             yes,
@@ -1198,6 +1201,7 @@ fn run_startup_migrations(
             | Command::Completions(_)
             | Command::Device { .. }
             | Command::Node { .. }
+            | Command::Admin { .. }
             | Command::Tailscale { .. }
             | Command::Update { .. }
             | Command::Install { .. }

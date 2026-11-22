@@ -1318,6 +1318,72 @@ fn merge_tools_doc(
     }
 }
 
+// `[admin]` — alle Felder `GlobalOnly` und sicherheitskritisch.
+fn merge_admin(
+    trusted: &mut HarnessConfig,
+    incoming: crate::admin_toml::AdminSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    let present = |field: &str| field_present(raw, &["admin", field]);
+    global_only(
+        &mut trusted.admin.listen,
+        incoming.listen,
+        present("listen"),
+        role,
+        "admin.listen",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.public_url,
+        incoming.public_url,
+        present("public_url"),
+        role,
+        "admin.public_url",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.public_endpoint,
+        incoming.public_endpoint,
+        present("public_endpoint"),
+        role,
+        "admin.public_endpoint",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.tenant,
+        incoming.tenant,
+        present("tenant"),
+        role,
+        "admin.tenant",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.restart_gateway,
+        incoming.restart_gateway,
+        present("restart_gateway"),
+        role,
+        "admin.restart_gateway",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.gateway_unit,
+        incoming.gateway_unit,
+        present("gateway_unit"),
+        role,
+        "admin.gateway_unit",
+        layer_path,
+        out,
+    );
+}
+
 // `[session_listener]` — alle sechzehn Felder `GlobalOnly` und
 // sicherheitskritisch: nur die Baseline (Home) setzt sie.
 fn merge_session_listener(
@@ -2595,6 +2661,14 @@ pub(crate) fn merge_layer_into(
     merge_session_listener(
         trusted,
         incoming.session_listener.clone(),
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
+    merge_admin(
+        trusted,
+        incoming.admin.clone(),
         raw,
         role,
         layer_path,
