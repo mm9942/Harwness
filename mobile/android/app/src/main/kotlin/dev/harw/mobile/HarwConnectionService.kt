@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -22,6 +24,10 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import uniffi.harw_mobile_ffi.ConnectionPhase
+
+// attempt == 0u -> null (Basistext verwenden); sonst die Versuchszahl als Int für %1$d.
+internal fun reconnectAttemptArg(attempt: UInt): Int? =
+    if (attempt == 0u) null else attempt.toInt()
 
 internal class HarwConnectionService : Service() {
     private val connection get() = (application as HarwApplication).connection
@@ -78,19 +84,29 @@ internal class HarwConnectionService : Service() {
         super.onDestroy()
     }
 
+    private data class Observed(
+        val phase: ConnectionPhase,
+        val stopping: Boolean,
+        val forgetting: Boolean,
+        val attempt: UInt,
+    )
+
     private fun observeConnection() {
         observation = scope.launch {
             connection.state
-                .map { Triple(it.phase, it.stopping, it.forgetting) }
+                .map { Observed(it.phase, it.stopping, it.forgetting, it.attempt) }
                 .distinctUntilChanged()
-                .collect { (phase, stopping, forgetting) ->
+                .collect { (phase, stopping, forgetting, attempt) ->
+                    val reconnecting = !forgetting && !stopping && phase == ConnectionPhase.RECONNECTING
                     val text = when {
-                        forgetting -> R.string.notification_forgetting
-                        stopping -> R.string.notification_disconnecting
+                        forgetting -> getString(R.string.notification_forgetting)
+                        stopping -> getString(R.string.notification_disconnecting)
                         else -> when (phase) {
-                            ConnectionPhase.CONNECTING -> R.string.notification_connecting
-                            ConnectionPhase.CONNECTED -> R.string.notification_connected
-                            ConnectionPhase.RECONNECTING -> R.string.notification_reconnecting
+                            ConnectionPhase.CONNECTING -> getString(R.string.notification_connecting)
+                            ConnectionPhase.CONNECTED -> getString(R.string.notification_connected)
+                            ConnectionPhase.RECONNECTING -> reconnectAttemptArg(attempt)
+                                ?.let { getString(R.string.notification_reconnecting_attempt, it) }
+                                ?: getString(R.string.notification_reconnecting)
                             else -> null
                         }
                     }
@@ -99,13 +115,22 @@ internal class HarwConnectionService : Service() {
                         foreground = false
                         stopSelfResult(latestStart)
                     } else {
-                        notifications.notify(NotificationId, notification(text))
+                        val power = getSystemService(PowerManager::class.java)
+                        val battery = reconnecting && power != null &&
+                            !power.isIgnoringBatteryOptimizations(packageName)
+                        notifications.notify(
+                            NotificationId,
+                            notification(text, stopAction = !forgetting && !stopping, batteryAction = battery),
+                        )
                     }
                 }
         }
     }
 
-    private fun notification(text: Int): Notification {
+    private fun notification(text: Int): Notification =
+        notification(getString(text), stopAction = true, batteryAction = false)
+
+    private fun notification(text: String, stopAction: Boolean, batteryAction: Boolean): Notification {
         val open = PendingIntent.getActivity(
             this, 1, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE,
@@ -117,13 +142,20 @@ internal class HarwConnectionService : Service() {
         val builder = NotificationCompat.Builder(this, ChannelId)
             .setSmallIcon(R.drawable.ic_harw_notification)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(getString(text))
+            .setContentText(text)
             .setContentIntent(open)
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-        if (text != R.string.notification_forgetting && text != R.string.notification_disconnecting) {
+        if (stopAction) {
             builder.addAction(0, getString(R.string.notification_stop), stop)
+        }
+        if (batteryAction) {
+            val battery = PendingIntent.getActivity(
+                this, 3, Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(0, getString(R.string.notification_battery), battery)
         }
         return builder.build()
     }

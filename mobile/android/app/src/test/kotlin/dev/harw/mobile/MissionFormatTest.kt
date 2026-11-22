@@ -176,4 +176,77 @@ class MissionFormatTest {
         assertEquals(0f, missionHeaderMaxHeightDp(100f), 0.001f)
         assertEquals(0f, missionHeaderMaxHeightDp(184f), 0.001f)
     }
+
+    @Test
+    fun sessionIsOfflineWhenNotOnline() {
+        assertEquals(SessionFreshness.Offline, sessionFreshness(false, 3L, 3L))
+        assertEquals(SessionFreshness.Offline, sessionFreshness(false, null, null))
+    }
+
+    @Test
+    fun sessionIsLiveWhenGenerationsMatch() {
+        assertEquals(SessionFreshness.Live, sessionFreshness(true, 3L, 3L))
+        assertEquals(SessionFreshness.Live, sessionFreshness(true, 0L, 0L))
+    }
+
+    @Test
+    fun sessionIsStaleWhenGenerationsDifferOrAreMissing() {
+        assertEquals(SessionFreshness.Stale, sessionFreshness(true, 4L, 3L))
+        assertEquals(SessionFreshness.Stale, sessionFreshness(true, 3L, null))
+        assertEquals(SessionFreshness.Stale, sessionFreshness(true, null, 3L))
+        assertEquals(SessionFreshness.Stale, sessionFreshness(true, null, null))
+    }
+
+    @Test
+    fun computesApprovalRemainingFromUtcTimestamp() {
+        // 2026-11-22T02:15:00Z = 1795313700000 ms
+        assertEquals(60_000L, approvalRemainingMs("2026-11-22T02:15:00Z", 1_795_313_640_000L))
+    }
+
+    @Test
+    fun computesApprovalRemainingFromOffsetTimestamp() {
+        assertEquals(60_000L, approvalRemainingMs("2026-11-22T03:15:00+01:00", 1_795_313_640_000L))
+    }
+
+    @Test
+    fun approvalRemainingMayBeZeroOrNegative() {
+        assertEquals(0L, approvalRemainingMs("2026-11-22T02:15:00Z", 1_795_313_700_000L))
+        assertEquals(-5_000L, approvalRemainingMs("2026-11-22T02:15:00Z", 1_795_313_705_000L))
+    }
+
+    @Test
+    fun approvalRemainingIsNullForEmptyOrInvalidTimestamp() {
+        assertEquals(null, approvalRemainingMs("", 0L))
+        assertEquals(null, approvalRemainingMs("   ", 0L))
+        assertEquals(null, approvalRemainingMs("not a date", 0L))
+        assertEquals(null, approvalRemainingMs("2026-11-22 02:15", 0L))
+    }
+
+    @Test
+    fun formatsRemainingTimeLikeElapsed() {
+        assertEquals("45s", formatRemaining(45_000L))
+        assertEquals("4m05s", formatRemaining(245_000L))
+        assertEquals("1h02m", formatRemaining(3_720_000L))
+    }
+
+    @Test
+    fun formatsNonPositiveRemainingAsExpired() {
+        assertEquals("expired", formatRemaining(0L))
+        assertEquals("expired", formatRemaining(-1L))
+        assertEquals("0s", formatRemaining(1L))
+    }
+
+    @Test
+    fun summarisesIdleMissionWhenNothingIsActive() {
+        assertEquals("idle", missionSummary(0, 0))
+    }
+
+    @Test
+    fun summarisesMissionWithSingularAndPlural() {
+        assertEquals("1 agent", missionSummary(1, 0))
+        assertEquals("3 jobs", missionSummary(0, 3))
+        assertEquals("1 job", missionSummary(0, 1))
+        assertEquals("2 agents · 1 job", missionSummary(2, 1))
+        assertEquals("1 agent · 2 jobs", missionSummary(1, 2))
+    }
 }

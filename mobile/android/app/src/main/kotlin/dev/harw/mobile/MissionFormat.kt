@@ -4,6 +4,8 @@ import uniffi.harw_mobile_ffi.FinishedCategory
 import uniffi.harw_mobile_ffi.MobileAgent
 import uniffi.harw_mobile_ffi.MobileAgentState
 import uniffi.harw_mobile_ffi.MobileJob
+import java.time.OffsetDateTime
+import java.time.format.DateTimeParseException
 import kotlin.math.max
 import kotlin.math.min
 
@@ -58,3 +60,33 @@ internal fun activeAgents(agents: List<MobileAgent>): Int =
 
 internal fun activeJobs(jobs: List<MobileJob>): Int =
     jobs.count { it.state.lowercase() !in TERMINAL_JOB_STATES }
+
+internal enum class SessionFreshness { Live, Stale, Offline }
+
+internal fun sessionFreshness(online: Boolean, workspaceGeneration: Long?, windowGeneration: Long?): SessionFreshness =
+    when {
+        !online -> SessionFreshness.Offline
+        workspaceGeneration != null && windowGeneration == workspaceGeneration -> SessionFreshness.Live
+        else -> SessionFreshness.Stale
+    }
+
+internal fun approvalRemainingMs(timeoutAt: String, nowMs: Long): Long? {
+    if (timeoutAt.isBlank()) return null
+    val expiresMs = try {
+        OffsetDateTime.parse(timeoutAt.trim()).toInstant().toEpochMilli()
+    } catch (_: DateTimeParseException) {
+        return null
+    }
+    return expiresMs - nowMs
+}
+
+internal fun formatRemaining(remainingMs: Long): String =
+    if (remainingMs <= 0L) "expired" else formatElapsed(0L, remainingMs)
+
+internal fun missionSummary(activeAgents: Int, activeJobs: Int): String {
+    val parts = buildList {
+        if (activeAgents > 0) add(if (activeAgents == 1) "1 agent" else "$activeAgents agents")
+        if (activeJobs > 0) add(if (activeJobs == 1) "1 job" else "$activeJobs jobs")
+    }
+    return if (parts.isEmpty()) "idle" else parts.joinToString(" · ")
+}

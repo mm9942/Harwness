@@ -91,6 +91,10 @@ pub struct ConnectionStatus {
     pub available_routes: Vec<ConnectionRoute>,
     /// Tor bootstrap progress; None until Tor was started.
     pub tor: Option<TorBootstrap>,
+    /// Reconnect attempts since the last successful connection; 0 while connected or idle.
+    pub attempt: u32,
+    /// Unix time in ms of the next scheduled dial while waiting in backoff, else None.
+    pub next_retry_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
