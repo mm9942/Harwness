@@ -2135,8 +2135,27 @@ fn dod_services(
     services
 }
 
+/// Die Reducer-Id eines Delegationsziels: der generische Schreib-Worker unter
+/// den benutzerdefinierten Agenten bekommt `reduce_to_read_write`, jeder
+/// andere benutzerdefinierte Agent den Reducer seiner Basisrolle, eine
+/// eingebaute Rolle ihren eigenen.
+fn target_reducer_id(
+    custom: &HashMap<String, harw_registry_defaults::CustomAgentWiring>,
+    role: &str,
+) -> Option<&'static str> {
+    match custom.get(role) {
+        Some(wiring) => harw_registry_defaults::authority::authority_reducer_for_custom_agent(
+            &wiring.base_role,
+            wiring.profile,
+        )
+        .map(|reducer| reducer.id()),
+        None => harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id()),
+    }
+}
+
 /// Die `delegate_wave`-Policy: Reducer und Delegationsziele je Rolle, mit
-/// benutzerdefinierten Agenten über ihre Basisrolle (Plan R9, Teile B/C).
+/// benutzerdefinierten Agenten über ihre Basisrolle (Plan R9, Teile B/C); der
+/// generische Schreib-Worker bekommt den Schreib-Reducer.
 fn delegate_wave_policy(
     custom_agents: &HashMap<String, harw_registry_defaults::CustomAgentWiring>,
 ) -> harw_core_bridge::DelegateWavePolicy {
@@ -2150,12 +2169,7 @@ fn delegate_wave_policy(
         Arc::new(custom_agents.keys().cloned().collect());
     let target_custom = Arc::clone(&custom);
     let policy = harw_core_bridge::DelegateWavePolicy::new(
-        move |role: &str| {
-            let role = target_custom
-                .get(role)
-                .map_or(role, |wiring| wiring.base_role.as_str());
-            harw_registry_defaults::authority_reducer_for_role(role).map(|reducer| reducer.id())
-        },
+        move |role: &str| target_reducer_id(&target_custom, role),
         move |role: &str| match custom.get(role) {
             Some(wiring) => wiring.delegation_targets.clone().or_else(|| {
                 harw_registry_defaults::authority::delegation_targets_for_role(&wiring.base_role)
@@ -7536,6 +7550,65 @@ admitted = ["fs.read", "fs.write"]
         assert_eq!(
             factory.granted_for(role_names::EXPLORER, explorer),
             explorer.required_permissions()
+        );
+        Ok(())
+    }
+
+    /// Der Ziel-Reducer: generischer Schreib-Worker -> `read_write`, anderer
+    /// eigener Agent -> Reducer der Basisrolle, Executor -> `read_execute`.
+    #[test]
+    fn target_reducer_id_follows_custom_profile_and_builtin_role() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        for (dir, source) in [
+            (
+                "scribe",
+                r#"schema = "harwness.agent/v1"
+id = "user.agent.scribe@1"
+version = "1.0.0"
+role = "worker"
+specialization = "scribe"
+"#,
+            ),
+            (
+                "note-taker",
+                r#"schema = "harwness.agent/v1"
+id = "user.agent.note-taker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "note-taker"
+"#,
+            ),
+        ] {
+            let path = home.path().join("agents").join(dir);
+            std::fs::create_dir_all(&path).map_err(ctx("Agentenordner"))?;
+            std::fs::write(path.join("definition.toml"), source).map_err(ctx("definition"))?;
+        }
+        let config =
+            harw_config::discover_config(&[home.path().to_path_buf()]).map_err(ctx("Discovery"))?;
+        let agents = harw_registry_defaults::ConfigAgents::from_config(&config)
+            .map_err(ctx("Agenten senken"))?;
+        let builtin = builtin_agent_definitions(&HashMap::new()).map_err(ctx("Rollen"))?;
+        let roster = harw_registry_defaults::AgentRoster::from_config(&builtin, &agents)
+            .map_err(ctx("Roster"))?;
+        let custom = roster.custom_wiring();
+
+        assert_eq!(
+            target_reducer_id(&custom, "scribe"),
+            Some("reduce_to_read_write")
+        );
+        let base_role = custom
+            .get("note-taker")
+            .map(|wiring| wiring.base_role.clone())
+            .ok_or(crate::test_support::TestError::Missing("note-taker wiring"))?;
+        assert_eq!(
+            target_reducer_id(&custom, "note-taker"),
+            harw_registry_defaults::authority_reducer_for_role(&base_role)
+                .map(|reducer| reducer.id())
+        );
+        assert_eq!(
+            target_reducer_id(&HashMap::new(), "executor"),
+            Some("reduce_to_read_execute")
         );
         Ok(())
     }

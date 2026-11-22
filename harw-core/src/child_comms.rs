@@ -1138,7 +1138,7 @@ struct PendingQuestion {
 struct CommsState {
     journals: BTreeMap<String, ChildJournal>,
     finished: VecDeque<String>,
-    mailboxes: BTreeMap<String, VecDeque<String>>,
+    mailboxes: BTreeMap<String, VecDeque<crate::guard::InboundMessage>>,
     questions: BTreeMap<String, PendingQuestion>,
     inbox: BTreeMap<String, VecDeque<ParentMessage>>,
     last_info: BTreeMap<String, Instant>,
@@ -1393,7 +1393,10 @@ impl ChildComms {
                  Nachrichten); warte, bis es sie an seiner nächsten Runden-Grenze gelesen hat"
             ));
         }
-        mailbox.push_back(format!("[Nachricht von {from_role}] {text}"));
+        mailbox.push_back(crate::guard::InboundMessage {
+            origin: crate::guard::InboundOrigin::Parent,
+            text: format!("[Nachricht von {from_role}] {text}"),
+        });
         Ok(MessageDelivery::Queued)
     }
 
@@ -1432,7 +1435,10 @@ impl ChildComms {
         if mailbox.len() >= MAILBOX_MAX_MESSAGES {
             mailbox.pop_front();
         }
-        mailbox.push_back(text.to_owned());
+        mailbox.push_back(crate::guard::InboundMessage {
+            origin: crate::guard::InboundOrigin::Other,
+            text: text.to_owned(),
+        });
         true
     }
 
@@ -1449,6 +1455,16 @@ impl ChildComms {
     /// Entnimmt die wartenden Nachrichten von `child` (Runden-Grenze).
     #[must_use]
     pub fn take_inbound(&self, child: &SessionId) -> Vec<String> {
+        self.take_inbound_with_origin(child)
+            .into_iter()
+            .map(|message| message.text)
+            .collect()
+    }
+
+    /// Entnimmt die wartenden Nachrichten von `child` samt Herkunft
+    /// (Runden-Grenze), in Eingangsreihenfolge.
+    #[must_use]
+    pub fn take_inbound_with_origin(&self, child: &SessionId) -> Vec<crate::guard::InboundMessage> {
         self.state()
             .mailboxes
             .remove(child.as_str())
@@ -1518,7 +1534,10 @@ impl ChildComms {
             if mailbox.len() >= MAILBOX_MAX_MESSAGES {
                 mailbox.pop_front();
             }
-            mailbox.push_back(message.to_model_text());
+            mailbox.push_back(crate::guard::InboundMessage {
+                origin: crate::guard::InboundOrigin::Other,
+                text: message.to_model_text(),
+            });
             return false;
         }
         let inbox = state
@@ -2174,6 +2193,47 @@ mod tests {
                 .to_model_text()
                 .starts_with("[Nachricht von root-orchestrator")
         );
+    }
+
+    #[test]
+    fn inbound_origin_is_parent_for_agent_message_and_other_for_notes_and_info() -> TestResult {
+        use crate::guard::InboundOrigin;
+        let comms = ChildComms::default();
+        let (child, parent) = ids();
+        comms.open_journal(&child, &parent, "root-orchestrator", None);
+        assert_eq!(
+            comms.deliver_to_child(&child, "uia", "Hallo"),
+            Ok(MessageDelivery::Queued)
+        );
+        assert!(comms.deliver_note_to_running_child(&child, "[job x] done"));
+        let taken = comms.take_inbound_with_origin(&child);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].origin, InboundOrigin::Parent);
+        assert!(taken[0].text.starts_with("[Nachricht von uia] "));
+        assert_eq!(taken[1].origin, InboundOrigin::Other);
+        assert_eq!(taken[1].text, "[job x] done");
+        assert!(comms.take_inbound_with_origin(&child).is_empty());
+
+        comms
+            .deliver_to_child(&child, "uia", "Zwei")
+            .map_err(TestError::Unexpected)?;
+        assert_eq!(
+            comms.take_inbound(&child),
+            vec!["[Nachricht von uia] Zwei".to_owned()]
+        );
+
+        let (orchestrator, root) = ids();
+        let worker = SessionId::new();
+        comms.open_journal(&orchestrator, &root, "coding-orchestrator", None);
+        comms.open_journal(&worker, &orchestrator, "executor", None);
+        comms
+            .post_info(&worker, &orchestrator, "executor", "Tests grün", Instant::now())
+            .map_err(TestError::Unexpected)?;
+        let info = comms.take_inbound_with_origin(&orchestrator);
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].origin, InboundOrigin::Other);
+        assert!(info[0].text.contains("Tests grün"));
+        Ok(())
     }
 
     #[test]

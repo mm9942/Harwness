@@ -1078,6 +1078,7 @@ pub fn assemble_default_registry(cwd: PathBuf) -> RegistryDefaultsResult<Assembl
 mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult, ctx};
+    use harw_authority::Permission;
 
     fn registered_names(assembled: &AssembledRegistry) -> Vec<String> {
         assembled
@@ -1730,9 +1731,16 @@ mod tests {
             let reducer = crate::authority::authority_reducer_for_role(role).ok_or_else(|| {
                 TestError::Unexpected(format!("eingebaute Rolle {role} ohne Reducer"))
             })?;
-            let is_documented_gated_exception = !profile
-                .required_permissions()
-                .is_subset_of(&reducer.ceiling());
+            // Seit der Entscheidung vom 2026-11-22 (D1) tragen die
+            // Durchreich-Reducer `DelegationPassThrough` (Root-, Coding- und
+            // Analyse-Orchestrator) und `ReadExecute` (Executor) Schreib- und
+            // Ausführungsrechte. Auch diese Rollen gelten daher als
+            // dokumentierte Ausnahme: ihre Freigabe läuft über den
+            // Kind-Freigabepfad, nicht über den Reducer allein.
+            let ceiling = reducer.ceiling();
+            let is_documented_gated_exception = !profile.required_permissions().is_subset_of(&ceiling)
+                || ceiling.contains(Permission::WriteWorkspace)
+                || ceiling.contains(Permission::ExecuteProcess);
             for tool in profile.tool_names() {
                 let needs_approval = DefaultApprovalPolicy::requires_explicit_approval(&call(tool));
                 if needs_approval && is_documented_gated_exception {
@@ -1745,6 +1753,14 @@ mod tests {
                     "Rolle {role}: {tool} würde im Kind an einer Rückfrage hängen"
                 );
             }
+        }
+        // Invariante d: `shell.exec` und `job.start` bleiben freigabepflichtig,
+        // unabhängig davon, welche Reducer Schreib- oder Ausführungsrechte tragen.
+        for tool in ["shell.exec", "job.start"] {
+            assert!(
+                DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                "{tool} muss eine ausdrückliche Freigabe verlangen"
+            );
         }
         Ok(())
     }

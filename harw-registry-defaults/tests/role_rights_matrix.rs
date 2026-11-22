@@ -22,7 +22,9 @@
 //!    Profil — **außer** `browser.open` in `UiaQuickHelper`
 //!    (Nutzerentscheidung, siehe `UIA_QUICK_HELPER_BROWSER_TOOLS`).
 //! 3. **Rolle × Rechtesatz**: nach dem Rollen-Reducer sieht keine Rolle
-//!    `fs.write` oder `shell.exec`, und `browser.*` höchstens `uia-worker`
+//!    `fs.write`/`fs.edit` (die Orchestratoren tragen W+X, ihr `Planning`-
+//!    Profil registriert beides nie), `shell.exec` nur der `executor` mit
+//!    `ExecuteProcess`, und `browser.*` höchstens `uia-worker`
 //!    das eine `browser.open` — und nur, wenn ihr Reducer
 //!    (`ReadExplore`) `NetworkAccess` vom Elternteil übernimmt. Netz sehen
 //!    nach dem Reducer nur `explorer`, `uia-explorer`, `uia-worker`,
@@ -115,7 +117,7 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         (
             role_names::ROOT_ORCHESTRATOR,
             RegistryProfile::Planning,
-            AuthorityReducer::ReadRegistry,
+            AuthorityReducer::DelegationPassThrough,
         ),
         // Nutzerentscheidung „der Explorer durchsucht auch das Internet“:
         // `ReadExplore` trägt zusätzlich `NetworkAccess`.
@@ -230,7 +232,7 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         (
             role_names::EXECUTOR,
             RegistryProfile::ShellExecution,
-            AuthorityReducer::ReadOnly,
+            AuthorityReducer::ReadExecute,
         ),
         (
             role_names::MEMORY_STEWARD,
@@ -299,7 +301,7 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         (
             role_names::CODING_ORCHESTRATOR,
             RegistryProfile::Planning,
-            AuthorityReducer::ReadRegistry,
+            AuthorityReducer::DelegationPassThrough,
         ),
         (
             role_names::RESEARCH_ORCHESTRATOR,
@@ -309,7 +311,7 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         (
             role_names::ANALYSIS_ORCHESTRATOR,
             RegistryProfile::Planning,
-            AuthorityReducer::ReadRegistry,
+            AuthorityReducer::DelegationPassThrough,
         ),
     ]
 }
@@ -502,27 +504,63 @@ fn test_role_by_permission_matrix_after_reducer() {
                 child.is_subset_of(&reducer.ceiling()),
                 "{role}: über der Obergrenze"
             );
+            // Erlaubte Schreib-/Exec-Rechte je Rolle: die drei Orchestratoren
+            // reichen W+X durch (`DelegationPassThrough`), der `executor`
+            // trägt nur X (`ReadExecute`), alle anderen weder noch.
+            let is_orchestrator = [
+                role_names::ROOT_ORCHESTRATOR,
+                role_names::CODING_ORCHESTRATOR,
+                role_names::ANALYSIS_ORCHESTRATOR,
+            ]
+            .contains(&role);
+            let is_executor = role == role_names::EXECUTOR;
+            assert!(
+                is_orchestrator || !child.contains(Permission::WriteWorkspace),
+                "{role}: WriteWorkspace"
+            );
+            assert!(
+                is_orchestrator
+                    || is_executor
+                    || !child.contains(Permission::ExecuteProcess),
+                "{role}: ExecuteProcess"
+            );
             for forbidden in [
-                Permission::WriteWorkspace,
-                Permission::ExecuteProcess,
                 Permission::ReadSecrets,
                 Permission::ManagePlugins,
+                Permission::ManageContainers,
             ] {
                 assert!(!child.contains(forbidden), "{role}: {forbidden:?}");
             }
 
             let tools = profile.tool_names_for(&child);
+            if is_executor {
+                // Das `ShellExecution`-Profil registriert `shell.exec`/
+                // `job.start` nur mit `ExecuteProcess` im Kindsatz.
+                for tool in ["shell.exec", "job.start"] {
+                    assert!(
+                        !tools.contains(&tool) || child.contains(Permission::ExecuteProcess),
+                        "{role}: {tool} ohne ExecuteProcess"
+                    );
+                }
+            }
+            if is_orchestrator {
+                // Das `Planning`-Profil bleibt auch mit W+X im Kindsatz lesend.
+                for tool in ["fs.write", "fs.edit", "shell.exec", "job.start"] {
+                    assert!(!tools.contains(&tool), "{role}: {tool} sichtbar");
+                }
+            }
             for tool in &tools {
                 // Einzige `browser.*`-Ausnahme: `browser.open` für
                 // `uia-worker`, und nur mit vom Elternteil übernommenem Netz.
                 let is_uia_worker_browser_open = role == role_names::UIA_WORKER
                     && *tool == "browser.open"
                     && child.contains(Permission::NetworkAccess);
+                let executor_exec_tool =
+                    is_executor && (*tool == "shell.exec" || *tool == "job.start");
                 assert!(
                     *tool != "fs.write"
                         && *tool != "fs.edit"
-                        && *tool != "shell.exec"
-                        && *tool != "job.start"
+                        && (executor_exec_tool || (*tool != "shell.exec" && *tool != "job.start"))
                         && *tool != "latex.build"
                         && *tool != "latex.template"
                         && *tool != "latex.check"
@@ -630,6 +668,12 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
             // `UIA_QUICK_HELPER_BROWSER_TOOLS` in
             // `harw-registry-defaults/src/profile.rs`).
             if tool == "browser.open" && *role == role_names::UIA_WORKER {
+                continue;
+            }
+            // `executor`: `ReadExecute` trägt jetzt `ExecuteProcess`, seine
+            // Shell-Werkzeuge sind keine Reducer-Ausnahme mehr, bleiben aber
+            // admittiert.
+            if *role == role_names::EXECUTOR && (tool == "shell.exec" || tool == "job.start") {
                 continue;
             }
             if is_documented_gated_exception

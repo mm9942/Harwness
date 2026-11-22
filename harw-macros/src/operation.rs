@@ -38,7 +38,7 @@ use syn::{FnArg, ItemFn, LitStr, Type, spanned::Spanned};
 /// Die Autoritäts-Reducer, die eine Laufzeit auflösen kann.
 ///
 /// Muss mit `KNOWN_AUTHORITY_REDUCERS` in `harw-core-bridge/src/agent_tool.rs`
-/// übereinstimmen. Die Duplikation ist unvermeidbar — `harw-macros` ist eine
+/// übereinstimmen (Inhalt und Reihenfolge). Die Duplikation ist unvermeidbar — `harw-macros` ist eine
 /// proc-macro-Crate und darf nicht auf `harw-core-bridge` zeigen (das würde die
 /// Laufzeit in den Compiler-Prozess ziehen).
 ///
@@ -55,6 +55,8 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
     "reduce_to_read_network",
     "reduce_to_read_explore",
     "reduce_to_read_workspace_network",
+    "reduce_to_read_write",
+    "reduce_to_delegation_pass_through",
 ];
 
 /// All parsed attribute arguments for `#[operation]`, collected into a single struct

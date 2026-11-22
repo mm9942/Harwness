@@ -2529,7 +2529,11 @@ fn paused_child_result(
 /// `reduce_to_read_network`, `reduce_to_read_explore` und
 /// `reduce_to_read_workspace_network` sind wortgleich mit
 /// `harw_registry_defaults::authority::REDUCE_TO_READ_*` (W5/RD), ebenso ihre
-/// Permission-Obergrenzen (siehe [`reducer_ceiling`]).
+/// Permission-Obergrenzen (siehe [`reducer_ceiling`]). Auch
+/// `reduce_to_read_execute`, `reduce_to_read_write` und
+/// `reduce_to_delegation_pass_through` sind wortgleich mit
+/// `harw_registry_defaults::authority::REDUCE_TO_*` (Kennungen und
+/// Obergrenzen).
 const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
     "reduce_to_read_only",
     "reduce_to_read_execute",
@@ -2537,6 +2541,8 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
     "reduce_to_read_network",
     "reduce_to_read_explore",
     "reduce_to_read_workspace_network",
+    "reduce_to_read_write",
+    "reduce_to_delegation_pass_through",
 ];
 
 /// Liefert die Permission-Obergrenze einer bekannten Reducer-Kennung.
@@ -2552,11 +2558,16 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
 /// | Kennung | Obergrenze |
 /// |---|---|
 /// | `reduce_to_read_only` | `{ReadWorkspace}` |
-/// | `reduce_to_read_execute` | `{ReadWorkspace, ExecuteProcess}` (nur Bridge) |
+/// | `reduce_to_read_execute` | `{ReadWorkspace, ExecuteProcess}` |
 /// | `reduce_to_read_registry` | `{ReadWorkspace, ReadCargoRegistry}` |
 /// | `reduce_to_read_network` | `{NetworkAccess}` — **ohne** `ReadWorkspace` |
 /// | `reduce_to_read_explore` | `{ReadWorkspace, ReadCargoRegistry, NetworkAccess}` |
 /// | `reduce_to_read_workspace_network` | `{ReadWorkspace, NetworkAccess}` |
+/// | `reduce_to_read_write` | `{ReadWorkspace, ReadCargoRegistry, WriteWorkspace}` |
+/// | `reduce_to_delegation_pass_through` | `{ReadWorkspace, ReadCargoRegistry, WriteWorkspace, ExecuteProcess}` |
+///
+/// Weder `reduce_to_read_write` noch `reduce_to_delegation_pass_through`
+/// enthält `NetworkAccess`.
 ///
 /// `reduce_to_read_network` liest den Workspace absichtlich nicht: ein Kind mit
 /// Netz und Workspace-Lesezugriff könnte Workspace-Daten über Anfrageparameter
@@ -2588,6 +2599,17 @@ fn reducer_ceiling(name: &str) -> Option<PermissionSet> {
         "reduce_to_read_workspace_network" => {
             &[Permission::ReadWorkspace, Permission::NetworkAccess]
         }
+        "reduce_to_read_write" => &[
+            Permission::ReadWorkspace,
+            Permission::ReadCargoRegistry,
+            Permission::WriteWorkspace,
+        ],
+        "reduce_to_delegation_pass_through" => &[
+            Permission::ReadWorkspace,
+            Permission::ReadCargoRegistry,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ],
         _ => return None,
     };
     Some(PermissionSet::from_policy(permissions.iter().copied()))
@@ -2631,6 +2653,8 @@ fn resolve_authority_reducer(name: &str) -> fn(&SandboxSpec) -> SandboxSpec {
         "reduce_to_read_network" => reduce_to_read_network,
         "reduce_to_read_explore" => reduce_to_read_explore,
         "reduce_to_read_workspace_network" => reduce_to_read_workspace_network,
+        "reduce_to_read_write" => reduce_to_read_write,
+        "reduce_to_delegation_pass_through" => reduce_to_delegation_pass_through,
         unknown => {
             tracing::warn!(
                 unknown,
@@ -2667,6 +2691,23 @@ fn reduce_to_read_only(parent: &SandboxSpec) -> SandboxSpec {
 /// Schnittmenge mit `{ ReadWorkspace, ExecuteProcess }`, Host-Scope geleert.
 fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
     restrict_without_network(parent, "reduce_to_read_execute")
+}
+
+/// Reduziert eine Sandbox auf lesende und schreibende Workspace-Rechte.
+///
+/// Schnittmenge mit `{ ReadWorkspace, ReadCargoRegistry, WriteWorkspace }`,
+/// Host-Scope geleert (generischer Schreib-Worker); nie Netz oder Prozesse.
+fn reduce_to_read_write(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_without_network(parent, "reduce_to_read_write")
+}
+
+/// Reduziert eine Sandbox für die Durchreichung an Orchestrator-Kinder.
+///
+/// Schnittmenge mit `{ ReadWorkspace, ReadCargoRegistry, WriteWorkspace,
+/// ExecuteProcess }`, Host-Scope geleert; nie Netz, Secrets, Plugins oder
+/// Container.
+fn reduce_to_delegation_pass_through(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_without_network(parent, "reduce_to_delegation_pass_through")
 }
 
 /// Reduziert eine Sandbox auf lesende Workspace- und Registry-Quellen.
@@ -5795,6 +5836,66 @@ specialization = "bridge-contract-test"
         for name in KNOWN_AUTHORITY_REDUCERS {
             assert!(reducer_ceiling(name).is_some(), "{name} ohne Obergrenze");
         }
+        assert_eq!(
+            reducer_ceiling("reduce_to_read_write"),
+            Some(set(&[
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::WriteWorkspace
+            ]))
+        );
+        assert_eq!(
+            reducer_ceiling("reduce_to_delegation_pass_through"),
+            Some(set(&[
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess
+            ]))
+        );
+    }
+
+    /// `reduce_to_read_write` und `reduce_to_delegation_pass_through` liefern
+    /// gegenüber einem voll berechtigten Parent exakt ihre Obergrenze (nie
+    /// Netz, Secrets, Plugins, Container) und geben `WriteWorkspace` nie
+    /// weiter, wenn der Parent es nicht trägt.
+    #[test]
+    fn test_write_and_delegation_reducers_yield_exactly_their_ceiling() -> TestResult {
+        let (ctx, tmp) = make_test_ctx()?;
+        let binding = ctx.sandbox().workspace().clone();
+        std::fs::remove_dir_all(tmp).ok();
+        let full = SandboxSpec::from_resolved(
+            binding.clone(),
+            PermissionSet::from_policy(ALL_PERMISSIONS),
+        );
+        let without_write = SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(
+                ALL_PERMISSIONS
+                    .iter()
+                    .copied()
+                    .filter(|permission| *permission != Permission::WriteWorkspace),
+            ),
+        );
+        for name in ["reduce_to_read_write", "reduce_to_delegation_pass_through"] {
+            let ceiling = reducer_ceiling(name).ok_or(TestError::Missing("Obergrenze bekannt"))?;
+            let child = resolve_authority_reducer(name)(&full);
+            assert_eq!(child.permissions(), &ceiling, "{name}");
+            for forbidden in [
+                Permission::NetworkAccess,
+                Permission::ReadSecrets,
+                Permission::ManagePlugins,
+                Permission::ManageContainers,
+            ] {
+                assert!(!child.permissions().contains(forbidden), "{name}");
+            }
+            let narrowed = resolve_authority_reducer(name)(&without_write);
+            assert!(
+                !narrowed.permissions().contains(Permission::WriteWorkspace),
+                "{name}: ohne Parent-Schreibrecht kein Schreibrecht"
+            );
+        }
+        Ok(())
     }
 
     /// `reduce_to_read_network` (und die zwei Explorer-Kennungen) reichen die
@@ -5858,6 +5959,8 @@ specialization = "bridge-contract-test"
             "reduce_to_read_only",
             "reduce_to_read_registry",
             "reduce_to_read_execute",
+            "reduce_to_read_write",
+            "reduce_to_delegation_pass_through",
         ] {
             let child = resolve_authority_reducer(name)(&parent);
             assert!(

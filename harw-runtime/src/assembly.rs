@@ -813,6 +813,13 @@ fn compiled_workspace_root(
     Ok(canonical)
 }
 
+/// Orchestrator-Wurzeln reichen ihre Aktivierung (ohne eigene lesende
+/// Agenten-Oberfläche) an die Worker ihrer Linie weiter; die UIA und andere
+/// Nicht-Orchestrator-Wurzeln tun das nicht.
+fn root_passes_delegation_activation(role: AgentRoleId) -> bool {
+    harw_core::background_children::is_orchestrator_role(role)
+}
+
 fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
     let Some(ir) = ir else {
         return SessionActivation::default();
@@ -6770,6 +6777,15 @@ fn build_spawner(
         .map_err(|error| RuntimeError::Spawner {
             detail: format!("could not register the trusted runtime root parent: {error}"),
         })?;
+    let spawner = if root_passes_delegation_activation(spawn_context.organizational_role) {
+        spawner
+            .with_external_root_delegation_activation(root_activation(None))
+            .map_err(|error| RuntimeError::Spawner {
+                detail: format!("could not register the root delegation activation: {error}"),
+            })?
+    } else {
+        spawner
+    };
 
     let spawner = Arc::new(spawner);
     spawner_slot
@@ -8864,6 +8880,14 @@ mod tests {
         );
         assert_eq!(root_activation(None).profile(), ToolProfile::default());
         Ok(())
+    }
+
+    #[test]
+    fn only_orchestrator_roots_pass_a_delegation_activation() {
+        assert!(root_passes_delegation_activation(AgentRoleId::RootOrchestrator));
+        assert!(root_passes_delegation_activation(AgentRoleId::ChildOrchestrator));
+        assert!(!root_passes_delegation_activation(AgentRoleId::UserInterface));
+        assert!(!root_passes_delegation_activation(AgentRoleId::Worker));
     }
 
     /// Z2c-05: Eine in `[agents]` konfigurierte Rolle löst auf — und geht der

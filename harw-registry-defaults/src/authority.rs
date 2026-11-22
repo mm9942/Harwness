@@ -99,6 +99,14 @@ pub const REDUCE_TO_READ_EXPLORE: &str = "reduce_to_read_explore";
 /// Kennung des Reducers „Workspace und Netz lesen“ (UIA-Explorer mit
 /// Websuche).
 pub const REDUCE_TO_READ_WORKSPACE_NETWORK: &str = "reduce_to_read_workspace_network";
+/// Kennung des Reducers „Workspace lesen und Prozesse ausführen“ (`executor`).
+pub const REDUCE_TO_READ_EXECUTE: &str = "reduce_to_read_execute";
+/// Kennung des Reducers „Workspace und Registry-Quellcache lesen, Workspace
+/// schreiben“ (schreibender Custom-Worker).
+pub const REDUCE_TO_READ_WRITE: &str = "reduce_to_read_write";
+/// Kennung des Reducers „Schreib- und Ausführungsrecht durchreichen“
+/// (Root-, Coding- und Analysis-Orchestrator).
+pub const REDUCE_TO_DELEGATION_PASS_THROUGH: &str = "reduce_to_delegation_pass_through";
 
 /// Die Rechte-Obergrenze, auf die ein Kind-Agent verengt wird.
 ///
@@ -108,8 +116,16 @@ pub const REDUCE_TO_READ_WORKSPACE_NETWORK: &str = "reduce_to_read_workspace_net
 /// ein Recht nicht, bekommt das Kind es auch über den großzügigsten Reducer
 /// nicht (monoton, durch Schnittmenge der beiden Mengen).
 ///
-/// Keine Obergrenze enthält `WriteWorkspace`, `ExecuteProcess`, `ReadSecrets`
-/// oder `ManagePlugins`. `ReadNetwork` enthält bewusst **kein**
+/// Nur die dokumentierten Durchreicher-Reducer tragen `WriteWorkspace` und/oder
+/// `ExecuteProcess`: `DelegationPassThrough` (Root-, Coding- und
+/// Analysis-Orchestrator), `ReadExecute` (`executor`) und `ReadWrite`
+/// (schreibender Custom-Worker über [`authority_reducer_for_custom_agent`]) —
+/// Nutzerentscheidung 2026-11-22 (D1). Keine Obergrenze enthält
+/// `NetworkAccess` (außer den Explorer-Netz-Reducern unten), `ReadSecrets`,
+/// `ManagePlugins` oder `ManageContainers`. Die Werkzeugoberfläche bleibt
+/// durch Profil und Freigaberichtlinie begrenzt: ein Orchestrator trägt das
+/// Recht nur weiter und registriert selbst kein Schreib-/Exec-Werkzeug.
+/// `ReadNetwork` enthält bewusst **kein**
 /// `ReadWorkspace` (Annahme A5): wer ins Netz darf, liest keine
 /// Workspace-Daten, die er hinaustragen könnte.
 ///
@@ -136,6 +152,10 @@ pub const REDUCE_TO_READ_WORKSPACE_NETWORK: &str = "reduce_to_read_workspace_net
 /// - `ReadNetwork` — `{NetworkAccess}`.
 /// - `ReadExplore` — `{ReadWorkspace, ReadCargoRegistry, NetworkAccess}`.
 /// - `ReadWorkspaceNetwork` — `{ReadWorkspace, NetworkAccess}`.
+/// - `ReadExecute` — `{ReadWorkspace, ExecuteProcess}`.
+/// - `ReadWrite` — `{ReadWorkspace, ReadCargoRegistry, WriteWorkspace}`.
+/// - `DelegationPassThrough` — `{ReadWorkspace, ReadCargoRegistry,
+///   WriteWorkspace, ExecuteProcess}`.
 ///
 /// # Nebenläufigkeit
 /// `Copy`, rein; von jedem Thread aus sicher.
@@ -164,6 +184,15 @@ pub enum AuthorityReducer {
     /// Workspace lesen plus ausgehendes Netz über die Egress-Policy
     /// (`uia-explorer`, `dependency-researcher`, `researcher`).
     ReadWorkspaceNetwork,
+    /// Workspace lesen plus Prozesse ausführen (`executor`).
+    ReadExecute,
+    /// Workspace und Registry-Quellcache lesen plus Workspace schreiben
+    /// (schreibender Custom-Worker).
+    ReadWrite,
+    /// Workspace und Registry-Quellcache lesen, Workspace schreiben und
+    /// Prozesse ausführen — reine Durchreichung der Orchestratoren an ihre
+    /// Worker.
+    DelegationPassThrough,
 }
 
 impl AuthorityReducer {
@@ -174,6 +203,9 @@ impl AuthorityReducer {
         AuthorityReducer::ReadNetwork,
         AuthorityReducer::ReadExplore,
         AuthorityReducer::ReadWorkspaceNetwork,
+        AuthorityReducer::ReadExecute,
+        AuthorityReducer::ReadWrite,
+        AuthorityReducer::DelegationPassThrough,
     ];
 
     /// Liefert die Kennung, unter der `harw-core-bridge` denselben Reducer führt.
@@ -181,7 +213,8 @@ impl AuthorityReducer {
     /// # Rückgabe
     /// [`REDUCE_TO_READ_ONLY`], [`REDUCE_TO_READ_REGISTRY`],
     /// [`REDUCE_TO_READ_NETWORK`], [`REDUCE_TO_READ_EXPLORE`] oder
-    /// [`REDUCE_TO_READ_WORKSPACE_NETWORK`].
+    /// [`REDUCE_TO_READ_WORKSPACE_NETWORK`], [`REDUCE_TO_READ_EXECUTE`],
+    /// [`REDUCE_TO_READ_WRITE`] oder [`REDUCE_TO_DELEGATION_PASS_THROUGH`].
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
@@ -190,6 +223,9 @@ impl AuthorityReducer {
             AuthorityReducer::ReadNetwork => REDUCE_TO_READ_NETWORK,
             AuthorityReducer::ReadExplore => REDUCE_TO_READ_EXPLORE,
             AuthorityReducer::ReadWorkspaceNetwork => REDUCE_TO_READ_WORKSPACE_NETWORK,
+            AuthorityReducer::ReadExecute => REDUCE_TO_READ_EXECUTE,
+            AuthorityReducer::ReadWrite => REDUCE_TO_READ_WRITE,
+            AuthorityReducer::DelegationPassThrough => REDUCE_TO_DELEGATION_PASS_THROUGH,
         }
     }
 
@@ -216,6 +252,20 @@ impl AuthorityReducer {
             AuthorityReducer::ReadWorkspaceNetwork => {
                 PermissionSet::from_policy([Permission::ReadWorkspace, Permission::NetworkAccess])
             }
+            AuthorityReducer::ReadExecute => {
+                PermissionSet::from_policy([Permission::ReadWorkspace, Permission::ExecuteProcess])
+            }
+            AuthorityReducer::ReadWrite => PermissionSet::from_policy([
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::WriteWorkspace,
+            ]),
+            AuthorityReducer::DelegationPassThrough => PermissionSet::from_policy([
+                Permission::ReadWorkspace,
+                Permission::ReadCargoRegistry,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+            ]),
         }
     }
 
@@ -304,6 +354,48 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
     AuthorityReducer::ReadWorkspaceNetwork.reduce(granted)
 }
 
+/// Verengt `granted` auf `{ReadWorkspace, ExecuteProcess}` — der Reducer für
+/// `executor`.
+///
+/// # Argumente
+/// - `granted` (`&PermissionSet`): Rechte des Elternteils.
+///
+/// # Rückgabe
+/// `granted ∩ {ReadWorkspace, ExecuteProcess}`; nie Netz, nie Schreiben.
+#[must_use]
+pub fn reduce_to_read_execute(granted: &PermissionSet) -> PermissionSet {
+    AuthorityReducer::ReadExecute.reduce(granted)
+}
+
+/// Verengt `granted` auf `{ReadWorkspace, ReadCargoRegistry, WriteWorkspace}` —
+/// der Reducer des schreibenden Custom-Workers.
+///
+/// # Argumente
+/// - `granted` (`&PermissionSet`): Rechte des Elternteils.
+///
+/// # Rückgabe
+/// `granted ∩ {ReadWorkspace, ReadCargoRegistry, WriteWorkspace}`;
+/// `WriteWorkspace` bleibt nur, wenn der Elternteil es selbst trägt.
+#[must_use]
+pub fn reduce_to_read_write(granted: &PermissionSet) -> PermissionSet {
+    AuthorityReducer::ReadWrite.reduce(granted)
+}
+
+/// Verengt `granted` auf `{ReadWorkspace, ReadCargoRegistry, WriteWorkspace,
+/// ExecuteProcess}` — der Reducer der Orchestratoren (Root, Coding, Analysis),
+/// die Schreib- und Ausführungsrecht an ihre Worker durchreichen.
+///
+/// # Argumente
+/// - `granted` (`&PermissionSet`): Rechte des Elternteils.
+///
+/// # Rückgabe
+/// `granted ∩ {ReadWorkspace, ReadCargoRegistry, WriteWorkspace,
+/// ExecuteProcess}`; nie Netz, nie Secrets.
+#[must_use]
+pub fn reduce_to_delegation_pass_through(granted: &PermissionSet) -> PermissionSet {
+    AuthorityReducer::DelegationPassThrough.reduce(granted)
+}
+
 /// Liefert den Reducer, den eine eingebaute Rolle bekommt.
 ///
 /// # Beschreibung
@@ -336,8 +428,13 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 ///   Schreiben, nie Exec).
 /// - `memory-steward` → [`AuthorityReducer::ReadRegistry`] (Profil
 ///   `MemoryStewardship`; nächstliegender Reducer gleicher Lese-Reichweite).
-/// - `executor` → [`AuthorityReducer::ReadOnly`] (Profil `ShellExecution`;
-///   engste Kennung des Vokabulars, analog den Triage-Rollen).
+/// - `executor` → [`AuthorityReducer::ReadExecute`] (Profil `ShellExecution`;
+///   `shell.exec`/`job.start` brauchen `ExecuteProcess`).
+/// - `root-orchestrator`, `coding-orchestrator`, `analysis-orchestrator` →
+///   [`AuthorityReducer::DelegationPassThrough`]: sie registrieren selbst
+///   kein Schreib-/Exec-Werkzeug (Profil `Planning`), reichen aber
+///   `WriteWorkspace` und `ExecuteProcess` an ihre Worker durch
+///   (Nutzerentscheidung 2026-11-22, D1).
 /// - `uia-worker` → [`AuthorityReducer::ReadExplore`] (Profil
 ///   `UiaQuickHelper`, Addendum I + Nutzerentscheidung „kurz online
 ///   recherchieren, manchmal Abhängigkeiten hinzufügen“): die Obergrenze
@@ -347,8 +444,8 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 ///   dokumentierte **Ausnahme nach Muster `executor`**, siehe unten.
 /// - `agent-steward` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `AgentStewardship`, Addendum K; ebenfalls **Muster `executor`** — die
-///   Rolle registriert die schreibenden Agentendefinitions-Werkzeuge, kein
-///   Reducer trägt je `WriteWorkspace` weiter).
+///   Rolle registriert die schreibenden Agentendefinitions-Werkzeuge, `ReadOnly`
+///   trägt `WriteWorkspace` nicht weiter).
 /// - `uia-explorer` → [`AuthorityReducer::ReadWorkspaceNetwork`] (Profil
 ///   `UiaExplorer`: `fs.read/list/search/glob/grep`, `doc.read_pdf`,
 ///   `explore.*` und `web.fetch`/`web.search` — die Obergrenze trägt genau
@@ -361,8 +458,7 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 /// - `uia-shell-worker` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `UiaShellWorker`; **Muster `uia-worker`**, dieselbe Ausnahme — die
 ///   Rolle registriert `fs.read/list/search/glob/grep` **und** `shell.exec`,
-///   kein Reducer trägt je `ExecuteProcess` gemeinsam mit `ReadWorkspace`
-///   weiter).
+///   `ReadOnly` trägt `ExecuteProcess` nicht weiter).
 /// - `uia-latex-writer` → [`AuthorityReducer::ReadOnly`] (Profil
 ///   `UiaLatexWriter`, Runde 4 Teil E): Workspace lesen, nie Netz.
 ///   `fs.write` (`WriteWorkspace`) und `latex.build` (`ExecuteProcess`)
@@ -380,7 +476,8 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 /// vollständig; `uia-worker`/`uia-writer` (`ReadExplore`) bis auf ihr eines
 /// Schreib- bzw. Ausführungsrecht. **Ausnahme:**
 /// `memory-steward` (braucht `WriteWorkspace` für `fs.write`), `executor`
-/// (braucht `ExecuteProcess` für `shell.exec`), `uia-worker` (braucht
+/// (trägt `ExecuteProcess` seit D1 über `ReadExecute`, ist aber weiter wegen
+/// der Profilwerkzeuge gelistet), `uia-worker` (braucht
 /// über `ReadExplore` hinaus nur noch `ExecuteProcess` für `shell.exec`),
 /// `agent-steward` (Addendum K, braucht
 /// `WriteWorkspace` für `agents.write_definition`/`agents.write_uia`/
@@ -390,10 +487,11 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 /// zusätzlich zu `ReadWorkspace` auch `ExecuteProcess` für `shell.exec`)
 /// und `uia-latex-writer` (braucht über `ReadOnly` hinaus nur
 /// `WriteWorkspace` für `fs.write` und `ExecuteProcess` für `latex.build`) —
-/// kein Reducer trägt je `WriteWorkspace` oder `ExecuteProcess` weiter
-/// (siehe `test_reduce_never_exceeds_parent_or_ceiling`, das ist Absicht:
-/// Delegation gibt nie Schreib-/Ausführungsrecht weiter), und
-/// `NetworkAccess` gemeinsam mit `ReadWorkspace` tragen nur `ReadExplore`
+/// `WriteWorkspace` und `ExecuteProcess` tragen nur die dokumentierten
+/// Durchreicher weiter (`DelegationPassThrough`, `ReadExecute`, `ReadWrite`;
+/// siehe `test_reduce_never_exceeds_parent_or_ceiling`), nie
+/// `NetworkAccess`, `ReadSecrets`, `ManagePlugins` oder `ManageContainers`,
+/// und `NetworkAccess` gemeinsam mit `ReadWorkspace` tragen nur `ReadExplore`
 /// und `ReadWorkspaceNetwork` (siehe
 /// `test_only_web_admitting_roles_get_network_access`). Diese sieben Rollen
 /// erhalten die fehlenden Rechte nicht über diesen Reducer-Mechanismus,
@@ -413,12 +511,15 @@ pub fn reduce_to_read_workspace_network(granted: &PermissionSet) -> PermissionSe
 #[must_use]
 pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
     match role {
-        role_names::ROOT_ORCHESTRATOR => Some(AuthorityReducer::ReadRegistry),
+        // Nutzerentscheidung 2026-11-22 (D1): die Orchestratoren (Profil
+        // `Planning`, read-only, kein eigenes `web.*`) reichen Schreib- und
+        // Ausführungsrecht an ihre Worker durch; selbst registrieren sie
+        // kein solches Werkzeug.
+        role_names::ROOT_ORCHESTRATOR => Some(AuthorityReducer::DelegationPassThrough),
         // Child-Orchestratoren (Plan Punkt 1) teilen das Profil `Planning`
-        // des Root-Orchestrators: read-only, `deps.source_*` braucht
-        // `ReadCargoRegistry`, kein eigenes `web.*`.
+        // des Root-Orchestrators.
         role_names::CODING_ORCHESTRATOR | role_names::ANALYSIS_ORCHESTRATOR => {
-            Some(AuthorityReducer::ReadRegistry)
+            Some(AuthorityReducer::DelegationPassThrough)
         }
         // Dokumentierte Durchreichung: `research-orchestrator` startet
         // `researcher-web`/`researcher`/`dependency-researcher`, deren Sandbox
@@ -444,8 +545,10 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         role_names::SECURITY_EGRESS_TRIAGE
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
-        | role_names::SECURITY_ENDPOINT_TRIAGE
-        | role_names::EXECUTOR => Some(AuthorityReducer::ReadOnly),
+        | role_names::SECURITY_ENDPOINT_TRIAGE => Some(AuthorityReducer::ReadOnly),
+        // `ShellExecution` registriert `shell.exec`/`job.start`
+        // (`ExecuteProcess`).
+        role_names::EXECUTOR => Some(AuthorityReducer::ReadExecute),
         // PL-100 O11: parametergetriebene Envelope-Rollen der
         // Sicherheitsfamilie; `intel-scout` liest über sein rollengebundenes
         // `deps.locked` höchstens den Workspace (`ReadWorkspace`).
@@ -463,12 +566,12 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         // `deps.*` und `web.fetch`/`web.search`, die TOML admittiert sie —
         // Netz nur egress-gebunden und nie weiter als beim Elternteil.
         // `shell.exec` bleibt die dokumentierte Ausnahme nach dem Muster
-        // `executor` (Addendum I): kein Reducer trägt `ExecuteProcess`.
+        // `executor` (Addendum I): dieser Reducer trägt `ExecuteProcess` nicht.
         role_names::UIA_WORKER => Some(AuthorityReducer::ReadExplore),
         // Addendum K: dokumentierte Ausnahme nach dem Muster `executor`/
         // `uia-worker` — `AgentStewardship` registriert die schreibenden
-        // Agentendefinitions-Werkzeuge (`WriteWorkspace`), die kein Reducer
-        // je zusammen mit `ReadWorkspace` weiterträgt.
+        // Agentendefinitions-Werkzeuge (`WriteWorkspace`), das `ReadOnly`
+        // nicht weiterträgt.
         role_names::AGENT_STEWARD => Some(AuthorityReducer::ReadOnly),
         // Explorer-Netz: `UiaExplorer` registriert
         // `fs.read/list/search/glob/grep`, `explore.*` **und**
@@ -477,18 +580,17 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         // Dieselbe Nutzerentscheidung wie `uia-worker`: `UiaWriter`
         // registriert `deps.*` und `web.fetch`/`web.search`. `fs.write`
         // bleibt die dokumentierte Ausnahme nach dem Muster `executor`:
-        // kein Reducer trägt `WriteWorkspace`.
+        // `ReadExplore` trägt `WriteWorkspace` nicht.
         role_names::UIA_WRITER => Some(AuthorityReducer::ReadExplore),
         // Muster `uia-worker`: `UiaShellWorker` registriert
         // `fs.read/list/search/glob/grep` **und** `shell.exec`, kein
-        // Reducer trägt je `ExecuteProcess` zusammen mit `ReadWorkspace`
-        // weiter.
+        // `ReadOnly` trägt `ExecuteProcess` nicht weiter.
         role_names::UIA_SHELL_WORKER => Some(AuthorityReducer::ReadOnly),
         // Runde 4, Teil E: `UiaLatexWriter` registriert lesende `fs.*`,
         // `fs.write`, `doc.read_pdf` und `latex.build` — kein Netz.
         // `fs.write`/`latex.build` bleiben die dokumentierte Ausnahme nach dem
-        // Muster `executor`: kein Reducer trägt `WriteWorkspace` oder
-        // `ExecuteProcess` weiter.
+        // Muster `executor`: `ReadOnly` trägt `WriteWorkspace`/`ExecuteProcess`
+        // nicht weiter.
         role_names::UIA_LATEX_WRITER => Some(AuthorityReducer::ReadOnly),
         // Runde 7, Teil M: der Game Master liest höchstens einen Brief im
         // Workspace (`MatrixReader`) — kein Netz, kein Schreiben, keine
@@ -496,6 +598,36 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         // Runner (`SandboxSpec::harness_read_view`), nie mehr als er selbst.
         role_names::MATRIX_GAME_MASTER => Some(AuthorityReducer::ReadOnly),
         _ => None,
+    }
+}
+
+/// Liefert den Reducer eines Custom-Agenten (Roster).
+///
+/// # Beschreibung
+/// Der generische schreibende Worker (`profile ==
+/// crate::roster::GENERIC_WRITING_WORKER_PROFILE`) bekommt
+/// [`AuthorityReducer::ReadWrite`]; jeder andere Custom-Agent den Reducer
+/// seiner Basisrolle ([`authority_reducer_for_role`], unverändert).
+///
+/// # Argumente
+/// - `base_role` (`&str`): Name der Basisrolle des Custom-Agenten.
+/// - `profile` (`RegistryProfile`): das Werkzeugprofil des Custom-Agenten.
+///
+/// # Rückgabe
+/// `Some(reducer)` oder `None` (fail-closed) für eine unbekannte Basisrolle
+/// ohne schreibendes Profil.
+///
+/// # Nebenläufigkeit
+/// Rein.
+#[must_use]
+pub fn authority_reducer_for_custom_agent(
+    base_role: &str,
+    profile: crate::profile::RegistryProfile,
+) -> Option<AuthorityReducer> {
+    if profile == crate::roster::GENERIC_WRITING_WORKER_PROFILE {
+        Some(AuthorityReducer::ReadWrite)
+    } else {
+        authority_reducer_for_role(base_role)
     }
 }
 
@@ -931,6 +1063,7 @@ mod tests {
             Permission::NetworkAccess,
             Permission::ReadSecrets,
             Permission::ManagePlugins,
+            Permission::ManageContainers,
             Permission::ReadCargoRegistry,
         ])
     }
@@ -1289,11 +1422,27 @@ mod tests {
             let reduced = reducer.reduce(&all);
             assert_eq!(reduced, reducer.ceiling(), "{reducer:?}");
             assert!(reducer.reduce(&none).iter().next().is_none(), "{reducer:?}");
+            // Schreiben/Ausführen nur bei den dokumentierten Durchreichern.
+            let (write, exec) = match reducer {
+                AuthorityReducer::ReadExecute => (false, true),
+                AuthorityReducer::ReadWrite => (true, false),
+                AuthorityReducer::DelegationPassThrough => (true, true),
+                _ => (false, false),
+            };
+            assert_eq!(
+                reduced.contains(Permission::WriteWorkspace),
+                write,
+                "{reducer:?}"
+            );
+            assert_eq!(
+                reduced.contains(Permission::ExecuteProcess),
+                exec,
+                "{reducer:?}"
+            );
             for forbidden in [
-                Permission::WriteWorkspace,
-                Permission::ExecuteProcess,
                 Permission::ReadSecrets,
                 Permission::ManagePlugins,
+                Permission::ManageContainers,
             ] {
                 assert!(!reduced.contains(forbidden), "{reducer:?}: {forbidden:?}");
             }
@@ -1424,6 +1573,17 @@ mod tests {
                 "{reducer:?}"
             );
         }
+        // Die drei Durchreicher tragen nie Netz.
+        for reducer in [
+            AuthorityReducer::ReadExecute,
+            AuthorityReducer::ReadWrite,
+            AuthorityReducer::DelegationPassThrough,
+        ] {
+            assert!(
+                !reducer.ceiling().contains(Permission::NetworkAccess),
+                "{reducer:?}"
+            );
+        }
     }
 
     #[test]
@@ -1481,6 +1641,13 @@ mod tests {
             AuthorityReducer::ReadWorkspaceNetwork.id(),
             REDUCE_TO_READ_WORKSPACE_NETWORK
         );
+        assert_eq!(AuthorityReducer::ReadExecute.id(), REDUCE_TO_READ_EXECUTE);
+        assert_eq!(AuthorityReducer::ReadWrite.id(), REDUCE_TO_READ_WRITE);
+        assert_eq!(
+            AuthorityReducer::DelegationPassThrough.id(),
+            REDUCE_TO_DELEGATION_PASS_THROUGH
+        );
+        assert_eq!(AuthorityReducer::ALL.len(), 8);
         let mut ids: Vec<&str> = AuthorityReducer::ALL.iter().map(|r| r.id()).collect();
         ids.sort_unstable();
         ids.dedup();
@@ -1497,9 +1664,12 @@ mod tests {
         // ebenfalls über `ReadExplore`) und `uia-shell-worker`
         // (ExecuteProcess) und `uia-latex-writer` (WriteWorkspace und
         // ExecuteProcess, ohne Netz) sind dokumentierte Ausnahmen von der
-        // Untermengen-Invariante: kein Reducer trägt je Schreib- oder
-        // Ausführungsrecht weiter (siehe
-        // `test_reduce_never_exceeds_parent_or_ceiling`); alle sieben Rollen
+        // Untermengen-Invariante: Schreib- und Ausführungsrecht tragen nur die
+        // dokumentierten Durchreicher weiter (siehe
+        // `test_reduce_never_exceeds_parent_or_ceiling`); `executor` bleibt
+        // trotz `ReadExecute` ausgenommen, weil `ShellExecution` neben
+        // `shell.exec` weitere Werkzeuge mit anderen Rechten registrieren
+        // kann; alle sieben Rollen
         // bekommen diese Rechte über ihre feste Profilzuweisung, nicht über
         // diesen Reducer (siehe Doku bei `authority_reducer_for_role`).
         // `uia-explorer` ist keine Ausnahme mehr: `ReadWorkspaceNetwork`
@@ -1572,7 +1742,7 @@ mod tests {
         );
         assert_eq!(
             authority_reducer_for_role(role_names::EXECUTOR),
-            Some(AuthorityReducer::ReadOnly)
+            Some(AuthorityReducer::ReadExecute)
         );
         assert_eq!(
             authority_reducer_for_role(role_names::AGENT_STEWARD),
@@ -1631,7 +1801,7 @@ mod tests {
         ] {
             assert_eq!(
                 authority_reducer_for_role(role),
-                Some(AuthorityReducer::ReadRegistry),
+                Some(AuthorityReducer::DelegationPassThrough),
                 "{role}"
             );
         }
@@ -1640,6 +1810,100 @@ mod tests {
             Some(AuthorityReducer::ReadExplore)
         );
         Ok(())
+    }
+
+    fn missing(what: &'static str) -> crate::test_support::TestError {
+        crate::test_support::TestError::Missing(what)
+    }
+
+    #[test]
+    fn test_read_only_orchestrators_pass_write_and_execute_through_without_write_tools()
+    -> crate::test_support::TestResult {
+        for role in [
+            role_names::ROOT_ORCHESTRATOR,
+            role_names::CODING_ORCHESTRATOR,
+            role_names::ANALYSIS_ORCHESTRATOR,
+        ] {
+            let reducer =
+                authority_reducer_for_role(role).ok_or(missing("Orchestrator ohne Reducer"))?;
+            let child = reducer.reduce(&every_permission());
+            assert!(child.contains(Permission::WriteWorkspace), "{role}");
+            assert!(child.contains(Permission::ExecuteProcess), "{role}");
+            assert!(!child.contains(Permission::NetworkAccess), "{role}");
+            let profile = crate::profile::profile_for_role(role)
+                .ok_or(missing("Orchestrator ohne Profil"))?;
+            let tools = profile.tool_names_for(&child);
+            for tool in ["fs.write", "fs.edit", "shell.exec", "job.start"] {
+                assert!(!tools.contains(&tool), "{role}: {tool}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_pass_through_chain_reaches_executor_and_writing_worker_tools()
+    -> crate::test_support::TestResult {
+        let child = AuthorityReducer::DelegationPassThrough.reduce(&every_permission());
+        let exec = AuthorityReducer::ReadExecute.reduce(&child);
+        assert!(exec.contains(Permission::ExecuteProcess));
+        let shell_tools = RegistryProfile::ShellExecution.tool_names_for(&exec);
+        assert!(shell_tools.contains(&"shell.exec"));
+        assert!(shell_tools.contains(&"job.start"));
+        let write = AuthorityReducer::ReadWrite.reduce(&child);
+        assert!(write.contains(Permission::WriteWorkspace));
+        let write_tools = crate::roster::GENERIC_WRITING_WORKER_PROFILE.tool_names_for(&write);
+        assert!(write_tools.contains(&"fs.write"));
+        assert!(write_tools.contains(&"fs.edit"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_pass_through_chain_never_exceeds_a_session_without_write()
+    -> crate::test_support::TestResult {
+        let session = PermissionSet::from_policy(
+            every_permission()
+                .iter()
+                .filter(|permission| *permission != Permission::WriteWorkspace),
+        );
+        let child = AuthorityReducer::DelegationPassThrough.reduce(&session);
+        assert!(!child.contains(Permission::WriteWorkspace));
+        let write = AuthorityReducer::ReadWrite.reduce(&child);
+        assert!(!write.contains(Permission::WriteWorkspace));
+        let tools = crate::roster::GENERIC_WRITING_WORKER_PROFILE.tool_names_for(&write);
+        assert!(!tools.contains(&"fs.write"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_authority_reducer_for_custom_agent_picks_read_write_only_for_the_writing_profile() {
+        for base in [role_names::ANALYST, role_names::EXECUTOR, "unbekannt"] {
+            assert_eq!(
+                authority_reducer_for_custom_agent(
+                    base,
+                    crate::roster::GENERIC_WRITING_WORKER_PROFILE
+                ),
+                Some(AuthorityReducer::ReadWrite),
+                "{base}"
+            );
+        }
+        assert_eq!(
+            authority_reducer_for_custom_agent(
+                role_names::ANALYST,
+                RegistryProfile::ReadOnlyExplore
+            ),
+            Some(AuthorityReducer::ReadRegistry)
+        );
+        assert_eq!(
+            authority_reducer_for_custom_agent(
+                role_names::CODING_ORCHESTRATOR,
+                RegistryProfile::Planning
+            ),
+            Some(AuthorityReducer::DelegationPassThrough)
+        );
+        assert_eq!(
+            authority_reducer_for_custom_agent("unbekannt", RegistryProfile::Planning),
+            None
+        );
     }
 
     /// Die Netz-Durchreichung des `research-orchestrator` ist KEIN eigenes

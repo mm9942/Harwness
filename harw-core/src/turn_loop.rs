@@ -3483,10 +3483,13 @@ fn notify_tool_progress(session: &AgentSession) {
 ///
 /// # Beschreibung
 /// Meldet dem [`crate::guard::ProgressObserver`] den jüngsten
-/// Assistententext (Aktivitätsjournal) und hängt die wartenden Nachrichten
-/// (`agent.message` vom Elternteil, `parent.message` der Kinder) als
-/// Hinweis an das letzte Verlaufs-Item an — provider-gültig, weil das
-/// letzte Item hier ein Tool-Ergebnis ist. Ohne Beobachter (Wurzel) ein
+/// Assistententext (Aktivitätsjournal) und stellt die wartenden Nachrichten
+/// zu. Nachrichten anderer Herkunft (`parent.message` der Kinder, Job-Notizen)
+/// werden als Hinweis an das letzte Verlaufs-Item gehängt — provider-gültig,
+/// weil das letzte Item hier ein Tool-Ergebnis ist. Nachrichten des
+/// Elternteils (`agent.message`, Instruktions-Vertrauen) werden dagegen ein
+/// eigenes `UserMessage`-Item nach dem letzten Item und stehen damit
+/// außerhalb der untrusted Tool-Ergebnis-Hülle. Ohne Beobachter (Wurzel) ein
 /// No-op.
 fn deliver_round_boundary(session: &mut AgentSession) {
     let Some(observer) = session.progress_observer().cloned() else {
@@ -3513,9 +3516,21 @@ fn deliver_round_boundary(session: &mut AgentSession) {
     if messages.is_empty() {
         return;
     }
-    let block = messages.join("\n\n");
-    if !session.history_mut().append_hint_to_last(&block) {
-        let _ = session.history_mut().push_user_text(block);
+    let join_texts = |origin: crate::guard::InboundOrigin| -> String {
+        messages
+            .iter()
+            .filter(|message| message.origin == origin)
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let other_block = join_texts(crate::guard::InboundOrigin::Other);
+    if !other_block.is_empty() && !session.history_mut().append_hint_to_last(&other_block) {
+        let _ = session.history_mut().push_user_text(other_block);
+    }
+    let parent_block = join_texts(crate::guard::InboundOrigin::Parent);
+    if !parent_block.is_empty() {
+        let _ = session.history_mut().push_user_text(parent_block);
     }
     tracing::info!(
         session = %session.id(),
@@ -16626,5 +16641,150 @@ mod tests {
         let expected: BTreeSet<String> = ["plan", "test"].iter().map(|t| (*t).to_owned()).collect();
         assert_eq!(tags, expected);
         assert!(wanted_tags("").is_empty());
+    }
+
+    /// Progress observer whose mailbox is drained by `take_inbound_messages`.
+    struct MailboxObserver {
+        mailbox: Mutex<Vec<crate::guard::InboundMessage>>,
+    }
+
+    impl crate::guard::ProgressObserver for MailboxObserver {
+        fn on_progress(&self, _session_id: &SessionId) {}
+
+        fn take_inbound_messages(&self, _session_id: &SessionId) -> Vec<crate::guard::InboundMessage> {
+            std::mem::take(
+                &mut *self
+                    .mailbox
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        }
+    }
+
+    fn inbound(origin: crate::guard::InboundOrigin, text: &str) -> crate::guard::InboundMessage {
+        crate::guard::InboundMessage {
+            origin,
+            text: text.to_owned(),
+        }
+    }
+
+    /// Session whose last history item is a tool result, with the given mailbox.
+    fn boundary_session(
+        mailbox: Option<Vec<crate::guard::InboundMessage>>,
+    ) -> TestResult<AgentSession> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let observer = mailbox.map(|mailbox| {
+            Arc::new(MailboxObserver {
+                mailbox: Mutex::new(mailbox),
+            }) as Arc<dyn crate::guard::ProgressObserver>
+        });
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            tx,
+        )
+        .with_progress_observer(observer);
+        session.history_mut().push_tool_result(
+            ToolCallId::new(),
+            ToolCallResult::Success {
+                value: serde_json::json!("ergebnis"),
+            },
+            0,
+        );
+        Ok(session)
+    }
+
+    fn last_tool_result_debug(session: &AgentSession) -> TestResult<String> {
+        session
+            .history()
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TurnItem::ToolResult(result) => Some(format!("{:?}", result.result)),
+                _ => None,
+            })
+            .ok_or_else(|| TestError::from(CoreError::ToolFailed("no tool result".to_owned())))
+    }
+
+    fn last_user_text(session: &AgentSession) -> Option<String> {
+        match session.history().items().last() {
+            Some(TurnItem::UserMessage(message)) => Some(
+                message
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn round_boundary_parent_message_becomes_its_own_user_item() -> TestResult {
+        let mut session = boundary_session(Some(vec![inbound(
+            crate::guard::InboundOrigin::Parent,
+            "[Nachricht von orchestrator] mach weiter",
+        )]))?;
+        let before = last_tool_result_debug(&session)?;
+        let count = session.history().items().len();
+        deliver_round_boundary(&mut session);
+        assert_eq!(last_tool_result_debug(&session)?, before);
+        assert_eq!(session.history().items().len(), count + 1);
+        let text = last_user_text(&session);
+        assert!(text.is_some_and(|t| t.starts_with("[Nachricht von ")));
+        Ok(())
+    }
+
+    #[test]
+    fn round_boundary_other_message_is_appended_to_the_tool_result() -> TestResult {
+        let mut session = boundary_session(Some(vec![inbound(
+            crate::guard::InboundOrigin::Other,
+            "[Nachricht von kind] fertig",
+        )]))?;
+        let before = last_tool_result_debug(&session)?;
+        let count = session.history().items().len();
+        deliver_round_boundary(&mut session);
+        let after = last_tool_result_debug(&session)?;
+        assert_ne!(after, before);
+        assert!(after.contains("[Nachricht von kind] fertig"));
+        assert_eq!(session.history().items().len(), count);
+        Ok(())
+    }
+
+    #[test]
+    fn round_boundary_mixed_messages_split_by_origin() -> TestResult {
+        let mut session = boundary_session(Some(vec![
+            inbound(crate::guard::InboundOrigin::Parent, "[Nachricht von eltern] a"),
+            inbound(crate::guard::InboundOrigin::Other, "[Nachricht von kind] b"),
+            inbound(crate::guard::InboundOrigin::Parent, "[Nachricht von eltern] c"),
+        ]))?;
+        let count = session.history().items().len();
+        deliver_round_boundary(&mut session);
+        let result = last_tool_result_debug(&session)?;
+        assert!(result.contains("[Nachricht von kind] b"));
+        assert!(!result.contains("[Nachricht von eltern]"));
+        assert_eq!(session.history().items().len(), count + 1);
+        assert_eq!(
+            last_user_text(&session).as_deref(),
+            Some("[Nachricht von eltern] a\n\n[Nachricht von eltern] c")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn round_boundary_without_messages_or_observer_is_a_no_op() -> TestResult {
+        for mailbox in [Some(Vec::new()), None] {
+            let mut session = boundary_session(mailbox)?;
+            let before = last_tool_result_debug(&session)?;
+            let count = session.history().items().len();
+            deliver_round_boundary(&mut session);
+            assert_eq!(last_tool_result_debug(&session)?, before);
+            assert_eq!(session.history().items().len(), count);
+        }
+        Ok(())
     }
 }

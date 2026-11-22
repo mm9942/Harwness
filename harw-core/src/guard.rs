@@ -302,6 +302,25 @@ impl SessionResolvedSet {
     }
 }
 
+/// Herkunft einer Nachricht, die an einer Runden-Grenze zugestellt wird.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundOrigin {
+    /// `agent.message` des eigenen Elternteils (Anweisungsvertrauen).
+    Parent,
+    /// Alles Übrige: `parent.message` von Kindern und Laufzeit-Job-Notizen.
+    Other,
+}
+
+/// Eine wartende Nachricht für die Sitzung an einer Runden-Grenze.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundMessage {
+    /// Woher die Nachricht stammt.
+    pub origin: InboundOrigin,
+    /// Modellseitiger Text, so wie er heute eingereiht wird
+    /// (Elternteil: `"[Nachricht von {role}] {text}"`).
+    pub text: String,
+}
+
 /// Wird nach jeder Modellrunde und jedem Tool-Ergebnis benachrichtigt, damit
 /// ein Lease-/Budget-Wächter (`harw-core/src/child_controller.rs`) erkennen
 /// kann, dass eine Kind-Session noch aktiv arbeitet.
@@ -325,8 +344,8 @@ pub trait ProgressObserver: Send + Sync {
 
     /// Runde 5, Teil M: entnimmt an einer Runden-Grenze die wartenden
     /// Nachrichten des Elternteils (`agent.message`) bzw. der Kinder
-    /// (`parent.message`) für diese Sitzung. Standard: keine.
-    fn take_inbound_messages(&self, _session_id: &harw_types::SessionId) -> Vec<String> {
+    /// (`parent.message`) für diese Sitzung, mit ihrer Herkunft. Standard: keine.
+    fn take_inbound_messages(&self, _session_id: &harw_types::SessionId) -> Vec<InboundMessage> {
         Vec::new()
     }
 }

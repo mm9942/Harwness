@@ -2336,6 +2336,9 @@ struct ExternalRootParent {
     /// gefahrene Wurzel keine Spiegelsitzung im [`SessionManager`] hat, aus
     /// der sich die Aktivierung sonst lesen ließe.
     activation: SessionActivation,
+    /// D1: die Aktivierung, die eine ORCHESTRATOR-Wurzel an die Worker ihrer
+    /// Linie weiterreicht (`with_external_root_delegation_activation`).
+    delegation_activation: Option<SessionActivation>,
 }
 
 /// Runde 9, E7: Eltern-Sicht einer admittierten Kind-Sitzung, deren Session
@@ -2757,9 +2760,9 @@ impl crate::guard::ProgressObserver for ActiveLeaseProgressObserver {
         self.comms.set_last_assistant(session_id, text);
     }
 
-    fn take_inbound_messages(&self, session_id: &SessionId) -> Vec<String> {
+    fn take_inbound_messages(&self, session_id: &SessionId) -> Vec<crate::guard::InboundMessage> {
         // Runde 5, Teil M: Postfach (`agent.message`/`parent.message`).
-        self.comms.take_inbound(session_id)
+        self.comms.take_inbound_with_origin(session_id)
     }
 
     fn on_progress(&self, session_id: &SessionId) {
@@ -3588,7 +3591,24 @@ impl ManagedAgentSpawner {
             spawn_context,
             reasoning_effort,
             activation: parent_activation,
+            delegation_activation: None,
         });
+        Ok(self)
+    }
+
+    /// The activation an ORCHESTRATOR root passes on to the workers of its
+    /// lineage (its activation without its own read-only agent surface).
+    /// Only the orchestrator pass-through reads it; never for a non-orchestrator root.
+    /// # Errors
+    /// "no external root parent is registered" if called before with_external_root_parent.
+    pub fn with_external_root_delegation_activation(
+        mut self,
+        activation: SessionActivation,
+    ) -> Result<Self, AgentSpawnError> {
+        let Some(root) = self.external_root_parent.as_mut() else {
+            return Err(Self::reject("no external root parent is registered"));
+        };
+        root.delegation_activation = Some(activation);
         Ok(self)
     }
 
@@ -6611,7 +6631,8 @@ impl ManagedAgentSpawner {
     ///   Eltern-Schnitt und Modus), zusätzlich geschnitten mit der
     ///   Eltern-Aktivierung, gegen die die Admission das Kind geschnitten hat
     ///   (Basis bei Live-Modus, sonst die aktuelle; siehe
-    ///   [`Self::parent_rights_ceiling`]).
+    ///   [`Self::parent_rights_ceiling`]; D1: unter einem Orchestrator-Elternteil
+    ///   die Aktivierung aus [`Self::delegation_activation_ceiling`]).
     /// - `write`/`shell`/`network_open`: die Rechte der aktuellen
     ///   Kind-Sandbox (`WriteWorkspace`, `ExecuteProcess`, `NetworkAccess`
     ///   aus [`harw_authority::Permission`]), die auch die Eltern-Sandbox
@@ -6660,6 +6681,13 @@ impl ManagedAgentSpawner {
         else {
             return ChildBackendRights::default();
         };
+        // D1: the same activation the admission cut the child against.
+        let child_role = session
+            .spawn_context()
+            .map(|context| context.organizational_role);
+        let parent_activation = child_role
+            .and_then(|role| self.delegation_activation_ceiling(&manager, parent, role))
+            .unwrap_or(parent_activation);
         drop(manager);
 
         let tools: BTreeSet<String> = specs
@@ -8198,6 +8226,80 @@ impl ManagedAgentSpawner {
         false
     }
 
+    /// D1 (owner decision 2026-11-22): the activation a worker/child orchestrator is cut
+    /// against when its parent is an orchestrator: the activation of the nearest
+    /// non-orchestrator ancestor (or of the lineage top). `None` = cut against the
+    /// parent as before (not an orchestrator parent, other target role, plan mode,
+    /// unknown hop). The caller holds the manager lock and must NOT hold `active`.
+    fn delegation_activation_ceiling(
+        &self,
+        manager: &SessionManager,
+        parent: &SessionId,
+        target_role: harw_agent_dsl::roles::AgentRoleId,
+    ) -> Option<SessionActivation> {
+        use harw_agent_dsl::roles::AgentRoleId;
+        const MAX_HOPS: u32 = 256;
+        if !matches!(target_role, AgentRoleId::Worker | AgentRoleId::ChildOrchestrator) {
+            return None;
+        }
+        if self.lineage_in_plan_mode(manager, parent) {
+            return None;
+        }
+        let follows_live_mode = self.live_mode.current().is_some();
+        let mut cursor = parent.clone();
+        for hop in 0..MAX_HOPS {
+            let (role, activation, next) = if let Ok(session) = manager.get(&cursor) {
+                let role = session.spawn_context()?.organizational_role;
+                let activation = if follows_live_mode {
+                    session.base_activation().clone()
+                } else {
+                    session.activation().clone()
+                };
+                (role, activation, session.parent_session_id().cloned())
+            } else if let Some(view) = self.checked_out_parent(&cursor) {
+                let role = view.spawn_context.as_ref()?.organizational_role;
+                let activation = if follows_live_mode {
+                    view.base_activation
+                } else {
+                    view.activation
+                };
+                (role, activation, view.parent_session_id)
+            } else {
+                // Lineage top driven outside the manager: never has a parent.
+                let root = self
+                    .external_root_parent
+                    .as_ref()
+                    .filter(|root| root.session_id == cursor)?;
+                let orchestrator = crate::background_children::is_orchestrator_role(
+                    root.spawn_context.organizational_role,
+                );
+                if hop == 0 && !orchestrator {
+                    return None;
+                }
+                if !orchestrator {
+                    return Some(root.activation.clone());
+                }
+                return Some(
+                    root.delegation_activation
+                        .clone()
+                        .unwrap_or_else(|| root.activation.clone()),
+                );
+            };
+            let orchestrator = crate::background_children::is_orchestrator_role(role);
+            if hop == 0 && !orchestrator {
+                return None;
+            }
+            if !orchestrator {
+                return Some(activation);
+            }
+            match next {
+                Some(next) => cursor = next,
+                None => return Some(activation),
+            }
+        }
+        None
+    }
+
     /// Admits a child immediately or fails fast: a thin wrapper over
     /// [`Self::admit_inner`] that discards the capacity-vs-other distinction.
     ///
@@ -8471,6 +8573,18 @@ impl ManagedAgentSpawner {
             (None, None)
         };
         let parent_activation = parent_base_activation.unwrap_or(parent_activation);
+        // D1 (owner decision 2026-11-22): under an orchestrator parent a worker /
+        // child orchestrator is cut against the activation of the nearest
+        // non-orchestrator ancestor (or of the lineage top), not against the
+        // orchestrator's own read-only agent surface. Sandbox, ParentGrant and
+        // the plan-mode brake stay as they are (outside: `parent_activation`).
+        let cut_activation = self
+            .delegation_activation_ceiling(
+                &manager,
+                &input.parent_session_id,
+                definition.organizational_role,
+            )
+            .unwrap_or_else(|| parent_activation.clone());
         // Nur eine unverändert durchgereichte Eltern-Sandbox (Handoff) wird auf
         // die Basis gehoben; eine bewusst engere Anfrage (Reducer, Sitz-
         // Sandbox) bleibt, wie sie ist, und wird gegen den aktuellen Stand
@@ -8959,7 +9073,7 @@ impl ManagedAgentSpawner {
             // (`session.rs`, `apply_mode`), ein über `activation_mut()`
             // gesetztes Verbot fiele dabei weg. Eine Autoritätsgrenze darf
             // keinen Moduswechsel überleben müssen — sie muss ihn überleben.
-            child_session.narrow_base_activation(&parent_activation);
+            child_session.narrow_base_activation(&cut_activation);
             // Runde 9, E6: das Kind startet im aktuellen Live-Modus des
             // Baums und folgt späteren Wechseln (von seiner Basis aus).
             child_session.attach_live_mode(self.live_mode.follower());
@@ -9591,6 +9705,11 @@ mod tests {
     // Gründe, Eltern-Schnitt gegen die Basis
     // (`child_controller/tests/plan_delegation.rs`).
     mod plan_delegation;
+
+    // D1 (2026-11-22): Orchestrator reichen die Aktivierung ihres nächsten
+    // Nicht-Orchestrator-Vorfahren an Worker weiter
+    // (`child_controller/tests/orchestrator_pass_through.rs`).
+    mod orchestrator_pass_through;
 
     // Welle 6: ein über den `ChildBackend` laufendes Kind bekommt seine
     // in-process Rechte (`child_controller/tests/child_backend_run.rs`).
