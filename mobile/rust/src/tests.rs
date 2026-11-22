@@ -916,7 +916,11 @@ struct CountingListener {
 
 impl CountingListener {
     fn counts(&self) -> (usize, usize, usize) {
-        let ids = self.ids.lock().unwrap_or_else(PoisonError::into_inner).len();
+        let ids = self
+            .ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
         (
             self.status.load(Ordering::SeqCst),
             self.sessions.load(Ordering::SeqCst),
@@ -964,7 +968,9 @@ async fn until(cond: impl Fn() -> bool) -> TestResult {
 async fn listener_hears_status_and_session_changes() -> TestResult {
     let fixture = HostFixture::start().await?;
     let listener = Arc::new(CountingListener::default());
-    fixture.core.set_listener(Arc::clone(&listener) as Arc<dyn CoreListener>);
+    fixture
+        .core
+        .set_listener(Arc::clone(&listener) as Arc<dyn CoreListener>);
     fixture.core.connect(fixture.profile.clone())?;
     let id = fixture.core.create_session(None)?.session_id;
     fixture.core.open_session(id.clone())?;
@@ -980,7 +986,9 @@ async fn listener_hears_status_and_session_changes() -> TestResult {
 async fn clear_listener_stops_notifications() -> TestResult {
     let fixture = HostFixture::start().await?;
     let listener = Arc::new(CountingListener::default());
-    fixture.core.set_listener(Arc::clone(&listener) as Arc<dyn CoreListener>);
+    fixture
+        .core
+        .set_listener(Arc::clone(&listener) as Arc<dyn CoreListener>);
     fixture.core.connect(fixture.profile.clone())?;
     until(|| listener.counts().0 > 0).await?;
     fixture.core.clear_listener();
@@ -996,7 +1004,10 @@ async fn clear_listener_stops_notifications() -> TestResult {
 #[cfg(not(feature = "local-host"))]
 #[test]
 fn connect_local_reports_unavailable_without_the_feature() -> TestResult {
-    let core = MobileCore::new(generate_identity("Phone".into())?.private_key, "Phone".into())?;
+    let core = MobileCore::new(
+        generate_identity("Phone".into())?.private_key,
+        "Phone".into(),
+    )?;
     let dir = tempfile::tempdir()?;
     let result = core.connect_local(
         dir.path().to_string_lossy().into_owned(),

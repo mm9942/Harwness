@@ -38,7 +38,10 @@ pub(crate) async fn open_local(
     keystore: Arc<dyn PlatformKeystore>,
     features: Vec<String>,
 ) -> Result<Backend, MobileError> {
-    use crate::{home::AppHome, providers::{ProviderStore, build_model_provider}};
+    use crate::{
+        home::AppHome,
+        providers::{ProviderStore, build_model_provider},
+    };
 
     let home = AppHome::open(&files_dir)?;
     home.install_process_home()?;
@@ -58,7 +61,10 @@ pub(crate) async fn open_local_with_model(
     model: Arc<dyn harw_core::ModelProvider>,
     features: Vec<String>,
 ) -> Result<Backend, MobileError> {
-    use harw_protocol::{SessionPort, session_wire::{HelloParams, SESSION_WIRE_MINOR}};
+    use harw_protocol::{
+        SessionPort,
+        session_wire::{HelloParams, SESSION_WIRE_MINOR},
+    };
 
     let config = home.local_host_config();
     let host = tokio::task::spawn_blocking(move || harw_local_host::LocalHost::open(config, model))
@@ -121,7 +127,7 @@ impl Drop for LocalGuard {
 
 #[cfg(all(test, feature = "local-host"))]
 mod tests {
-    use harw_protocol::{SessionPort, session_wire::CreateParams};
+    use harw_protocol::session_wire::CreateParams;
 
     use super::*;
     use crate::{backend::BackendKind, home::AppHome};

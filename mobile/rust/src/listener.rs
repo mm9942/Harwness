@@ -78,7 +78,12 @@ impl Notifier {
         if self.slot.worker.get() == Some(&thread::current().id()) {
             return;
         }
-        drop(self.slot.calling.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(
+            self.slot
+                .calling
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
     }
 
     pub(crate) fn notify(&self, change: Change) {
@@ -103,9 +108,7 @@ impl Notifier {
             }
             *sender = Some(tx);
         }
-        let failed = sender
-            .as_ref()
-            .is_some_and(|tx| tx.send(change).is_err());
+        let failed = sender.as_ref().is_some_and(|tx| tx.send(change).is_err());
         if failed {
             *sender = None;
         }
@@ -269,9 +272,11 @@ mod tests {
         notifier.set(recorder.clone());
         assert!(wait_until(|| recorder.calls().len() >= 2));
         let threads = lock(&recorder.threads).clone();
-        assert!(threads
-            .iter()
-            .all(|name| name.as_deref() == Some("harw-mobile-notify")));
+        assert!(
+            threads
+                .iter()
+                .all(|name| name.as_deref() == Some("harw-mobile-notify"))
+        );
         Ok(())
     }
 
@@ -284,7 +289,9 @@ mod tests {
             notifier.status();
             notifier.session(&format!("s{index:03}"));
         }
-        let expected = (0..100).map(|i| format!("session:s{i:03}")).collect::<Vec<_>>();
+        let expected = (0..100)
+            .map(|i| format!("session:s{i:03}"))
+            .collect::<Vec<_>>();
         assert!(wait_until(|| {
             let calls = recorder.calls();
             expected.iter().all(|id| calls.contains(id))

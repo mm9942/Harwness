@@ -3,6 +3,7 @@ package dev.harw.mobile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.fail
 import org.junit.Test
+import uniffi.harw_mobile_ffi.DeviceException
 
 class TermuxBridgeTest {
     @Test

@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::time::Duration;
 
 use harw_node_transport::{LocalNode, NodeBody, empty_body};
+use harw_protocol::PortError;
 use harw_protocol::session_wire::{
     ApprovalRespondParams, AttachParams, ClientCaps, CreateParams, Cursor, DEFAULT_TAIL_ITEMS,
     InterruptParams, RespondResult, StreamProfile, SubmitParams, SubmitResult, features,
 };
-use harw_protocol::{PortError, SessionPort};
 use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError};
 use harw_types::{ApprovalId, SessionId, TurnId};
 use http::Method;
@@ -70,7 +70,11 @@ enum NetworkAction {
     Restart,
 }
 
-fn network_action(phase: ConnectionPhase, run_active: bool, retryable_failure: bool) -> NetworkAction {
+fn network_action(
+    phase: ConnectionPhase,
+    run_active: bool,
+    retryable_failure: bool,
+) -> NetworkAction {
     match phase {
         ConnectionPhase::Connecting | ConnectionPhase::Reconnecting if run_active => {
             NetworkAction::WakeBackoff
@@ -83,7 +87,9 @@ fn network_action(phase: ConnectionPhase, run_active: bool, retryable_failure: b
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+        })
 }
 
 impl Shared {
@@ -444,10 +450,7 @@ impl MobileCore {
             self.shared.notifier.sessions();
         }
         let profile = state.profile.as_ref().map(|profile| &profile.profile);
-        let active_caps = state
-            .active()
-            .ok()
-            .map(|link| link.backend.granted());
+        let active_caps = state.active().ok().map(|link| link.backend.granted());
         let phase = if state.phase == ConnectionPhase::Connected && active_caps.is_none() {
             ConnectionPhase::Reconnecting
         } else {
@@ -965,8 +968,9 @@ async fn drive_connection(
                     break;
                 }
                 state.attempt = retry;
-                state.next_retry_at_ms =
-                    Some(now_ms().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64));
+                state.next_retry_at_ms = Some(
+                    now_ms().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                );
                 shared.notifier.status();
             }
             let woken = tokio::select! {
@@ -1777,7 +1781,10 @@ mod route_failure_tests {
     fn network_action_wakes_backoff_while_dialing() {
         for phase in [ConnectionPhase::Connecting, ConnectionPhase::Reconnecting] {
             for retryable in [false, true] {
-                assert_eq!(network_action(phase, true, retryable), NetworkAction::WakeBackoff);
+                assert_eq!(
+                    network_action(phase, true, retryable),
+                    NetworkAction::WakeBackoff
+                );
             }
         }
     }
@@ -1786,7 +1793,10 @@ mod route_failure_tests {
     fn network_action_ignores_dialing_without_run() {
         for phase in [ConnectionPhase::Connecting, ConnectionPhase::Reconnecting] {
             for retryable in [false, true] {
-                assert_eq!(network_action(phase, false, retryable), NetworkAction::Ignore);
+                assert_eq!(
+                    network_action(phase, false, retryable),
+                    NetworkAction::Ignore
+                );
             }
         }
     }

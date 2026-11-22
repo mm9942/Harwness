@@ -90,4 +90,116 @@ class ModelManagerTest {
         assertTrue(hasRoom(free, 1000L, 900L))
         assertFalse(hasRoom(free - 1L, 1000L, 900L))
     }
+
+    private val hash = "ab".repeat(32)
+    private val base = java.net.URL("https://cdn.example/models/a.gguf")
+
+    @Test
+    fun constantsHaveExpectedValues() {
+        assertEquals(5, MaxRedirects)
+        assertEquals(100L * 1024 * 1024, StorageMarginBytes)
+    }
+
+    @Test
+    fun redirectStatusesAreRecognised() {
+        for (code in listOf(301, 302, 303, 307, 308)) assertTrue(code.toString(), isRedirect(code))
+        for (code in listOf(200, 206, 300, 304, 305, 306, 309, 404, 500)) {
+            assertFalse(code.toString(), isRedirect(code))
+        }
+    }
+
+    @Test
+    fun resolveRedirectFollowsAbsoluteHttps() {
+        assertEquals(
+            "https://other.example/x",
+            resolveRedirect(base, "https://other.example/x")?.toString(),
+        )
+    }
+
+    @Test
+    fun resolveRedirectResolvesRelativeLocation() {
+        assertEquals(
+            "https://cdn.example/models/b.gguf",
+            resolveRedirect(base, "b.gguf")?.toString(),
+        )
+        assertEquals(
+            "https://cdn.example/z",
+            resolveRedirect(base, "/z")?.toString(),
+        )
+    }
+
+    @Test
+    fun resolveRedirectTrimsWhitespace() {
+        assertEquals(
+            "https://cdn.example/y",
+            resolveRedirect(base, "  /y \n")?.toString(),
+        )
+    }
+
+    @Test
+    fun resolveRedirectRejectsMissingOrBlank() {
+        assertNull(resolveRedirect(base, null))
+        assertNull(resolveRedirect(base, ""))
+        assertNull(resolveRedirect(base, "   "))
+    }
+
+    @Test
+    fun resolveRedirectRejectsHttpDowngrade() {
+        assertNull(resolveRedirect(base, "http://cdn.example/x"))
+    }
+
+    @Test
+    fun resolveRedirectRejectsUserInfo() {
+        assertNull(resolveRedirect(base, "https://user:pw@cdn.example/x"))
+    }
+
+    @Test
+    fun resolveRedirectRejectsOtherSchemesAndMalformed() {
+        assertNull(resolveRedirect(base, "ftp://cdn.example/x"))
+        assertNull(resolveRedirect(base, "foo://cdn.example/x"))
+    }
+
+    @Test
+    fun resolveRedirectRejectsEmptyHost() {
+        assertNull(resolveRedirect(base, "https:///x"))
+    }
+
+    @Test
+    fun linkedEtagNullHeaderIsUnknown() {
+        assertNull(linkedEtagMatches(null, hash))
+    }
+
+    @Test
+    fun linkedEtagMatchesQuotedWeakAndCase() {
+        assertEquals(true, linkedEtagMatches(hash, hash))
+        assertEquals(true, linkedEtagMatches("\"$hash\"", hash))
+        assertEquals(true, linkedEtagMatches("W/\"$hash\"", hash))
+        assertEquals(true, linkedEtagMatches(" \"${hash.uppercase()}\" ", hash))
+        assertEquals(true, linkedEtagMatches(hash, hash.uppercase()))
+    }
+
+    @Test
+    fun linkedEtagMismatchIsFalse() {
+        assertEquals(false, linkedEtagMatches("\"" + "cd".repeat(32) + "\"", hash))
+        assertEquals(false, linkedEtagMatches("", hash))
+    }
+
+    @Test
+    fun linkedSizeNullHeaderIsUnknown() {
+        assertNull(linkedSizeMatches(null, 1000L))
+    }
+
+    @Test
+    fun linkedSizeMatchesPlainAndQuoted() {
+        assertEquals(true, linkedSizeMatches("1000", 1000L))
+        assertEquals(true, linkedSizeMatches(" 1000 ", 1000L))
+        assertEquals(true, linkedSizeMatches("\"1000\"", 1000L))
+    }
+
+    @Test
+    fun linkedSizeMismatchOrGarbageIsFalse() {
+        assertEquals(false, linkedSizeMatches("999", 1000L))
+        assertEquals(false, linkedSizeMatches("abc", 1000L))
+        assertEquals(false, linkedSizeMatches("", 1000L))
+    }
 }

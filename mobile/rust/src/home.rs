@@ -51,8 +51,8 @@ impl AppHome {
         fs::create_dir_all(files_dir).map_err(|e| io_error(files_dir, &e))?;
         let home = files_dir.join("harw-home");
         let profile_name = harw_home::active_profile_name(&home);
-        let profile_dir = harw_home::profile_dir(&home, &profile_name)
-            .map_err(|e| internal(e.to_string()))?;
+        let profile_dir =
+            harw_home::profile_dir(&home, &profile_name).map_err(|e| internal(e.to_string()))?;
         let app = Self {
             files_dir: files_dir.to_path_buf(),
             workspace: files_dir.join("workspaces").join("default"),
@@ -70,7 +70,9 @@ impl AppHome {
 
         let config = self.config_path();
         if !config.exists() {
-            let body = format!("{CONFIG_HEADER}{KEY_UIA} = \"{PHONE_UIA_ID}\"\nsingle_agent_mode = true\n");
+            let body = format!(
+                "{CONFIG_HEADER}{KEY_UIA} = \"{PHONE_UIA_ID}\"\nsingle_agent_mode = true\n"
+            );
             write_private_atomic(&config, body.as_bytes())?;
         }
 
@@ -141,8 +143,12 @@ impl AppHome {
                 path.display()
             )));
         }
-        toml::from_str::<toml::Table>(&text)
-            .map_err(|_| internal(format!("{}: profile config is not valid TOML", path.display())))
+        toml::from_str::<toml::Table>(&text).map_err(|_| {
+            internal(format!(
+                "{}: profile config is not valid TOML",
+                path.display()
+            ))
+        })
     }
 
     fn write_config(&self, table: &toml::Table) -> Result<(), MobileError> {
@@ -288,7 +294,10 @@ mod tests {
         let home = AppHome::open(dir.path())?;
         assert_eq!(home.home(), dir.path().join("harw-home"));
         assert_eq!(home.workspace(), dir.path().join("workspaces/default"));
-        assert_eq!(home.state_dir(), dir.path().join("harw-home/state/local-host"));
+        assert_eq!(
+            home.state_dir(),
+            dir.path().join("harw-home/state/local-host")
+        );
         assert!(home.profile_dir().starts_with(home.home().join("profiles")));
         for path in [
             home.home(),
@@ -315,7 +324,9 @@ mod tests {
             Some(PHONE_UIA_ID)
         );
         assert_eq!(
-            table.get("single_agent_mode").and_then(toml::Value::as_bool),
+            table
+                .get("single_agent_mode")
+                .and_then(toml::Value::as_bool),
             Some(true)
         );
         Ok(())
@@ -340,7 +351,8 @@ mod tests {
     fn existing_config_gets_the_uia_key_and_keeps_other_keys() -> TestResult {
         let dir = tempfile::tempdir()?;
         let home_dir = dir.path().join("harw-home");
-        let profile = harw_home::profile_dir(&home_dir, &harw_home::active_profile_name(&home_dir))?;
+        let profile =
+            harw_home::profile_dir(&home_dir, &harw_home::active_profile_name(&home_dir))?;
         fs::create_dir_all(&profile)?;
         fs::write(profile.join(CONFIG_FILE), "custom_key = \"keep\"\n")?;
         let home = AppHome::open(dir.path())?;

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -5,6 +7,40 @@ plugins {
 
 val uniffiSources = layout.buildDirectory.dir("generated/uniffi")
 val mobileLibraries = layout.buildDirectory.dir("generated/jniLibs")
+
+// Stable signing from a local, uncommitted properties file. This build never creates a key.
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.isFile) file.inputStream().use { load(it) }
+}
+val signingConfigPath: String? =
+    (System.getenv("HARW_SIGNING_CONFIG") ?: localProperties.getProperty("harw.signing.config"))
+        ?.takeIf { it.isNotBlank() }
+
+val signingProps: Properties? = signingConfigPath?.let { path ->
+    val cfg = File(path)
+    if (!cfg.isAbsolute || !cfg.isFile) {
+        throw GradleException("harw signing config incomplete: file")
+    }
+    Properties().apply { cfg.inputStream().use { load(it) } }
+}
+val repoRoot = rootProject.rootDir.parentFile.parentFile.canonicalFile
+val signingStoreFile: File? = signingProps?.let { props ->
+    for (key in listOf("storeFile", "storePassword", "keyAlias", "keyPassword")) {
+        if (props.getProperty(key).isNullOrBlank()) {
+            throw GradleException("harw signing config incomplete: $key")
+        }
+    }
+    val store = File(props.getProperty("storeFile").trim())
+    if (!store.isAbsolute || !store.isFile) {
+        throw GradleException("harw signing config incomplete: storeFile")
+    }
+    if (store.canonicalFile.toPath().startsWith(repoRoot.toPath())) {
+        throw GradleException("harw signing config invalid: storeFile must be outside the repository")
+    }
+    store.canonicalFile
+}
+val signDebugWithStableKey = signingProps?.getProperty("signDebug")?.trim() != "false"
 
 android {
     namespace = "dev.harw.mobile"
@@ -17,15 +53,30 @@ android {
         applicationId = "dev.harw.mobile"
         minSdk = 28
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
         ndk { abiFilters += "arm64-v8a" }
     }
 
     buildFeatures { compose = true }
 
+    val harwStable = if (signingProps != null && signingStoreFile != null) {
+        signingConfigs.create("harwStable") {
+            storeFile = signingStoreFile
+            storePassword = signingProps.getProperty("storePassword").trim()
+            keyAlias = signingProps.getProperty("keyAlias").trim()
+            keyPassword = signingProps.getProperty("keyPassword").trim()
+        }
+    } else {
+        null
+    }
+
     buildTypes {
+        if (harwStable != null && signDebugWithStableKey) {
+            debug { signingConfig = harwStable }
+        }
         release {
+            if (harwStable != null) signingConfig = harwStable
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }

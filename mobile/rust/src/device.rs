@@ -334,7 +334,10 @@ mod tests {
             path_err("dot segment")
         );
         assert_eq!(normalize_device_path("./a".into()), path_err("dot segment"));
-        assert_eq!(normalize_device_path("/a".into()), path_err("absolute path"));
+        assert_eq!(
+            normalize_device_path("/a".into()),
+            path_err("absolute path")
+        );
         assert_eq!(normalize_device_path("a\\b".into()), path_err("backslash"));
         assert_eq!(
             normalize_device_path("a//b".into()),
@@ -357,13 +360,15 @@ mod tests {
         assert_eq!(normalize_device_path("/".into()), path_err("absolute path"));
         assert_eq!(normalize_device_path("a/b/".into()), Ok("a/b".to_owned()));
         assert_eq!(normalize_device_path("a".into()), Ok("a".to_owned()));
-        assert_eq!(normalize_device_path("a//".into()), path_err("empty segment"));
+        assert_eq!(
+            normalize_device_path("a//".into()),
+            path_err("empty segment")
+        );
     }
 
     #[test]
     fn callback_failure_maps_to_failed_without_payload() {
-        let error =
-            DeviceError::from(uniffi::UnexpectedUniFFICallbackError::new("secret-payload"));
+        let error = DeviceError::from(uniffi::UnexpectedUniFFICallbackError::new("secret-payload"));
         assert_eq!(
             error,
             DeviceError::Failed {
