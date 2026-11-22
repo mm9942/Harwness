@@ -270,8 +270,8 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 218 Einträge (Kontrollsumme
-/// wie in `merge_rule_tests` geprüft: `ProfileReplaces` 113 · `GlobalOnly` 21 ·
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 219 Einträge (Kontrollsumme
+/// wie in `merge_rule_tests` geprüft: `ProfileReplaces` 114 · `GlobalOnly` 21 ·
 /// `MinBound` 58 · `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 ·
 /// `Union` 2 · `AndBool` 2 · `StricterOf` 3 · `PerFileValidated` 1).
 /// Die Abschnitt-6.3-Tabelle der Spezifikation deckt nur die Felder bis zur
@@ -328,6 +328,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "tui.reasoning", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // `[tui] footer_counts`: Agentenzahlen-Fußzeile (rein darstellend).
     FieldScope { path: "tui.footer_counts", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // `[tui] cell_aspect`: Zellseitenverhältnis für die Hochformat-Geometrie (rein darstellend).
+    FieldScope { path: "tui.cell_aspect", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.4 [session] (5)
     FieldScope { path: "session.store_dir", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "session.journal_format", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -586,7 +588,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_218_entries() {
+    fn test_field_table_has_exactly_219_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -611,12 +613,13 @@ mod merge_rule_tests {
         // PL-97 E2: +1 für `sandbox.execution`.
         // PL-97 R1: +1 für `tui.reasoning`.
         // +1 für `tui.footer_counts`.
+        // +1 für `tui.cell_aspect`.
         // PL-97 E3: +2 für `jobs.cgroup_root`, `jobs.trampoline`.
         // Interface localization: +1 for `tui.language`.
         // PL-100 Phase 4: +1 für `sandbox.host_lease_ttl_secs`.
         // PL-100 WP0.12: +10 für `retention.dod_verdicts.*`, `retention.dod_labels.*`
         // (12 Klassen x 5 Schlüssel).
-        assert_eq!(FIELD_TABLE.len(), 218);
+        assert_eq!(FIELD_TABLE.len(), 219);
     }
 
     #[test]
@@ -648,10 +651,11 @@ mod merge_rule_tests {
         // +1 for `internal_models.image_understanding`.
         // PL-97 R1: +1 (`tui.reasoning`).
         // +1 (`tui.footer_counts`).
+        // +1 (`tui.cell_aspect`).
         // PL-97 E3: +2 (`jobs.cgroup_root`, `jobs.trampoline`).
         // Interface localization: +1 for `tui.language`.
         // PL-100 Phase 4: +1 (`sandbox.host_lease_ttl_secs`).
-        assert_eq!(count(MergeRule::ProfileReplaces), 113);
+        assert_eq!(count(MergeRule::ProfileReplaces), 114);
         assert_eq!(count(MergeRule::GlobalOnly), 21);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1

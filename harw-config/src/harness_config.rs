@@ -877,6 +877,37 @@ pub struct TuiSection {
     /// Vorgabe: aus). Rein darstellend.
     #[serde(default)]
     pub footer_counts: bool,
+    /// Zellseitenverhältnis (Zellbreite / Zellhöhe) für die Quadrat-Geometrie
+    /// im Hochformat (`[tui] cell_aspect`, z. B. `0.48`). `None` (Vorgabe)
+    /// bedeutet: die TUI misst es zur Laufzeit oder nimmt 0.5. Gültig sind
+    /// Werte im Bereich [`TUI_CELL_ASPECT_MIN`]..=[`TUI_CELL_ASPECT_MAX`].
+    #[serde(default)]
+    pub cell_aspect: Option<f32>,
+}
+
+/// Kleinster zulässiger Wert für `[tui] cell_aspect`.
+pub const TUI_CELL_ASPECT_MIN: f32 = 0.2;
+/// Größter zulässiger Wert für `[tui] cell_aspect`.
+pub const TUI_CELL_ASPECT_MAX: f32 = 1.5;
+
+impl TuiSection {
+    /// Prüft Wertebereiche, die reine Deserialisierung nicht ausdrückt.
+    ///
+    /// # Errors
+    /// Liefert `Err(String)` mit einer menschenlesbaren Begründung, wenn
+    /// `cell_aspect` gesetzt ist, aber nicht im Bereich
+    /// [`TUI_CELL_ASPECT_MIN`]..=[`TUI_CELL_ASPECT_MAX`] liegt (`NaN` und
+    /// unendliche Werte fallen ebenfalls hinein).
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(aspect) = self.cell_aspect
+            && !(TUI_CELL_ASPECT_MIN..=TUI_CELL_ASPECT_MAX).contains(&aspect)
+        {
+            return Err(format!(
+                "tui.cell_aspect muss zwischen {TUI_CELL_ASPECT_MIN} und {TUI_CELL_ASPECT_MAX} liegen, gefunden {aspect}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for TuiSection {
@@ -890,6 +921,7 @@ impl Default for TuiSection {
             goal_mode: false,
             reasoning: ReasoningDisplayMode::default(),
             footer_counts: false,
+            cell_aspect: None,
         }
     }
 }
@@ -1144,6 +1176,50 @@ mod tests {
         let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse tui.footer_counts"))?;
         assert!(cfg.tui.footer_counts);
         Ok(())
+    }
+
+    /// `[tui] cell_aspect` ist standardmäßig nicht gesetzt, parst Gleitkommawerte
+    /// und wird im gültigen Bereich 0.2..=1.5 akzeptiert.
+    #[test]
+    fn test_tui_cell_aspect_defaults_none_and_parses() -> TestResult {
+        assert_eq!(TuiSection::default().cell_aspect, None);
+        assert!(TuiSection::default().validate().is_ok());
+        let src =
+            "default_provider = \"anthropic\"\ndefault_model = \"m\"\n[tui]\ncell_aspect = 0.48\n";
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse tui.cell_aspect"))?;
+        assert_eq!(cfg.tui.cell_aspect, Some(0.48));
+        assert!(cfg.tui.validate().is_ok());
+        for edge in ["cell_aspect = 0.2", "cell_aspect = 1.5"] {
+            let src = format!("[tui]\n{edge}\n");
+            let cfg: HarnessConfig = toml::from_str(&src).map_err(ctx("parse cell_aspect edge"))?;
+            assert!(cfg.tui.validate().is_ok(), "{edge} must be accepted");
+        }
+        Ok(())
+    }
+
+    /// `[tui] cell_aspect` außerhalb von 0.2..=1.5 (inklusive NaN) wird
+    /// von `TuiSection::validate` mit einer Begründung abgelehnt.
+    #[test]
+    fn test_tui_cell_aspect_out_of_range_is_rejected() -> TestResult {
+        for value in ["0.19", "1.51", "0.0", "-0.5", "nan", "inf"] {
+            let src = format!("[tui]\ncell_aspect = {value}\n");
+            let cfg: HarnessConfig = toml::from_str(&src).map_err(ctx("parse cell_aspect"))?;
+            let Err(message) = cfg.tui.validate() else {
+                return Err(TestError::Unexpected(format!(
+                    "cell_aspect = {value} must be rejected"
+                )));
+            };
+            assert!(message.contains("tui.cell_aspect"), "{message}");
+        }
+        Ok(())
+    }
+
+    /// `[tui] cell_aspect` ist ein bekannter Schlüssel: ein Tippfehler im
+    /// Namen bleibt wegen `deny_unknown_fields` ein Parsefehler.
+    #[test]
+    fn test_tui_cell_aspect_typo_is_unknown_field() {
+        let src = "[tui]\ncell_aspet = 0.5\n";
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
     }
 
     /// PL-97 R1: `[tui] reasoning` hat die Vorgabe `message`, parst die
