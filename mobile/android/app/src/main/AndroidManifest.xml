@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <application
         android:name=".HarwApplication"
@@ -28,16 +30,6 @@
             android:name=".SessionWindowActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
-
-        <provider
-            android:name=".PairingCameraFileProvider"
-            android:authorities="dev.harw.mobile.pairing-camera"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/pairing_camera_paths" />
-        </provider>
 
         <service
             android:name=".HarwConnectionService"

@@ -1,8 +1,6 @@
 package dev.harw.mobile
 
 import android.Manifest
-import android.content.ClipData
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -39,10 +37,7 @@ import androidx.lifecycle.lifecycleScope
 import java.util.UUID
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.SessionCursor
@@ -108,27 +103,24 @@ internal open class MainActivity : ComponentActivity() {
             if (it != null) connection.exportEnrollment(it)
         }
         val selectedProfileKey = remember(state.profile) { state.profile?.windowKey() }
-        var captureName by rememberSaveable { mutableStateOf<String?>(null) }
-        var captureProfileKey by rememberSaveable { mutableStateOf<String?>(null) }
-        var captureResetEpoch by rememberSaveable { mutableStateOf(0L) }
-        var preparingCamera by remember { mutableStateOf(false) }
+        var scannerOpen by rememberSaveable { mutableStateOf(false) }
         var enrollmentQr by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
-        val takePairingPicture = remember { PairingPictureContract() }
-        val camera = rememberLauncherForActivityResult(takePairingPicture) { captured ->
-            val name = captureName
-            val current = connection.state.value
-            val stillSelected = captureProfileKey == current.profile?.windowKey() && captureResetEpoch == current.sessionResetEpoch
-            captureName = null
-            if (name != null) {
-                val file = pairingPhotoFile(applicationContext, name)
-                if (captured && stillSelected) connection.importProfilePhoto(file)
-                else lifecycleScope.launch(Dispatchers.IO) { discardPairingPhoto(file) }
-            }
+        val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) scannerOpen = true else connection.reportCameraUnavailable()
         }
         LaunchedEffect(state.deviceNodeId) {
             if (state.deviceNodeId == null) enrollmentQr = null
         }
         enrollmentQr?.let { EnrollmentQrDialog(it, onClose = { enrollmentQr = null }) }
+        if (scannerOpen) {
+            QrScanDialog(
+                onDismiss = { scannerOpen = false },
+                onImport = {
+                    scannerOpen = false
+                    connection.importScannedProfile(it)
+                },
+            )
+        }
         val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
             notificationDenied = !it
             startConnection()
@@ -163,34 +155,12 @@ internal open class MainActivity : ComponentActivity() {
                 },
                 onExport = { enrollmentPicker.launch("harw-device-enrollment.json") },
                 onShowEnrollmentQr = { connection.showEnrollmentQr { enrollmentQr = it } },
-                scanning = preparingCamera || captureName != null,
+                scanning = scannerOpen,
                 onScanProfile = {
-                    if (!preparingCamera && captureName == null) {
-                        preparingCamera = true
-                        val profileKey = selectedProfileKey
-                        val resetEpoch = state.sessionResetEpoch
-                        lifecycleScope.launch {
-                            var photo: PairingPhoto? = null
-                            try {
-                                val prepared = withContext(Dispatchers.IO) { newPairingPhoto(applicationContext) }
-                                photo = prepared
-                                captureName = prepared.name
-                                captureProfileKey = profileKey
-                                captureResetEpoch = resetEpoch
-                                camera.launch(prepared.uri)
-                            } catch (error: Exception) {
-                                if (error is CancellationException) throw error
-                                captureName = null
-                                photo?.let {
-                                    withContext(Dispatchers.IO) {
-                                        discardPairingPhoto(pairingPhotoFile(applicationContext, it.name))
-                                    }
-                                }
-                                connection.reportCameraUnavailable()
-                            } finally {
-                                preparingCamera = false
-                            }
-                        }
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                        scannerOpen = true
+                    } else {
+                        cameraPermission.launch(Manifest.permission.CAMERA)
                     }
                 },
                 onConnect = {
@@ -262,13 +232,6 @@ internal open class MainActivity : ComponentActivity() {
                 .putExtra(WindowProfileKey, connection.state.value.profile?.windowKey())
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT),
         )
-    }
-}
-
-private class PairingPictureContract : ActivityResultContracts.TakePicture() {
-    override fun createIntent(context: Context, input: Uri): Intent = super.createIntent(context, input).apply {
-        clipData = ClipData.newRawUri("Harw pairing photo", input)
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
     }
 }
 
