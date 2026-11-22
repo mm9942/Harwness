@@ -79,15 +79,16 @@ pub fn decode_pairing_text(text: String) -> Result<ScannedProfile, MobileError> 
 
 pub(crate) fn fingerprint(public_key_hex: &str) -> Result<String, MobileError> {
     let hex = public_key_hex.as_bytes();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(invalid("server public key is not valid hex"));
     }
     let mut key = Vec::with_capacity(hex.len() / 2);
     for pair in hex.chunks_exact(2) {
-        let s = std::str::from_utf8(pair).map_err(|_| invalid("server public key is not valid hex"))?;
-        key.push(
-            u8::from_str_radix(s, 16).map_err(|_| invalid("server public key is not valid hex"))?,
-        );
+        let byte = std::str::from_utf8(pair)
+            .ok()
+            .and_then(|s| u8::from_str_radix(s, 16).ok())
+            .ok_or_else(|| invalid("server public key is not valid hex"))?;
+        key.push(byte);
     }
     let digest = blake3::hash(&key);
     let groups: Vec<String> = digest.as_bytes()[..16]

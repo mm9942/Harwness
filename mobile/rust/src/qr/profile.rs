@@ -3,7 +3,6 @@
 use super::base45;
 use crate::types::{MobileError, ServerProfile};
 
-const PROFILE_PREFIX: &str = "HARW:PROFILE:";
 const PREFIX_V1: &str = "HARW:PROFILE:1:";
 const PREFIX_V2: &str = "HARW:PROFILE:2:";
 const ENROLL_PREFIX: &str = "HARW:ENROLL:";
@@ -41,14 +40,12 @@ pub(crate) fn decode_profile_text(text: &str) -> Result<ServerProfile, MobileErr
         (rest, false)
     } else if let Some(rest) = text.strip_prefix(PREFIX_V2) {
         (rest, true)
-    } else if text.starts_with(PROFILE_PREFIX) {
-        return Err(invalid("The profile QR has invalid fields."));
     } else {
         return Err(invalid("This is not a Harw server profile QR code."));
     };
     let bytes = base45::decode(payload).map_err(|_| invalid("Invalid Harw QR encoding."))?;
     let header = if v2 { 4 } else { 3 };
-    if bytes.len() < header {
+    if bytes.len() < PUBLIC_KEY_SIZE + header {
         return Err(invalid("The server profile code is incomplete."));
     }
     let label_len = bytes[0] as usize;

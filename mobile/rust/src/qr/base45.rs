@@ -43,7 +43,7 @@ pub(crate) fn decode(text: &str) -> Result<Vec<u8>, String> {
 
 /// Encodes bytes as base45 text.
 pub(crate) fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity((bytes.len() * 3 + 1) / 2);
+    let mut out = String::with_capacity((bytes.len() * 3).div_ceil(2));
     let mut chunks = bytes.chunks_exact(2);
     for chunk in &mut chunks {
         let value = u32::from(chunk[0]) * 256 + u32::from(chunk[1]);
