@@ -13,8 +13,8 @@
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use harw_onion::{
@@ -38,10 +38,10 @@ fn private_dir(path: &Path) -> std::io::Result<PathBuf> {
 /// Echoes up to 64 bytes back to the peer.
 async fn echo(mut stream: OnionStream) {
     let mut buf = [0u8; 64];
-    if let Ok(n) = stream.read(&mut buf).await {
-        if stream.write_all(&buf[..n]).await.is_ok() {
-            let _ = stream.flush().await;
-        }
+    if let Ok(n) = stream.read(&mut buf).await
+        && stream.write_all(&buf[..n]).await.is_ok()
+    {
+        let _ = stream.flush().await;
     }
 }
 

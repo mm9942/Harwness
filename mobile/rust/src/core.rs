@@ -957,7 +957,10 @@ fn dial_failure(error: &RemoteError) -> DialFailure {
     let RemoteError::Connect(detail) = error else {
         return DialFailure::Final;
     };
-    if TOR_SETUP_FAILURES.iter().any(|prefix| detail.starts_with(prefix)) {
+    if TOR_SETUP_FAILURES
+        .iter()
+        .any(|prefix| detail.starts_with(prefix))
+    {
         return DialFailure::Unavailable;
     }
     // An upgrade refusal is terminal for this dial. HTTP 403 can also
@@ -1393,7 +1396,10 @@ mod route_failure_tests {
         ];
         assert_eq!(attempt_failure(&auto), DialFailure::Retry);
         let refused = [
-            (ConnectionRoute::Onion, connect("tor: tor bootstrap failed: x")),
+            (
+                ConnectionRoute::Onion,
+                connect("tor: tor bootstrap failed: x"),
+            ),
             (
                 ConnectionRoute::Direct,
                 connect("upgrade: peer did not switch protocols (status 403)"),

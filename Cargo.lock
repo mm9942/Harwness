@@ -4623,6 +4623,7 @@ dependencies = [
 name = "harw-node-listener"
 version = "0.10.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "futures-util",
  "harw-fsutil",

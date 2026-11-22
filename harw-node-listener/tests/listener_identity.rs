@@ -4,16 +4,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
+use futures_util::{SinkExt, StreamExt};
 use harw_node_listener::{
     DeviceRecord, DeviceRegistry, IdentityMapper, ListenerError, NodeListener,
     RegistryIdentityMapper, RevocationSink, UpgradeHandler,
 };
 use harw_node_transport::{
-    AuthenticatedPeer, ClientOptions, LocalNode, ML_DSA_65_SIGNATURE_LEN, NodeIdentity,
-    NodeSigner, NodeTransportClient, NodeTransportServer, PinnedPeers, ServerOptions, SignFuture,
-    SignerError, UpgradeError, UpgradedIo, empty_body,
+    AuthenticatedPeer, ClientOptions, LocalNode, ML_DSA_65_SIGNATURE_LEN, NodeIdentity, NodeSigner,
+    NodeTransportClient, NodeTransportServer, PinnedPeers, ServerOptions, SignFuture, SignerError,
+    UpgradeError, UpgradedIo, empty_body,
 };
 use harw_protocol::methods::METHOD_SESSION_HELLO;
 use harw_protocol::session_wire::HelloAck;
@@ -382,7 +382,11 @@ fn test_node(name: &str, seed: u8) -> TestResult<TestNode> {
         key_ref: format!("test-only/{name}"),
     };
     let local = LocalNode::new(identity.clone(), Arc::new(TestSigner { key }));
-    Ok(TestNode { id, identity, local })
+    Ok(TestNode {
+        id,
+        identity,
+        local,
+    })
 }
 
 type IntakeWs = WebSocketStream<UpgradedIo>;
@@ -477,9 +481,12 @@ impl Rig {
         .await?;
         let (request, _key) = upgrade::client_request("localhost")?;
         match transport.upgrade(request.map(|_| empty_body())).await {
-            Ok(upgraded) => Ok(Ok(
-                WebSocketStream::from_raw_socket(upgraded.io, Role::Client, None).await,
-            )),
+            Ok(upgraded) => Ok(Ok(WebSocketStream::from_raw_socket(
+                upgraded.io,
+                Role::Client,
+                None,
+            )
+            .await)),
             Err(UpgradeError::NotSwitched(status)) => Ok(Err(status)),
             Err(other) => Err(other.into()),
         }
