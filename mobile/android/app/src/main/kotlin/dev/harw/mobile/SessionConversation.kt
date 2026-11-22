@@ -46,7 +46,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -62,7 +61,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -95,13 +93,6 @@ internal fun SessionConversation(
     var approvalId by rememberSaveable(sessionId) { mutableStateOf<String?>(null) }
     var confirmingInterrupt by rememberSaveable(sessionId) { mutableStateOf(false) }
     var transcriptJump by remember(sessionId) { mutableIntStateOf(0) }
-    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(1000)
-            nowMs = System.currentTimeMillis()
-        }
-    }
     val approval = approvals.firstOrNull { it.id == approvalId }
     val turnId = snapshot?.runningTurnId
     val approvalPending = SessionAction(sessionId, SessionActionKind.Decide) in state.pendingActions
@@ -197,7 +188,6 @@ internal fun SessionConversation(
                 jobs = snapshot.jobs,
                 reasoning = snapshot.reasoning,
                 finished = snapshot.finished,
-                nowMs = nowMs,
                 availableHeight = availableHeight,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 4.dp),
             )

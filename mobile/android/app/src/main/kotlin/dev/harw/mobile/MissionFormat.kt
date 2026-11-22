@@ -4,8 +4,20 @@ import uniffi.harw_mobile_ffi.FinishedCategory
 import uniffi.harw_mobile_ffi.MobileAgent
 import uniffi.harw_mobile_ffi.MobileAgentState
 import uniffi.harw_mobile_ffi.MobileJob
+import kotlin.math.max
+import kotlin.math.min
 
-private val TERMINAL_JOB_STATES = setOf("done", "succeeded", "failed", "cancelled", "stopped")
+// Mirrors the terminal states of `job_outcome` in mobile/rust/src/mission.rs.
+private val TERMINAL_JOB_STATES = setOf(
+    "completed", "complete", "done", "succeeded", "success", "ok",
+    "failed", "error", "timed_out", "timeout", "dead",
+    "cancelled", "canceled", "aborted", "stopped",
+)
+
+internal fun missionCardHeightDp(sideDp: Float, availableHeightDp: Float, panelDp: Float, stripDp: Float, imeVisible: Boolean): Float =
+    if (!imeVisible) sideDp else min(sideDp, max(72f, availableHeightDp - panelDp - stripDp - 190f))
+
+internal fun missionHeaderMaxHeightDp(availableHeightDp: Float): Float = max(0f, availableHeightDp - 184f)
 
 internal fun formatElapsed(startedMs: Long, nowMs: Long): String {
     val elapsedMs = nowMs - startedMs
