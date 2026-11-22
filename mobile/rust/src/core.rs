@@ -6,7 +6,7 @@ use std::time::Duration;
 use harw_node_transport::{LocalNode, NodeBody, empty_body};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, AttachParams, ClientCaps, CreateParams, Cursor, DEFAULT_TAIL_ITEMS,
-    InterruptParams, RespondResult, StreamProfile, SubmitParams, SubmitResult,
+    InterruptParams, RespondResult, StreamProfile, SubmitParams, SubmitResult, features,
 };
 use harw_protocol::{PortError, SessionPort};
 use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError, RemotePort, connect_node};
@@ -672,6 +672,7 @@ async fn drive_connection(
         }
         let mut options = ConnectOptions::new(&label);
         options.requested_caps = Some(ClientCaps::OPERATE);
+        options.features = requested_features();
         let connected = run
             .run_until_cancelled(connect_node(
                 profile.endpoint.clone(),
@@ -828,6 +829,29 @@ fn retry_delay(attempt: u32, entropy: u64) -> Duration {
         .unwrap_or(Duration::from_secs(30))
 }
 
+/// Features the phone asks the host for in `session.hello`.
+fn requested_features() -> Vec<String> {
+    [
+        features::COMPACT,
+        features::CHILD_FRAMES,
+        features::COMPACT_REASONING,
+        features::JOB_FRAMES,
+    ]
+    .iter()
+    .map(|feature| (*feature).to_owned())
+    .collect()
+}
+
+/// Profile for `session.attach`: reasoning-aware only when the host granted it.
+/// An older host cannot decode the new profile, so fall back to `Compact`.
+fn attach_profile(granted: &[String]) -> StreamProfile {
+    if granted.iter().any(|feature| feature == features::COMPACT_REASONING) {
+        StreamProfile::CompactReasoning
+    } else {
+        StreamProfile::Compact
+    }
+}
+
 fn start_attachment(
     shared: &Arc<Shared>,
     session: &mut SessionState,
@@ -865,7 +889,7 @@ async fn drive_attachment(
             // from the live ring or its snapshot: compact replay can merge an
             // already seen delta and a new delta into the same envelope.
             from: from.map(|cursor| Cursor { live: 0, ..cursor }),
-            profile: StreamProfile::Compact,
+            profile: attach_profile(&link.port.connection().hello_ack().features),
             tail_items: DEFAULT_TAIL_ITEMS,
         };
         let (mut ack, mut source) = match link.request(link.port.attach(params)).await {
@@ -1124,5 +1148,26 @@ fn unopened() -> MobileError {
 fn ambiguous() -> MobileError {
     MobileError::Ambiguous {
         detail: "Check the session transcript before sending the draft again".into(),
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn attach_profile_follows_the_granted_features() {
+        assert!(matches!(attach_profile(&[]), StreamProfile::Compact));
+        assert!(matches!(
+            attach_profile(&["compact".into(), "child_frames".into()]),
+            StreamProfile::Compact
+        ));
+        assert!(matches!(
+            attach_profile(&["compact_reasoning".into()]),
+            StreamProfile::CompactReasoning
+        ));
+        let requested = requested_features();
+        assert!(requested.iter().any(|feature| feature == "compact_reasoning"));
+        assert!(requested.iter().any(|feature| feature == "job_frames"));
     }
 }

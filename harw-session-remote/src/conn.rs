@@ -90,6 +90,8 @@ pub struct ConnectOptions {
     pub client_label: String,
     /// Caps to request; `None` asks for the full ceiling (can only narrow).
     pub requested_caps: Option<ClientCaps>,
+    /// Optional features to request in `session.hello` (see `harw_protocol::session_wire::features`); the host answers with the subset it implements in `HelloAck::features`. Empty by default.
+    pub features: Vec<String>,
     /// Client-side WebSocket limits.
     pub limits: WsLimits,
 }
@@ -101,6 +103,7 @@ impl ConnectOptions {
         Self {
             client_label: client_label.into(),
             requested_caps: None,
+            features: Vec::new(),
             limits: WsLimits::default(),
         }
     }
@@ -606,7 +609,7 @@ where
     let params = HelloParams {
         client_label: options.client_label.clone(),
         wire_minor: SESSION_WIRE_MINOR,
-        features: Vec::new(),
+        features: options.features.clone(),
         requested_caps: options.requested_caps,
     };
     connection.hello = connection

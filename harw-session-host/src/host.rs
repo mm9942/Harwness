@@ -93,6 +93,8 @@ const HOST_FEATURES: &[&str] = &[
     features::CHILD_FRAMES,
     features::TOOLS,
     features::GATEWAY,
+    features::COMPACT_REASONING,
+    features::JOB_FRAMES,
 ];
 
 /// Features that exist only from [`TOOL_GATEWAY_WIRE_MINOR`] on.
@@ -856,8 +858,9 @@ impl SlotState {
     }
 
     /// Fan out a frame that does not belong to a driver turn (gateway tool
-    /// events of an agent-run turn). Buffered in the live ring only while a
-    /// driver turn is active there, so it never outlives the ring's turn.
+    /// events of an agent-run turn, and child-agent and agent-job frames from
+    /// the driver). Buffered in the live ring only while a driver turn is
+    /// active there, so it never outlives the ring's turn.
     fn publish_side(&mut self, session_id: &SessionId, frame: SessionFrame) {
         if self.ring.active_turn().is_some() {
             self.publish(session_id, frame);
@@ -926,13 +929,27 @@ impl EventSink for SlotSink {
                 parent,
                 role,
                 event,
-            } => state.publish(
+            } => state.publish_side(
                 id,
                 SessionFrame::Child {
                     agent,
                     parent,
                     role,
                     event,
+                },
+            ),
+            DriverEvent::Job {
+                work_id,
+                kind,
+                state: job_state,
+                summary,
+            } => state.publish_side(
+                id,
+                SessionFrame::Job {
+                    work_id,
+                    kind,
+                    state: job_state,
+                    summary,
                 },
             ),
             DriverEvent::ApprovalRequested(request) => {

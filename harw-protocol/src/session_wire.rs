@@ -54,6 +54,10 @@ pub mod features {
     pub const HISTORY: &str = "history";
     /// The host emits [`super::SessionFrame::Child`] frames.
     pub const CHILD_FRAMES: &str = "child_frames";
+    /// The host honours [`super::StreamProfile::CompactReasoning`]. A client sends that profile only when the host granted this feature.
+    pub const COMPACT_REASONING: &str = "compact_reasoning";
+    /// The host emits [`super::SessionFrame::Job`] frames (agent jobs of the session).
+    pub const JOB_FRAMES: &str = "job_frames";
     /// The host serves `tool.list`/`tool.call`/`tool.cancel` (R18 D-A).
     pub const TOOLS: &str = "tools";
     /// The host serves the `gateway.*` methods (R18 D-B).
@@ -298,6 +302,8 @@ pub enum StreamProfile {
     Full,
     /// Phone profile: no reasoning/child deltas, coalesced assistant text.
     Compact,
+    /// Phone profile with live reasoning: like `Compact` (coalesced assistant text, no child assistant/usage/context deltas) but delivers reasoning deltas of the root and of child agents and child progress. Only sent when `HelloAck::features` contains [`features::COMPACT_REASONING`]; an older host cannot decode it.
+    CompactReasoning,
 }
 
 /// Durable state of a hosted session.
@@ -1189,6 +1195,21 @@ mod tests {
         assert_eq!(params.tail_items, DEFAULT_TAIL_ITEMS);
         assert_eq!(params.profile, StreamProfile::Full);
         assert_eq!(params.from, None);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_reasoning_profile_uses_its_snake_case_name() -> TestResult {
+        let value = ctx(
+            serde_json::to_value(StreamProfile::CompactReasoning),
+            "encode profile",
+        )?;
+        assert_eq!(value, serde_json::json!("compact_reasoning"));
+        let json = r#"{"session_id":"s-9","profile":"compact_reasoning"}"#;
+        let params: AttachParams = ctx(serde_json::from_str(json), "decode attach")?;
+        assert_eq!(params.profile, StreamProfile::CompactReasoning);
+        assert_eq!(features::COMPACT_REASONING, "compact_reasoning");
+        assert_eq!(features::JOB_FRAMES, "job_frames");
         Ok(())
     }
 
