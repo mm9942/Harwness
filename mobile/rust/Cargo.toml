@@ -29,20 +29,28 @@ onion = ["harw-onion/client"]
 bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
 bootstrap = [
     "dep:clap", "dep:harw-infra-client", "dep:harw-node-listener", "dep:rustix",
-    "dep:harw-tailscale", "dep:tempfile", "dep:toml", "tokio/process", "tokio/signal", "tokio/io-util",
+    "dep:harw-tailscale", "dep:tempfile", "tokio/process", "tokio/signal", "tokio/io-util",
 ]
+# Standalone mode: in-process harw session host, provider-http validation and the
+# model source. Off in the APK build until the phone runtime is enabled.
+local-host = ["dep:harw-local-host", "dep:harw-provider-http", "dep:harw-core"]
 
 [dependencies]
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 blake3 = "1.8.7"
 bytes = "1"
 clap = { version = "4.6", features = ["derive"], optional = true }
+harw-config = { path = "../../harw-config" }
+harw-core = { path = "../../harw-core", optional = true }
+harw-home = { path = "../../harw-home" }
 harw-infra-client = { path = "../../harw-infra-client", optional = true }
+harw-local-host = { path = "../../harw-local-host", optional = true }
 harw-mobile-core = { path = "../../harw-mobile-core" }
 harw-node-listener = { path = "../../harw-node-listener", optional = true }
 harw-node-transport = { path = "../../harw-node-transport" }
 harw-onion = { path = "../../harw-onion" }
 harw-protocol = { path = "../../harw-protocol" }
+harw-provider-http = { path = "../../harw-provider-http", optional = true }
 harw-session-remote = { path = "../../harw-session-remote" }
 harw-tailscale = { path = "../../harw-tailscale", optional = true }
 harw-types = { path = "../../harw-types" }
@@ -50,13 +58,14 @@ hex = "0.4.3"
 http = "1"
 jiff = "0.2"
 rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
+secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tempfile = { version = "3.27.0", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-toml = { version = "1.1.3", optional = true }
+toml = "1.1.3"
 uniffi = { version = "=0.32.2", default-features = false }
 zeroize = "1.9.0"
 

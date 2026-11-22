@@ -60,4 +60,5 @@
     <string name="notification_approval_text">A session is waiting for your approval</string>
     <string name="notification_turn_done_title">Reply finished</string>
     <string name="notification_turn_done_text">A session has finished its reply</string>
+    <string name="model_download_channel">Model downloads</string>
 </resources>

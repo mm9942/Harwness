@@ -6,12 +6,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.RUN_USER_INITIATED_JOBS" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
     <application
         android:name=".HarwApplication"
         android:allowBackup="false"
         android:icon="@drawable/harw_mark"
         android:label="@string/app_name"
+        android:requestLegacyExternalStorage="true"
         android:resizeableActivity="true"
         android:theme="@style/Theme.Harw"
         android:usesCleartextTraffic="false">
@@ -58,5 +62,16 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Keeps the user-started authenticated Harw workspace connection open for live sessions and approvals." />
         </service>
+        <service
+            android:name=".ModelDownloadJob"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+        <service
+            android:name=".ModelDownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <receiver
+            android:name=".ModelDownloadReceiver"
+            android:exported="false" />
     </application>
 </manifest>

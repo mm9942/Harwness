@@ -64,6 +64,8 @@ members = [
     "harw-session-remote",
     "harw-session-client",
     "harw-session-driver",
+    # Standalone phone mode: in-process session host shared by gateway and Android app.
+    "harw-local-host",
     "harw-node-listener",
     "harw-mobile-core",
     "harw-mobile-term",

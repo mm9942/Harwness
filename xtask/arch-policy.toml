@@ -482,6 +482,9 @@ layer = "A"
 layer = "A"
 [packages."harw-session-driver"]
 layer = "A"
+# In-process session host (gateway + Android standalone app).
+[packages."harw-local-host"]
+layer = "A"
 [packages."harw-node-listener"]
 layer = "A"
 [packages."harw-mobile-core"]
@@ -618,8 +621,15 @@ reason = "PL-100 WP2.1 / I8: the dispatch core is pure (no IO, clock, runtime or
 # das prüft kein Gate (siehe gate_arch.rs, „Was dieses Gate nicht prüft").
 [[forbidden_crates]]
 names = ["harw-dod-warden-proto", "harw-dod-ladder", "harw-dod-escalate", "harw-escalator"]
-packages = ["harw", "harw-agent-runner", "harw-cli", "harw-core", "harw-core-bridge", "harw-ops", "harw-plan-bridge", "harw-runtime", "harw-tui", "harwness-sdk"]
+packages = ["harw", "harw-agent-runner", "harw-cli", "harw-core", "harw-core-bridge", "harw-local-host", "harw-ops", "harw-plan-bridge", "harw-runtime", "harw-tui", "harwness-sdk"]
 reason = "PL-100 WP3.0 / I8: model-facing processes never link the signing part of the warden protocol, the escalation ladder, the escalation authorization or the escalator"
+
+# Standalone phone mode: the in-process host must stay phone-portable and never
+# pull the desktop entry points into the Android library.
+[[forbidden_crates]]
+names = ["harw-cli", "harw-tui"]
+packages = ["harw-local-host"]
+reason = "standalone app: the phone-portable in-process host never links the CLI or the TUI"
 
 # PL-100 WP 3.0 / I8: Was modellnahe Prozesse linken dürfen, bleibt
 # signierfrei. Leiter, Triage-Einreichung und Warden-Vokabular erreichen den
