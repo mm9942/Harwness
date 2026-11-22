@@ -167,6 +167,9 @@ pub(crate) fn classify_mission(area: Rect, state: &PanelState, rows: MissionRows
     let layout = harw_tui_layout::classify_mission(harw_tui_layout::MissionInput {
         cols: area.width,
         rows: area.height,
+        // 0 = default cell aspect (500); the measured value follows with the
+        // portrait integration.
+        cell_aspect_permille: 0,
         status_rows: rows.status,
         composer_rows: rows.composer,
         live_body_lines_wanted: rows.live_body_lines,
