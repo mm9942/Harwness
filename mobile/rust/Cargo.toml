@@ -57,6 +57,7 @@ harw-types = { path = "../../harw-types" }
 hex = "0.4.3"
 http = "1"
 jiff = "0.2"
+rqrr = { version = "0.11", default-features = false }
 rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
 secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -78,3 +79,4 @@ harw-session-host = { path = "../../harw-session-host" }
 harw-session-store = { path = "../../harw-session-store" }
 harw-session-ws = { path = "../../harw-session-ws" }
 tempfile = "3.27.0"
+qrcode = { version = "0.15", default-features = false }

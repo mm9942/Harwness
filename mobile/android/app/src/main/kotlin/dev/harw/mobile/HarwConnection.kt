@@ -37,6 +37,7 @@ import uniffi.harw_mobile_ffi.MobileSession
 import uniffi.harw_mobile_ffi.MobileSessionRow
 import uniffi.harw_mobile_ffi.MobileShareInfo
 import uniffi.harw_mobile_ffi.RoutePreference
+import uniffi.harw_mobile_ffi.ScannedProfile
 import uniffi.harw_mobile_ffi.ServerProfile
 import uniffi.harw_mobile_ffi.SessionCursor
 import uniffi.harw_mobile_ffi.SessionSnapshot
@@ -328,15 +329,8 @@ internal class HarwConnection(private val context: Context) {
         }.use(::readProfileDocument)
     }
 
-    fun importProfilePhoto(file: File) {
-        val accepted = importProfileDocument("Scan server profile") {
-            try {
-                decodeProfileQr(readPairingPhoto(file))
-            } finally {
-                discardPairingPhoto(file)
-            }
-        }
-        if (!accepted) scope.launch(Dispatchers.IO) { discardPairingPhoto(file) }
+    fun importScannedProfile(scanned: ScannedProfile) {
+        importProfileDocument("Scan server profile") { scanned.documentJson }
     }
 
     fun showEnrollmentQr(onPreview: (Bitmap) -> Unit) = setup("Show enrollment QR") {
@@ -401,7 +395,7 @@ internal class HarwConnection(private val context: Context) {
     }
 
     fun reportCameraUnavailable() {
-        change { it.copy(setupError = "Android could not open the camera. You can import the profile file.") }
+        change { it.copy(setupError = "Camera access is needed to scan. You can import the profile file instead.") }
     }
 
     fun reportServiceError(error: Exception) {

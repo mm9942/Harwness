@@ -13,6 +13,7 @@ mod projection;
 mod provider;
 mod providers;
 mod secrets;
+mod qr;
 mod types;
 
 pub use core::MobileCore;
@@ -31,6 +32,7 @@ pub use provider::{ChatgptProviderCredential, ChatgptProviderStatus};
 pub use providers::ProviderStore;
 pub use secrets::{KeystoreError, KeystoreSecretResolver, PlatformKeystore};
 pub use types::*;
+pub use qr::{decode_pairing_text, scan_pairing_frame, ScannedProfile};
 
 uniffi::setup_scaffolding!();
 

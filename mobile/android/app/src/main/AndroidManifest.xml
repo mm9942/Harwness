@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RUN_USER_INITIATED_JOBS" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <application
         android:name=".HarwApplication"
@@ -43,16 +45,6 @@
             android:name=".SessionWindowActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
-
-        <provider
-            android:name=".PairingCameraFileProvider"
-            android:authorities="dev.harw.mobile.pairing-camera"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/pairing_camera_paths" />
-        </provider>
 
         <service
             android:name=".HarwConnectionService"
