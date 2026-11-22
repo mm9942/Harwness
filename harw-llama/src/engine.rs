@@ -196,7 +196,7 @@ mod real {
     };
     use llama_cpp_2::sampling::LlamaSampler;
 
-    use super::{EngineConfig, FinishReason, GenerateStats, SamplingParams, default_threads};
+    use super::{EngineConfig, FinishReason, GenerateStats, SamplingParams, StopFilter, default_threads};
     use crate::error::LlamaError;
     use crate::stream::Utf8Stream;
 
@@ -462,6 +462,8 @@ mod real {
                 LlamaSampler::greedy()
             } else {
                 let mut chain = Vec::new();
+                // Wiederholungsbremse: kleine Modelle (4B) laufen sonst in Schleifen ("Ich schau kurz ...").
+                chain.push(LlamaSampler::penalties(self.model.n_vocab(), 256, 1.08, 0.0, 0.4));
                 if sampling.top_k > 0 {
                     chain.push(LlamaSampler::top_k(sampling.top_k));
                 }
@@ -477,6 +479,7 @@ mod real {
             };
 
             let mut decoder = Utf8Stream::default();
+            let mut stop_filter = StopFilter::default();
             let mut generated: u64 = 0;
             let finish = loop {
                 if should_stop() {
@@ -495,8 +498,12 @@ mod real {
                 generated += 1;
                 // `special = true`: render `<think>`/`<tool_call>` even if flagged special.
                 let text = decoder.push(&vocab.token_to_piece(token, true, None));
-                if !text.is_empty() {
-                    on_text(&text);
+                let (emit, hit_stop) = stop_filter.push(&text);
+                if !emit.is_empty() {
+                    on_text(&emit);
+                }
+                if hit_stop {
+                    break FinishReason::EndOfGeneration;
                 }
                 batch.clear();
                 batch.add(token, pos, &[0], true).map_err(generate_error)?;
@@ -535,5 +542,42 @@ mod real {
                 mmproj.display()
             )),
         }
+    }
+}
+
+/// Textuelle Endmarken, die manche Modelle als normalen Text ausgeben (statt als Sondertoken).
+const STOP_STRINGS: [&str; 5] = ["<|eos|>", "<|im_end|>", "<|endoftext|>", "</s>", "<|end|>"];
+
+/// Filtert Endmarken aus dem Textstrom, auch wenn sie sich auf mehrere Token verteilen.
+#[derive(Default)]
+struct StopFilter {
+    held: String,
+}
+
+impl StopFilter {
+    /// Gibt (auszugebender Text, Endmarke gefunden) zurück; ein möglicher Marken-Anfang wird zurückgehalten.
+    fn push(&mut self, text: &str) -> (String, bool) {
+        self.held.push_str(text);
+        for stop in STOP_STRINGS {
+            if let Some(at) = self.held.find(stop) {
+                let emit = self.held[..at].to_owned();
+                self.held.clear();
+                return (emit, true);
+            }
+        }
+        // Längstes Ende von `held`, das ein Anfang einer Endmarke sein könnte, zurückhalten.
+        let mut keep = 0;
+        for stop in STOP_STRINGS {
+            for len in (1..stop.len()).rev() {
+                if self.held.len() >= len && self.held.is_char_boundary(self.held.len() - len) && self.held.ends_with(&stop[..len]) {
+                    keep = keep.max(len);
+                    break;
+                }
+            }
+        }
+        let cut = self.held.len() - keep;
+        let emit = self.held[..cut].to_owned();
+        self.held = self.held[cut..].to_owned();
+        (emit, false)
     }
 }

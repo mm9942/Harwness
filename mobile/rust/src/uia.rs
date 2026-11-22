@@ -346,6 +346,47 @@ fn quote_block(text: &str) -> String {
         .join("\n")
 }
 
+const PERSONA_HEADING: &str = "## Wer du bist";
+
+/// Klarer Namensanker am Anfang der Systemanweisung: kleine Modelle halten den Namen sonst für ein Projekt oder eine Figur.
+fn persona_block(name: &str) -> String {
+    format!(
+        "{PERSONA_HEADING}\n\nDu bist {name}. Das ist dein eigener Name, kein Projekt und keine Romanfigur. \
+         Antworte immer als {name}, in der Ich-Form und mit der Persönlichkeit weiter unten. \
+         Nenne dich {name}, wenn jemand nach deinem Namen fragt. \
+         Suche nicht in Dateien nach „{name}“, um herauszufinden, wer du bist.\n"
+    )
+}
+
+/// Ergänzt ältere `system.md`-Dateien (ohne Namensanker) um den Block direkt nach dem Titel.
+fn with_persona_anchor(text: &str) -> Option<String> {
+    if text.contains(PERSONA_HEADING) {
+        return None;
+    }
+    let (first, rest) = text.split_once('\n')?;
+    let name = first.strip_prefix("# ")?.trim();
+    if name.is_empty() || name == "Harw Phone" {
+        return None;
+    }
+    Some(format!("{first}\n\n{}\n{}", persona_block(name), rest.trim_start_matches('\n')))
+}
+
+/// Rüstet vorhandene UIA-Systemanweisungen beim Öffnen des App-Homes um den Namensanker nach (idempotent).
+pub(crate) fn upgrade_personas(profile_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(profile_dir.join("agents")) else {
+        return;
+    };
+    for dir in entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).take(MAX_PROFILES * 2) {
+        let path = dir.join("system.md");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(upgraded) = with_persona_anchor(&text) {
+            let _ = write_private_atomic(&path, upgraded.as_bytes());
+        }
+    }
+}
+
 fn render_system(clean: &CleanSetup) -> String {
     let base = TEMPLATE_SYSTEM.strip_prefix(TEMPLATE_TITLE).map_or_else(
         || TEMPLATE_SYSTEM.to_owned(),
@@ -364,7 +405,7 @@ fn render_system(clean: &CleanSetup) -> String {
     } else {
         quote_block(&clean.personality)
     };
-    let mut out = base.trim_end().to_owned();
+    let mut out = with_persona_anchor(base.trim_end()).unwrap_or_else(|| base.trim_end().to_owned());
     out.push_str("\n\n## Identität\n\n");
     out.push_str(&identity);
     out.push_str("\n\n## Persönlichkeit\n\n");

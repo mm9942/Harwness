@@ -67,6 +67,7 @@ impl AppHome {
             profile_dir,
         };
         app.scaffold()?;
+        crate::uia::upgrade_personas(app.profile_dir());
         Ok(app)
     }
 
