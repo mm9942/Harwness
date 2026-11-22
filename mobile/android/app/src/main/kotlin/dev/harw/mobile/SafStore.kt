@@ -35,6 +35,16 @@ internal fun normalizeSafPath(path: String): String {
     return trimmed
 }
 
+internal fun sha256Hex(data: ByteArray): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(data)
+    val hex = StringBuilder(digest.size * 2)
+    for (byte in digest) {
+        hex.append("0123456789abcdef"[(byte.toInt() shr 4) and 0xF])
+        hex.append("0123456789abcdef"[byte.toInt() and 0xF])
+    }
+    return hex.toString()
+}
+
 internal fun rootIdFor(uri: String): String {
     val digest = MessageDigest.getInstance("SHA-256").digest(uri.toByteArray(Charsets.UTF_8))
     val hex = StringBuilder(digest.size * 2)
@@ -166,6 +176,25 @@ internal class SafStore(private val context: Context) : FileAccess {
             discard(created)
             throw e
         }
+    }
+
+    /**
+     * Overwrites an existing file for the in-app editor. Refuses with a conflict when the file
+     * changed since [expectedSha] (SHA-256 hex of the text that was loaded). Not part of the
+     * agent-facing [FileAccess]: agent writes stay create-only.
+     */
+    fun replace(rootId: String, path: String, data: ByteArray, expectedSha: String) = guard {
+        val normalized = normalizeSafPath(path)
+        if (data.size.toLong() > SAF_MAX_TRANSFER_BYTES) throw DeviceException.TooLarge()
+        if (normalized.isEmpty()) throw DeviceException.Invalid("path is a directory")
+        val tree = treeFor(rootId)
+        val child = resolveChild(tree, normalized)
+        if (child.isDir) throw DeviceException.Invalid("path is a directory")
+        val current = read(rootId, normalized, SAF_MAX_TRANSFER_BYTES.toULong())
+        if (sha256Hex(current) != expectedSha) throw DeviceException.Failed("conflict")
+        val uri = DocumentsContract.buildDocumentUriUsingTree(tree, child.docId)
+        val output = resolver.openOutputStream(uri, "wt") ?: throw DeviceException.Failed("i/o error")
+        output.use { it.write(data) }
     }
 
     private fun discard(uri: Uri) {

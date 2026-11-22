@@ -196,6 +196,7 @@ internal open class MainActivity : ComponentActivity() {
                 BackStep.Exit -> Unit
             }
         }
+        DeviceApprovalHost()
         // Step-up-Host: immer ueber allen Zweigen, auch im Hub. Nichts davon ueberlebt Prozesstod.
         state.manage.stepUp?.let { stepUp ->
             StepUpDialog(

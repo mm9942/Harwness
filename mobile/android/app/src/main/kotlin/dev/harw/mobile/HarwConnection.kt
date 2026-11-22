@@ -535,6 +535,7 @@ internal class HarwConnection(private val context: Context) {
                 val native = loadCore()
                 if (request != lifecycle) return@launch
                 val status = withContext(Dispatchers.IO) {
+                    DeviceTools.register(context, native)
                     native.connectLocal(context.filesDir.path, AndroidPlatformKeystore(context))
                     native.status()
                 }

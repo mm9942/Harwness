@@ -32,6 +32,7 @@ private const val TERMUX_PACKAGE = "com.termux"
 private const val TERMUX_PERMISSION = "com.termux.permission.RUN_COMMAND"
 private const val TERMUX_SERVICE = "com.termux.app.RunCommandService"
 private const val TERMUX_ACTION = "com.termux.RUN_COMMAND"
+private const val TERMUX_BASH = "/data/data/com.termux/files/usr/bin/bash"
 private const val TERMUX_HOME = "/data/data/com.termux/files/home/"
 private const val TERMUX_NO_ERROR = -1
 private const val APPROVAL_TIMEOUT_MS = 60_000L
@@ -129,6 +130,32 @@ internal class TermuxBridge(
         val approved = runBlocking { withTimeoutOrNull(APPROVAL_TIMEOUT_MS) { approver.approve(request.argv, request.cwd) } }
         if (approved != true) throw DeviceException.Declined()
         return execute(request)
+    }
+
+    /**
+     * Opens an interactive Termux terminal session running [shellCommand] (fixed launchers such
+     * as "exec bash -l", "exec claude", "exec codex"). The person tapped the launcher, so there is
+     * no extra approval; the agent never uses this path.
+     */
+    fun launchInteractive(shellCommand: String) {
+        if (!termuxInstalled()) throw DeviceException.Unavailable("Termux is not installed")
+        if (!permissionGranted()) throw DeviceException.Unavailable("Termux RUN_COMMAND permission missing")
+        val intent =
+            Intent(TERMUX_ACTION).apply {
+                setClassName(TERMUX_PACKAGE, TERMUX_SERVICE)
+                putExtra("com.termux.RUN_COMMAND_PATH", TERMUX_BASH)
+                putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-l", "-c", shellCommand))
+                putExtra("com.termux.RUN_COMMAND_WORKDIR", TERMUX_HOME)
+                putExtra("com.termux.RUN_COMMAND_BACKGROUND", false)
+                putExtra("com.termux.RUN_COMMAND_SESSION_ACTION", "0")
+            }
+        try {
+            context.startService(intent)
+        } catch (_: SecurityException) {
+            throw DeviceException.Unavailable("Termux RUN_COMMAND permission missing")
+        } catch (_: IllegalStateException) {
+            throw DeviceException.Unavailable("Termux could not start")
+        }
     }
 
     private fun termuxInstalled(): Boolean =
