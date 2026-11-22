@@ -124,6 +124,12 @@ impl AppHome {
         &self.workspace
     }
 
+    /// Folder of the local projects: every folder in it is a project.
+    #[cfg(feature = "local-host")]
+    pub(crate) fn projects_dir(&self) -> PathBuf {
+        self.home.join("projects")
+    }
+
     pub(crate) fn state_dir(&self) -> &Path {
         &self.state_dir
     }

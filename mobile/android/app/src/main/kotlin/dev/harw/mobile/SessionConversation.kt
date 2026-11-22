@@ -803,27 +803,73 @@ internal fun ApprovalDecision.displayName() = when (this) {
 
 private val ShortTime = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT)
 
+/** Zweistufiger Modellwechsel fuer Cloud-Sessions: erst Provider, dann Modell aus dem Katalog; gilt ab der naechsten Nachricht. */
 @Composable
 private fun ModelSwitchSheet(state: WorkspaceState, connection: HarwConnection, sessionId: String, active: Boolean) {
     val manage = state.manage
-    val models = switchableModels(manage.catalog?.models.orEmpty()) { it.lifecycle }
+    val catalog = manage.catalog
+    val models = switchableModels(catalog?.models.orEmpty()) { it.lifecycle }
     val allowed = modelChipBlock(manage.support, active) == null
-    val running = manage.running != null
+    var provider by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val providers = models.groupBy { it.provider }
     Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text("Modell wechseln", style = MaterialTheme.typography.titleMedium)
-        manage.card?.let { CommandResultCard(card = it, onClose = connection::clearCommandCard) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (provider == null) "Provider wählen" else "Modell wählen",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
+            if (provider != null) TextButton(onClick = { provider = null; error = null }) { Text("Zurück") }
+        }
+        Text(
+            "Aktuell: " + modelChipLabel(null, catalog?.liveModel, catalog?.liveProvider) + " · gilt ab der nächsten Nachricht.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         manage.catalogError?.let { StatusMessage(it, error = true) }
+        error?.let { StatusMessage(it, error = true) }
         if (models.isEmpty()) {
             StatusMessage("Keine Modelle im Katalog.")
-        } else {
+        } else if (provider == null) {
             LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
-                items(models, key = { "${it.provider}/${it.id}" }) { model ->
-                    val line = modelSwitchLine(model.provider, model.id)
-                    val live = manage.catalog?.liveProvider == model.provider && manage.catalog?.liveModel == model.id
+                items(providers.keys.toList(), key = { it }) { name ->
+                    val live = catalog?.liveProvider == name
                     Row(
                         Modifier.fillMaxWidth()
-                            .selectable(selected = live, enabled = allowed && !running && line != null, role = Role.RadioButton) {
-                                if (line != null) connection.runCommand(sessionId, line)
+                            .selectable(selected = live, enabled = allowed && !busy, role = Role.Button) { provider = name }
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        RadioButton(selected = live, onClick = null)
+                        Column(Modifier.weight(1f)) {
+                            Text(name, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "${providers[name]?.size ?: 0} Modell(e)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            val chosen = provider.orEmpty()
+            LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                items(providers[chosen].orEmpty(), key = { "${it.provider}/${it.id}" }) { model ->
+                    val line = modelSwitchLine(model.provider, model.id)
+                    val live = catalog?.liveProvider == model.provider && catalog.liveModel == model.id
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .selectable(selected = live, enabled = allowed && !busy && line != null, role = Role.RadioButton) {
+                                busy = true
+                                error = null
+                                connection.setSessionModel(sessionId, "${model.provider}/${model.id}") { failure ->
+                                    busy = false
+                                    error = failure
+                                }
                             }
                             .padding(vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,

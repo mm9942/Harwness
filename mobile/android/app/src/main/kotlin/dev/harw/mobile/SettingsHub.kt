@@ -162,6 +162,8 @@ internal fun SettingsHub(
     var showReasoning by remember { mutableStateOf(readShowReasoningPref(context)) }
     var editing by remember { mutableStateOf<ManageConfigEntry?>(null) }
     val block = manageOpenBlock(state)
+    var modelsFolderOpen by remember { mutableStateOf(false) }
+    var modelsFolderRevision by remember { mutableStateOf(0) }
 
     Column(Modifier.fillMaxSize()) {
         HarwHeader(title = "Einstellungen", onBack = onBack) {}
@@ -176,6 +178,7 @@ internal fun SettingsHub(
             HubRow("Agents", "Agents der Sitzung", null) { onOpen(SettingsRoute.Agents) }
             HubRow("Jobs", "Hintergrund-Jobs der Sitzung", null) { onOpen(SettingsRoute.Jobs) }
             HubRow("Lokale Modelle", "GGUF-Modelle laden oder importieren", null) { onOpen(SettingsRoute.LocalModels) }
+            HubRow("Ordner für lokale Modelle", modelsFolderLabel(context, modelsFolderRevision), null) { modelsFolderOpen = true }
             HubRow("Dateien", "Ordner dieses Geräts freigeben und durchsuchen", null) { onOpen(SettingsRoute.Files) }
             HubRow("Termux", "Befehle in Termux ausführen", null) { onOpen(SettingsRoute.Termux) }
 
@@ -238,6 +241,14 @@ internal fun SettingsHub(
         }
     }
 
+    if (modelsFolderOpen) {
+        ModelsFolderDialog(
+            context = context,
+            onDismiss = { modelsFolderOpen = false },
+            onChanged = { modelsFolderRevision++ },
+        )
+    }
+
     editing?.let { entry ->
         ConfigEditDialog(
             entry = entry,
@@ -253,6 +264,100 @@ internal fun SettingsHub(
             },
         )
     }
+}
+
+/** Untertitel der Zeile "Ordner für lokale Modelle": aktueller Pfad, Zusatz bei eigener Wahl. */
+private fun modelsFolderLabel(context: Context, @Suppress("UNUSED_PARAMETER") revision: Int): String = try {
+    val store = ModelStore(context)
+    val custom = store.customDir()
+    if (custom != null) "${custom.path} (eigener Ordner)" else "${store.defaultDir().path} (Standard)"
+} catch (_: Exception) {
+    "Ordner unbekannt"
+}
+
+/** Tree-URI des Dokumentenpickers -> Dateipfad im internen Speicher; `null` bei anderen Speichern. */
+private fun treeUriToPath(uri: android.net.Uri): String? {
+    val docId = try {
+        android.provider.DocumentsContract.getTreeDocumentId(uri)
+    } catch (_: Exception) {
+        return null
+    }
+    val (volume, rel) = docId.split(":", limit = 2).let { it[0] to it.getOrElse(1) { "" } }
+    if (volume != "primary") return null
+    val root = android.os.Environment.getExternalStorageDirectory()
+    return if (rel.isEmpty()) root.path else java.io.File(root, rel).path
+}
+
+@Composable
+private fun ModelsFolderDialog(context: Context, onDismiss: () -> Unit, onChanged: () -> Unit) {
+    val store = remember { ModelStore(context) }
+    var path by remember { mutableStateOf((store.customDir() ?: store.defaultDir()).path) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var ggufCount by remember { mutableStateOf<Int?>(null) }
+    val picker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree(),
+    ) { uri ->
+        if (uri != null) {
+            val picked = treeUriToPath(uri)
+            if (picked == null) error = "Nur Ordner im internen Speicher des Geräts sind möglich." else {
+                path = picked
+                error = null
+            }
+        }
+    }
+    LaunchedEffect(path) {
+        ggufCount = try {
+            java.io.File(path).listFiles { f -> f.isFile && f.name.endsWith(".gguf", ignoreCase = true) }?.size
+        } catch (_: Exception) {
+            null
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Ordner für lokale Modelle") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Alle GGUF-Dateien in diesem Ordner erscheinen unter „Auf diesem Gerät“. " +
+                        "Ein neues Modell muss danach erneut gewählt werden.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(
+                    value = path,
+                    onValueChange = { path = it.replace("\n", "").replace("\r", ""); error = null },
+                    singleLine = true,
+                    label = { Text("Pfad") },
+                    supportingText = {
+                        Text(ggufCount?.let { "$it GGUF-Datei(en) gefunden" } ?: "Ordner nicht lesbar oder neu")
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextButton(onClick = { picker.launch(null) }) { Text("Ordner wählen …") }
+                TextButton(onClick = { path = store.dirFor(store.location).path; error = null }) {
+                    Text("Standard verwenden")
+                }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val dir = java.io.File(path.trim())
+                    val isDefault = dir.absolutePath == store.dirFor(store.location).absolutePath
+                    when {
+                        path.isBlank() || !dir.isAbsolute -> error = "Bitte einen absoluten Pfad angeben."
+                        !store.probeDir(dir) -> error = "Der Ordner ist nicht beschreibbar (Speicherzugriff prüfen)."
+                        else -> {
+                            store.setCustomDir(if (isDefault) null else dir)
+                            onChanged()
+                            onDismiss()
+                        }
+                    }
+                },
+            ) { Text("Übernehmen") }
+        },
+    )
 }
 
 @Composable

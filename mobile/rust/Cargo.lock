@@ -3305,6 +3305,7 @@ dependencies = [
  "harw-authority",
  "harw-core",
  "harw-extension-api",
+ "harw-protocol",
  "harw-registry-defaults",
  "harw-runtime",
  "harw-session-driver",
@@ -3312,6 +3313,7 @@ dependencies = [
  "harw-session-store",
  "harw-tools",
  "harw-types",
+ "jiff 0.2.37",
  "thiserror 2.0.21",
 ]
 

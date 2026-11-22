@@ -33,9 +33,8 @@ import androidx.compose.ui.unit.dp
 import java.text.Normalizer
 import uniffi.harw_mobile_ffi.MobileProject
 
-internal const val LocalNoProjectsText =
-    "Lokal gibt es keine Projekte: Der On-Device-Host kennt das Projekt-Feature nicht. " +
-        "Die Session bleibt ohne Projekt, der Titel wird aus der Nachricht abgeleitet."
+internal const val NoProjectsSupportText =
+    "Dieser Host kennt keine Projekte. Die Session bleibt ohne Projekt, der Titel wird aus der Nachricht abgeleitet."
 
 internal const val ServerCreatesNoProjectsText =
     "Der Server legt Projekte nicht selbst an: Ein Projekt entsteht aus einem vorhandenen Ordner mit " +
@@ -103,7 +102,7 @@ internal fun NewChatSheet(
     var message by rememberSaveable { mutableStateOf("") }
     var menu by rememberSaveable { mutableStateOf(false) }
     val real = projects.filter { it.projectKey != NoProjectKey }
-    val choice = if (local) null else picked
+    val choice = picked
     val topicMode = choice == null
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -118,27 +117,19 @@ internal fun NewChatSheet(
                 LocalModelChip()
             }
             Text("Projekt", style = MaterialTheme.typography.labelLarge)
-            if (local) {
-                Text(
-                    "Lokal gibt es keine Projekte.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+            OutlinedButton(onClick = { menu = true }, modifier = Modifier.fillMaxWidth()) {
+                Text(real.firstOrNull { it.projectKey == choice }?.displayLabel() ?: "Kein Projekt – neues zum Thema anlegen")
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(
+                    text = { Text("Kein Projekt – neues zum Thema anlegen") },
+                    onClick = { picked = null; menu = false },
                 )
-            } else {
-                OutlinedButton(onClick = { menu = true }, modifier = Modifier.fillMaxWidth()) {
-                    Text(real.firstOrNull { it.projectKey == choice }?.displayLabel() ?: "Kein Projekt – neues zum Thema anlegen")
-                }
-                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                for (project in real) {
                     DropdownMenuItem(
-                        text = { Text("Kein Projekt – neues zum Thema anlegen") },
-                        onClick = { picked = null; menu = false },
+                        text = { Text(project.displayLabel()) },
+                        onClick = { picked = project.projectKey; menu = false },
                     )
-                    for (project in real) {
-                        DropdownMenuItem(
-                            text = { Text(project.displayLabel()) },
-                            onClick = { picked = project.projectKey; menu = false },
-                        )
-                    }
                 }
             }
             OutlinedTextField(
@@ -149,7 +140,7 @@ internal fun NewChatSheet(
                 maxLines = 6,
                 label = { Text(if (topicMode) "Erste Nachricht (bestimmt das Thema)" else "Erste Nachricht (optional)") },
             )
-            if (topicMode && !local) {
+            if (topicMode) {
                 Text(
                     "Aus der ersten Nachricht wird ein Projektname abgeleitet und die Session dem Projekt zugewiesen.",
                     style = MaterialTheme.typography.bodySmall,
@@ -158,7 +149,7 @@ internal fun NewChatSheet(
             }
             Button(
                 onClick = { onStart(choice, message.trim()) },
-                enabled = canStart && !busy && (!topicMode || local || message.isNotBlank()),
+                enabled = canStart && !busy && (!topicMode || message.isNotBlank()),
                 modifier = Modifier.fillMaxWidth(),
             ) { Text(if (busy) "Startet …" else "Starten") }
         }

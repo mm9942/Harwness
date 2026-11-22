@@ -223,7 +223,7 @@ internal open class MainActivity : ComponentActivity() {
         }
         DeviceApprovalHost()
         // Verwalten ist eine Server-Funktion: Hub, Modelle und Befehle sprechen immer mit der Cloud,
-        // auch wenn gerade die Lokal-Ansicht offen ist (der On-Device-Host kennt weder Verwaltung noch Projekte).
+        // auch wenn gerade die Lokal-Ansicht offen ist (der On-Device-Host kennt keine Verwaltung).
         val manageRoute = settingsRoute == SettingsRoute.Hub || settingsRoute == SettingsRoute.Models ||
             settingsRoute == SettingsRoute.Providers || settingsRoute == SettingsRoute.Commands
         val manageConnection = if (manageRoute) cloud else connection
@@ -368,7 +368,7 @@ internal open class MainActivity : ComponentActivity() {
                 onDismissPlanNotice = cloud::dismissChatgptPlanNotice,
                 onManageChatgpt = ::openChatgptUsage,
             )
-        } else if (projectKey == null && sessionId == null && !state.local) {
+        } else if (projectKey == null && sessionId == null) {
             LaunchedEffect(state.online, state.generation) { if (state.online) connection.refreshProjects() }
             Box(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize()) {
@@ -378,7 +378,7 @@ internal open class MainActivity : ComponentActivity() {
                         Icon(Icons.Outlined.Settings, "Einstellungen")
                     }
                 }
-                BackendSwitch(local = false, enabled = !state.stopping, onSelect = { viewChosen = true; viewLocal = it })
+                BackendSwitch(local = state.local, enabled = !state.stopping, onSelect = { viewChosen = true; viewLocal = it })
                 ProjectsScreen(
                     onNewProject = { newProjectOpen = true },
                     projects = state.projects,
@@ -432,6 +432,7 @@ internal open class MainActivity : ComponentActivity() {
         if (newChatOpen) {
             val target = if (sheetLocal) onDevice else cloud
             val targetState = if (sheetLocal) localState else cloudState
+            LaunchedEffect(sheetLocal, targetState.online) { if (targetState.online) target.refreshProjects() }
             NewChatSheet(
                 local = sheetLocal,
                 projects = targetState.projects,

@@ -602,11 +602,11 @@ internal class HarwConnection(private val context: Context, private val localBac
                     } else {
                         native.createSession(null)
                     }
-                    if (existing != null && !supported) note = LocalNoProjectsText
+                    if (existing != null && !supported) note = NoProjectsSupportText
                     if (existing == null && topic.isNotBlank()) {
                         val slug = slugify(topic)
                         if (!supported) {
-                            note = LocalNoProjectsText
+                            note = NoProjectsSupportText
                         } else {
                             try {
                                 native.setProject(created.sessionId, slug)
@@ -657,8 +657,8 @@ internal class HarwConnection(private val context: Context, private val localBac
             result("Keine Verbindung oder keine Berechtigung zum Anlegen.")
             return
         }
-        if (current.local || !current.projectsSupported) {
-            result(LocalNoProjectsText)
+        if (!current.projectsSupported) {
+            result(NoProjectsSupportText)
             return
         }
         commands.launch {
@@ -992,6 +992,24 @@ internal class HarwConnection(private val context: Context, private val localBac
 
     fun clearCommandCard() {
         changeManage { it.copy(card = null) }
+    }
+
+    /** Setzt das Modell einer Cloud-Session (`session.set_model`, `<provider>/<modell>`); gilt ab der naechsten Nachricht. */
+    fun setSessionModel(sessionId: String, model: String, onDone: (String?) -> Unit = {}) {
+        val generation = gate.generation ?: return onDone("Keine Verbindung")
+        val native = core ?: return onDone("Keine Verbindung")
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { native.setSessionModel(sessionId, model) }
+                if (generation == gate.generation) {
+                    refreshCatalog(sessionId)
+                    onDone(null)
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) onDone("Modellwechsel: ${error.displayMessage()}")
+            }
+        }
     }
 
     fun refreshCatalog(sessionId: String?) {

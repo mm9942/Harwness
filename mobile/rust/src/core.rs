@@ -8,7 +8,7 @@ use harw_node_transport::{LocalNode, NodeBody, empty_body};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams,
     Cursor, DEFAULT_TAIL_ITEMS, HolderInfo, InterruptParams, PageParams, ProjectsParams,
-    RenameParams, RespondResult, SessionFrame, SetProjectParams, StreamProfile, SubmitImage,
+    RenameParams, RespondResult, SessionFrame, SetModelParams, SetProjectParams, StreamProfile, SubmitImage,
     SubmitParams, SubmitResult, features,
 };
 use harw_protocol::{PortError, PortFuture, SessionPort};
@@ -681,6 +681,24 @@ impl MobileCore {
             )
             .await
             .map(Into::into)
+        })
+    }
+
+    /// `session.set_model`: `model` is `<provider>/<modell>`; applies from the next message of the session.
+    pub fn set_session_model(
+        &self,
+        session_id: String,
+        model: String,
+    ) -> Result<(), MobileError> {
+        let session_id = parse_session_id(session_id)?;
+        let link = self.shared.state().active()?;
+        self.run(async move {
+            link.request(
+                link.backend
+                    .port()
+                    .set_model(SetModelParams { session_id, model }),
+            )
+            .await
         })
     }
 
@@ -1691,12 +1709,6 @@ fn requested_features() -> Vec<String> {
 }
 
 fn link_supports_projects(link: &Link) -> bool {
-    // The on-device host grants the feature on the wire but holds no profile
-    // share, so every project call there ends in "Dieses Gateway teilt keine
-    // TUI-Sessions". Projects live on the gateway only.
-    if link.backend.kind() == crate::backend::BackendKind::Local {
-        return false;
-    }
     link.backend
         .ack()
         .features

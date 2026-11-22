@@ -4487,6 +4487,7 @@ dependencies = [
  "harw-session-store",
  "harw-tools",
  "harw-types",
+ "jiff 0.2.37",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

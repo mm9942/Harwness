@@ -44,6 +44,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod projects;
+pub use projects::FolderProfileIndex;
+
 use harw_authority::FileWriteScope;
 use harw_core::{AgentSession, ModelProvider, StateStore, TranscriptStateStore};
 use harw_registry_defaults::{IdentityOverrides, RegistryProfile};
@@ -226,7 +229,12 @@ pub struct LocalCoreFactory {
     contributors: Vec<Arc<dyn AssemblyContributor>>,
     /// Model-visible tool surface; `None` = every registered tool.
     surface: Option<ToolSurface>,
+    /// Working directory per session (project folder); `None` answer = `base_spec.cwd`.
+    session_cwd: Option<SessionCwdResolver>,
 }
+
+/// Resolves the working directory of a hosted session (its project folder).
+pub type SessionCwdResolver = Arc<dyn Fn(&SessionId) -> Option<PathBuf> + Send + Sync>;
 
 impl std::fmt::Debug for LocalCoreFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -279,7 +287,16 @@ impl LocalCoreFactory {
             actor: None,
             contributors: Vec::new(),
             surface: None,
+            session_cwd: None,
         }
+    }
+
+    /// Runs each session in the directory `resolver` names for it (its
+    /// project folder); no answer keeps the default workspace.
+    #[must_use]
+    pub fn with_session_cwd(mut self, resolver: SessionCwdResolver) -> Self {
+        self.session_cwd = Some(resolver);
+        self
     }
 
     /// Narrows the tools the model sees in every hosted session.
@@ -330,10 +347,13 @@ impl LocalCoreFactory {
         let principal = admission
             .map(|admission| admission.principal_with_ceiling(self.rights.tier))
             .unwrap_or_else(|| self.base_spec.principal.clone());
-        let spec = RuntimeSpec {
+        let mut spec = RuntimeSpec {
             principal,
             ..self.base_spec.clone()
         };
+        if let Some(cwd) = self.session_cwd.as_ref().and_then(|resolve| resolve(session_id)) {
+            spec.cwd = cwd;
+        }
         let mut builder = RuntimeAssembly::builder(spec)
             .model(ModelSource::Override(Arc::clone(&self.model)))
             .stores(RuntimeStores {
@@ -479,6 +499,9 @@ pub fn open_durable_stores(
     })
 }
 
+/// Tenant of the on-device share (the local owner sees every row).
+const LOCAL_TENANT: &str = "phone";
+
 /// Layout and policy of a local host.
 #[derive(Clone, Debug)]
 pub struct LocalHostConfig {
@@ -590,6 +613,22 @@ impl LocalHost {
         contributors: Vec<Arc<dyn AssemblyContributor>>,
         surface: Option<ToolSurface>,
     ) -> Result<Self, LocalHostError> {
+        Self::open_with_projects(config, model, contributors, surface, None)
+    }
+
+    /// Like [`Self::open_with_surface`], with a folder-based project index:
+    /// every folder below `projects_root` is a project (`None` = no projects).
+    /// Sessions can be created in a project and then run in its folder.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    pub fn open_with_projects(
+        config: LocalHostConfig,
+        model: Arc<dyn ModelProvider>,
+        contributors: Vec<Arc<dyn AssemblyContributor>>,
+        surface: Option<ToolSurface>,
+        projects_root: Option<PathBuf>,
+    ) -> Result<Self, LocalHostError> {
         std::fs::create_dir_all(&config.workspace).map_err(|error| {
             LocalHostError::Setup(format!("{}: {error}", config.workspace.display()))
         })?;
@@ -607,17 +646,46 @@ impl LocalHost {
         if let Some(surface) = surface {
             factory = factory.with_tool_surface(surface);
         }
+        let index = projects_root.map(|root| {
+            // Best effort: a missing folder is created on first use.
+            let _ = std::fs::create_dir_all(&root);
+            Arc::new(FolderProfileIndex::new(sessions_root.clone(), root))
+        });
+        if let Some(index) = &index {
+            let index = Arc::clone(index);
+            factory = factory.with_session_cwd(Arc::new(move |id: &SessionId| {
+                harw_session_host::ProfileIndex::workdir(&*index, id).ok().flatten()
+            }));
+        }
         let driver = CoreTurnDriver::with_factory(
             CoreDriverConfig::new(sessions_root),
             Arc::new(factory),
         )
         .map_err(|error| LocalHostError::Setup(format!("session driver: {error}")))?;
-        let host = SessionHost::open(
-            HostConfig::new(host_state_dir),
-            Arc::new(driver),
-            stores.transcripts,
-            stores.approvals,
-        )
+        let host = match index {
+            None => SessionHost::open(
+                HostConfig::new(host_state_dir),
+                Arc::new(driver),
+                stores.transcripts,
+                stores.approvals,
+            ),
+            Some(index) => SessionHost::open_with_profile(
+                HostConfig::new(host_state_dir),
+                Arc::new(driver),
+                stores.transcripts,
+                stores.approvals,
+                harw_session_host::ToolHost::disabled(),
+                harw_session_host::ProfileShare {
+                    settings: harw_session_host::ShareSettings {
+                        mode: harw_session_host::ShareMode::Continue,
+                        tenant: harw_types::TenantId::from_str(LOCAL_TENANT),
+                        legacy_rows: 100,
+                        listener_tier: PermissionTier::Owner,
+                    },
+                    index,
+                },
+            ),
+        }
         .map_err(|error| LocalHostError::Host(error.to_string()))?;
         Ok(Self {
             host,

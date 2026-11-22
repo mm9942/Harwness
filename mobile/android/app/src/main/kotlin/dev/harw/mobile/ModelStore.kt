@@ -20,6 +20,7 @@ internal const val HiddenAppDir = ".harw"
 internal const val VisibleAppDir = "harw"
 internal const val ModelStorePrefs = "harw_models"
 internal const val PrefLocation = "location"
+internal const val PrefCustomDir = "custom_dir" // user-chosen models folder, overrides the location
 internal const val PrefWifiOnly = "wifi_only" // default true, used by ModelDownloadJob
 internal const val ProbePrefix = ".harw-probe-"
 
@@ -58,7 +59,40 @@ internal class ModelStore(context: Context) {
     val location: ModelLocation
         get() = locationFromKey(prefs.getString(PrefLocation, null)) ?: select()
 
-    fun modelsDir(): File = dirFor(location).also { it.mkdirs() }
+    /** Folder chosen in the settings, `null` = the default place ([location]). */
+    fun customDir(): File? =
+        prefs.getString(PrefCustomDir, null)?.takeIf { it.isNotBlank() }?.let { File(it) }
+
+    /** Saves [dir] as the models folder (`null` = back to the default). */
+    fun setCustomDir(dir: File?) {
+        prefs.edit().apply {
+            if (dir == null) remove(PrefCustomDir) else putString(PrefCustomDir, dir.absolutePath)
+        }.apply()
+    }
+
+    /** The default folder (Documents/.harw/models or its fallback), ignoring a custom choice. */
+    fun defaultDir(): File = dirFor(location)
+
+    /** Creates [dir], writes a probe file and removes it again. */
+    fun probeDir(dir: File): Boolean {
+        var probe: File? = null
+        return try {
+            if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) return false
+            val file = File(dir, ProbePrefix + System.currentTimeMillis())
+            probe = file
+            file.outputStream().use { it.write(ByteArray(ProbeBytes)) }
+            true
+        } catch (_: Exception) {
+            false
+        } finally {
+            try {
+                probe?.delete()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun modelsDir(): File = (customDir() ?: dirFor(location)).also { it.mkdirs() }
 
     fun dirFor(location: ModelLocation): File =
         modelsDirFor(location, documentsRoot, app.filesDir)

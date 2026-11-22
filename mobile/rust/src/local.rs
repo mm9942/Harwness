@@ -254,8 +254,15 @@ async fn open_local_with_tools(
     };
 
     let config = home.local_host_config();
+    let projects_root = Some(home.projects_dir());
     let host = tokio::task::spawn_blocking(move || {
-        harw_local_host::LocalHost::open_with_surface(config, model, contributors, surface)
+        harw_local_host::LocalHost::open_with_projects(
+            config,
+            model,
+            contributors,
+            surface,
+            projects_root,
+        )
     })
     .await
     .map_err(|_| host_task_failed())?
