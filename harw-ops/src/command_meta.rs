@@ -1549,12 +1549,12 @@ const GOAL: RemotePolicy = RemotePolicy {
     verbs: &[RemoteVerb::read(&["-"]), RemoteVerb::read(&["show", "-"])],
     denied_tokens: NO_DENIED,
 };
-const PLAN: RemotePolicy = RemotePolicy {
+const PLAN_REMOTE: RemotePolicy = RemotePolicy {
     path: "/plan",
     verbs: &[RemoteVerb::read(&["show", "-"])],
     denied_tokens: NO_DENIED,
 };
-const MEMORY: RemotePolicy = RemotePolicy {
+const MEMORY_REMOTE: RemotePolicy = RemotePolicy {
     path: "/memory",
     verbs: &[RemoteVerb::read(&["list", "*"])],
     denied_tokens: NO_DENIED,
@@ -1568,7 +1568,7 @@ const SKILLS: RemotePolicy = RemotePolicy {
     ],
     denied_tokens: NO_DENIED,
 };
-const AGENT: RemotePolicy = RemotePolicy {
+const AGENT_REMOTE: RemotePolicy = RemotePolicy {
     path: "/agent",
     verbs: &[
         RemoteVerb::read(&["-"]),
@@ -1587,7 +1587,7 @@ const CANCEL: RemotePolicy = RemotePolicy {
     verbs: &[RemoteVerb::steer(&["*"], RemoteEffect::Applied)],
     denied_tokens: NO_DENIED,
 };
-const MODE: RemotePolicy = RemotePolicy {
+const MODE_REMOTE: RemotePolicy = RemotePolicy {
     path: "/mode",
     verbs: &[
         RemoteVerb::read(&["-"]),
@@ -1597,7 +1597,7 @@ const MODE: RemotePolicy = RemotePolicy {
     ],
     denied_tokens: NO_DENIED,
 };
-const EFFORT: RemotePolicy = RemotePolicy {
+const EFFORT_REMOTE: RemotePolicy = RemotePolicy {
     path: "/effort",
     verbs: &[
         RemoteVerb::read(&["-"]),
@@ -1606,7 +1606,7 @@ const EFFORT: RemotePolicy = RemotePolicy {
     ],
     denied_tokens: NO_DENIED,
 };
-const MODEL: RemotePolicy = RemotePolicy {
+const MODEL_REMOTE: RemotePolicy = RemotePolicy {
     path: "/model",
     verbs: &[
         RemoteVerb::read(&["-"]),
@@ -1626,15 +1626,15 @@ pub static REMOTE_POLICIES: &[&RemotePolicy] = &[
     &WORK,
     &DIFF,
     &GOAL,
-    &PLAN,
-    &MEMORY,
+    &PLAN_REMOTE,
+    &MEMORY_REMOTE,
     &SKILLS,
-    &AGENT,
+    &AGENT_REMOTE,
     &STOP,
     &CANCEL,
-    &MODE,
-    &EFFORT,
-    &MODEL,
+    &MODE_REMOTE,
+    &EFFORT_REMOTE,
+    &MODEL_REMOTE,
     &crate::models::REMOTE,
     &crate::jobs::REMOTE,
     &crate::settings::REMOTE,

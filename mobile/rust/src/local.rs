@@ -129,10 +129,10 @@ async fn open_local_with_tools(
         harw_local_host::LocalHost::open_with_contributors(config, model, contributors)
     })
     .await
-        .map_err(|_| host_task_failed())?
-        .map_err(|e| MobileError::Internal {
-            detail: e.to_string(),
-        })?;
+    .map_err(|_| host_task_failed())?
+    .map_err(|e| MobileError::Internal {
+        detail: e.to_string(),
+    })?;
     let connection = match host.connect_owner() {
         Ok(connection) => connection,
         Err(e) => {

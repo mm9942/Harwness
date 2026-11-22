@@ -113,9 +113,10 @@ impl ChatgptLocal {
         let credential = Zeroizing::new(credential);
         let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         validate(&credential)?;
-        let bytes = Zeroizing::new(serde_json::to_vec(&*credential).map_err(|_| {
-            denied("Die ChatGPT-Zugangsdaten konnten nicht kodiert werden")
-        })?);
+        let bytes = Zeroizing::new(
+            serde_json::to_vec(&*credential)
+                .map_err(|_| denied("Die ChatGPT-Zugangsdaten konnten nicht kodiert werden"))?,
+        );
         if bytes.len() > MAX_SECRET_BYTES {
             return Err(denied("Die ChatGPT-Zugangsdaten sind zu gross"));
         }
@@ -131,7 +132,9 @@ impl ChatgptLocal {
     /// Darf nicht auf der Async-Runtime laufen.
     pub fn list_models(&self) -> Result<Vec<String>, MobileError> {
         if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(internal("model discovery must not run on the async runtime"));
+            return Err(internal(
+                "model discovery must not run on the async runtime",
+            ));
         }
         {
             let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -151,7 +154,10 @@ impl ChatgptLocal {
         self.secrets
             .remove(CREDENTIAL_SLOT)
             .map_err(|e| internal(e.diagnostic()))?;
-        for path in [self.plan_file(), self.plan_file().with_extension("json.tmp")] {
+        for path in [
+            self.plan_file(),
+            self.plan_file().with_extension("json.tmp"),
+        ] {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -227,7 +233,10 @@ impl ChatgptLocal {
         let mut table = toml::Table::new();
         table.insert("name".into(), toml::Value::String(ROUTE_ID.into()));
         table.insert("api".into(), toml::Value::String(ROUTE_API.into()));
-        table.insert("base_url".into(), toml::Value::String(ROUTE_BASE_URL.into()));
+        table.insert(
+            "base_url".into(),
+            toml::Value::String(ROUTE_BASE_URL.into()),
+        );
         table.insert("models".into(), toml::Value::Array(Vec::new()));
         let text = toml::to_string(&table).map_err(|_| internal("could not render the route"))?;
         write_private_atomic(&path, text.as_bytes())
@@ -332,8 +341,14 @@ fn parse_doc(bytes: &[u8]) -> Option<PlanDoc> {
         linked: true,
         client_id,
         subject,
-        email: object.get("email").and_then(Value::as_str).map(str::to_owned),
-        expires_at: object.get("expires_at").and_then(Value::as_u64).unwrap_or(0),
+        email: object
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        expires_at: object
+            .get("expires_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -350,19 +365,25 @@ fn internal(detail: &str) -> MobileError {
 }
 
 fn token_ok(token: &str) -> bool {
-    !token.is_empty() && token.len() <= MAX_TOKEN_BYTES && token.bytes().all(|b| b.is_ascii_graphic())
+    !token.is_empty()
+        && token.len() <= MAX_TOKEN_BYTES
+        && token.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// Gleiche Regeln wie der Plan-Store (`harw-oauth`), damit der Provider die Datei annimmt.
 fn validate(credential: &ChatgptProviderCredential) -> Result<(), MobileError> {
-    let invalid = || denied("Die ChatGPT-Anmeldung lieferte ungueltige oder unzureichende Zugangsdaten");
-    let client_ok = credential.client_id.strip_prefix("oaiapp_").is_some_and(|id| {
-        !id.is_empty()
-            && id.len() <= 256
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-    });
+    let invalid =
+        || denied("Die ChatGPT-Anmeldung lieferte ungueltige oder unzureichende Zugangsdaten");
+    let client_ok = credential
+        .client_id
+        .strip_prefix("oaiapp_")
+        .is_some_and(|id| {
+            !id.is_empty()
+                && id.len() <= 256
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        });
     let scopes: Vec<&str> = credential.scope.split_ascii_whitespace().collect();
     let now = jiff::Timestamp::now().as_second();
     let expires = i64::try_from(credential.expires_at).ok();

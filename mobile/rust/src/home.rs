@@ -231,7 +231,10 @@ impl AppHome {
 
     /// Remembers where the on-device model files live (absolute path).
     pub(crate) fn set_local_models_dir(&self, dir: &str) -> Result<(), MobileError> {
-        write_private_atomic(&self.state_dir().join(LOCAL_MODELS_DIR_FILE), dir.as_bytes())
+        write_private_atomic(
+            &self.state_dir().join(LOCAL_MODELS_DIR_FILE),
+            dir.as_bytes(),
+        )
     }
 
     /// The models directory saved by [`Self::set_local_models_dir`].
@@ -267,7 +270,10 @@ impl AppHome {
     }
 
     /// Sets (`Some`) or clears (`None`) the explicit device-tools choice.
-    pub(crate) fn set_device_tools_setting(&self, enabled: Option<bool>) -> Result<(), MobileError> {
+    pub(crate) fn set_device_tools_setting(
+        &self,
+        enabled: Option<bool>,
+    ) -> Result<(), MobileError> {
         let path = self.state_dir().join(DEVICE_TOOLS_FILE);
         match enabled {
             Some(on) => write_private_atomic(&path, if on { b"on" } else { b"off" }),

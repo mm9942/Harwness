@@ -40,7 +40,7 @@ import uniffi.harw_mobile_ffi.DeviceException
 import uniffi.harw_mobile_ffi.SafEntry
 import uniffi.harw_mobile_ffi.SafRoot
 
-private const val PREVIEW_MAX_BYTES = 256UL * 1024UL
+private const val PREVIEW_MAX_BYTES = 262144UL
 private const val TRANSFER_MAX_BYTES = 8L * 1024 * 1024
 
 /** Offener Texteditor; [sha] ist null bei einer neuen Datei. */

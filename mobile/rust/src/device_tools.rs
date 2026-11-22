@@ -115,7 +115,9 @@ mod tools {
 
     fn root_id(raw: String) -> Result<String, Fail> {
         if raw.is_empty() || raw.len() > MAX_ROOT_ID_BYTES || raw.contains('\0') {
-            return Err(Fail::Args("root must be an id from device_roots".to_owned()));
+            return Err(Fail::Args(
+                "root must be an id from device_roots".to_owned(),
+            ));
         }
         Ok(raw)
     }

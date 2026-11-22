@@ -140,7 +140,10 @@ impl CodexLocal {
 
     /// Schliesst die Anmeldung mit dem Request-Target der Rueckleitung ab
     /// (`/auth/callback?code=..&state=..`). Darf nicht auf der Async-Runtime laufen.
-    pub fn complete_sign_in(&self, callback_target: String) -> Result<CodexLocalStatus, MobileError> {
+    pub fn complete_sign_in(
+        &self,
+        callback_target: String,
+    ) -> Result<CodexLocalStatus, MobileError> {
         let callback_target = Zeroizing::new(callback_target);
         guard_blocking()?;
         let pending = self
@@ -151,7 +154,9 @@ impl CodexLocal {
             .ok_or_else(|| denied("Es laeuft keine Codex-Anmeldung. Starte sie erneut"))?;
         let (code, state) = parse_callback(&callback_target)?;
         if state != pending.state {
-            return Err(denied("Die Codex-Anmeldung passt nicht zum gestarteten Vorgang"));
+            return Err(denied(
+                "Die Codex-Anmeldung passt nicht zum gestarteten Vorgang",
+            ));
         }
         let code = Zeroizing::new(code);
         let body = Zeroizing::new(
@@ -193,7 +198,10 @@ impl CodexLocal {
         self.secrets
             .remove(CREDENTIAL_SLOT)
             .map_err(|e| internal(e.diagnostic()))?;
-        for path in [self.auth_file(), self.auth_file().with_extension("json.tmp")] {
+        for path in [
+            self.auth_file(),
+            self.auth_file().with_extension("json.tmp"),
+        ] {
             remove_if_exists(&path, "could not remove the Codex credential file")?;
         }
         remove_if_exists(&self.route_file(), "could not remove the Codex route file")?;
@@ -265,7 +273,10 @@ impl CodexLocal {
         let mut table = toml::Table::new();
         table.insert("name".into(), toml::Value::String(ROUTE_ID.into()));
         table.insert("api".into(), toml::Value::String(ROUTE_API.into()));
-        table.insert("base_url".into(), toml::Value::String(ROUTE_BASE_URL.into()));
+        table.insert(
+            "base_url".into(),
+            toml::Value::String(ROUTE_BASE_URL.into()),
+        );
         table.insert("auth".into(), toml::Value::String(auth));
         table.insert("models".into(), toml::Value::Array(Vec::new()));
         let text = toml::to_string(&table).map_err(|_| internal("could not render the route"))?;
@@ -405,9 +416,11 @@ fn build_auth_json(body: &str) -> Result<Vec<u8>, MobileError> {
             .filter(|t| t.bytes().all(|b| b.is_ascii_graphic()))
             .map(str::to_owned)
     };
-    let (Some(id), Some(access), Some(refresh)) =
-        (field("id_token"), field("access_token"), field("refresh_token"))
-    else {
+    let (Some(id), Some(access), Some(refresh)) = (
+        field("id_token"),
+        field("access_token"),
+        field("refresh_token"),
+    ) else {
         return Err(invalid());
     };
     if id.split('.').count() != 3 {

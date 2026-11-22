@@ -120,7 +120,9 @@ impl UiaStore {
             let dir_name = format!("{DIR_PREFIX}{tail}");
             let id = format!("{ID_PREFIX}{tail}@1");
             if !self.agents_dir().join(&dir_name).exists()
-                && !existing.iter().any(|(_, existing_id, _)| *existing_id == id)
+                && !existing
+                    .iter()
+                    .any(|(_, existing_id, _)| *existing_id == id)
             {
                 break (dir_name, id);
             }
@@ -159,7 +161,10 @@ impl UiaStore {
         if id == PHONE_UIA_ID {
             return Err(rejected("Die eingebaute UIA kann nicht gelöscht werden."));
         }
-        let Some((dir, _, _)) = self.scan().into_iter().find(|(_, existing, _)| *existing == id)
+        let Some((dir, _, _)) = self
+            .scan()
+            .into_iter()
+            .find(|(_, existing, _)| *existing == id)
         else {
             return Err(rejected("Dieses Agenten-Profil gibt es nicht."));
         };
@@ -169,7 +174,9 @@ impl UiaStore {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(DIR_PREFIX));
         if !own {
-            return Err(rejected("Dieses Agenten-Profil kann nicht gelöscht werden."));
+            return Err(rejected(
+                "Dieses Agenten-Profil kann nicht gelöscht werden.",
+            ));
         }
         std::fs::remove_dir_all(&dir).map_err(|_| MobileError::Internal {
             detail: "could not remove the UIA directory".into(),
@@ -256,7 +263,9 @@ fn clean_text(
 ) -> Result<String, MobileError> {
     let value = value.trim();
     if value.chars().count() > limit {
-        return Err(rejected(&format!("{what} ist zu lang (höchstens {limit} Zeichen).")));
+        return Err(rejected(&format!(
+            "{what} ist zu lang (höchstens {limit} Zeichen)."
+        )));
     }
     let bad = |c: char| c.is_control() && !(multiline && (c == '\n' || c == '\t'));
     if value.chars().any(bad) {
@@ -272,8 +281,18 @@ fn clean_setup(setup: &UiaSetup) -> Result<CleanSetup, MobileError> {
     }
     Ok(CleanSetup {
         name,
-        identity: clean_text(&setup.identity, MAX_IDENTITY_CHARS, true, "Die Selbstbeschreibung")?,
-        personality: clean_text(&setup.personality, MAX_PERSONALITY_CHARS, true, "Die Persönlichkeit")?,
+        identity: clean_text(
+            &setup.identity,
+            MAX_IDENTITY_CHARS,
+            true,
+            "Die Selbstbeschreibung",
+        )?,
+        personality: clean_text(
+            &setup.personality,
+            MAX_PERSONALITY_CHARS,
+            true,
+            "Die Persönlichkeit",
+        )?,
         user_name: clean_text(&setup.user_name, MAX_USER_NAME_CHARS, false, "Die Anrede")?,
         user_context: clean_text(&setup.user_context, MAX_CONTEXT_CHARS, true, "Der Kontext")?,
     })
@@ -306,7 +325,11 @@ fn slug_of(name: &str) -> String {
         }
     }
     let slug = slug.trim_matches('-').to_owned();
-    if slug.is_empty() { "agent".to_owned() } else { slug }
+    if slug.is_empty() {
+        "agent".to_owned()
+    } else {
+        slug
+    }
 }
 
 /// Entschaerft Markdown-Ueberschriften in Nutzertext, damit er keine Abschnitte vortaeuscht.
@@ -324,11 +347,15 @@ fn quote_block(text: &str) -> String {
 }
 
 fn render_system(clean: &CleanSetup) -> String {
-    let base = TEMPLATE_SYSTEM
-        .strip_prefix(TEMPLATE_TITLE)
-        .map_or_else(|| TEMPLATE_SYSTEM.to_owned(), |rest| format!("# {}{rest}", clean.name));
+    let base = TEMPLATE_SYSTEM.strip_prefix(TEMPLATE_TITLE).map_or_else(
+        || TEMPLATE_SYSTEM.to_owned(),
+        |rest| format!("# {}{rest}", clean.name),
+    );
     let identity = if clean.identity.is_empty() {
-        format!("Ich bin {}, eine lokale Benutzeroberflächen-Agentin.", clean.name)
+        format!(
+            "Ich bin {}, eine lokale Benutzeroberflächen-Agentin.",
+            clean.name
+        )
     } else {
         quote_block(&clean.identity)
     };

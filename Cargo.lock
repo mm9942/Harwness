@@ -1981,12 +1981,12 @@ checksum = "17933e749f2502cfcd1c27519292fbbea22e8fc64ce680e863f855e8cd8cce23"
 dependencies = [
  "heck",
  "indexmap 2.14.2",
- "itertools 0.13.0",
+ "itertools 0.15.0",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "sha3 0.11.0",
- "strum 0.26.3",
+ "sha3 0.12.0",
+ "strum 0.28.0",
  "syn 3.0.6",
  "unicode-ident",
  "void",
@@ -2439,6 +2439,15 @@ name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
+
+[[package]]
+name = "find_cuda_helper"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f9e65c593dd01ac77daad909ea4ad17f0d6d1776193fc8ea766356177abdad"
+dependencies = [
+ "glob",
+]
 
 [[package]]
 name = "fixedbitset"
@@ -4446,6 +4455,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-llama"
+version = "0.10.0"
+dependencies = [
+ "harw-core",
+ "harw-protocol",
+ "harw-tools",
+ "harw-types",
+ "jiff 0.2.37",
+ "llama-cpp-2",
+ "minijinja",
+ "minijinja-contrib",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "harw-local-host"
 version = "0.10.0"
 dependencies = [
@@ -4458,6 +4485,7 @@ dependencies = [
  "harw-session-driver",
  "harw-session-host",
  "harw-session-store",
+ "harw-tools",
  "harw-types",
  "tempfile",
  "thiserror 2.0.21",
@@ -7179,6 +7207,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
+name = "llama-cpp-2"
+version = "0.1.161"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e5249e590eab4a5015ba35cf078a4548b941e841ef8024310c3a10b2edb7179"
+dependencies = [
+ "enumflags2",
+ "llama-cpp-sys-2",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-core",
+]
+
+[[package]]
+name = "llama-cpp-sys-2"
+version = "0.1.161"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9bea77fde41bbc15a278891cd5edd2ba07c5260d162614b41080ba1f100b39b"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
+ "find_cuda_helper",
+ "glob",
+ "walkdir",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7314,6 +7369,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "memo-map"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5449c8c750f1a07ea702bbd212bd999fceece9b3d1508b17023b3e174583124b"
+
+[[package]]
 name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7336,6 +7397,27 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "minijinja"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
+dependencies = [
+ "memo-map",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
+dependencies = [
+ "minijinja",
+ "serde",
 ]
 
 [[package]]

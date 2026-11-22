@@ -178,7 +178,10 @@ impl ClaudeLocal {
             ));
         }
         self.secrets
-            .store(&route_slot(ROUTE_ID), Zeroizing::new(token.as_bytes().to_vec()))
+            .store(
+                &route_slot(ROUTE_ID),
+                Zeroizing::new(token.as_bytes().to_vec()),
+            )
             .map_err(|e| internal(e.diagnostic()))?;
         self.write_route()?;
         self.read_status()
@@ -230,7 +233,10 @@ impl ClaudeLocal {
         let mut table = toml::Table::new();
         table.insert("name".into(), toml::Value::String(ROUTE_ID.into()));
         table.insert("api".into(), toml::Value::String(ROUTE_API.into()));
-        table.insert("base_url".into(), toml::Value::String(ROUTE_BASE_URL.into()));
+        table.insert(
+            "base_url".into(),
+            toml::Value::String(ROUTE_BASE_URL.into()),
+        );
         table.insert(
             "auth".into(),
             toml::Value::String(format!("secrets:{}", route_slot(ROUTE_ID))),

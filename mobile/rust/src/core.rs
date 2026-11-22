@@ -31,8 +31,8 @@ use crate::{
     ChatgptProviderStatus, ConnectionPhase, ConnectionRoute, ConnectionStatus, DeviceEnrollment,
     HostKind, HostRef, ManageSupport, MobileError, MobileHolder, MobileProject, MobileProjectPage,
     MobileRowOrigin, MobileSession, MobileSessionPage, MobileSessionRow, MobileShareInfo,
-    MobileShareMode, MobileTier, PlatformKeystore, RoutePreference, ServerProfile, SessionCursor,
-    PromptImage, SessionSnapshot, SubmitOutcome, SubmitReceipt,
+    MobileShareMode, MobileTier, PlatformKeystore, PromptImage, RoutePreference, ServerProfile,
+    SessionCursor, SessionSnapshot, SubmitOutcome, SubmitReceipt,
 };
 
 pub(crate) mod route;
@@ -813,7 +813,13 @@ impl MobileCore {
         expected_head: SessionCursor,
         client_message_id: String,
     ) -> Result<SubmitReceipt, MobileError> {
-        self.submit_with_images(session_id, text, expected_head, client_message_id, Vec::new())
+        self.submit_with_images(
+            session_id,
+            text,
+            expected_head,
+            client_message_id,
+            Vec::new(),
+        )
     }
 
     /// Wie `submit`, mit Bildern am Prompt. Ohne Host-Feature `images` wird das ohne Anfrage abgelehnt.
@@ -849,10 +855,12 @@ impl MobileCore {
 
     /// Ob der aktive Host Bilder am Prompt annimmt (Feature `images`). Ohne Verbindung `false`.
     pub fn supports_images(&self) -> bool {
-        self.shared
-            .state()
-            .active()
-            .is_ok_and(|link| link.backend.features().iter().any(|f| f == features::IMAGES))
+        self.shared.state().active().is_ok_and(|link| {
+            link.backend
+                .features()
+                .iter()
+                .any(|f| f == features::IMAGES)
+        })
     }
 
     pub fn interrupt(&self, session_id: String, turn_id: String) -> Result<(), MobileError> {
@@ -1012,8 +1020,7 @@ impl MobileCore {
                 polls += 1;
                 tokio::time::sleep(LOCAL_STOP_POLL).await;
             }
-            let backend =
-                match open_local(
+            let backend = match open_local(
                 PathBuf::from(files_dir),
                 keystore,
                 requested_features(),
@@ -1021,12 +1028,12 @@ impl MobileCore {
             )
             .await
             {
-                    Ok(backend) => backend,
-                    Err(error) => {
-                        fail_local(&shared, &run, error.to_string());
-                        return Err(error);
-                    }
-                };
+                Ok(backend) => backend,
+                Err(error) => {
+                    fail_local(&shared, &run, error.to_string());
+                    return Err(error);
+                }
+            };
             let (link, failure_rx) = {
                 let mut state = shared.state();
                 if run.is_cancelled() {

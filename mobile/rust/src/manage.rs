@@ -110,7 +110,11 @@ impl MobileCore {
         client_msg_id: String,
     ) -> Result<ManageRunResult, MobileError> {
         check_target_id(&agent_id)?;
-        self.command(Some(session_id), format!("/agent stop {agent_id}"), client_msg_id)
+        self.command(
+            Some(session_id),
+            format!("/agent stop {agent_id}"),
+            client_msg_id,
+        )
     }
 
     /// Bricht einen Hintergrund-Job der Sitzung ab: `command.run "/jobs stop <id>"` (Feature manage, Cap steer).
@@ -121,7 +125,11 @@ impl MobileCore {
         client_msg_id: String,
     ) -> Result<ManageRunResult, MobileError> {
         check_target_id(&work_id)?;
-        self.command(Some(session_id), format!("/jobs stop {work_id}"), client_msg_id)
+        self.command(
+            Some(session_id),
+            format!("/jobs stop {work_id}"),
+            client_msg_id,
+        )
     }
 
     /// `catalog.get` (Feature manage). `session_id` fuer das Live-Modell.

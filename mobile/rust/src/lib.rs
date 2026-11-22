@@ -39,7 +39,7 @@ pub use models::{
     import_model, local_models, model_catalog, model_path,
 };
 pub use provider::{ChatgptLinkAvailability, ChatgptProviderCredential, ChatgptProviderStatus};
-pub use providers::{ProviderStore, active_local_model, activate_local_model};
+pub use providers::{ProviderStore, activate_local_model, active_local_model};
 pub use qr::{ScannedProfile, decode_pairing_text, scan_pairing_frame};
 pub use secrets::{KeystoreError, KeystoreSecretResolver, PlatformKeystore};
 pub use types::*;
