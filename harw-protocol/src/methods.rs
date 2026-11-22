@@ -41,6 +41,18 @@ pub const METHOD_SESSION_SET_PROJECT: &str = "session.set_project";
 pub const METHOD_SESSION_RENAME: &str = "session.rename";
 pub const METHOD_SESSION_ARCHIVE: &str = "session.archive";
 
+// Minor 4, feature `manage`.
+pub const METHOD_COMMANDS_LIST: &str = "commands.list";
+pub const METHOD_COMMAND_RUN: &str = "command.run";
+pub const METHOD_CATALOG_GET: &str = "catalog.get";
+pub const METHOD_CONFIG_GET: &str = "config.get";
+// Minor 4, feature `stepup`.
+pub const METHOD_CONFIG_SET: &str = "config.set";
+pub const METHOD_CONFIG_RESET: &str = "config.reset";
+pub const METHOD_SECRET_PUT: &str = "secret.put";
+pub const METHOD_STEPUP_CONFIRM: &str = "stepup.confirm";
+pub const METHOD_STEPUP_CANCEL: &str = "stepup.cancel";
+
 pub const NOTIF_SESSION_EVENT: &str = "event.session";
 pub const NOTIF_TURN_EVENT: &str = "event.turn";
 pub const NOTIF_APPROVAL_REQ: &str = "approval.request";
@@ -77,6 +89,24 @@ pub const PROJECT_METHODS: &[&str] = &[
     METHOD_SESSION_ARCHIVE,
 ];
 
+/// Minor 4, feature `manage`: typed, allow-listed operation execution (W00 D5
+/// amendment). Own table.
+pub const MANAGE_METHODS: &[&str] = &[
+    METHOD_COMMANDS_LIST,
+    METHOD_COMMAND_RUN,
+    METHOD_CATALOG_GET,
+    METHOD_CONFIG_GET,
+];
+
+/// Minor 4, feature `stepup`: step-up confirmed global writes. Own table.
+pub const STEPUP_METHODS: &[&str] = &[
+    METHOD_CONFIG_SET,
+    METHOD_CONFIG_RESET,
+    METHOD_SECRET_PUT,
+    METHOD_STEPUP_CONFIRM,
+    METHOD_STEPUP_CANCEL,
+];
+
 /// R18 D-A: the closed `tool.*` method table.
 pub const TOOL_METHODS: &[&str] = &[METHOD_TOOL_LIST, METHOD_TOOL_CALL, METHOD_TOOL_CANCEL];
 
@@ -109,6 +139,8 @@ mod tests {
         let mut all: Vec<&str> = SESSION_METHODS
             .iter()
             .chain(PROJECT_METHODS)
+            .chain(MANAGE_METHODS)
+            .chain(STEPUP_METHODS)
             .chain(TOOL_METHODS)
             .chain(GATEWAY_READ_METHODS)
             .chain(GATEWAY_ADMIN_METHODS)
@@ -130,7 +162,33 @@ mod tests {
                 .chain(GATEWAY_ADMIN_METHODS)
                 .all(|name| name.starts_with("gateway."))
         );
+        assert!(
+            MANAGE_METHODS
+                .iter()
+                .chain(STEPUP_METHODS)
+                .all(|n| !n.starts_with("gateway.") && !n.starts_with("tool."))
+        );
         // Schlüsseloperationen bleiben außerhalb jeder Gateway-Fläche.
         assert!(!all.iter().any(|name| name.contains("keys")));
+    }
+
+    #[test]
+    fn manage_tables_have_exact_names() {
+        assert_eq!(MANAGE_METHODS.len(), 4);
+        assert_eq!(STEPUP_METHODS.len(), 5);
+        assert_eq!(
+            MANAGE_METHODS,
+            &["commands.list", "command.run", "catalog.get", "config.get"]
+        );
+        assert_eq!(
+            STEPUP_METHODS,
+            &[
+                "config.set",
+                "config.reset",
+                "secret.put",
+                "stepup.confirm",
+                "stepup.cancel"
+            ]
+        );
     }
 }

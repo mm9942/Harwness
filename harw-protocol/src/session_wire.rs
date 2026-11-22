@@ -25,6 +25,11 @@
 //! [`SessionFrame::Holder`] frame and the vocabulary types for them
 //! ([`ProjectSummary`], [`SessionRow`], [`ShareInfo`], ...). Minor 2 bytes
 //! are unchanged; `SessionSummary` is not touched.
+//!
+//! Wire minor 4 adds the `manage` and `stepup` features: typed, allow-listed
+//! operation execution (`command.run`, W00 D5 amendment), read-only
+//! catalog/config views, and step-up confirmed global writes. Minor 3 bytes
+//! are unchanged.
 
 use harw_types::{
     ApprovalId, DeviceId, PermissionTier, ReviewDecision, SessionId, TenantId, ToolCallId, TurnId,
@@ -43,7 +48,25 @@ use crate::items::{ResultTrust, ToolCallResult, ToolPlacement};
 ///   `gateway_read`, `gateway_admin`).
 /// - 3: projects (`session.projects`, `session.page`, ..., frame `holder`,
 ///   feature `projects`).
-pub const SESSION_WIRE_MINOR: u32 = 3;
+/// - 4: manage (`commands.list`, `command.run`, `catalog.get`, `config.get`),
+///   stepup (`config.set`/`reset`, `secret.put`, `stepup.confirm`/`cancel`,
+///   frame `stepup_request`).
+pub const SESSION_WIRE_MINOR: u32 = 4;
+
+/// First wire minor with the features `manage` and `stepup`.
+pub const MANAGE_WIRE_MINOR: u32 = 4;
+
+/// Upper bound for `client_msg_id` of `command.run`, `config.set`, `config.reset` (bytes).
+pub const MAX_CLIENT_MSG_ID_BYTES: usize = 128;
+
+/// Upper bound for `command.run.line` (bytes).
+pub const MAX_COMMAND_LINE_BYTES: usize = 512;
+
+/// Upper bound for `secret.put.value` (bytes).
+pub const MAX_SECRET_VALUE_BYTES: usize = 8194;
+
+/// Upper bound for the number of `config.get.keys`.
+pub const MAX_CONFIG_KEYS: usize = 32;
 
 /// First wire minor with feature `projects` and the project/page methods.
 pub const PROJECTS_WIRE_MINOR: u32 = 3;
@@ -87,6 +110,11 @@ pub mod features {
     pub const GATEWAY: &str = "gateway";
     /// Projects and pages (`session.projects`, `session.page`, ...) and the `holder` frame. Minor >= 3.
     pub const PROJECTS: &str = "projects";
+    /// `commands.list`, `command.run`, `catalog.get`, `config.get`. Minor >= 4.
+    pub const MANAGE: &str = "manage";
+    /// `config.set`, `config.reset`, `secret.put`, `stepup.confirm`, `stepup.cancel` and the
+    /// `stepup_request` frame. Minor >= 4, only together with `manage`.
+    pub const STEPUP: &str = "stepup";
 }
 
 /// Position in a session stream.
@@ -646,6 +674,8 @@ pub enum SessionFrame {
         session_id: SessionId,
         holder: Option<HolderInfo>,
     },
+    /// A step-up challenge (feature `stepup`). Only to the requesting connection.
+    StepupRequest(StepUpChallenge),
     /// A frame kind this client does not know (additive evolution). Must stay last.
     Unknown,
 }
@@ -668,6 +698,7 @@ const KNOWN_FRAME_KINDS: &[&str] = &[
     "revoked",
     "heartbeat",
     "holder",
+    "stepup_request",
     "unknown",
 ];
 
@@ -691,6 +722,7 @@ impl SessionFrame {
             Self::Revoked => "revoked",
             Self::Heartbeat => "heartbeat",
             Self::Holder { .. } => "holder",
+            Self::StepupRequest(_) => "stepup_request",
             Self::Unknown => "unknown",
         }
     }
@@ -1284,6 +1316,371 @@ pub mod error_codes {
     pub const INTERNAL: i32 = -32603;
 }
 
+// ---------------------------------------------------------------------------
+// Wire minor 4: `manage` and `stepup` features.
+// ---------------------------------------------------------------------------
+
+/// Origin of a command (mirror of the ops command metadata kind).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOrigin {
+    Operation,
+    TuiLocal,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Effect of `command.run` / `config.set` / `stepup.confirm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandEffect {
+    /// Effective immediately.
+    Applied,
+    /// Effective from the next turn of the session.
+    Staged,
+    /// Effective from the next session (roles, default model, provider).
+    NextSession,
+    /// Not executed; `reason_code`/`text` say why. `ok = false`.
+    Refused,
+    /// Nothing written yet; `stepup` carries the challenge. `ok = true`.
+    StepupRequired,
+    #[serde(other)]
+    Unknown,
+}
+
+/// How a provider authenticates (mirror of the ops `AuthKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthKind {
+    None,
+    Env,
+    File,
+    Keyring,
+    Secrets,
+    FileJson,
+    InlineKey,
+    #[serde(other)]
+    Unknown,
+}
+
+/// `commands.list` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandsListParams {
+    /// Session for which `available` is computed. `None` = profile wide.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+/// A sub-command hint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandHint {
+    pub name: String,
+    pub args: String,
+    pub summary: String,
+}
+
+/// A command as shown in the TUI popup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandEntry {
+    /// Without the leading `/`.
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    pub summary: String,
+    pub usage: String,
+    /// Operation domain in snake_case. A string so new domains do not break old clients.
+    pub domain: String,
+    pub permission: PermissionTier,
+    /// `immediate` | `staged` | `deferred`.
+    pub busy: String,
+    pub origin: CommandOrigin,
+    pub remote: bool,
+    pub available: bool,
+    /// Reason text, only when `!available`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Stable machine id, only when `!available`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub subcommands: Vec<CommandHint>,
+}
+
+/// `commands.list` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandsListResult {
+    /// Sorted by `name`.
+    pub commands: Vec<CommandEntry>,
+    /// 16 hex digits; a string because a u64 may lose precision in JSON parsers.
+    pub rev: String,
+}
+
+/// `command.run` parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandRunParams {
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    /// Whole line with `/`, at most [`MAX_COMMAND_LINE_BYTES`].
+    pub line: String,
+    /// Idempotency across reconnects, 1..=[`MAX_CLIENT_MSG_ID_BYTES`].
+    pub client_msg_id: String,
+}
+
+/// A step-up challenge. Contains nothing secret. Also the payload of the
+/// `stepup_request` frame.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepUpChallenge {
+    /// 32 lowercase hex.
+    pub stepup_id: String,
+    /// For example `config.set`, `models.set`, `provider.add`.
+    pub action: String,
+    pub target: String,
+    /// Canonical text the app shows completely before the biometric prompt.
+    pub text: String,
+    /// 64 lowercase hex.
+    pub nonce: String,
+    /// `hex(sha256(b"harw-stepup-v1\0" || nonce_bytes || 0x00 || text_utf8))`, 64 lowercase hex.
+    pub hash: String,
+    pub expires_at: jiff::Timestamp,
+}
+
+/// Result of `command.run`, `config.set`, `config.reset`, `stepup.confirm`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CommandRunResult {
+    pub ok: bool,
+    /// Human readable text.
+    pub text: String,
+    /// Operation output data, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    pub effect: CommandEffect,
+    /// With `effect = refused`: a refusal code (see [`refusal_codes`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// With `effect = stepup_required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepup: Option<StepUpChallenge>,
+}
+
+/// Refusal codes that do not come from the ops allow-list (gateway side). Stable.
+pub mod refusal_codes {
+    /// Session command without a `session_id`.
+    pub const SESSION_REQUIRED: &str = "session_required";
+    /// Session action on a profile session without a host record.
+    pub const SESSION_NOT_HOSTED: &str = "session_not_hosted";
+    /// The operation reports `NotAvailable` (service missing in the gateway).
+    pub const NOT_AVAILABLE: &str = "not_available";
+    /// The operation failed.
+    pub const OP_FAILED: &str = "op_failed";
+    /// The value changed since the confirmation.
+    pub const STALE: &str = "stale";
+    /// Step-up writes are not enabled on this gateway.
+    pub const STEPUP_DISABLED: &str = "stepup_disabled";
+}
+
+/// `catalog.get` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogGetParams {
+    /// For `live` (model of the session). `None` = profile only.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+/// A redacted provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogProvider {
+    pub name: String,
+    pub api: String,
+    /// `scheme://host[:port]/path` without userinfo/query/fragment; empty if unparsable.
+    pub base_url: String,
+    pub enabled: bool,
+    pub auth_kind: ProviderAuthKind,
+    /// Only a name/entry for `env`/`keyring`/`secrets`, else `None`. Never a path, never a value.
+    #[serde(default)]
+    pub auth_name: Option<String>,
+    pub has_secret: bool,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub max_concurrency: Option<u64>,
+}
+
+/// A model of the catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogModel {
+    pub key: String,
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub provider: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    pub reasoning: bool,
+    #[serde(default)]
+    pub input_types: Vec<String>,
+    /// `active` | `deprecated` | `retirement_window` | `retired` | `unknown` (string, additive).
+    pub lifecycle: String,
+}
+
+/// A role binding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogRole {
+    pub role: String,
+    pub label: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub source: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// The live model of the session.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogLive {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// `catalog.get` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogResult {
+    pub providers: Vec<CatalogProvider>,
+    pub models: Vec<CatalogModel>,
+    pub roles: Vec<CatalogRole>,
+    pub live: CatalogLive,
+    /// For example "applies from the next session".
+    pub note: String,
+}
+
+/// `config.get` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigGetParams {
+    /// `None` = all allow-listed keys. At most [`MAX_CONFIG_KEYS`].
+    #[serde(default)]
+    pub keys: Option<Vec<String>>,
+}
+
+/// One config row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigEntry {
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
+    /// Always `profile`.
+    pub scope: String,
+    /// `now` | `next_session`.
+    pub apply: String,
+}
+
+/// `config.get` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigGetResult {
+    pub entries: Vec<ConfigEntry>,
+}
+
+/// `config.set` (feature `stepup`). Result: [`CommandRunResult`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSetParams {
+    pub key: String,
+    pub value: String,
+    pub client_msg_id: String,
+}
+
+/// `config.reset` (feature `stepup`). Result: [`CommandRunResult`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigResetParams {
+    pub key: String,
+    pub client_msg_id: String,
+}
+
+/// A secret on its way to the server. `Debug` redacts; no `Display`,
+/// no `PartialEq`, no `Clone`. Serde transparent (JSON string).
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WireSecret(String);
+
+impl WireSecret {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// The only access; the server moves the value into a secret type at once.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Length in bytes (for the upper bound without reading the value).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for WireSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WireSecret([redacted])")
+    }
+}
+
+/// `secret.put` (feature `stepup`).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretPutParams {
+    /// Name in the secret store, `[A-Za-z0-9._-]`, 1..=64.
+    pub name: String,
+    /// The NEW provider of this operation the key is bound to.
+    pub for_provider: String,
+    pub value: WireSecret,
+}
+
+/// `secret.put` result. Never contains the value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretPutResult {
+    /// 32 hex; for `--key <handle>` of a following provider add.
+    pub handle: String,
+    pub key_name: String,
+    pub for_provider: String,
+    pub expires_at: jiff::Timestamp,
+}
+
+/// `stepup.confirm` parameters. Result: [`CommandRunResult`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepUpConfirmParams {
+    pub stepup_id: String,
+    /// The hash of the challenge (64 hex), sent after a fresh biometric prompt.
+    pub hash: String,
+}
+
+/// `stepup.cancel` parameters. Result `()`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepUpCancelParams {
+    pub stepup_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,9 +1734,237 @@ mod tests {
         Ok(())
     }
 
+    fn sample_challenge() -> StepUpChallenge {
+        StepUpChallenge {
+            stepup_id: "0".repeat(32),
+            action: "config.set".into(),
+            target: "theme".into(),
+            text: "Set theme to dark".into(),
+            nonce: "a".repeat(64),
+            hash: "b".repeat(64),
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn minor_four_constants() {
+        assert_eq!(MANAGE_WIRE_MINOR, 4);
+        assert_eq!(features::MANAGE, "manage");
+        assert_eq!(features::STEPUP, "stepup");
+        assert_eq!(MAX_CLIENT_MSG_ID_BYTES, 128);
+        assert_eq!(MAX_COMMAND_LINE_BYTES, 512);
+        assert_eq!(MAX_SECRET_VALUE_BYTES, 8194);
+        assert_eq!(MAX_CONFIG_KEYS, 32);
+    }
+
+    #[test]
+    fn stepup_frame_round_trips_and_future_kinds_are_unknown() -> TestResult {
+        let frame = SessionFrame::StepupRequest(sample_challenge());
+        let value = ctx(serde_json::to_value(&frame), "encode")?;
+        assert_eq!(value["kind"], "stepup_request");
+        assert_eq!(value["data"]["action"], "config.set");
+        let back: SessionFrame = ctx(serde_json::from_value(value), "decode")?;
+        assert!(matches!(back, SessionFrame::StepupRequest(_)));
+        assert!(!back.is_disposable());
+        let future: SessionFrame = ctx(
+            serde_json::from_str(r#"{"kind":"stepup_request_v9","data":{}}"#),
+            "decode future",
+        )?;
+        assert!(matches!(future, SessionFrame::Unknown));
+        Ok(())
+    }
+
+    #[test]
+    fn minor_four_params_reject_unknown_fields() {
+        fn rejects<T: serde::de::DeserializeOwned>(json: &str) -> bool {
+            serde_json::from_str::<T>(json).is_err()
+        }
+        assert!(rejects::<CommandsListParams>(r#"{"tenant":"tenant-test"}"#));
+        assert!(rejects::<CommandRunParams>(
+            r#"{"line":"/status","client_msg_id":"m-1","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<CommandRunParams>(
+            r#"{"line":"/status","client_msg_id":"m-1","tier":"owner"}"#
+        ));
+        assert!(rejects::<CatalogGetParams>(r#"{"tenant":"tenant-test"}"#));
+        assert!(rejects::<ConfigGetParams>(r#"{"tenant":"tenant-test"}"#));
+        assert!(rejects::<ConfigSetParams>(
+            r#"{"key":"k","value":"v","client_msg_id":"m","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<ConfigResetParams>(
+            r#"{"key":"k","client_msg_id":"m","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<SecretPutParams>(
+            r#"{"name":"n","for_provider":"p","value":"fake-SECRET-marker","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<StepUpConfirmParams>(
+            r#"{"stepup_id":"x","hash":"y","actor":"x"}"#
+        ));
+        assert!(rejects::<StepUpConfirmParams>(
+            r#"{"stepup_id":"x","hash":"y","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<StepUpCancelParams>(
+            r#"{"stepup_id":"x","tenant":"tenant-test"}"#
+        ));
+    }
+
+    #[test]
+    fn minor_four_params_accept_plain_shape() -> TestResult {
+        let _: CommandsListParams = ctx(serde_json::from_str("{}"), "commands.list")?;
+        let _: CatalogGetParams = ctx(serde_json::from_str("{}"), "catalog.get")?;
+        let _: ConfigGetParams = ctx(serde_json::from_str("{}"), "config.get")?;
+        let run: CommandRunParams = ctx(
+            serde_json::from_str(r#"{"line":"/status","client_msg_id":"m-1"}"#),
+            "command.run",
+        )?;
+        assert_eq!(run.line, "/status");
+        assert!(run.session_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn minor_four_results_accept_additional_fields() -> TestResult {
+        let challenge = serde_json::to_value(sample_challenge());
+        let mut challenge = ctx(challenge, "encode challenge")?;
+        challenge["future"] = serde_json::json!(1);
+        let _: StepUpChallenge = ctx(serde_json::from_value(challenge), "challenge")?;
+        let _: CommandsListResult = ctx(
+            serde_json::from_str(r#"{"commands":[],"rev":"0000000000000000","future":1}"#),
+            "list result",
+        )?;
+        let _: CommandEntry = ctx(
+            serde_json::from_str(
+                r#"{"name":"status","summary":"s","usage":"/status","domain":"session","permission":"observer","busy":"immediate","origin":"operation","remote":true,"available":true,"future":1}"#,
+            ),
+            "entry",
+        )?;
+        let _: CommandRunResult = ctx(
+            serde_json::from_str(r#"{"ok":true,"text":"t","effect":"applied","future":1}"#),
+            "run result",
+        )?;
+        let _: CatalogResult = ctx(
+            serde_json::from_str(
+                r#"{"providers":[],"models":[],"roles":[],"live":{},"note":"n","future":1}"#,
+            ),
+            "catalog",
+        )?;
+        let _: CatalogProvider = ctx(
+            serde_json::from_str(
+                r#"{"name":"p","api":"a","base_url":"https://x.example.test","enabled":true,"auth_kind":"env","has_secret":false,"future":1}"#,
+            ),
+            "provider",
+        )?;
+        let _: ConfigGetResult = ctx(
+            serde_json::from_str(r#"{"entries":[],"future":1}"#),
+            "config result",
+        )?;
+        let _: SecretPutResult = ctx(
+            serde_json::from_str(
+                r#"{"handle":"h","key_name":"k","for_provider":"p","expires_at":"2026-01-01T00:00:00Z","future":1}"#,
+            ),
+            "secret result",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn minor_four_enums_decode_unknown() -> TestResult {
+        let origin: CommandOrigin = ctx(serde_json::from_str("\"future\""), "origin")?;
+        assert_eq!(origin, CommandOrigin::Unknown);
+        let effect: CommandEffect = ctx(serde_json::from_str("\"future\""), "effect")?;
+        assert_eq!(effect, CommandEffect::Unknown);
+        let auth: ProviderAuthKind = ctx(serde_json::from_str("\"future\""), "auth")?;
+        assert_eq!(auth, ProviderAuthKind::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn command_effect_names_are_stable() -> TestResult {
+        for (effect, name) in [
+            (CommandEffect::Applied, "applied"),
+            (CommandEffect::Staged, "staged"),
+            (CommandEffect::NextSession, "next_session"),
+            (CommandEffect::Refused, "refused"),
+            (CommandEffect::StepupRequired, "stepup_required"),
+        ] {
+            assert_eq!(ctx(serde_json::to_value(effect), "encode")?, name);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wire_secret_debug_is_redacted_but_wire_carries_value() -> TestResult {
+        let params = SecretPutParams {
+            name: "key-a".into(),
+            for_provider: "prov-a".into(),
+            value: WireSecret::new("sk-test-FAKE-0000000000000000".into()),
+        };
+        let debug = format!("{params:?}");
+        assert!(!debug.contains("FAKE"));
+        assert!(debug.contains("[redacted]"));
+        let json = ctx(serde_json::to_string(&params), "encode")?;
+        assert!(json.contains("sk-test-FAKE-0000000000000000"));
+        assert_eq!(params.value.len(), 29);
+        assert!(!params.value.is_empty());
+        assert_eq!(params.value.expose().len(), params.value.len());
+        let result = SecretPutResult {
+            handle: "0".repeat(32),
+            key_name: "key-a".into(),
+            for_provider: "prov-a".into(),
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let value = ctx(serde_json::to_value(&result), "encode result")?;
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        assert_eq!(keys, ["expires_at", "for_provider", "handle", "key_name"]);
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_provider_has_no_secret_fields() -> TestResult {
+        let provider = CatalogProvider {
+            name: "p".into(),
+            api: "a".into(),
+            base_url: "https://x.example.test".into(),
+            enabled: true,
+            auth_kind: ProviderAuthKind::Env,
+            auth_name: None,
+            has_secret: false,
+            models: vec![],
+            max_concurrency: None,
+        };
+        let value = ctx(serde_json::to_value(&provider), "encode")?;
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "api",
+                "auth_kind",
+                "auth_name",
+                "base_url",
+                "enabled",
+                "has_secret",
+                "max_concurrency",
+                "models",
+                "name"
+            ]
+        );
+        for forbidden in ["api_key", "headers", "auth_header", "auth"] {
+            assert!(!keys.contains(&forbidden));
+        }
+        Ok(())
+    }
+
     #[test]
     fn minor_three_constants() {
-        assert_eq!(SESSION_WIRE_MINOR, 3);
+        assert_eq!(SESSION_WIRE_MINOR, 4);
         assert_eq!(PROJECTS_WIRE_MINOR, 3);
         assert_eq!(features::PROJECTS, "projects");
         const { assert!(DEFAULT_PAGE_LIMIT <= MAX_PAGE_LIMIT) };
@@ -1455,6 +2080,7 @@ mod tests {
             },
             SessionFrame::HistoryReplaced { item_count: 3 },
             SessionFrame::Presence { attached: vec![] },
+            SessionFrame::StepupRequest(sample_challenge()),
             SessionFrame::Job {
                 work_id: "w".into(),
                 kind: "work".into(),

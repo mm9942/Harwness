@@ -1,7 +1,11 @@
 //! Closed method tables (W00 D5, R18 §2.1): one wire request → one typed
 //! port call.
 //!
-//! There is no generic operation execution here. Every method of
+//! There is no generic dispatcher here. Minor 4 adds typed, allow-listed
+//! operation execution (`command.run`, W00 D5 amendment): the line is
+//! resolved against the server's remote allow-list in the host, never here.
+//! Every method of `MANAGE_METHODS` / `STEPUP_METHODS` maps to one
+//! [`SessionPort`] call. Every method of
 //! [`harw_protocol::methods::SESSION_METHODS`] maps to exactly one
 //! [`SessionPort`] call, every method of
 //! [`harw_protocol::methods::TOOL_METHODS`] to one [`ToolPort`] call and
@@ -40,6 +44,15 @@ use harw_protocol::session_wire::{
     HistoryParams, HistoryResult, InterruptParams, ListResult, SessionRef, SetEffortParams,
     SetModeParams, SetModelParams, SubmitParams, ToolCallParams, ToolCancelParams, ToolListParams,
     error_codes,
+};
+use harw_protocol::methods::{
+    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
+    METHOD_STEPUP_CONFIRM,
+};
+use harw_protocol::session_wire::{
+    CatalogGetParams, CommandRunParams, CommandsListParams, ConfigGetParams, ConfigResetParams,
+    ConfigSetParams, SecretPutParams, StepUpCancelParams, StepUpConfirmParams,
 };
 use harw_protocol::session_wire::{
     ArchiveParams, CreateInParams, PageParams, ProjectsParams, RenameParams, SetProjectParams,
@@ -398,6 +411,42 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
             Ok(params) => encode(id, port.archive(params).await),
             Err(response) => *response,
         },
+        METHOD_COMMANDS_LIST => match decode::<CommandsListParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.commands_list(params).await),
+            Err(response) => *response,
+        },
+        METHOD_COMMAND_RUN => match decode::<CommandRunParams>(&id, params) {
+            Ok(params) => encode(id, port.command_run(params).await),
+            Err(response) => *response,
+        },
+        METHOD_CATALOG_GET => match decode::<CatalogGetParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.catalog_get(params).await),
+            Err(response) => *response,
+        },
+        METHOD_CONFIG_GET => match decode::<ConfigGetParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.config_get(params).await),
+            Err(response) => *response,
+        },
+        METHOD_CONFIG_SET => match decode::<ConfigSetParams>(&id, params) {
+            Ok(params) => encode(id, port.config_set(params).await),
+            Err(response) => *response,
+        },
+        METHOD_CONFIG_RESET => match decode::<ConfigResetParams>(&id, params) {
+            Ok(params) => encode(id, port.config_reset(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SECRET_PUT => match decode_secret_put(&id, params) {
+            Ok(params) => encode(id, port.secret_put(params).await),
+            Err(response) => *response,
+        },
+        METHOD_STEPUP_CONFIRM => match decode::<StepUpConfirmParams>(&id, params) {
+            Ok(params) => encode(id, port.stepup_confirm(params).await),
+            Err(response) => *response,
+        },
+        METHOD_STEPUP_CANCEL => match decode::<StepUpCancelParams>(&id, params) {
+            Ok(params) => encode(id, port.stepup_cancel(params).await),
+            Err(response) => *response,
+        },
         _ => error_response(
             id,
             error_codes::METHOD_NOT_FOUND,
@@ -452,6 +501,18 @@ fn decode<P: DeserializeOwned>(id: &str, params: Value) -> Result<P, Box<Respons
             id.to_owned(),
             error_codes::INVALID_PARAMS,
             format!("invalid params: {error}"),
+        ))
+    })
+}
+
+/// Decodes `secret.put` without echoing any input: a serde error message can
+/// quote a string value, so the detail is replaced by a fixed text.
+fn decode_secret_put(id: &str, params: Value) -> Result<SecretPutParams, Box<ResponseEnvelope>> {
+    serde_json::from_value::<SecretPutParams>(params).map_err(|_| {
+        Box::new(error_response(
+            id.to_owned(),
+            error_codes::INVALID_PARAMS,
+            "invalid secret.put params",
         ))
     })
 }
@@ -513,6 +574,10 @@ mod tests {
         GatewayListenersResult, GatewayRevokeResult, GatewayStatus, GatewayToolRights,
         GatewayToolsResult, HelloAck, ListenerKind, RespondResult, SessionSummary, SubmitResult,
         ToolCallResultFrame, ToolListResult,
+    };
+    use harw_protocol::methods::{MANAGE_METHODS, STEPUP_METHODS};
+    use harw_protocol::session_wire::{
+        CatalogLive, CatalogResult, CommandsListResult, ConfigGetResult,
     };
     use harw_protocol::session_wire::{PageResult, ProjectsResult, ShareInfo, ShareMode};
     use harw_protocol::{
@@ -687,6 +752,35 @@ mod tests {
                 PageResult {
                     sessions: Vec::new(),
                     next_cursor: None,
+                },
+            )
+        }
+        fn commands_list(&self, _params: CommandsListParams) -> PortFuture<'_, CommandsListResult> {
+            self.answer(
+                "commands_list",
+                CommandsListResult {
+                    commands: Vec::new(),
+                    rev: "0000000000000000".to_owned(),
+                },
+            )
+        }
+        fn catalog_get(&self, _params: CatalogGetParams) -> PortFuture<'_, CatalogResult> {
+            self.answer(
+                "catalog_get",
+                CatalogResult {
+                    providers: Vec::new(),
+                    models: Vec::new(),
+                    roles: Vec::new(),
+                    live: CatalogLive::default(),
+                    note: String::new(),
+                },
+            )
+        }
+        fn config_get(&self, _params: ConfigGetParams) -> PortFuture<'_, ConfigGetResult> {
+            self.answer(
+                "config_get",
+                ConfigGetResult {
+                    entries: Vec::new(),
                 },
             )
         }
@@ -1273,5 +1367,83 @@ mod tests {
         assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
         assert!(port.calls().is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn manage_reads_route_with_null_params() -> TestResult {
+        let port = FakePort::new(false)?;
+        for method in [METHOD_COMMANDS_LIST, METHOD_CATALOG_GET, METHOD_CONFIG_GET] {
+            let response = plain(dispatch(&port, request(method, Value::Null)).await)?;
+            assert!(response.error.is_none(), "{method}");
+            assert!(response.result.is_some(), "{method}");
+        }
+        assert_eq!(
+            port.calls(),
+            vec!["commands_list", "catalog_get", "config_get"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_run_requires_line_and_client_msg_id() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "line": "/status" });
+        let response = plain(dispatch(&port, request(METHOD_COMMAND_RUN, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_field_in_command_run_is_invalid_params() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "line": "/status", "client_msg_id": "m-1", "tier": "owner" });
+        let response = plain(dispatch(&port, request(METHOD_COMMAND_RUN, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secret_put_decode_error_never_echoes_value() -> TestResult {
+        let port = FakePort::new(false)?;
+        let bad = [
+            json!("sk-test-FAKE-0000000000000000"),
+            json!({
+                "name": "k",
+                "for_provider": "p",
+                "value": "sk-test-FAKE-0000000000000000",
+                "x": 1
+            }),
+        ];
+        for params in bad {
+            let response = plain(dispatch(&port, request(METHOD_SECRET_PUT, params)).await)?;
+            assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+            let error = response.error.ok_or("missing error")?;
+            assert_eq!(error.message, "invalid secret.put params");
+            assert!(!error.message.contains("FAKE"));
+        }
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    /// `command.run` is not overridden by the fake, so the default body answers.
+    #[tokio::test]
+    async fn default_port_answers_protocol_error_for_command_run() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "line": "/status", "client_msg_id": "m-1" });
+        let response = plain(dispatch(&port, request(METHOD_COMMAND_RUN, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        let error = response.error.ok_or("missing error")?;
+        assert!(error.message.contains("command.run"), "{}", error.message);
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn manage_methods_are_not_r18_gated() {
+        for method in MANAGE_METHODS.iter().chain(STEPUP_METHODS) {
+            assert_eq!(required_cap(method), None, "{method}");
+        }
     }
 }
