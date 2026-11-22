@@ -788,13 +788,38 @@ mod recovery {
     struct Sleeper(std::process::Child);
 
     impl Sleeper {
+        /// Startet `sleep 30` und wartet, bis der Kindprozess das Programm
+        /// tatsächlich ausführt. Unter Last kann die Identität sonst noch vor
+        /// dem `exec` erfasst werden (Programm = Testbinary statt `sleep`).
         fn spawn() -> TestResult<Self> {
             let child = std::process::Command::new("sleep")
                 .arg("30")
                 .process_group(0)
                 .spawn()
                 .map_err(ctx("spawn sleep"))?;
-            Ok(Self(child))
+            let sleeper = Self(child);
+            sleeper.wait_for_sleep_exec()?;
+            Ok(sleeper)
+        }
+
+        /// Pollt bis zu 2 s, bis `/proc/<pid>/exe` auf `sleep` zeigt oder
+        /// `comm` `sleep` ist.
+        fn wait_for_sleep_exec(&self) -> TestResult {
+            let pid = self.pid();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let exe_is_sleep = fs::read_link(format!("/proc/{pid}/exe"))
+                    .is_ok_and(|exe| exe.file_name().is_some_and(|name| name == "sleep"));
+                let comm_is_sleep = fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .is_ok_and(|comm| comm.trim_end() == "sleep");
+                if exe_is_sleep || comm_is_sleep {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(TestError::Missing("sleep exec"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
 
         fn pid(&self) -> u32 {
