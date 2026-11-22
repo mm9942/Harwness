@@ -108,6 +108,9 @@ see Section 2 for the field's current, implemented rule.
 | `tui.status_expiry` | `StatusExpiryMode` (`consolidate`/`hide`) | `consolidate` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
 | `tui.goal_mode` | `bool` | `false` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
 | `tui.reasoning` | `ReasoningDisplayMode` (`message`/`collapsed`/`hidden`) | `message` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.language` | `UiLanguage` (`en`, `de`, `es`, `fr`, `pt`, `ja`, `zh-CN`, `ko`, `vi`, `hi`) | `en` | `harness_config.rs` (`TuiSection`) | not in this table yet; follow-up: register like `footer_counts` |
+| `tui.footer_counts` | `bool` | `false` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.cell_aspect` | `Option<f32>` (cell width / height, valid 0.2–1.5; unset = measured via `window_size()`, else 0.5) | unset | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
 
 ### 1.4 `[session]` (`harness_config.rs:306-343`, Defaults `429-437`)
 
@@ -822,7 +825,7 @@ subsection numbers, so the table can be checked 1:1 against Section 1.
 **1.2 `[logging]`** (3): `logging.level`, `logging.target_module_paths`,
 `logging.json` — all Profile / `ProfileReplaces`.
 
-**1.3 `[tui]`** (6): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`, `tui.status_expiry`, `tui.goal_mode`, `tui.reasoning`
+**1.3 `[tui]`** (7 registered + `tui.language` pending): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`, `tui.status_expiry`, `tui.goal_mode`, `tui.reasoning`, `tui.footer_counts`, `tui.cell_aspect` (the last two, added 2026-11-22, follow the same pattern; `tui.language` exists in `TuiSection` but is missing from the field table)
 — all Profile / `ProfileReplaces`.
 
 **1.4 `[session]`** (5 fields)

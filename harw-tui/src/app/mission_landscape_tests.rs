@@ -392,6 +392,7 @@ fn render_viewport_at_120x42_is_the_dense_three_column_landscape() -> TestResult
             composer: 3,
             live_body_lines: 2,
             finished: 1,
+            cell_aspect_permille: 0,
         },
     );
     assert_eq!(
@@ -453,13 +454,13 @@ fn render_viewport_at_100x30_is_shallow_with_finished_and_live_strips() -> TestR
     Ok(())
 }
 
-/// PL-97 C3: kompakt (39×60, 48×19) bleibt die einzeilige Zusammenfassung;
+/// PL-97 C3: kompakt (29×60 unter 30 Spalten, 48×19 unter 20 Zeilen) bleibt die einzeilige Zusammenfassung;
 /// sie trägt vorn die Zähler `Agents n · Jobs n · Done ok/✗failed`, es gibt
 /// keine Fenster.
 #[test]
 fn render_viewport_at_39x60_and_48x19_shows_the_compact_counters() -> TestResult {
     let app = mission_app()?;
-    for (width, height) in [(39u16, 60u16), (48, 19)] {
+    for (width, height) in [(29u16, 60u16), (48, 19)] {
         let rows = rendered(&app, width, height)?;
         let shown = rows.join("\n");
         let regions = app.last_regions.get();
@@ -529,14 +530,17 @@ fn render_viewport_resize_flip_keeps_selection_scroll_and_jobs() -> TestResult {
     assert_eq!(state(&app), expected);
     assert_eq!(app.mission.jobs.scroll_offset(), 5);
 
-    // Hochformat mit eigenem Jobs-Fenster (ab 68 Spalten).
+    // Hochformat mit zwei gleich hohen Fenstern (Agenten | Jobs).
     let _ = rendered(&app, 70, 90)?;
     let regions = app.last_regions.get();
     assert_eq!(
         regions.agents.map(|rect| (rect.y, rect.height)),
-        Some((0, 4))
+        Some((0, 18))
     );
-    assert!(!regions.presence.live, "portrait LIVE is a strip");
+    assert!(
+        regions.presence.live,
+        "the portrait Reasoning window is focusable"
+    );
     assert_eq!(state(&app), expected);
     assert_eq!(app.mission.jobs.scroll_offset(), 5);
     assert!(!app.scroll.is_following(), "the chat stays scrolled up");
@@ -741,15 +745,15 @@ fn render_viewport_click_focuses_the_window_under_the_pointer() -> TestResult {
     assert_eq!(app.panels.focus, PaneFocus::Jobs);
     assert!(app.mission.live_detail_agent().is_none());
 
-    // Hochformat: der LIVE-Streifen nimmt den Klick, ohne zu fokussieren.
+    // Hochformat: das Reasoning-Fenster ist fokussierbar und nimmt den Klick.
     let _ = rendered(&app, 70, 90)?;
     let strip = app
         .last_regions
         .get()
         .live
-        .ok_or(TestError::Missing("LIVE-Streifen"))?;
-    assert_eq!(route_scroll_input(&mut app, &on(strip)), Some(false));
-    assert_eq!(app.panels.focus, PaneFocus::Jobs);
+        .ok_or(TestError::Missing("Reasoning-Fenster"))?;
+    assert_eq!(route_scroll_input(&mut app, &on(strip)), Some(true));
+    assert_eq!(app.panels.focus, PaneFocus::Live);
 
     // Offener Dialog: kein Fokuswechsel per Klick.
     app.pending_approval_dialog = Some(approval_dialog());
@@ -760,7 +764,7 @@ fn render_viewport_click_focuses_the_window_under_the_pointer() -> TestResult {
         .agents
         .ok_or(TestError::Missing("Agenten mit Dialog"))?;
     assert_eq!(route_scroll_input(&mut app, &on(agents)), None);
-    assert_eq!(app.panels.focus, PaneFocus::Jobs);
+    assert_eq!(app.panels.focus, PaneFocus::Live);
     Ok(())
 }
 
@@ -859,7 +863,7 @@ fn render_viewport_names_a_workbench_without_room_in_the_status_line() -> TestRe
 
 /// PL-97 C3 (§3.3.3): die Zeile `Agent child (pending)` zählt nie mit —
 /// weder im Titel des gerahmten Finished-Fensters (160×45) noch in den
-/// kompakten Zählern (39×60); sie steht trotzdem als eigene Zeile da.
+/// kompakten Zählern (29×60); sie steht trotzdem als eigene Zeile da.
 #[test]
 fn render_viewport_never_counts_the_pending_child_row() -> TestResult {
     let mut app = test_chat_app()?;
@@ -890,7 +894,7 @@ fn render_viewport_never_counts_the_pending_child_row() -> TestResult {
         "{shown}"
     );
 
-    let rows = rendered(&app, 39, 60)?;
+    let rows = rendered(&app, 29, 60)?;
     assert!(
         rows.iter()
             .any(|row| row.starts_with("Agents 1 · Jobs 0 · Done 0/✗0")),
@@ -900,13 +904,13 @@ fn render_viewport_never_counts_the_pending_child_row() -> TestResult {
     Ok(())
 }
 
-/// PL-97 C3: verschwindet das LIVE-Fenster (Querformat → Hochformat), gehen
-/// mit dem Fokus auch seine Details an Ort und Stelle — eine beliebige Taste
-/// räumt sie ab, und `Alt+L` öffnet im Hochformat gleich beim ersten Druck
-/// die Detailansicht aus C2. Zurück im Querformat zeigt das LIVE-Rechteck
-/// wieder LIVE.
+/// Hochformat: das Reasoning-Fenster bleibt Fokusziel, zeigt aber keine
+/// Details an Ort und Stelle — beim Wechsel Querformat → Hochformat behält
+/// LIVE den Fokus, das erste `Alt+L` räumt die Details ab, das nächste
+/// öffnet die maximierte Detailansicht aus C2. Zurück im Querformat zeigt
+/// das LIVE-Rechteck wieder LIVE.
 #[test]
-fn render_viewport_resize_closes_the_in_place_live_detail() -> TestResult {
+fn render_viewport_resize_to_portrait_keeps_live_focus() -> TestResult {
     let mut app = mission_app()?;
     let live = Rect::new(88, 5, 40, 36);
     let live_title = |app: &ChatApp| -> TestResult<String> {
@@ -914,26 +918,25 @@ fn render_viewport_resize_closes_the_in_place_live_detail() -> TestResult {
         cells(&rows, live.x + 1, live.y, live.width - 2)
     };
 
-    // Eine beliebige Taste im Hochformat schließt die unsichtbaren Details.
+    // Die Details an Ort und Stelle schließt im Hochformat `Alt+L`.
     let _ = rendered(&app, 160, 45)?;
     assert_eq!(handle_panel_key(&mut app, alt('l')), Some(true));
     assert_eq!(app.mission.live_detail_agent(), Some("o1"));
     let _ = rendered(&app, 70, 90)?;
-    let _ = handle_panel_key(&mut app, key(KeyCode::Char('j')));
-    assert_eq!(app.panels.focus, PaneFocus::Chat);
+    assert_eq!(app.panels.focus, PaneFocus::Live, "LIVE stays focusable");
+    assert_eq!(handle_panel_key(&mut app, alt('l')), Some(true));
     assert!(app.mission.live_detail_agent().is_none());
     assert!(!app.mission.live_expanded);
     let title = live_title(&app)?;
     assert!(title.starts_with(" LIVE · "), "{title}");
 
-    // `Alt+L` im Hochformat: sofort die C2-Detailansicht.
-    assert_eq!(handle_panel_key(&mut app, alt('l')), Some(true));
-    assert_eq!(app.mission.live_detail_agent(), Some("o1"));
+    // `Alt+L` im Hochformat (Reasoning-Fenster: `revealed.live` bleibt aus):
+    // sofort die maximierte C2-Detailansicht, nie Details an Ort und Stelle.
     let _ = rendered(&app, 70, 90)?;
     assert_eq!(handle_panel_key(&mut app, alt('l')), Some(true));
     assert!(
         app.mission.live_detail_agent().is_none(),
-        "the in-place detail is gone"
+        "no in-place detail in portrait"
     );
     assert_eq!(
         app.agent_detail.as_ref().map(|detail| detail.agent.clone()),

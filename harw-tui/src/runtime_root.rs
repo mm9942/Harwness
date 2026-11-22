@@ -1141,6 +1141,7 @@ fn build_root_runtime(
         ),
     );
     app = app.with_footer_counts(assembly.config().harness.tui.footer_counts);
+    app = app.with_cell_aspect(assembly.config().harness.tui.cell_aspect);
     app.refresh_display_preferences();
     // Runde 5, Teil F: Plan-Fragekanal (`plan.exit`/`plan.enter`/`ask_user`,
     // nur TUI-Montage) und geteilter Plan-Zustand (Sperre, `/plan …`).

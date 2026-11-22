@@ -626,7 +626,7 @@ mod tests {
                 Some(Err(BaselineError::DuplicateMetric { .. }))
             ));
             assert!(matches!(index.get("mem-used"), Some(Ok(b)) if b.id == "mem"));
-            assert!(index.get("io-wait").is_none());
+            assert!(!index.contains_key("io-wait"));
             assert_eq!(index.len(), 2);
         }
         Ok(())

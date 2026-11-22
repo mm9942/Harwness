@@ -177,6 +177,23 @@ impl ChatScroll {
             .map_or(usize::MAX, |m| m.total.saturating_sub(m.viewport))
     }
 
+    /// Kappt den Offset auf `max_offset`, ohne ihn anzuheben (nur Senken).
+    ///
+    /// Für Zeichenpfade, die nur `&self` besitzen und deren sichtbarer
+    /// Bereich kleiner ist als der zuletzt gemessene Gesamtstand. Der
+    /// Identitätsanker und die letzte Messung bleiben unverändert, damit das
+    /// nächste [`ChatScroll::sync_layout`] gegen die monotone Gesamtzahl
+    /// vergleicht.
+    ///
+    /// # Returns
+    /// Den neuen Offset vom Ende.
+    pub fn cap_offset(&self, max_offset: usize) -> usize {
+        let offset = self.offset.get().min(max_offset);
+        self.offset.set(offset);
+        self.unseen.set(self.unseen.get().min(offset));
+        offset
+    }
+
     /// Scrollt um `lines` Zeilen nach oben (in Richtung älterer Nachrichten).
     ///
     /// # Description
@@ -843,6 +860,20 @@ mod tests {
             ScrollAction::Redraw
         );
         assert!(s.is_following());
+    }
+
+    #[test]
+    fn cap_offset_only_lowers_the_offset() -> crate::test_support::TestResult {
+        let mut s = ChatScroll::new();
+        assert_eq!(s.sync_layout(100, 10, 40), 0);
+        s.scroll_up(80, 100, 10);
+        assert_eq!(s.offset(), 80);
+        assert_eq!(s.cap_offset(30), 30);
+        assert_eq!(s.offset(), 30);
+        assert!(s.unseen_lines() <= 30);
+        // Ein größeres Limit hebt den Offset nicht an.
+        assert_eq!(s.cap_offset(500), 30);
+        Ok(())
     }
 
     #[test]

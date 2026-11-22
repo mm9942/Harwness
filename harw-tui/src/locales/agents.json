@@ -491,18 +491,6 @@
     "vi": "nội bộ",
     "hi": "आंतरिक"
   },
-  "agents.live_detail": {
-    "en": "── {p0} live · Enter details ──",
-    "de": "── {p0} live · Enter Details ──",
-    "es": "── {p0} en vivo · Enter detalles ──",
-    "fr": "── {p0} en direct · Enter détails ──",
-    "pt": "── {p0} ao vivo · Enter detalhes ──",
-    "ja": "── {p0} 実行中 · Enter 詳細 ──",
-    "zh-CN": "── {p0} 实时 · Enter 详情 ──",
-    "ko": "── {p0} 실시간 · Enter 상세 ──",
-    "vi": "── {p0} trực tiếp · Enter chi tiết ──",
-    "hi": "── {p0} लाइव · Enter विवरण ──"
-  },
   "agents.dock_title": {
     "en": " Agents · {active} active ",
     "de": " Agenten · {active} aktiv ",
@@ -802,6 +790,18 @@
     "ko": "… 이전 단계 {p0}개",
     "vi": "… {p0} bước trước",
     "hi": "… {p0} पिछले चरण"
+  },
+  "agents.older_in_detail": {
+    "en": "… {p0} older entries in /agent detail",
+    "de": "… {p0} ältere Einträge im /agent-Detail",
+    "es": "… {p0} entradas anteriores en el detalle de /agent",
+    "fr": "… {p0} entrées plus anciennes dans le détail /agent",
+    "pt": "… {p0} entradas anteriores no detalhe de /agent",
+    "ja": "… 古い {p0} 件は /agent の詳細に",
+    "zh-CN": "… 较早的 {p0} 条见 /agent 详情",
+    "ko": "… 이전 항목 {p0}개는 /agent 상세에",
+    "vi": "… {p0} mục cũ hơn trong chi tiết /agent",
+    "hi": "… {p0} पुरानी प्रविष्टियाँ /agent विवरण में"
   },
   "agents.hidden_lines": {
     "en": "  … ({hidden} more lines)",

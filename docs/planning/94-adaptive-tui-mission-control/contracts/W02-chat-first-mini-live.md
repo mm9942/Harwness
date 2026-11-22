@@ -24,6 +24,15 @@ baseline_dev: 090a9d2b786a3a6c025182d8da9c7b28bb7cbece
 > language (owner). Sections CURRENT and DELTA below are the original
 > planning record.
 
+> **Superseded in part, 2026-11-22 (owner decision, PL-97 §3.3.1/§7).** The
+> portrait layout of this contract (flat cards row, `Combined` dock below 68
+> columns, unframed non-focusable LIVE strip above the chat, FINISHED above
+> LIVE) is replaced by `portrait_square_stack`: two square Agents|Jobs windows
+> (never combined), a boxed 8-row Reasoning window mixing all agents with a role
+> prefix, the FINISHED strip below it, chat floor 8 rows. Agent lists no longer
+> show reasoning/preview lines. The landscape parts and the chat-first
+> principle stay valid.
+
 > **Operator-approved UX clarification, 2026-10-09. PLAN ONLY.** The screenshot layout of three status windows above the main Chat is the reference. The earlier PL-94 proposal for a separate model-backed Progress Agent, automatically generated todo narratives, a progress bar and a second large output viewport is **superseded for the primary TUI design** by this contract. This wave makes no runtime code changes.
 
 ## CURRENT — confirmed source, not an implementation claim for W02
