@@ -14,26 +14,43 @@
 //! ([`ClientCaps::for_wire_minor`]). Revoking a connection, device or agent
 //! principal cancels its in-flight tool calls; draining refuses new ones and
 //! lets in-flight calls finish.
+//!
+//! Sharing profile sessions (plan §3.2-§3.5, contract K-W1 §8.3): with a
+//! [`ProfileShare`] ([`SessionHost::open_with_profile`]) the host lists, pages
+//! and reads TUI sessions of the profile store without writing anything.
+//! Steering one adopts it first (a hosted record with the caller's creator
+//! authority, created at most once). Every turn of a shared session runs
+//! under the session lease (`HolderKind::Gateway`); a lease held elsewhere
+//! answers `BUSY` (or `SubmitResult::Denied` for a minor-2 client). Attached
+//! profile sessions without a host turn are watched for transcript growth and
+//! lease changes every [`HostConfig::profile_head_poll`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, GatewayConnectionInfo,
-    GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams,
-    GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult, GatewayStatus,
-    GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams,
-    HistoryParams, InterruptParams, PrincipalSummary, RespondResult, SESSION_WIRE_MINOR,
-    SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SubmitParams, SubmitResult,
-    TOOL_GATEWAY_WIRE_MINOR, ToolCallParams, ToolCallResultFrame, ToolCancelParams, ToolListParams,
-    ToolListResult, features,
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CreateInParams, CreateParams,
+    DEFAULT_PAGE_LIMIT, GatewayConnectionInfo, GatewayConnectionsResult, GatewayDrainParams,
+    GatewayListenerInfo, GatewayListenerSetParams, GatewayListenersResult, GatewayRevokeParams,
+    GatewayRevokeResult, GatewayStatus, GatewayToolRights, GatewayToolRightsParams,
+    GatewayToolsResult, HelloAck, HelloParams, HistoryParams, HolderInfo, InterruptParams,
+    MAX_PAGE_LIMIT, NO_PROJECT_KEY, PROJECTS_WIRE_MINOR, PageParams, PageResult, PrincipalSummary,
+    ProjectsParams, ProjectsResult, ReadOnlyReason, RenameParams, RespondResult, RowOrigin,
+    SESSION_WIRE_MINOR, SessionRow, SessionSummary, SetEffortParams, SetModeParams, SetModelParams,
+    SetProjectParams, ShareInfo, SubmitParams, SubmitResult, TOOL_GATEWAY_WIRE_MINOR,
+    ToolCallParams, ToolCallResultFrame, ToolCancelParams, ToolListParams, ToolListResult,
+    features,
 };
 use harw_protocol::{
     ApprovalRequest, ClientCaps, Cursor, FrameEnvelope, FrameSource, GatewayPort, HostedState,
     PortError, PortFuture, PresenceEntry, SessionEvent, SessionFrame, SessionPort, ToolPort,
     ToolRefusal, TurnEvent,
+};
+use harw_session_store::{
+    HolderKind, LastOrigin, SessionLease, SessionStoreError, TitleSource, meta, peek_holder,
 };
 use harw_types::{DeviceId, SessionId, TenantId};
 use tokio::sync::watch;
@@ -51,8 +68,12 @@ use crate::identity::{
     AgentPrincipal, ClientIdentity, ConnectionId, Need, ToolGrant, admit, admit_tool_call,
     tenant_admits,
 };
+use crate::index::{
+    DENIED_NOT_SHARED, DENIED_READ_ONLY, ProfileRow, ProfileShare, ShareMode, busy_reason,
+    decode_cursor, encode_cursor, wire_holder, wire_last_origin,
+};
 use crate::live_ring::LiveRing;
-use crate::record::{HostedSessionRecord, RecordStore};
+use crate::record::{CreateOutcome, HostedSessionRecord, RecordStore};
 use crate::replay::{TranscriptSource, history_before, replay, tail_start};
 use crate::tool_host::{SessionScope, ToolEvents, ToolHost};
 
@@ -70,6 +91,9 @@ pub struct HostConfig {
     pub max_history_page: u32,
     /// Keep-alive frame interval.
     pub heartbeat: Duration,
+    /// Interval of the head watch of attached profile sessions (plan §3.2
+    /// step 10).
+    pub profile_head_poll: Duration,
 }
 
 impl HostConfig {
@@ -82,6 +106,7 @@ impl HostConfig {
             arbiter: ArbiterLimits::default(),
             max_history_page: 500,
             heartbeat: Duration::from_secs(15),
+            profile_head_poll: Duration::from_secs(2),
         }
     }
 }
@@ -95,10 +120,22 @@ const HOST_FEATURES: &[&str] = &[
     features::GATEWAY,
     features::COMPACT_REASONING,
     features::JOB_FRAMES,
+    features::PROJECTS,
 ];
 
 /// Features that exist only from [`TOOL_GATEWAY_WIRE_MINOR`] on.
 const R18_FEATURES: &[&str] = &[features::TOOLS, features::GATEWAY];
+
+/// Features that exist only from [`PROJECTS_WIRE_MINOR`] on. Granted with or
+/// without sharing (a client then shows its empty state).
+const PROJECT_FEATURES: &[&str] = &[features::PROJECTS];
+
+/// Denied: the project key is unknown or its root failed validation.
+const DENIED_UNKNOWN_PROJECT: &str = "unbekanntes Projekt";
+/// Denied: the session's first record is not a CLI session.
+const DENIED_FOREIGN_ORIGIN: &str = "Session stammt nicht aus der TUI";
+/// Denied: the session has no valid working directory.
+const DENIED_NO_WORKDIR: &str = "Session hat keinen gültigen Arbeitsordner";
 
 /// One live connection as `gateway.connections.list` shows it.
 struct ConnEntry {
@@ -117,6 +154,8 @@ struct AttachEntry {
     device: Option<DeviceId>,
     queue: AttachmentQueue,
     presence: PresenceEntry,
+    /// The connection negotiated feature `projects` (receives `holder`).
+    projects: bool,
 }
 
 struct SlotState {
@@ -130,6 +169,36 @@ struct SlotState {
     pending_settings: Vec<Setting>,
     /// A turn is parked on an approval.
     parked: bool,
+    /// Profile session read without a hosted record: `record` is a
+    /// synthetic in-memory view and is never saved.
+    ephemeral: bool,
+    /// Session lease held for the host's turns (shared profile store only),
+    /// from the submit until the final turn outcome.
+    lease: Option<SessionLease>,
+    /// Transcript head the driver's cached state reflects (set when a host
+    /// turn ends). `None`: the driver hydrates from the transcript.
+    driver_head: Option<u64>,
+    /// Lease holder last announced to `projects` attachments.
+    seen_holder: Option<HolderInfo>,
+}
+
+impl SlotState {
+    fn new(record: HostedSessionRecord, limits: ArbiterLimits, head: u64, ephemeral: bool) -> Self {
+        Self {
+            record,
+            arbiter: Arbiter::new(limits),
+            ring: LiveRing::default(),
+            durable_head: head,
+            attachments: Vec::new(),
+            cancel: None,
+            pending_settings: Vec::new(),
+            parked: false,
+            ephemeral,
+            lease: None,
+            driver_head: None,
+            seen_holder: None,
+        }
+    }
 }
 
 struct Slot {
@@ -163,6 +232,8 @@ struct HostInner {
     connections: Mutex<BTreeMap<ConnectionId, ConnEntry>>,
     /// R18 configured listeners (`gateway.listeners.*`).
     listeners: Mutex<Vec<GatewayListenerInfo>>,
+    /// Sharing of profile (TUI) sessions; `None` without sharing.
+    profile: Option<ProfileShare>,
 }
 
 /// The persistent session host. Cheap to clone.
@@ -203,6 +274,32 @@ impl SessionHost {
         approvals: Arc<dyn ApprovalBackend>,
         tools: ToolHost,
     ) -> Result<Self, HostError> {
+        Self::open_inner(config, driver, transcripts, approvals, tools, None)
+    }
+
+    /// Like [`SessionHost::open_with_tools`], sharing the profile sessions of
+    /// `share.index` (plan §3.2). `transcripts` must read the same store as
+    /// `share.index.sessions_root()`. [`SessionHost::open`] and
+    /// [`SessionHost::open_with_tools`] never share.
+    pub fn open_with_profile(
+        config: HostConfig,
+        driver: Arc<dyn TurnDriver>,
+        transcripts: Arc<dyn TranscriptSource>,
+        approvals: Arc<dyn ApprovalBackend>,
+        tools: ToolHost,
+        share: ProfileShare,
+    ) -> Result<Self, HostError> {
+        Self::open_inner(config, driver, transcripts, approvals, tools, Some(share))
+    }
+
+    fn open_inner(
+        config: HostConfig,
+        driver: Arc<dyn TurnDriver>,
+        transcripts: Arc<dyn TranscriptSource>,
+        approvals: Arc<dyn ApprovalBackend>,
+        tools: ToolHost,
+        profile: Option<ProfileShare>,
+    ) -> Result<Self, HostError> {
         let records = RecordStore::new(&config.state_dir);
         let epoch = records.next_epoch()?;
         let interrupted = records.recover_after_restart(epoch)?;
@@ -229,6 +326,7 @@ impl SessionHost {
                 tools,
                 connections: Mutex::new(BTreeMap::new()),
                 listeners: Mutex::new(Vec::new()),
+                profile,
             }),
         })
     }
@@ -272,6 +370,8 @@ impl SessionHost {
             host: Arc::clone(&self.inner),
             identity,
             granted: Mutex::new(None),
+            wire_minor: AtomicU32::new(0),
+            projects: AtomicBool::new(false),
         })
     }
 
@@ -490,19 +590,67 @@ impl SessionHost {
         }
     }
 
-    /// Spawn the heartbeat timer on the current Tokio runtime.
+    /// Spawn the heartbeat timer on the current Tokio runtime. With sharing
+    /// it also drives the profile head watch
+    /// ([`SessionHost::poll_profile_heads`]) every
+    /// [`HostConfig::profile_head_poll`].
     #[must_use]
     pub fn spawn_heartbeat(&self) -> tokio::task::JoinHandle<()> {
         let host = self.clone();
         let every = self.inner.config.heartbeat;
+        let poll = self
+            .inner
+            .config
+            .profile_head_poll
+            .max(Duration::from_millis(100));
+        let watch_heads = self.inner.share().is_some();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
             tick.tick().await;
+            let mut heads = tokio::time::interval(poll);
+            heads.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heads.tick().await;
             loop {
-                tick.tick().await;
-                host.heartbeat();
+                tokio::select! {
+                    _ = tick.tick() => host.heartbeat(),
+                    _ = heads.tick(), if watch_heads => host.poll_profile_heads(),
+                }
             }
         })
+    }
+
+    /// One round of the profile head watch (plan §3.2 step 10): for every
+    /// attached shared session without a host turn, send transcript records
+    /// written elsewhere (as replay frames) and lease changes (`holder`
+    /// frames, `projects` connections only). Never writes.
+    pub fn poll_profile_heads(&self) {
+        let Some(share) = self.inner.share() else {
+            return;
+        };
+        let root = share.index.sessions_root();
+        for slot in self.inner.all_slots() {
+            let Ok(mut state) = slot.lock() else { continue };
+            state.attachments.retain(|entry| !entry.queue.is_closed());
+            if state.attachments.is_empty()
+                || state.lease.is_some()
+                || state.arbiter.is_running()
+                || state.parked
+            {
+                continue;
+            }
+            self.inner.observe_head(&slot.id, &mut state);
+            match peek_holder(root, &slot.id) {
+                Ok(holder) => {
+                    let holder = holder.as_ref().map(wire_holder);
+                    if holder != state.seen_holder {
+                        state.publish_holder(&slot.id, holder);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, session = %slot.id.as_str(), "session host: lease peek failed");
+                }
+            }
+        }
     }
 }
 
@@ -743,16 +891,7 @@ impl HostInner {
         let head = self.transcripts.head(id)?;
         let slot = Arc::new(Slot {
             id: id.clone(),
-            state: Mutex::new(SlotState {
-                record,
-                arbiter: Arbiter::new(self.config.arbiter),
-                ring: LiveRing::default(),
-                durable_head: head,
-                attachments: Vec::new(),
-                cancel: None,
-                pending_settings: Vec::new(),
-                parked: false,
-            }),
+            state: Mutex::new(SlotState::new(record, self.config.arbiter, head, false)),
         });
         let mut slots = self
             .slots
@@ -761,20 +900,19 @@ impl HostInner {
         Ok(Arc::clone(slots.entry(id.clone()).or_insert(slot)))
     }
 
+    /// The slot already in memory, without touching the record store.
+    fn loaded_slot(&self, id: &SessionId) -> Option<Arc<Slot>> {
+        self.slots
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(id).cloned())
+    }
+
     fn insert_slot(&self, record: HostedSessionRecord) -> Result<Arc<Slot>, HostError> {
         let id = record.session_id.clone();
         let slot = Arc::new(Slot {
             id: id.clone(),
-            state: Mutex::new(SlotState {
-                record,
-                arbiter: Arbiter::new(self.config.arbiter),
-                ring: LiveRing::default(),
-                durable_head: 0,
-                attachments: Vec::new(),
-                cancel: None,
-                pending_settings: Vec::new(),
-                parked: false,
-            }),
+            state: Mutex::new(SlotState::new(record, self.config.arbiter, 0, false)),
         });
         self.slots
             .lock()
@@ -796,10 +934,246 @@ impl HostInner {
     }
 
     fn save(&self, state: &mut SlotState) {
+        if state.ephemeral {
+            // A profile session read without adoption never gets a record.
+            return;
+        }
         state.record.updated_at = jiff::Timestamp::now();
         if let Err(error) = self.records.save(&state.record) {
             tracing::warn!(%error, session = %state.record.session_id.as_str(), "session host: record save failed");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile sharing (contract K-W1 §8.3)
+    // -----------------------------------------------------------------------
+
+    /// The active share (`None` without a profile or in mode `off`).
+    fn share(&self) -> Option<&ProfileShare> {
+        self.profile
+            .as_ref()
+            .filter(|share| share.settings.mode != ShareMode::Off)
+    }
+
+    /// The active share, if a caller of tenant `caller` may see its rows.
+    fn share_for(&self, caller: Option<&TenantId>) -> Option<&ProfileShare> {
+        self.share()
+            .filter(|share| tenant_admits(caller, Some(&share.settings.tenant)))
+    }
+
+    /// The slot of `id`: a hosted one, or a read-only view of a visible
+    /// profile session (no record, no file written; plan §3.2 step 5).
+    fn profile_slot(
+        &self,
+        id: &SessionId,
+        caller: Option<&TenantId>,
+    ) -> Result<Arc<Slot>, HostError> {
+        match self.slot(id) {
+            Err(HostError::NotFound) => {}
+            other => return other,
+        }
+        let share = self.share_for(caller).ok_or(HostError::NotFound)?;
+        let row = share.index.row(id)?.ok_or(HostError::NotFound)?;
+        let head = self.transcripts.head(id)?;
+        let now = jiff::Timestamp::now();
+        let record = HostedSessionRecord {
+            session_id: id.clone(),
+            tenant: Some(share.settings.tenant.clone()),
+            owner_principal: String::new(),
+            creator_execution: None,
+            workspace: None,
+            title: Some(row.title),
+            created_at: now,
+            updated_at: row.updated_at,
+            state: HostedState::Idle,
+            host_epoch: self.epoch,
+            generation: 0,
+            owner_agent: None,
+            tool_agents: Vec::new(),
+        };
+        let slot = Arc::new(Slot {
+            id: id.clone(),
+            state: Mutex::new(SlotState::new(record, self.config.arbiter, head, true)),
+        });
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| HostError::Storage("slot table poisoned".into()))?;
+        Ok(Arc::clone(slots.entry(id.clone()).or_insert(slot)))
+    }
+
+    /// Install an adopted record: upgrade a read-only view in place (its
+    /// attachments stay) or build a new slot at the current head.
+    fn publish_record(&self, record: HostedSessionRecord) -> Result<Arc<Slot>, HostError> {
+        let id = record.session_id.clone();
+        if let Some(slot) = self.loaded_slot(&id) {
+            let mut state = slot.lock()?;
+            if state.ephemeral {
+                state.record = record;
+                state.ephemeral = false;
+            }
+            drop(state);
+            return Ok(slot);
+        }
+        let head = self.transcripts.head(&id)?;
+        let slot = Arc::new(Slot {
+            id: id.clone(),
+            state: Mutex::new(SlotState::new(record, self.config.arbiter, head, false)),
+        });
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| HostError::Storage("slot table poisoned".into()))?;
+        Ok(Arc::clone(slots.entry(id).or_insert(slot)))
+    }
+
+    /// Take the session lease for a host turn (plan §3.5). No-op without
+    /// sharing or when the slot holds it already. Afterwards the head check:
+    /// a transcript that moved since the driver's last turn here makes the
+    /// driver drop its cached state and hydrate again.
+    ///
+    /// # Errors
+    /// [`HostError::Busy`] with the display reason when another process
+    /// holds the lease; storage errors otherwise.
+    fn ensure_lease(&self, id: &SessionId, state: &mut SlotState) -> Result<(), HostError> {
+        let Some(share) = self.share() else {
+            return Ok(());
+        };
+        if state.lease.is_some() {
+            return Ok(());
+        }
+        let lease =
+            match SessionLease::acquire(share.index.sessions_root(), id, HolderKind::Gateway) {
+                Ok(lease) => lease,
+                Err(SessionStoreError::LeaseHeld { holder, .. }) => {
+                    return Err(HostError::Busy(
+                        busy_reason(holder.map(|holder| holder.kind)).to_owned(),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
+        let head = self.transcripts.head(id)?;
+        if state.driver_head.is_some_and(|seen| seen != head) {
+            tracing::info!(
+                session = %id.as_str(),
+                "session host: transcript changed outside the host; rehydrating"
+            );
+            self.forget_driver_state(id)?;
+            state.driver_head = None;
+        }
+        state.durable_head = head;
+        let holder = Some(wire_holder(lease.holder()));
+        state.lease = Some(lease);
+        state.publish_holder(id, holder);
+        Ok(())
+    }
+
+    /// Drop the driver's cached core state of `id` ([OFFEN-1]).
+    fn forget_driver_state(&self, id: &SessionId) -> Result<(), HostError> {
+        self.driver.forget_session(id)
+    }
+
+    /// Release the turn lease. After a turn, `last_origin = gateway` is
+    /// recorded first (still under the lease).
+    fn release_lease(&self, id: &SessionId, state: &mut SlotState, turn_ran: bool) {
+        let Some(lease) = state.lease.take() else {
+            return;
+        };
+        if turn_ran
+            && let Some(share) = self.share()
+            && let Err(error) = meta::set_last_origin(
+                share.index.sessions_root(),
+                id,
+                LastOrigin::Gateway,
+                jiff::Timestamp::now(),
+            )
+        {
+            tracing::warn!(%error, session = %id.as_str(), "session host: last_origin not recorded");
+        }
+        drop(lease);
+        state.publish_holder(id, None);
+    }
+
+    /// Send records another writer appended since the cached head.
+    fn observe_head(&self, id: &SessionId, state: &mut SlotState) {
+        let head = match self.transcripts.head(id) {
+            Ok(head) => head,
+            Err(error) => {
+                tracing::debug!(%error, session = %id.as_str(), "session host: head read failed");
+                return;
+            }
+        };
+        if head == state.durable_head {
+            return;
+        }
+        let generation = state.record.generation;
+        if head < state.durable_head {
+            // Rewritten elsewhere (retention, repair): start over.
+            state.durable_head = head;
+            let cursor = state.head_cursor();
+            state.publish_side(
+                id,
+                SessionFrame::Resync {
+                    reason: "transcript rewritten outside the host".into(),
+                    head: cursor,
+                },
+            );
+            return;
+        }
+        let budget = (self.config.queue.max_frames / 2).max(1);
+        let frames = match replay(
+            self.transcripts.as_ref(),
+            id,
+            generation,
+            state.durable_head,
+            budget,
+        ) {
+            Ok(frames) => frames,
+            Err(error) => {
+                tracing::debug!(%error, session = %id.as_str(), "session host: head replay failed");
+                return;
+            }
+        };
+        let reached = frames
+            .last()
+            .map_or(head, |frame| frame.cursor.durable.max(state.durable_head));
+        state.attachments.retain(|entry| !entry.queue.is_closed());
+        for frame in frames {
+            for entry in &state.attachments {
+                entry.queue.push(frame.clone());
+            }
+        }
+        state.durable_head = reached.min(head);
+    }
+
+    /// Projects with a running or parked host turn, by project key
+    /// (`""` = no project) [OFFEN-8: TUI leases are not counted].
+    fn active_by_project(
+        &self,
+        share: &ProfileShare,
+        caller: Option<&TenantId>,
+    ) -> HashMap<String, u32> {
+        let active: Vec<SessionId> = self
+            .all_slots()
+            .iter()
+            .filter(|slot| {
+                slot.lock().is_ok_and(|state| {
+                    (state.arbiter.is_running() || state.parked)
+                        && tenant_admits(caller, state.record.tenant.as_ref())
+                })
+            })
+            .map(|slot| slot.id.clone())
+            .collect();
+        let mut out: HashMap<String, u32> = HashMap::new();
+        for id in active {
+            let key = match share.index.row(&id) {
+                Ok(Some(row)) => row.project_key.unwrap_or_default(),
+                Ok(None) | Err(_) => continue,
+            };
+            let entry = out.entry(key).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+        out
     }
 }
 
@@ -855,6 +1229,24 @@ impl SlotState {
 
     fn set_state(&mut self, state: HostedState) {
         self.record.state = state;
+    }
+
+    /// Announce a lease change to the attachments that negotiated
+    /// `projects` (older clients would only decode `Unknown`).
+    fn publish_holder(&mut self, session_id: &SessionId, holder: Option<HolderInfo>) {
+        self.seen_holder.clone_from(&holder);
+        self.attachments.retain(|entry| !entry.queue.is_closed());
+        let envelope = FrameEnvelope {
+            session_id: session_id.clone(),
+            cursor: self.head_cursor(),
+            frame: SessionFrame::Holder {
+                session_id: session_id.clone(),
+                holder,
+            },
+        };
+        for entry in self.attachments.iter().filter(|entry| entry.projects) {
+            entry.queue.push(envelope.clone());
+        }
     }
 
     /// Fan out a frame that does not belong to a driver turn (gateway tool
@@ -964,7 +1356,7 @@ impl EventSink for SlotSink {
 fn pump(host: Arc<HostInner>, slot: Arc<Slot>) {
     tokio::spawn(async move {
         loop {
-            let (input, settings, cancel_rx) = {
+            let next = {
                 let Ok(mut state) = slot.lock() else { return };
                 if state.parked || state.record.state.is_terminal() {
                     return;
@@ -972,20 +1364,36 @@ fn pump(host: Arc<HostInner>, slot: Arc<Slot>) {
                 let Some(input) = state.arbiter.next_input() else {
                     return;
                 };
-                let (cancel_tx, cancel_rx) = watch::channel(false);
-                state.cancel = Some(cancel_tx);
-                let depth = state.arbiter.depth();
-                state.set_state(if depth > 0 {
-                    HostedState::Queued { depth }
-                } else {
-                    HostedState::Running
-                });
-                host.save(&mut state);
-                (
-                    input,
-                    std::mem::take(&mut state.pending_settings),
-                    cancel_rx,
-                )
+                // Normally taken at submit already; a queue resumed after a
+                // restart takes it here (plan §3.5: no turn without lease).
+                match host.ensure_lease(&slot.id, &mut state) {
+                    Err(error) => Err(error),
+                    Ok(()) => {
+                        let (cancel_tx, cancel_rx) = watch::channel(false);
+                        state.cancel = Some(cancel_tx);
+                        let depth = state.arbiter.depth();
+                        state.set_state(if depth > 0 {
+                            HostedState::Queued { depth }
+                        } else {
+                            HostedState::Running
+                        });
+                        host.save(&mut state);
+                        Ok((
+                            input,
+                            std::mem::take(&mut state.pending_settings),
+                            cancel_rx,
+                        ))
+                    }
+                }
+            };
+            let (input, settings, cancel_rx) = match next {
+                Ok(next) => next,
+                Err(error) => {
+                    if !settle(&host, &slot, &TurnOutcome::Failed(error.to_string())) {
+                        return;
+                    }
+                    continue;
+                }
             };
             if let Err(error) = host.prepare_execution(&slot).await {
                 if !settle(&host, &slot, &TurnOutcome::Failed(error.to_string())) {
@@ -1031,8 +1439,12 @@ fn settle(host: &HostInner, slot: &Slot, outcome: &TurnOutcome) -> bool {
         state.durable_head = head;
     }
     state.cancel = None;
+    // The driver's state now reflects the transcript up to here (head check
+    // before the next leased turn).
+    state.driver_head = Some(state.durable_head);
     match outcome {
         TurnOutcome::AwaitingApproval => {
+            // The lease stays through the approval pause (plan §3.5).
             state.parked = true;
             state.set_state(HostedState::WaitingForApproval);
             host.save(&mut state);
@@ -1075,6 +1487,10 @@ fn settle(host: &HostInner, slot: &Slot, outcome: &TurnOutcome) -> bool {
                 });
             }
             host.save(&mut state);
+            // Final outcome: keep the lease only for a queued next turn.
+            if closed || state.arbiter.depth() == 0 {
+                host.release_lease(&slot.id, &mut state, true);
+            }
             !closed
         }
     }
@@ -1093,6 +1509,12 @@ fn resume_parked(host: Arc<HostInner>, slot: Arc<Slot>) {
             state.cancel = Some(cancel_tx);
             state.set_state(HostedState::Running);
             host.save(&mut state);
+            // Held since the turn parked; re-taken only if it was lost.
+            if let Err(error) = host.ensure_lease(&slot.id, &mut state) {
+                drop(state);
+                settle(&host, &slot, &TurnOutcome::Failed(error.to_string()));
+                return;
+            }
             cancel_rx
         };
         let sink: Arc<dyn EventSink> = Arc::new(SlotSink {
@@ -1153,6 +1575,10 @@ pub struct HostConnection {
     host: Arc<HostInner>,
     identity: ClientIdentity,
     granted: Mutex<Option<ClientCaps>>,
+    /// Negotiated wire minor (0 before hello).
+    wire_minor: AtomicU32,
+    /// Feature `projects` was granted at hello.
+    projects: AtomicBool,
 }
 
 impl Drop for HostConnection {
@@ -1234,18 +1660,28 @@ impl HostConnection {
         {
             entry.granted = Some(caps);
         }
-        let features = params
+        let granted_features: Vec<String> = params
             .features
             .iter()
             .filter(|feature| HOST_FEATURES.contains(&feature.as_str()))
             .filter(|feature| {
                 wire_minor >= TOOL_GATEWAY_WIRE_MINOR || !R18_FEATURES.contains(&feature.as_str())
             })
+            .filter(|feature| {
+                wire_minor >= PROJECTS_WIRE_MINOR || !PROJECT_FEATURES.contains(&feature.as_str())
+            })
             .cloned()
             .collect();
+        self.wire_minor.store(wire_minor, Ordering::SeqCst);
+        self.projects.store(
+            granted_features
+                .iter()
+                .any(|feature| feature.as_str() == features::PROJECTS),
+            Ordering::SeqCst,
+        );
         Ok(HelloAck {
             wire_minor,
-            features,
+            features: granted_features,
             host_epoch: self.host.epoch,
             granted: caps,
         })
@@ -1256,7 +1692,52 @@ impl HostConnection {
         if !granted.observe {
             return Err(HostError::Denied("capability `observe` not granted".into()));
         }
-        self.summaries()
+        let mut out = self.summaries()?;
+        // Minor-2 clients see the newest profile sessions in the flat list,
+        // prefixed with their project (contract K-W1 §8.3).
+        if !self.has_projects()
+            && let Some(share) = self.host.share_for(self.identity.tenant.as_ref())
+        {
+            let hosted: HashSet<SessionId> = out
+                .iter()
+                .map(|summary| summary.session_id.clone())
+                .collect();
+            for row in share.index.newest(share.settings.legacy_rows)? {
+                if hosted.contains(&row.session_id) {
+                    continue;
+                }
+                let title = match row.project_label.as_deref() {
+                    Some(label) if !label.is_empty() => format!("{label} · {}", row.title),
+                    _ => row.title,
+                };
+                out.push(SessionSummary {
+                    session_id: row.session_id,
+                    title: Some(title),
+                    tenant: Some(share.settings.tenant.clone()),
+                    state: HostedState::Idle,
+                    attached: 0,
+                    updated_at: row.updated_at,
+                    model: None,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Feature `projects` was negotiated at hello.
+    fn has_projects(&self) -> bool {
+        self.projects.load(Ordering::SeqCst)
+    }
+
+    /// Observe admission that also reaches visible profile sessions without
+    /// a record (read-only view, nothing written).
+    fn observed_slot(&self, id: &SessionId) -> Result<Arc<Slot>, HostError> {
+        let granted = self.granted()?;
+        Need::Observe.require(granted)?;
+        let slot = self.host.profile_slot(id, self.identity.tenant.as_ref())?;
+        let tenant = slot.lock()?.record.tenant.clone();
+        admit(&self.identity, granted, tenant.as_ref(), Need::Observe)?;
+        Ok(slot)
     }
 
     /// Summaries of every session visible to this caller's tenant.
@@ -1297,7 +1778,7 @@ impl HostConnection {
         params: &AttachParams,
     ) -> Result<(AttachAck, crate::fanout::AttachmentStream), HostError> {
         let granted = self.granted()?;
-        let slot = self.admitted_slot(&params.session_id, Need::Observe)?;
+        let slot = self.observed_slot(&params.session_id)?;
         let mut state = slot.lock()?;
         let generation = state.record.generation;
         let head = self.host.transcripts.head(&slot.id)?;
@@ -1435,11 +1916,32 @@ impl HostConnection {
                 true
             }
         });
+        let projects = self.has_projects();
+        if projects && let Some(share) = self.host.share() {
+            // Current lease holder, so the client starts with the right badge.
+            match peek_holder(share.index.sessions_root(), &slot.id) {
+                Ok(Some(holder)) => {
+                    let _ = queue.push(FrameEnvelope {
+                        session_id: slot.id.clone(),
+                        cursor: state.head_cursor(),
+                        frame: SessionFrame::Holder {
+                            session_id: slot.id.clone(),
+                            holder: Some(wire_holder(&holder)),
+                        },
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, session = %slot.id.as_str(), "session host: lease peek failed");
+                }
+            }
+        }
         state.attachments.push(AttachEntry {
             connection,
             device: self.identity.device.clone(),
             queue,
             presence,
+            projects,
         });
         state.broadcast_presence(&slot.id);
         let ack = AttachAck {
@@ -1474,17 +1976,31 @@ impl HostConnection {
         if !granted.steer {
             return Err(HostError::Denied("capability `steer` not granted".into()));
         }
+        Ok(self.new_record(
+            SessionId::new(),
+            params.title.as_deref(),
+            params.workspace.clone(),
+            self.identity.tenant.clone(),
+        ))
+    }
+
+    /// A fresh record owned by this caller (creator authority from the
+    /// authenticated identity, never from the wire).
+    fn new_record(
+        &self,
+        session_id: SessionId,
+        title: Option<&str>,
+        workspace: Option<String>,
+        tenant: Option<TenantId>,
+    ) -> HostedSessionRecord {
         let now = jiff::Timestamp::now();
-        let session_id = SessionId::new();
-        let title = params
-            .title
-            .as_deref()
+        let title = title
             .map(str::trim)
             .filter(|title| !title.is_empty())
             .map(|title| title.chars().take(200).collect::<String>());
-        Ok(HostedSessionRecord {
+        HostedSessionRecord {
             session_id,
-            tenant: self.identity.tenant.clone(),
+            tenant,
             owner_principal: self.identity.principal.id().to_owned(),
             creator_execution: Some(crate::record::CreatorExecutionRequest {
                 binding: Some(crate::record::CreatorExecutionBinding::from_identity(
@@ -1493,7 +2009,7 @@ impl HostConnection {
                 maximum_tier: self.identity.principal.tier(),
                 approval_actor: self.identity.actor.clone(),
             }),
-            workspace: params.workspace.clone(),
+            workspace,
             title,
             created_at: now,
             updated_at: now,
@@ -1504,7 +2020,7 @@ impl HostConnection {
             // calls; its delegates inherit access, other agents do not.
             owner_agent: self.identity.agent.as_ref().map(|agent| agent.id.clone()),
             tool_agents: Vec::new(),
-        })
+        }
     }
 
     fn submit_sync(
@@ -1540,6 +2056,23 @@ impl HostConnection {
             }
             _ => {}
         }
+        if state.ephemeral {
+            // Profile sessions are adopted before a submit reaches here.
+            return Err(HostError::NotFound);
+        }
+        // Plan §3.5: no turn without the session lease. Taken only when no
+        // host turn holds it already (running or parked).
+        let idle = !state.arbiter.is_running() && !state.parked;
+        let leased_now = idle && state.lease.is_none();
+        if idle && let Err(error) = self.host.ensure_lease(&params.session_id, &mut state) {
+            return match error {
+                // A minor-2 app maps BUSY onto a broken transport.
+                HostError::Busy(reason) if !self.has_projects() => {
+                    Ok((SubmitResult::Denied { reason }, None))
+                }
+                other => Err(other),
+            };
+        }
         let head = Cursor {
             generation: state.record.generation,
             durable: state.durable_head,
@@ -1566,6 +2099,11 @@ impl HostConnection {
             if depth > 0 {
                 state.set_state(HostedState::Queued { depth });
             }
+        }
+        if leased_now && !run && !state.arbiter.is_running() && !state.parked {
+            // Nothing will run (stale, queue full, duplicate): give it back.
+            self.host
+                .release_lease(&params.session_id, &mut state, false);
         }
         drop(state);
         Ok((result, run.then_some(slot)))
@@ -1599,6 +2137,12 @@ impl HostConnection {
         let owner = state.record.owner_principal == self.identity.principal.id();
         let need = if owner { Need::Steer } else { Need::Control };
         admit(&self.identity, granted, state.record.tenant.as_ref(), need)?;
+        if state.ephemeral {
+            // A TUI session read through the share is not the host's to close.
+            return Err(HostError::Denied(
+                "profile session is not hosted; nothing to close".into(),
+            ));
+        }
         state.arbiter.clear();
         if let Some(cancel) = &state.cancel {
             let _ = cancel.send(true);
@@ -1705,6 +2249,488 @@ impl HostConnection {
             self.apply_settings_now(&id).await?;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Profile sharing: projects, pages, adoption (contract K-W1 §8.3)
+// ---------------------------------------------------------------------------
+
+/// Page size after clamping (`None | 0` -> default, upper bound).
+fn page_limit(limit: Option<u32>) -> usize {
+    let limit = limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .min(MAX_PAGE_LIMIT);
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+/// Why a hosted row cannot be continued (`None`: it can).
+fn hosted_reason(granted: ClientCaps, state: &HostedState) -> Option<ReadOnlyReason> {
+    if !granted.steer {
+        Some(ReadOnlyReason::NoSteer)
+    } else if *state == HostedState::Closed {
+        Some(ReadOnlyReason::Closed)
+    } else {
+        None
+    }
+}
+
+impl HostConnection {
+    /// The share for a steering method: mode `continue`, else the matching
+    /// refusal (`read`: read-only, `off`/no profile: not shared).
+    fn share_for_change(&self) -> Result<&ProfileShare, HostError> {
+        match self.host.profile.as_ref() {
+            Some(share) if share.settings.mode == ShareMode::Continue => Ok(share),
+            Some(share) if share.settings.mode == ShareMode::Read => {
+                Err(HostError::Denied(DENIED_READ_ONLY.into()))
+            }
+            _ => Err(HostError::Denied(DENIED_NOT_SHARED.into())),
+        }
+    }
+
+    /// The share for a steering method on a profile session: mode, `steer`,
+    /// then tenant (a foreign tenant reads as `NotFound`).
+    fn steering_share(&self) -> Result<&ProfileShare, HostError> {
+        let granted = self.granted()?;
+        let share = self.share_for_change()?;
+        Need::Steer.require(granted)?;
+        if !tenant_admits(self.identity.tenant.as_ref(), Some(&share.settings.tenant)) {
+            return Err(HostError::NotFound);
+        }
+        Ok(share)
+    }
+
+    /// True when `turn.submit` on `id` must adopt the profile session first.
+    fn needs_adoption(&self, id: &SessionId) -> Result<bool, HostError> {
+        if self.host.share().is_none() {
+            return Ok(false);
+        }
+        if let Some(slot) = self.host.loaded_slot(id) {
+            return Ok(slot.lock()?.ephemeral);
+        }
+        Ok(self.host.records.load(id)?.is_none())
+    }
+
+    /// Adoption, synchronous part (plan §3.2 step 6): the hosted record of a
+    /// continuable profile session, created at most once (`O_EXCL`; a second
+    /// device gets the first device's record).
+    fn adopt_sync(&self, id: &SessionId) -> Result<HostedSessionRecord, HostError> {
+        let granted = self.granted()?;
+        let share = self.steering_share()?;
+        if let Some(record) = self.host.records.load(id)? {
+            admit(&self.identity, granted, record.tenant.as_ref(), Need::Steer)?;
+            return Ok(record);
+        }
+        let row = share.index.row(id)?.ok_or(HostError::NotFound)?;
+        if !row.origin.is_continuable() {
+            return Err(HostError::Denied(DENIED_FOREIGN_ORIGIN.into()));
+        }
+        if share.index.workdir(id)?.is_none() {
+            return Err(HostError::Denied(DENIED_NO_WORKDIR.into()));
+        }
+        let record = self.new_record(
+            id.clone(),
+            Some(&row.title),
+            None,
+            Some(share.settings.tenant.clone()),
+        );
+        match self.host.records.create_if_absent(&record)? {
+            CreateOutcome::Created => {
+                tracing::info!(session = %id.as_str(), "session host: profile session adopted");
+                Ok(record)
+            }
+            CreateOutcome::Existing(existing) => {
+                admit(
+                    &self.identity,
+                    granted,
+                    existing.tenant.as_ref(),
+                    Need::Steer,
+                )?;
+                Ok(*existing)
+            }
+        }
+    }
+
+    /// Adoption: record, fresh creator admission, `last_origin`, slot. No
+    /// `create_session`: the transcript exists.
+    async fn adopt_inner(&self, id: &SessionId) -> Result<Arc<Slot>, HostError> {
+        self.steering_share()?;
+        if let Some(slot) = self.host.loaded_slot(id) {
+            let (ephemeral, tenant) = {
+                let state = slot.lock()?;
+                (state.ephemeral, state.record.tenant.clone())
+            };
+            if !ephemeral {
+                // Already hosted: adoption is idempotent.
+                admit(
+                    &self.identity,
+                    self.granted()?,
+                    tenant.as_ref(),
+                    Need::Steer,
+                )?;
+                return Ok(slot);
+            }
+        }
+        let record = self.adopt_sync(id)?;
+        if let Some(admission) = self.host.execution_admission(&record)? {
+            self.host.driver.prepare_execution(id, admission).await?;
+        }
+        if let Some(share) = self.host.share()
+            && let Err(error) = meta::update(share.index.sessions_root(), id, |meta| {
+                meta.last_origin = Some(LastOrigin::Gateway);
+            })
+        {
+            tracing::warn!(%error, session = %id.as_str(), "session host: adoption meta not updated");
+        }
+        self.host.publish_record(record)
+    }
+
+    fn projects_sync(&self, params: &ProjectsParams) -> Result<ProjectsResult, HostError> {
+        let granted = self.granted()?;
+        Need::Observe.require(granted)?;
+        let device_tier = self.identity.principal.tier();
+        let caller = self.identity.tenant.as_ref();
+        let Some(share) = self.host.share_for(caller) else {
+            let tier = self.host.profile.as_ref().map_or(device_tier, |share| {
+                device_tier.min(share.settings.listener_tier)
+            });
+            return Ok(ProjectsResult {
+                projects: Vec::new(),
+                next_cursor: None,
+                share: ShareInfo {
+                    mode: ShareMode::Off,
+                    tier,
+                },
+            });
+        };
+        let page = share.index.projects(params)?;
+        let active = self.host.active_by_project(share, caller);
+        let projects = page
+            .projects
+            .into_iter()
+            .map(|mut project| {
+                let running = active.get(&project.project_key).copied().unwrap_or(0);
+                project.active_count = project.active_count.saturating_add(running);
+                project
+            })
+            .collect();
+        Ok(ProjectsResult {
+            projects,
+            next_cursor: page.next_cursor,
+            share: ShareInfo {
+                mode: share.settings.mode,
+                tier: device_tier.min(share.settings.listener_tier),
+            },
+        })
+    }
+
+    fn page_sync(&self, params: &PageParams) -> Result<PageResult, HostError> {
+        let granted = self.granted()?;
+        Need::Observe.require(granted)?;
+        match self.host.share_for(self.identity.tenant.as_ref()) {
+            Some(share) => {
+                let page = share.index.page(params)?;
+                let sessions = page
+                    .rows
+                    .into_iter()
+                    .map(|row| self.profile_row(share, granted, row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PageResult {
+                    sessions,
+                    next_cursor: page.next_cursor,
+                })
+            }
+            None => self.record_page(granted, params),
+        }
+    }
+
+    /// One `session.page` row of a profile session (hosted when a record
+    /// exists; state, attachments and model then come from the host).
+    fn profile_row(
+        &self,
+        share: &ProfileShare,
+        granted: ClientCaps,
+        row: ProfileRow,
+    ) -> Result<SessionRow, HostError> {
+        let id = row.session_id.clone();
+        let (state, attached, model, hosted) = match self.host.loaded_slot(&id) {
+            Some(slot) => {
+                let slot_state = slot.lock()?;
+                let attached = slot_state
+                    .attachments
+                    .iter()
+                    .filter(|entry| !entry.queue.is_closed())
+                    .count();
+                let hosted = !slot_state.ephemeral;
+                (
+                    slot_state.record.state.clone(),
+                    count(attached),
+                    hosted.then(|| self.host.driver.model_name(&id)).flatten(),
+                    hosted,
+                )
+            }
+            None => match self.host.records.load(&id)? {
+                Some(record) => (record.state, 0, self.host.driver.model_name(&id), true),
+                None => (HostedState::Idle, 0, None, false),
+            },
+        };
+        let reason = if hosted {
+            hosted_reason(granted, &state)
+        } else if share.settings.mode != ShareMode::Continue {
+            Some(ReadOnlyReason::ShareReadOnly)
+        } else if !granted.steer {
+            Some(ReadOnlyReason::NoSteer)
+        } else if !row.origin.is_continuable() {
+            Some(ReadOnlyReason::ForeignOrigin)
+        } else if share.index.workdir(&id)?.is_none() {
+            Some(ReadOnlyReason::NoWorkdir)
+        } else if state == HostedState::Closed {
+            Some(ReadOnlyReason::Closed)
+        } else {
+            None
+        };
+        let holder = match peek_holder(share.index.sessions_root(), &id) {
+            Ok(holder) => holder.as_ref().map(wire_holder),
+            Err(error) => {
+                tracing::debug!(%error, session = %id.as_str(), "session host: lease peek failed");
+                None
+            }
+        };
+        Ok(SessionRow {
+            session_id: id,
+            title: Some(row.title),
+            project_key: row.project_key,
+            updated_at: row.updated_at,
+            turns: (row.turns > 0).then_some(row.turns),
+            state,
+            attached,
+            model,
+            origin: if hosted {
+                RowOrigin::Hosted
+            } else {
+                RowOrigin::Profile
+            },
+            continuable: reason.is_none(),
+            reason,
+            holder,
+            last_origin: row.last_origin.map(wire_last_origin),
+            first_message: row.first_message,
+        })
+    }
+
+    /// A `session.page` row of a hosted session without profile data.
+    fn hosted_row(granted: ClientCaps, summary: SessionSummary) -> SessionRow {
+        let reason = hosted_reason(granted, &summary.state);
+        SessionRow {
+            session_id: summary.session_id,
+            title: summary.title,
+            project_key: None,
+            updated_at: summary.updated_at,
+            turns: None,
+            state: summary.state,
+            attached: summary.attached,
+            model: summary.model,
+            origin: RowOrigin::Hosted,
+            continuable: reason.is_none(),
+            reason,
+            holder: None,
+            last_origin: None,
+            first_message: None,
+        }
+    }
+
+    /// `session.page` without sharing: the caller's records as rows, newest
+    /// first, paged with the opaque cursor.
+    fn record_page(
+        &self,
+        granted: ClientCaps,
+        params: &PageParams,
+    ) -> Result<PageResult, HostError> {
+        let after = match params.cursor.as_deref() {
+            None => None,
+            Some(cursor) => Some(
+                decode_cursor(cursor)
+                    .ok_or_else(|| HostError::Protocol("invalid cursor".into()))?,
+            ),
+        };
+        if params
+            .project_key
+            .as_deref()
+            .is_some_and(|key| key != NO_PROJECT_KEY)
+        {
+            // Records carry no project.
+            return Ok(PageResult {
+                sessions: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let query = params
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_lowercase);
+        let mut summaries: Vec<SessionSummary> = self
+            .summaries()?
+            .into_iter()
+            .filter(|summary| {
+                query.as_deref().is_none_or(|query| {
+                    summary
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.to_lowercase().contains(query))
+                })
+            })
+            .collect();
+        let sort_key = |summary: &SessionSummary| {
+            (
+                summary.updated_at.as_millisecond(),
+                summary.session_id.as_str().to_owned(),
+            )
+        };
+        summaries.sort_by_key(|summary| std::cmp::Reverse(sort_key(summary)));
+        if let Some((at, key)) = after {
+            let bound = (at.as_millisecond(), key);
+            summaries.retain(|summary| sort_key(summary) < bound);
+        }
+        let limit = page_limit(params.limit);
+        let next_cursor = (summaries.len() > limit)
+            .then(|| summaries.get(limit - 1))
+            .flatten()
+            .map(|last| encode_cursor(last.updated_at, last.session_id.as_str()));
+        summaries.truncate(limit);
+        Ok(PageResult {
+            sessions: summaries
+                .into_iter()
+                .map(|summary| Self::hosted_row(granted, summary))
+                .collect(),
+            next_cursor,
+        })
+    }
+
+    /// The updated row after a profile mutation.
+    fn row_for(&self, share: &ProfileShare, id: &SessionId) -> Result<SessionRow, HostError> {
+        let granted = self.granted()?;
+        if let Some(row) = share.index.row(id)? {
+            return self.profile_row(share, granted, row);
+        }
+        let slot = self.host.slot(id)?;
+        let summary = self.host.summary(&*slot.lock()?);
+        Ok(Self::hosted_row(granted, summary))
+    }
+
+    /// Steering admission of a profile mutation on `id`: the session is a
+    /// visible profile session or a hosted one of the caller's tenant.
+    fn profile_target(&self, id: &SessionId) -> Result<&ProfileShare, HostError> {
+        let share = self.steering_share()?;
+        if share.index.row(id)?.is_some() {
+            return Ok(share);
+        }
+        match self.host.records.load(id)? {
+            Some(record)
+                if tenant_admits(self.identity.tenant.as_ref(), record.tenant.as_ref()) =>
+            {
+                Ok(share)
+            }
+            _ => Err(HostError::NotFound),
+        }
+    }
+
+    async fn create_in_inner(&self, params: CreateInParams) -> Result<SessionSummary, HostError> {
+        let share = self.steering_share()?;
+        let project = share
+            .index
+            .resolve_project(&params.project_key)?
+            .ok_or_else(|| HostError::Denied(DENIED_UNKNOWN_PROJECT.into()))?;
+        let record = self.new_record(
+            SessionId::new(),
+            params.title.as_deref(),
+            None,
+            Some(share.settings.tenant.clone()),
+        );
+        let mut publication = UnpublishedCreation {
+            host: &self.host,
+            session_id: record.session_id.clone(),
+            armed: true,
+        };
+        if let Some(admission) = self.host.execution_admission(&record)? {
+            self.host
+                .driver
+                .prepare_execution(&record.session_id, admission)
+                .await?;
+        }
+        // The project goes into the meta before the driver writes anything,
+        // so the TUI and the index see the session in its project.
+        meta::update(share.index.sessions_root(), &record.session_id, |meta| {
+            meta.cwd = Some(project.project_root.clone());
+            meta.project_root = Some(project.project_root.clone());
+            meta.project_key = Some(project.project_key.clone());
+            meta.last_origin = Some(LastOrigin::Gateway);
+        })?;
+        self.host
+            .driver
+            .create_session(&record.session_id, record.title.as_deref())
+            .await?;
+        self.host.records.save(&record)?;
+        let slot = self.host.insert_slot(record)?;
+        let summary = self.host.summary(&*slot.lock()?);
+        publication.armed = false;
+        Ok(summary)
+    }
+
+    fn set_project_sync(&self, params: &SetProjectParams) -> Result<SessionRow, HostError> {
+        let id = &params.session_id;
+        let share = self.profile_target(id)?;
+        let root = share.index.sessions_root();
+        if params.project_key == NO_PROJECT_KEY {
+            // "Ohne Projekt": drop the assignment, keep the working directory.
+            meta::update(root, id, |meta| {
+                meta.project_root = None;
+                meta.project_key = None;
+            })?;
+        } else {
+            let project = share
+                .index
+                .resolve_project(&params.project_key)?
+                .ok_or_else(|| HostError::Denied(DENIED_UNKNOWN_PROJECT.into()))?;
+            meta::set_project(
+                root,
+                id,
+                Some(project.project_root.as_path()),
+                Some(project.project_root.as_path()),
+                Some(project.project_key.as_str()),
+            )?;
+        }
+        self.row_for(share, id)
+    }
+
+    fn rename_sync(&self, params: &RenameParams) -> Result<SessionRow, HostError> {
+        let id = &params.session_id;
+        let title = params.title.trim();
+        if title.is_empty() {
+            return Err(HostError::Protocol("empty title".into()));
+        }
+        let share = self.profile_target(id)?;
+        meta::set_title(share.index.sessions_root(), id, title, TitleSource::Manual)?;
+        let slot = match self.host.loaded_slot(id) {
+            Some(slot) => Some(slot),
+            None if self.host.records.load(id)?.is_some() => Some(self.host.slot(id)?),
+            None => None,
+        };
+        if let Some(slot) = slot {
+            let mut state = slot.lock()?;
+            state.record.title = Some(title.chars().take(200).collect());
+            self.host.save(&mut state);
+        }
+        self.row_for(share, id)
+    }
+
+    fn archive_sync(&self, params: &ArchiveParams) -> Result<SessionRow, HostError> {
+        let id = &params.session_id;
+        let share = self.profile_target(id)?;
+        meta::set_archived(share.index.sessions_root(), id, params.archived)?;
+        self.row_for(share, id)
     }
 }
 
@@ -2095,7 +3121,7 @@ impl SessionPort for HostConnection {
 
     fn history(&self, params: HistoryParams) -> PortFuture<'_, Vec<FrameEnvelope>> {
         let result = (|| {
-            let slot = self.admitted_slot(&params.session_id, Need::Observe)?;
+            let slot = self.observed_slot(&params.session_id)?;
             let generation = slot.lock()?.record.generation;
             if params.before.generation != generation {
                 return Err(HostError::Protocol(
@@ -2115,13 +3141,21 @@ impl SessionPort for HostConnection {
     }
 
     fn submit(&self, params: SubmitParams) -> PortFuture<'_, SubmitResult> {
-        let result = self.submit_sync(params).map(|(result, run)| {
-            if let Some(slot) = run {
-                pump(Arc::clone(&self.host), slot);
+        Box::pin(
+            async move {
+                // A profile session without a record is adopted first (same
+                // code as `session.adopt`).
+                if self.needs_adoption(&params.session_id)? {
+                    self.adopt_inner(&params.session_id).await?;
+                }
+                let (result, run) = self.submit_sync(params)?;
+                if let Some(slot) = run {
+                    pump(Arc::clone(&self.host), slot);
+                }
+                Ok(result)
             }
-            result
-        });
-        port(result)
+            .map_err_port(),
+        )
     }
 
     fn interrupt(&self, params: InterruptParams) -> PortFuture<'_, ()> {
@@ -2170,6 +3204,41 @@ impl SessionPort for HostConnection {
             self.set(params.session_id, Setting::Effort(params.effort))
                 .map_err_port(),
         )
+    }
+
+    fn projects(&self, params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
+        port(self.projects_sync(&params))
+    }
+
+    fn page(&self, params: PageParams) -> PortFuture<'_, PageResult> {
+        port(self.page_sync(&params))
+    }
+
+    fn adopt(&self, session: SessionId) -> PortFuture<'_, SessionSummary> {
+        Box::pin(
+            async move {
+                let slot = self.adopt_inner(&session).await?;
+                let summary = self.host.summary(&*slot.lock()?);
+                Ok(summary)
+            }
+            .map_err_port(),
+        )
+    }
+
+    fn create_in(&self, params: CreateInParams) -> PortFuture<'_, SessionSummary> {
+        Box::pin(self.create_in_inner(params).map_err_port())
+    }
+
+    fn set_project(&self, params: SetProjectParams) -> PortFuture<'_, SessionRow> {
+        port(self.set_project_sync(&params))
+    }
+
+    fn rename(&self, params: RenameParams) -> PortFuture<'_, SessionRow> {
+        port(self.rename_sync(&params))
+    }
+
+    fn archive(&self, params: ArchiveParams) -> PortFuture<'_, SessionRow> {
+        port(self.archive_sync(&params))
     }
 }
 
@@ -2251,3 +3320,697 @@ where
 
 #[cfg(test)]
 mod tests;
+
+/// Acceptance S3 (contract K-W1 §8.3): sharing profile sessions. Synthetic
+/// ids and temp dirs only.
+#[cfg(test)]
+mod share_tests {
+    use std::collections::HashMap;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use harw_protocol::session_wire::{
+        AttachParams, CreateInParams, HelloParams, HistoryParams, HolderKind as WireHolderKind,
+        PageParams, ProjectsParams, ReadOnlyReason, SubmitParams, SubmitResult, features,
+    };
+    use harw_protocol::{Cursor, FrameSource, PortError, SessionFrame, SessionPort, StreamProfile};
+    use harw_types::{PermissionTier, SessionId, TenantId};
+
+    use super::{HostConfig, HostConnection, SessionHost};
+    use crate::approvals::MemoryApprovals;
+    use crate::driver::{
+        CancelSignal, DriverFuture, EventSink, ExecutionAdmission, Setting, TurnDriver, TurnInput,
+        TurnOutcome,
+    };
+    use crate::error::HostError;
+    use crate::identity::ClientIdentity;
+    use crate::identity::test_identity::scoped;
+    use crate::index::{
+        DENIED_READ_ONLY, ProfileIndex, ProfilePage, ProfileRow, ProfileShare, ProjectPage,
+        ResolvedProject, ShareMode, ShareSettings, ThreadOrigin,
+    };
+    use crate::record::CreateOutcome;
+    use crate::replay::MemoryTranscripts;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Minimal runtime: admission and creation succeed, turns complete.
+    struct QuietDriver;
+
+    impl TurnDriver for QuietDriver {
+        fn prepare_execution(&self, _: &SessionId, _: ExecutionAdmission) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn run_turn(
+            &self,
+            _: TurnInput,
+            _: CancelSignal,
+            _: Arc<dyn EventSink>,
+        ) -> DriverFuture<'_, TurnOutcome> {
+            Box::pin(async { Ok(TurnOutcome::Completed) })
+        }
+
+        fn resume_after_approval(
+            &self,
+            _: &SessionId,
+            _: CancelSignal,
+            _: Arc<dyn EventSink>,
+        ) -> DriverFuture<'_, TurnOutcome> {
+            Box::pin(async { Ok(TurnOutcome::Completed) })
+        }
+
+        fn apply_setting(&self, _: &SessionId, _: Setting) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn model_name(&self, _: &SessionId) -> Option<String> {
+            None
+        }
+    }
+
+    /// Scripted profile index over a temp profile store.
+    struct FakeIndex {
+        root: PathBuf,
+        rows: Mutex<Vec<ProfileRow>>,
+        workdirs: Mutex<HashMap<SessionId, PathBuf>>,
+        projects: HashMap<String, ResolvedProject>,
+    }
+
+    impl ProfileIndex for FakeIndex {
+        fn sessions_root(&self) -> &Path {
+            &self.root
+        }
+
+        fn projects(&self, _: &ProjectsParams) -> Result<ProjectPage, HostError> {
+            Ok(ProjectPage {
+                projects: Vec::new(),
+                next_cursor: None,
+            })
+        }
+
+        fn page(&self, _: &PageParams) -> Result<ProfilePage, HostError> {
+            Ok(ProfilePage {
+                rows: self.newest(usize::MAX)?,
+                next_cursor: None,
+            })
+        }
+
+        fn row(&self, id: &SessionId) -> Result<Option<ProfileRow>, HostError> {
+            Ok(self
+                .rows
+                .lock()
+                .map_err(|_| HostError::Storage("rows poisoned".into()))?
+                .iter()
+                .find(|row| &row.session_id == id)
+                .cloned())
+        }
+
+        fn newest(&self, limit: usize) -> Result<Vec<ProfileRow>, HostError> {
+            let mut rows: Vec<ProfileRow> = self
+                .rows
+                .lock()
+                .map_err(|_| HostError::Storage("rows poisoned".into()))?
+                .iter()
+                .filter(|row| !row.archived)
+                .cloned()
+                .collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
+            rows.truncate(limit);
+            Ok(rows)
+        }
+
+        fn resolve_project(&self, key: &str) -> Result<Option<ResolvedProject>, HostError> {
+            Ok(self.projects.get(key).cloned())
+        }
+
+        fn workdir(&self, id: &SessionId) -> Result<Option<PathBuf>, HostError> {
+            Ok(self
+                .workdirs
+                .lock()
+                .map_err(|_| HostError::Storage("workdirs poisoned".into()))?
+                .get(id)
+                .cloned())
+        }
+    }
+
+    struct Share {
+        state: tempfile::TempDir,
+        profile: tempfile::TempDir,
+        host: SessionHost,
+        index: Arc<FakeIndex>,
+        tenant: TenantId,
+    }
+
+    fn tenant() -> TestResult<TenantId> {
+        Ok(TenantId::try_from_str("tenant-test")?)
+    }
+
+    fn share_fixture(mode: ShareMode, legacy_rows: usize) -> TestResult<Share> {
+        let state = tempfile::tempdir()?;
+        let profile = tempfile::tempdir()?;
+        let tenant = tenant()?;
+        let index = Arc::new(FakeIndex {
+            root: profile.path().to_path_buf(),
+            rows: Mutex::new(Vec::new()),
+            workdirs: Mutex::new(HashMap::new()),
+            projects: HashMap::new(),
+        });
+        let host = SessionHost::open_with_profile(
+            HostConfig::new(state.path().to_path_buf()),
+            Arc::new(QuietDriver) as Arc<dyn TurnDriver>,
+            Arc::new(MemoryTranscripts::new()),
+            Arc::new(MemoryApprovals::new()),
+            crate::tool_host::ToolHost::disabled(),
+            ProfileShare {
+                settings: ShareSettings {
+                    mode,
+                    tenant: tenant.clone(),
+                    legacy_rows,
+                    listener_tier: PermissionTier::Operator,
+                },
+                index: Arc::clone(&index) as Arc<dyn ProfileIndex>,
+            },
+        )?;
+        Ok(Share {
+            state,
+            profile,
+            host,
+            index,
+            tenant,
+        })
+    }
+
+    impl Share {
+        /// A visible profile session; continuable when `origin` is Cli.
+        fn add_row(
+            &self,
+            origin: ThreadOrigin,
+            project: Option<&str>,
+            title: &str,
+        ) -> TestResult<SessionId> {
+            let id = SessionId::new();
+            let count = self.index.rows.lock().map_err(|_| "rows poisoned")?.len();
+            let millis = 1_764_000_000_000_i64 + i64::try_from(count)? * 1_000;
+            self.index
+                .rows
+                .lock()
+                .map_err(|_| "rows poisoned")?
+                .push(ProfileRow {
+                    session_id: id.clone(),
+                    title: title.to_owned(),
+                    project_key: project.map(|label| format!("{label}-0123456789ab")),
+                    project_label: project.map(str::to_owned),
+                    updated_at: jiff::Timestamp::from_millisecond(millis)?,
+                    turns: 1,
+                    first_message: Some("hallo".into()),
+                    origin,
+                    last_origin: None,
+                    archived: false,
+                });
+            self.index
+                .workdirs
+                .lock()
+                .map_err(|_| "workdirs poisoned")?
+                .insert(id.clone(), self.profile.path().to_path_buf());
+            Ok(id)
+        }
+    }
+
+    async fn connect(
+        host: &SessionHost,
+        identity: ClientIdentity,
+        wire_minor: u32,
+        with_projects: bool,
+    ) -> TestResult<HostConnection> {
+        let connection = host.connect(identity)?;
+        let features = if with_projects {
+            vec![features::PROJECTS.to_owned()]
+        } else {
+            Vec::new()
+        };
+        connection
+            .hello(HelloParams {
+                client_label: "test".into(),
+                wire_minor,
+                features,
+                requested_caps: None,
+            })
+            .await?;
+        Ok(connection)
+    }
+
+    fn attach(session: &SessionId) -> AttachParams {
+        AttachParams {
+            session_id: session.clone(),
+            from: None,
+            profile: StreamProfile::Full,
+            tail_items: 200,
+        }
+    }
+
+    fn submit(session: &SessionId) -> SubmitParams {
+        SubmitParams {
+            session_id: session.clone(),
+            text: "weiter".into(),
+            expect_head: Cursor {
+                generation: 0,
+                durable: 0,
+                live: 0,
+            },
+            client_msg_id: "msg-1".into(),
+            force: true,
+        }
+    }
+
+    /// Simulates a TUI process holding the lease: its own fd, locked, with
+    /// holder JSON (flock is per open file description).
+    fn hold_lease_as_tui(root: &Path, id: &SessionId) -> TestResult<std::fs::File> {
+        let path = harw_session_store::lease_path(root, id)?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        fs4::FileExt::try_lock(&file).map_err(|_| "lease already locked")?;
+        file.set_len(0)?;
+        file.write_all(br#"{"holder":"tui","pid":4242,"since":"2026-11-22T10:00:00Z"}"#)?;
+        file.sync_data()?;
+        Ok(file)
+    }
+
+    /// Every file below `dir`, relative, sorted.
+    fn files_below(dir: &Path) -> TestResult<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(next) = stack.pop() {
+            for entry in std::fs::read_dir(&next)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path.strip_prefix(dir)?.to_path_buf());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Frames already queued, without waiting for more.
+    async fn drain(source: &mut Box<dyn FrameSource>) -> TestResult<Vec<SessionFrame>> {
+        let mut frames = Vec::new();
+        while let Ok(next) = tokio::time::timeout(Duration::from_millis(50), source.next()).await {
+            match next? {
+                Some(envelope) => frames.push(envelope.frame),
+                None => break,
+            }
+        }
+        Ok(frames)
+    }
+
+    #[tokio::test]
+    async fn foreign_tenant_sees_no_profile_rows() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let foreign = TenantId::try_from_str("tenant-other")?;
+        let legacy = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &foreign),
+            2,
+            false,
+        )
+        .await?;
+        assert!(legacy.list().await?.is_empty());
+        let modern = connect(
+            &fx.host,
+            scoped(2, PermissionTier::Operator, &foreign),
+            3,
+            true,
+        )
+        .await?;
+        let projects = modern.projects(ProjectsParams::default()).await?;
+        assert!(projects.projects.is_empty());
+        assert_eq!(projects.share.mode, ShareMode::Off);
+        assert!(
+            modern
+                .page(PageParams::default())
+                .await?
+                .sessions
+                .is_empty()
+        );
+        assert!(matches!(
+            modern.attach(attach(&id)).await,
+            Err(PortError::NotFound)
+        ));
+        assert!(matches!(
+            modern.adopt(id.clone()).await,
+            Err(PortError::NotFound)
+        ));
+
+        // Control: the share tenant does see the row.
+        let own = connect(
+            &fx.host,
+            scoped(3, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let page = own.page(PageParams::default()).await?;
+        assert_eq!(page.sessions.len(), 1);
+        assert!(
+            page.sessions[0].continuable,
+            "{:?}",
+            page.sessions[0].reason
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observer_attach_writes_no_record() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let observer = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Observer, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let state_before = files_below(fx.state.path())?;
+        let profile_before = files_below(fx.profile.path())?;
+
+        let (ack, _stream) = observer.attach(attach(&id)).await?;
+        assert_eq!(ack.session.session_id, id);
+        observer
+            .history(HistoryParams {
+                session_id: id.clone(),
+                before: ack.head,
+                limit: 10,
+            })
+            .await?;
+        observer.detach(id.clone()).await?;
+
+        assert_eq!(files_below(fx.state.path())?, state_before);
+        assert_eq!(files_below(fx.profile.path())?, profile_before);
+        assert!(fx.host.inner.records.load(&id)?.is_none());
+        // An observer cannot adopt.
+        assert!(matches!(
+            observer.adopt(id).await,
+            Err(PortError::Denied(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adopted_record_has_caller_creator_execution() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let identity = scoped(1, PermissionTier::Operator, &fx.tenant);
+        let caller = connect(&fx.host, identity.clone(), 3, true).await?;
+        let summary = caller.adopt(id.clone()).await?;
+        assert_eq!(summary.session_id, id);
+        assert_eq!(summary.tenant.as_ref(), Some(&fx.tenant));
+
+        let record = fx.host.inner.records.load(&id)?.ok_or("record missing")?;
+        assert_eq!(record.owner_principal, identity.principal.id());
+        assert_eq!(record.title.as_deref(), Some("titel"));
+        assert_eq!(record.workspace, None);
+        let creator = record.creator_execution.ok_or("creator missing")?;
+        assert_eq!(
+            creator.binding,
+            Some(crate::record::CreatorExecutionBinding::from_identity(
+                &identity
+            ))
+        );
+        assert_eq!(creator.approval_actor, identity.actor);
+        assert_eq!(creator.maximum_tier, identity.principal.tier());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_devices_adopt_one_record() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let first_identity = scoped(1, PermissionTier::Operator, &fx.tenant);
+        let first = connect(&fx.host, first_identity.clone(), 3, true).await?;
+        let second = connect(
+            &fx.host,
+            scoped(2, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+
+        let a = first.adopt(id.clone()).await?;
+        let b = second.adopt(id.clone()).await?;
+        assert_eq!(a.session_id, b.session_id);
+        let records: Vec<_> = fx
+            .host
+            .inner
+            .records
+            .list()?
+            .into_iter()
+            .filter(|record| record.session_id == id)
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner_principal, first_identity.principal.id());
+
+        // The losing side of a race gets the winner's record unchanged.
+        let late = second.new_record(id.clone(), Some("anders"), None, Some(fx.tenant.clone()));
+        match fx.host.inner.records.create_if_absent(&late)? {
+            CreateOutcome::Existing(existing) => assert_eq!(*existing, records[0]),
+            CreateOutcome::Created => return Err("second create must not win".into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_with_held_lease_is_busy_with_reason() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let _tui = hold_lease_as_tui(fx.profile.path(), &id)?;
+        match caller.submit(submit(&id)).await {
+            Err(PortError::Busy(reason)) => assert_eq!(reason, "Läuft gerade in der TUI"),
+            other => return Err(format!("expected busy, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_client_gets_denied_instead_of_busy() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            2,
+            false,
+        )
+        .await?;
+        let _tui = hold_lease_as_tui(fx.profile.path(), &id)?;
+        match caller.submit(submit(&id)).await? {
+            SubmitResult::Denied { reason } => assert_eq!(reason, "Läuft gerade in der TUI"),
+            other => return Err(format!("expected denied, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_mode_submit_is_denied() -> TestResult {
+        let fx = share_fixture(ShareMode::Read, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        match caller.submit(submit(&id)).await {
+            Err(PortError::Denied(reason)) => assert_eq!(reason, DENIED_READ_ONLY),
+            other => return Err(format!("expected denied, got {other:?}").into()),
+        }
+        assert!(fx.host.inner.records.load(&id)?.is_none());
+        // Reading still works, and the row says why it is read-only.
+        let page = caller.page(PageParams::default()).await?;
+        assert_eq!(page.sessions[0].reason, Some(ReadOnlyReason::ShareReadOnly));
+        caller.attach(attach(&id)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_list_prefixes_project_and_respects_limit() -> TestResult {
+        let fx = share_fixture(ShareMode::Read, 2)?;
+        fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel eins")?;
+        fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel zwei")?;
+        fx.add_row(ThreadOrigin::Cli, None, "titel drei")?;
+        let legacy = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            2,
+            false,
+        )
+        .await?;
+        let list = legacy.list().await?;
+        let titles: Vec<_> = list.iter().filter_map(|s| s.title.as_deref()).collect();
+        assert_eq!(titles, vec!["titel drei", "proj · titel zwei"]);
+        assert!(list.iter().all(|s| s.tenant.as_ref() == Some(&fx.tenant)));
+
+        // A `projects` client pages instead and gets no legacy rows.
+        let modern = connect(
+            &fx.host,
+            scoped(2, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        assert!(modern.list().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_feature_only_from_minor_3() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        for (minor, granted) in [(2, false), (3, true)] {
+            let connection =
+                fx.host
+                    .connect(scoped(minor, PermissionTier::Operator, &fx.tenant))?;
+            let ack = connection
+                .hello(HelloParams {
+                    client_label: "test".into(),
+                    wire_minor: minor,
+                    features: vec![features::PROJECTS.to_owned()],
+                    requested_caps: None,
+                })
+                .await?;
+            assert_eq!(
+                ack.features.iter().any(|f| f == features::PROJECTS),
+                granted,
+                "minor {minor}"
+            );
+            assert_eq!(connection.has_projects(), granted);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn holder_frame_only_to_projects_connections() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let modern = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let legacy = connect(
+            &fx.host,
+            scoped(2, PermissionTier::Operator, &fx.tenant),
+            2,
+            false,
+        )
+        .await?;
+        let (_, mut modern_stream) = modern.attach(attach(&id)).await?;
+        let (_, mut legacy_stream) = legacy.attach(attach(&id)).await?;
+        drain(&mut modern_stream).await?;
+        drain(&mut legacy_stream).await?;
+
+        let tui = hold_lease_as_tui(fx.profile.path(), &id)?;
+        fx.host.poll_profile_heads();
+        let seen = drain(&mut modern_stream).await?;
+        assert!(
+            seen.iter().any(|frame| matches!(
+                frame,
+                SessionFrame::Holder { holder: Some(info), .. } if info.kind == WireHolderKind::Tui
+            )),
+            "{seen:?}"
+        );
+        let legacy_seen = drain(&mut legacy_stream).await?;
+        assert!(
+            !legacy_seen
+                .iter()
+                .any(|frame| matches!(frame, SessionFrame::Holder { .. })),
+            "{legacy_seen:?}"
+        );
+
+        // Unchanged holder: no repeat. Released: `holder: None`.
+        fx.host.poll_profile_heads();
+        assert!(drain(&mut modern_stream).await?.is_empty());
+        drop(tui);
+        fx.host.poll_profile_heads();
+        let freed = drain(&mut modern_stream).await?;
+        assert!(
+            freed
+                .iter()
+                .any(|frame| matches!(frame, SessionFrame::Holder { holder: None, .. })),
+            "{freed:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_origin_row_is_not_continuable() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Web, None, "aus dem web")?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let page = caller.page(PageParams::default()).await?;
+        let row = page.sessions.first().ok_or("row missing")?;
+        assert!(!row.continuable);
+        assert_eq!(row.reason, Some(ReadOnlyReason::ForeignOrigin));
+        assert!(matches!(
+            caller.adopt(id.clone()).await,
+            Err(PortError::Denied(_))
+        ));
+        assert!(fx.host.inner.records.load(&id)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_in_unknown_key_is_denied() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let before = files_below(fx.state.path())?;
+        match caller
+            .create_in(CreateInParams {
+                project_key: "nirgends-0123456789ab".into(),
+                title: None,
+            })
+            .await
+        {
+            Err(PortError::Denied(reason)) => assert_eq!(reason, super::DENIED_UNKNOWN_PROJECT),
+            other => return Err(format!("expected denied, got {other:?}").into()),
+        }
+        assert_eq!(files_below(fx.state.path())?, before);
+        assert!(files_below(fx.profile.path())?.is_empty());
+        Ok(())
+    }
+}

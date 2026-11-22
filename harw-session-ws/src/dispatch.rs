@@ -30,12 +30,19 @@ use harw_protocol::methods::{
     METHOD_SESSION_SET_MODEL, METHOD_TOOL_CALL, METHOD_TOOL_CANCEL, METHOD_TOOL_LIST,
     METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT, TOOL_METHODS,
 };
+use harw_protocol::methods::{
+    METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE,
+    METHOD_SESSION_PROJECTS, METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT,
+};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, AttachParams, CreateParams, GatewayDrainParams,
     GatewayListenerSetParams, GatewayRevokeParams, GatewayToolRightsParams, HelloParams,
     HistoryParams, HistoryResult, InterruptParams, ListResult, SessionRef, SetEffortParams,
     SetModeParams, SetModelParams, SubmitParams, ToolCallParams, ToolCancelParams, ToolListParams,
     error_codes,
+};
+use harw_protocol::session_wire::{
+    ArchiveParams, CreateInParams, PageParams, ProjectsParams, RenameParams, SetProjectParams,
 };
 use harw_protocol::{
     ClientCaps, FrameSource, GatewayPort, PortError, RequestEnvelope, ResponseEnvelope,
@@ -363,6 +370,34 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
             Ok(params) => encode(id, port.set_effort(params).await),
             Err(response) => *response,
         },
+        METHOD_SESSION_PROJECTS => match decode::<ProjectsParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.projects(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_PAGE => match decode::<PageParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.page(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_ADOPT => match decode::<SessionRef>(&id, params) {
+            Ok(target) => encode(id, port.adopt(target.session_id).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_CREATE_IN => match decode::<CreateInParams>(&id, params) {
+            Ok(params) => encode(id, port.create_in(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_SET_PROJECT => match decode::<SetProjectParams>(&id, params) {
+            Ok(params) => encode(id, port.set_project(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_RENAME => match decode::<RenameParams>(&id, params) {
+            Ok(params) => encode(id, port.rename(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_ARCHIVE => match decode::<ArchiveParams>(&id, params) {
+            Ok(params) => encode(id, port.archive(params).await),
+            Err(response) => *response,
+        },
         _ => error_response(
             id,
             error_codes::METHOD_NOT_FOUND,
@@ -421,6 +456,15 @@ fn decode<P: DeserializeOwned>(id: &str, params: Value) -> Result<P, Box<Respons
     })
 }
 
+/// `null` params become an empty object, so all-optional param structs decode.
+fn null_to_object(params: Value) -> Value {
+    if params.is_null() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        params
+    }
+}
+
 /// `null` or `{}`: the only params a parameterless method accepts.
 fn is_empty_params(params: &Value) -> bool {
     match params {
@@ -447,6 +491,7 @@ fn encode<T: Serialize>(id: String, result: Result<T, PortError>) -> ResponseEnv
 fn port_error(id: String, error: &PortError) -> ResponseEnvelope {
     match error {
         PortError::ToolRefused { detail, .. } => error_response(id, error.code(), detail.clone()),
+        PortError::Busy(detail) => error_response(id, error.code(), detail.clone()),
         _ => error_response(id, error.code(), error.to_string()),
     }
 }
@@ -469,9 +514,11 @@ mod tests {
         GatewayToolsResult, HelloAck, ListenerKind, RespondResult, SessionSummary, SubmitResult,
         ToolCallResultFrame, ToolListResult,
     };
+    use harw_protocol::session_wire::{PageResult, ProjectsResult, ShareInfo, ShareMode};
     use harw_protocol::{
         PortFuture, ProtocolVersion, ResultTrust, ToolCallResult, ToolPlacement, ToolRefusal,
     };
+    use harw_types::PermissionTier;
     use serde_json::json;
 
     use super::*;
@@ -614,6 +661,40 @@ mod tests {
         }
         fn set_mode(&self, _params: SetModeParams) -> PortFuture<'_, ()> {
             self.answer("set_mode", ())
+        }
+        fn projects(&self, _params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
+            let share = ShareInfo {
+                mode: ShareMode::Read,
+                tier: PermissionTier::Observer,
+            };
+            self.answer(
+                "projects",
+                ProjectsResult {
+                    projects: Vec::new(),
+                    next_cursor: None,
+                    share,
+                },
+            )
+        }
+        fn page(&self, params: PageParams) -> PortFuture<'_, PageResult> {
+            if params.query.as_deref() == Some("busy") {
+                return Box::pin(std::future::ready(Err(PortError::Busy(
+                    "running in the TUI".into(),
+                ))));
+            }
+            self.answer(
+                "page",
+                PageResult {
+                    sessions: Vec::new(),
+                    next_cursor: None,
+                },
+            )
+        }
+        fn adopt(&self, _session: SessionId) -> PortFuture<'_, SessionSummary> {
+            self.answer("adopt", self.summary.clone())
+        }
+        fn create_in(&self, _params: CreateInParams) -> PortFuture<'_, SessionSummary> {
+            self.answer("create_in", self.summary.clone())
         }
         fn set_effort(&self, _params: SetEffortParams) -> PortFuture<'_, ()> {
             self.answer("set_effort", ())
@@ -1115,6 +1196,82 @@ mod tests {
                 }
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_routes_with_null_params() -> TestResult {
+        let port = FakePort::new(false)?;
+        for method in [METHOD_SESSION_PROJECTS, METHOD_SESSION_PAGE] {
+            let response = plain(dispatch(&port, request(method, Value::Null)).await)?;
+            assert!(response.error.is_none(), "{method}");
+            assert!(response.result.is_some(), "{method}");
+        }
+        assert_eq!(port.calls(), vec!["projects", "page"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_field_in_page_is_invalid_params() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "project_key": "p", "tenant": "other" });
+        let response = plain(dispatch(&port, request(METHOD_SESSION_PAGE, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adopt_and_create_in_route_to_the_port() -> TestResult {
+        let port = FakePort::new(false)?;
+        let adopt = plain(
+            dispatch(
+                &port,
+                request(METHOD_SESSION_ADOPT, json!({ "session_id": "s-1" })),
+            )
+            .await,
+        )?;
+        assert!(adopt.error.is_none());
+        let create = plain(
+            dispatch(
+                &port,
+                request(METHOD_SESSION_CREATE_IN, json!({ "project_key": "proj-a" })),
+            )
+            .await,
+        )?;
+        assert!(create.error.is_none());
+        assert_eq!(port.calls(), vec!["adopt", "create_in"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_round_trips_bare_detail() -> TestResult {
+        let port = FakePort::new(false)?;
+        let response = plain(
+            dispatch(
+                &port,
+                request(METHOD_SESSION_PAGE, json!({ "query": "busy" })),
+            )
+            .await,
+        )?;
+        let error = response.error.ok_or("missing error")?;
+        assert_eq!(error.code, error_codes::BUSY);
+        assert_eq!(error.message, "running in the TUI");
+        assert_eq!(
+            PortError::from_code(error.code, error.message),
+            PortError::Busy("running in the TUI".into())
+        );
+        Ok(())
+    }
+
+    /// `set_project` is not overridden by the fake, so the default body answers.
+    #[tokio::test]
+    async fn default_port_answers_protocol_error_for_projects() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "session_id": "s-1", "project_key": "proj-a" });
+        let response = plain(dispatch(&port, request(METHOD_SESSION_SET_PROJECT, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        assert!(port.calls().is_empty());
         Ok(())
     }
 }

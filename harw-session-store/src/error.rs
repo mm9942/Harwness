@@ -214,6 +214,13 @@ pub enum SessionStoreError {
     #[msg("refusing to overwrite existing store file '{path}'")]
     PersistTargetExists { path: String },
 
+    /// Plan §3.5: die Besitz-Sperre der Session hält ein anderer Prozess.
+    #[msg("session '{session}' is leased by another writer")]
+    LeaseHeld {
+        session: SessionId,
+        holder: Option<crate::lease::LeaseHolder>,
+    },
+
     #[msg("job '{work_id}' lifecycle transition failed: {detail}")]
     JobRuntime { work_id: WorkId, detail: String },
 }

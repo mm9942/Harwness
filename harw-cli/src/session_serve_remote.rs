@@ -9,7 +9,9 @@
 //!
 //! ```text
 //! start_remote(config, model, LocalNode, verifier, TcpListener)
-//!   |-- SessionHost  own state dir  <profile>/session-host/remote/host
+//!   |-- SessionHost  own records    <profile>/session-host/remote/host
+//!   |-- transcripts  share off:     <profile>/session-host/remote/sessions
+//!   |                share on:      <profile>/sessions (the TUI's store)
 //!   |-- driver       CoreTurnDriver + GatewayCoreFactory (tier = config.tier)
 //!   |-- identity     RegistryIdentityMapper (<state>/remote/node-devices.conf)
 //!   `-- listener     NodeListener::serve (revocation closes live connections)
@@ -19,10 +21,26 @@
 //! A hosted session's rights come from the factory, which does not see who
 //! created the session. The local socket's peer is the gateway's own uid
 //! (an operator); remote devices are different principals. They therefore get
-//! their **own host, state and factory**: the sandbox rights are cut to
+//! their **own host, records and factory**: the sandbox rights are cut to
 //! [`RemoteServeConfig::tier`] (default observer), and a device's registry tier
-//! only decides its host caps. Sessions are not shared between the local and
-//! the remote host.
+//! only decides its host caps.
+//!
+//! # Sharing the TUI's sessions
+//! [`RemoteServeConfig::share`] (`[session_listener] share_profile_sessions`,
+//! default `off`) decides whether remote devices see the profile's own
+//! sessions. With `off` the remote host keeps its private transcript store and
+//! nothing of the profile is visible. With `read` or `continue` the transcript
+//! and approval store is the profile store `<profile>/sessions`, the core
+//! writes with the `cli-session:<id>` thread (the same one `harw` uses, so a
+//! continued TUI session sees its earlier entries), a read-only
+//! [`crate::profile_index::FsProfileIndex`] lists the profile's sessions and
+//! projects for the host, and every session runs in its checked working
+//! directory (`project_root`/`cwd` of its meta, only inside the known project
+//! roots, narrowed by `share_roots`). Host records stay in the remote
+//! directory. Leases, meta writes on adopt and turn end, and the read/continue
+//! gates are the host's (`harw-session-host`); this module only composes.
+//! Startup tail repair runs for the host's own record ids only, never for all
+//! profile sessions (another process may be writing them).
 //!
 //! # Approvals
 //! A parked approval is bound to one actor. Remote sessions bind it to
@@ -69,14 +87,17 @@ use harw_node_transport::{LocalNode, NodeTransportServer, NodeVerifier, ServerOp
 use harw_session_daemon::DaemonServices;
 use harw_session_driver::{CoreDriverConfig, CoreTurnDriver};
 use harw_session_host::driver::TurnDriver;
-use harw_session_host::{DurableApprovals, DurableTranscripts, HostConfig, SessionHost};
+use harw_session_host::index::{ProfileIndex, ProfileShare, ShareMode, ShareSettings};
+use harw_session_host::{DurableApprovals, DurableTranscripts, HostConfig, SessionHost, ToolHost};
 use harw_session_ws::WsLimits;
 use harw_types::{ApprovalActor, DeviceId, PermissionTier};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::session_serve::{GatewayCoreFactory, private_dir};
+use crate::profile_index::{FsProfileIndex, IndexOptions};
+use crate::session_listener::SharePlan;
+use crate::session_serve::{GatewayCoreFactory, SessionCwdResolver, private_dir};
 
 /// Directory below the profile's session-host state that belongs to the
 /// remote ingress.
@@ -122,6 +143,9 @@ pub struct RemoteServeConfig {
     /// How often registry and pin policy is revalidated (live invalidation).
     /// Default 5 s; values below 10 ms are clamped to 10 ms.
     pub revocation_poll: Duration,
+    /// Sharing of the profile's own sessions (`[session_listener]
+    /// share_*`). Default off: the remote host keeps its private store.
+    pub share: SharePlan,
     /// Digest of the exact owner pin file used to build the transport verifier.
     pub(crate) peer_pins_digest: Option<[u8; 32]>,
     #[cfg(test)]
@@ -197,6 +221,7 @@ impl RemoteServeConfig {
             approval_device: None,
             provider_link_device: None,
             revocation_poll: Duration::from_secs(5),
+            share: SharePlan::off(),
             peer_pins_digest: None,
             #[cfg(test)]
             injected_peer_trust: false,
@@ -214,6 +239,61 @@ impl RemoteServeConfig {
         );
         ApprovalActor::Operator { id }
     }
+}
+
+/// The profile store shared with remote devices (`share.mode != off`).
+struct SharedProfile {
+    /// `<profile>/sessions` (transcripts, metas, approvals, leases).
+    sessions_root: PathBuf,
+    index: Arc<FsProfileIndex>,
+    settings: ShareSettings,
+}
+
+/// Resolves the shared profile store of `config`; `None` when sharing is off.
+///
+/// # Errors
+/// Sharing without a tenant (never a panic, although `SharePlan` validation
+/// already rejects it) or an unresolvable profile sessions directory.
+fn open_share(config: &RemoteServeConfig) -> Result<Option<SharedProfile>, String> {
+    let share = &config.share;
+    if matches!(share.mode, ShareMode::Off) {
+        return Ok(None);
+    }
+    let tenant = share.tenant.clone().ok_or_else(|| {
+        "[session_listener] share_tenant fehlt für share_profile_sessions".to_owned()
+    })?;
+    let sessions_root = crate::runtime_entry::profile_sessions_root(&config.home)?;
+    let index = Arc::new(FsProfileIndex::open(
+        sessions_root.clone(),
+        IndexOptions {
+            since: share.since,
+            share_roots: share.roots.clone(),
+        },
+    ));
+    Ok(Some(SharedProfile {
+        sessions_root,
+        index,
+        settings: ShareSettings {
+            mode: share.mode,
+            tenant,
+            legacy_rows: share.legacy_rows,
+            listener_tier: config.tier,
+        },
+    }))
+}
+
+/// Working directory of a shared session: the index's checked
+/// `project_root`/`cwd`. `None` (unknown, outside the known roots, lookup
+/// error) falls back to the factory's default `cwd`; the host itself refuses
+/// to continue such a session. Paths are never logged.
+fn workdir_resolver(index: Arc<dyn ProfileIndex>) -> SessionCwdResolver {
+    Arc::new(move |id: &harw_types::SessionId| match index.workdir(id) {
+        Ok(dir) => dir,
+        Err(_) => {
+            tracing::warn!(session = %id, "profile index: working directory lookup failed");
+            None
+        }
+    })
 }
 
 /// Owner policy files are bounded regular files and are never followed through
@@ -408,22 +488,31 @@ pub async fn start_remote(
     verifier: Arc<dyn NodeVerifier>,
     listener: TcpListener,
 ) -> Result<RemoteIngress, String> {
-    let sessions_root = config.remote_dir().join(SESSIONS_DIR_NAME);
-    private_dir(&sessions_root)?;
-    let factory = Arc::new(
-        GatewayCoreFactory::new(
-            model,
-            &sessions_root,
-            config.home.clone(),
-            config.cwd.clone(),
-            0,
-        )
-        .with_tier(config.tier)
-        .with_actor(config.actor()),
-    );
-    let driver = CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), factory)
-        .map_err(|error| format!("remote session driver: {error}"))?;
-    start_remote_with_driver(config, Arc::new(driver), local, verifier, listener).await
+    let share = open_share(config)?;
+    let sessions_root = transcript_root(config, share.as_ref())?;
+    let factory = GatewayCoreFactory::new(
+        model,
+        &sessions_root,
+        config.home.clone(),
+        config.cwd.clone(),
+        0,
+    )
+    .with_tier(config.tier)
+    .with_actor(config.actor());
+    let factory = match &share {
+        // The TUI's thread and store, and the session's own project folder.
+        Some(shared) => factory
+            .with_thread_mapper(
+                crate::session_serve::cli_session_thread,
+                &shared.sessions_root,
+            )
+            .with_session_cwd(workdir_resolver(shared.index.clone())),
+        None => factory,
+    };
+    let driver =
+        CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), Arc::new(factory))
+            .map_err(|error| format!("remote session driver: {error}"))?;
+    start_remote_composed(config, share, Arc::new(driver), local, verifier, listener).await
 }
 
 /// Like [`start_remote`] around an injected `driver` (tests use a fake one).
@@ -437,13 +526,42 @@ pub async fn start_remote_with_driver(
     verifier: Arc<dyn NodeVerifier>,
     listener: TcpListener,
 ) -> Result<RemoteIngress, String> {
+    let share = open_share(config)?;
+    start_remote_composed(config, share, driver, local, verifier, listener).await
+}
+
+/// Transcript and approval root: the profile store when sharing, otherwise
+/// the remote ingress's private `<remote>/sessions` (created owner-only).
+fn transcript_root(
+    config: &RemoteServeConfig,
+    share: Option<&SharedProfile>,
+) -> Result<PathBuf, String> {
+    match share {
+        Some(shared) => Ok(shared.sessions_root.clone()),
+        None => {
+            let root = config.remote_dir().join(SESSIONS_DIR_NAME);
+            private_dir(&root)?;
+            Ok(root)
+        }
+    }
+}
+
+async fn start_remote_composed(
+    config: &RemoteServeConfig,
+    share: Option<SharedProfile>,
+    driver: Arc<dyn TurnDriver>,
+    local: LocalNode,
+    verifier: Arc<dyn NodeVerifier>,
+    listener: TcpListener,
+) -> Result<RemoteIngress, String> {
     let remote_dir = config.remote_dir();
-    let sessions_root = remote_dir.join(SESSIONS_DIR_NAME);
-    private_dir(&sessions_root)?;
-    private_dir(&remote_dir.join("host"))?;
+    let sessions_root = transcript_root(config, share.as_ref())?;
+    // Host records stay in the remote directory in both modes.
+    let host_dir = remote_dir.join("host");
+    private_dir(&host_dir)?;
     let transcripts = DurableTranscripts::open(&sessions_root)
         .map_err(|error| format!("remote transcripts: {error}"))?;
-    let host_dir = remote_dir.join("host");
+    // Only the host's own records: profile sessions may have live writers.
     let persisted_ids: Vec<_> = harw_session_host::record::RecordStore::new(&host_dir)
         .list()
         .map_err(|error| format!("remote hosted session records: {error}"))?
@@ -456,15 +574,26 @@ pub async fn start_remote_with_driver(
     let approvals = DurableApprovals::open(&sessions_root)
         .map_err(|error| format!("remote approvals: {error}"))?;
     let services = DaemonServices::new(driver, Arc::new(transcripts), Arc::new(approvals));
-    let host = Arc::new(
-        SessionHost::open(
+    let host = match share {
+        None => SessionHost::open(
             HostConfig::new(host_dir),
             services.driver,
             services.transcripts,
             services.approvals,
-        )
-        .map_err(|error| format!("remote host: {error}"))?,
-    );
+        ),
+        Some(shared) => SessionHost::open_with_profile(
+            HostConfig::new(host_dir),
+            services.driver,
+            services.transcripts,
+            services.approvals,
+            ToolHost::disabled(),
+            ProfileShare {
+                settings: shared.settings,
+                index: shared.index,
+            },
+        ),
+    };
+    let host = Arc::new(host.map_err(|error| format!("remote host: {error}"))?);
     let addr = listener
         .local_addr()
         .map_err(|error| format!("remote listener address: {error}"))?;
@@ -1402,6 +1531,384 @@ mod tests {
         // Pinned by the transport but not enrolled in the device registry.
         assert!(dial(ingress.addr(), &gateway, &stranger).await.is_err());
         ingress.shutdown().await;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Sharing the profile's sessions (plan Welle 1, acceptance S4)
+    // ---------------------------------------------------------------------
+
+    /// The Tui entry requires an active UIA: the same fixture the runtime
+    /// tests use (`<home>/profiles/default`).
+    fn write_fixture_uia(home: &Path) -> TestResult {
+        let profile_dir = home.join("profiles").join("default");
+        let agent_dir = profile_dir.join("agents").join("fixture-uia");
+        std::fs::create_dir_all(&agent_dir)?;
+        std::fs::write(
+            agent_dir.join("definition.toml"),
+            "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
+        )?;
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
+        )?;
+        Ok(())
+    }
+
+    /// Shared-profile mode `continue` over `dir` (home = state = cwd).
+    fn share_config(dir: &Path, tenant: &TenantId) -> RemoteServeConfig {
+        let mut config = injected_config(dir);
+        config.tier = PermissionTier::Operator;
+        config.share = SharePlan {
+            mode: ShareMode::Continue,
+            tenant: Some(tenant.clone()),
+            ..SharePlan::off()
+        };
+        config
+    }
+
+    fn enroll(config: &RemoteServeConfig, phone: &TestNode, tenant: &TenantId) -> TestResult {
+        std::fs::create_dir_all(config.remote_dir())?;
+        DeviceRegistry::new(&config.remote_dir()).enroll(&DeviceRecord {
+            node_id: phone.id.clone(),
+            device: DeviceId::try_from_str("dev-test-1")?,
+            tenant: tenant.clone(),
+            tier: PermissionTier::Operator,
+            revoked: false,
+            label: "phone".into(),
+            approve_optin: false,
+        })?;
+        Ok(())
+    }
+
+    /// Like [`dial`], asking for the `projects` feature (a minor-3 app).
+    async fn dial_projects(
+        addr: SocketAddr,
+        gateway: &TestNode,
+        phone: &TestNode,
+    ) -> Result<RemotePort, harw_session_remote::RemoteError> {
+        let verifier = pinned(&gateway.identity)
+            .map_err(|error| harw_session_remote::RemoteError::Connect(error.to_string()))?;
+        let mut options = ConnectOptions::new("phone");
+        options.features = vec![harw_protocol::session_wire::features::PROJECTS.to_owned()];
+        let connection = connect_node(
+            NodeEndpoint {
+                addr,
+                expected_node: gateway.id.clone(),
+            },
+            &phone.local,
+            &verifier,
+            options,
+        )
+        .await?;
+        Ok(RemotePort::new(connection))
+    }
+
+    /// A canonical, existing project folder below `dir`.
+    fn project_dir(dir: &Path, name: &str) -> TestResult<PathBuf> {
+        let project = dir.join(name);
+        std::fs::create_dir_all(&project)?;
+        Ok(std::fs::canonicalize(project)?)
+    }
+
+    fn text_item(user: bool, text: &str) -> harw_protocol::TurnItem {
+        use harw_protocol::{AssistantMessageItem, ContentPart, TurnItem, UserMessageItem};
+        let content = vec![ContentPart::Text {
+            text: text.to_owned(),
+        }];
+        if user {
+            TurnItem::UserMessage(UserMessageItem {
+                id: harw_types::ItemId::new(),
+                content,
+            })
+        } else {
+            TurnItem::AssistantMessage(AssistantMessageItem {
+                id: harw_types::ItemId::new(),
+                content,
+                phase: None,
+            })
+        }
+    }
+
+    /// A TUI session in the profile store, written as `harw` writes it
+    /// (`cli-session:` thread), with its meta bound to `project`. Returns
+    /// the project key.
+    async fn seed_tui_session(
+        root: &Path,
+        id: &SessionId,
+        project: &Path,
+        text: &str,
+    ) -> TestResult<String> {
+        use harw_core::{StateStore as _, TranscriptStateStore};
+        let store = TranscriptStateStore::new(
+            harw_session_store::TranscriptStore::new(root),
+            crate::session_serve::cli_session_thread,
+        );
+        store.save_turn(id, &text_item(true, text)).await?;
+        store
+            .save_turn(id, &text_item(false, "earlier answer"))
+            .await?;
+        let key = harw_home::project::project_key(project);
+        let bound = key.clone();
+        harw_session_store::meta::update(root, id, |meta| {
+            meta.turns = meta.turns.max(1);
+            if meta.first_user_message.is_none() {
+                meta.first_user_message = Some(text.to_owned());
+            }
+            meta.cwd = Some(project.to_path_buf());
+            meta.project_root = Some(project.to_path_buf());
+            meta.project_key = Some(bound);
+        })?;
+        Ok(key)
+    }
+
+    /// Fake driver that, like the core, writes the first transcript record
+    /// of a new session into the profile store (`cli-session:` thread).
+    struct ProfileWritingDriver {
+        root: PathBuf,
+    }
+
+    impl TurnDriver for ProfileWritingDriver {
+        fn prepare_execution(
+            &self,
+            _: &SessionId,
+            _: harw_session_host::driver::ExecutionAdmission,
+        ) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn create_session(&self, id: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
+            let id = id.clone();
+            Box::pin(async move {
+                use harw_core::{StateStore as _, TranscriptStateStore};
+                TranscriptStateStore::new(
+                    harw_session_store::TranscriptStore::new(&self.root),
+                    crate::session_serve::cli_session_thread,
+                )
+                .save_turn(&id, &text_item(true, "first words from the phone"))
+                .await
+                .map_err(|error| harw_session_host::HostError::Storage(error.to_string()))
+            })
+        }
+        fn run_turn(
+            &self,
+            _: TurnInput,
+            _: CancelSignal,
+            _: Arc<dyn EventSink>,
+        ) -> DriverFuture<'_, TurnOutcome> {
+            Box::pin(async { Ok(TurnOutcome::Completed) })
+        }
+        fn resume_after_approval(
+            &self,
+            _: &SessionId,
+            _: CancelSignal,
+            _: Arc<dyn EventSink>,
+        ) -> DriverFuture<'_, TurnOutcome> {
+            Box::pin(async { Ok(TurnOutcome::Completed) })
+        }
+        fn apply_setting(&self, _: &SessionId, _: Setting) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn model_name(&self, _: &SessionId) -> Option<String> {
+            None
+        }
+    }
+
+    /// Acceptance S4: a TUI session continued over the remote host hydrates
+    /// from the profile store with the TUI's thread, so the model sees the
+    /// earlier entries; nothing lands in the private remote store.
+    #[tokio::test]
+    async fn tui_session_continued_over_remote_host_sees_earlier_entries() -> TestResult {
+        use harw_protocol::session_wire::{AttachParams, SubmitParams, SubmitResult};
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        write_fixture_uia(dir)?;
+        let tenant = TenantId::try_from_str("tenant-test")?;
+        let config = share_config(dir, &tenant);
+        let gateway = node("gateway-share", 1)?;
+        let phone = node("phone-share", 2)?;
+        enroll(&config, &phone, &tenant)?;
+        let root = crate::runtime_entry::profile_sessions_root(dir)?;
+        let project = project_dir(dir, "proj")?;
+        let id = SessionId::try_from_str("sess-a1")?;
+        seed_tui_session(&root, &id, &project, "earlier-entry-marker").await?;
+
+        let model = harw_core::RecordingModelProvider::new();
+        let ingress = start_remote(
+            &config,
+            Arc::new(model.clone()),
+            gateway.local.clone(),
+            Arc::new(pinned(&phone.identity)?),
+            TcpListener::bind("127.0.0.1:0").await?,
+        )
+        .await?;
+        let mobile = dial_projects(ingress.addr(), &gateway, &phone).await?;
+        let (ack, frames) = mobile
+            .attach(AttachParams {
+                session_id: id.clone(),
+                from: None,
+                profile: Default::default(),
+                tail_items: 50,
+            })
+            .await?;
+        assert!(ack.head.durable > 0, "the TUI transcript is readable");
+        let submitted = mobile
+            .submit(SubmitParams {
+                session_id: id.clone(),
+                text: "continue-from-phone".to_owned(),
+                expect_head: ack.head,
+                client_msg_id: "m1".to_owned(),
+                force: false,
+            })
+            .await?;
+        assert!(
+            matches!(submitted, SubmitResult::Accepted { .. }),
+            "{submitted:?}"
+        );
+        let mut request = None;
+        for _ in 0..100 {
+            request = model.last();
+            if request.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let request = request.ok_or("the model was never called")?;
+        let history = format!("{:?}", request.history.items());
+        assert!(
+            history.contains("earlier-entry-marker"),
+            "the model must see the TUI's earlier entries"
+        );
+        assert!(history.contains("continue-from-phone"));
+        assert!(
+            !config
+                .remote_dir()
+                .join(SESSIONS_DIR_NAME)
+                .join("sess-a1.jsonl")
+                .exists(),
+            "a shared session never moves into the private remote store"
+        );
+        drop((mobile, frames));
+        ingress.shutdown().await;
+        Ok(())
+    }
+
+    /// Acceptance S4: a session the phone creates in a project is a normal
+    /// profile session: `harw -r` discovers it, with its project.
+    #[tokio::test]
+    async fn phone_session_is_discoverable_with_project() -> TestResult {
+        use harw_protocol::session_wire::CreateInParams;
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let tenant = TenantId::try_from_str("tenant-test")?;
+        let config = share_config(dir, &tenant);
+        let gateway = node("gateway-create", 1)?;
+        let phone = node("phone-create", 2)?;
+        enroll(&config, &phone, &tenant)?;
+        let root = crate::runtime_entry::profile_sessions_root(dir)?;
+        let project = project_dir(dir, "proj")?;
+        // A known project: one TUI session already ran there.
+        let key = seed_tui_session(
+            &root,
+            &SessionId::try_from_str("sess-a1")?,
+            &project,
+            "tui work",
+        )
+        .await?;
+
+        let ingress = start_remote_with_driver(
+            &config,
+            Arc::new(ProfileWritingDriver { root: root.clone() }),
+            gateway.local.clone(),
+            Arc::new(pinned(&phone.identity)?),
+            TcpListener::bind("127.0.0.1:0").await?,
+        )
+        .await?;
+        let mobile = dial_projects(ingress.addr(), &gateway, &phone).await?;
+        let created = mobile
+            .create_in(CreateInParams {
+                project_key: key.clone(),
+                title: Some("from the phone".to_owned()),
+            })
+            .await?;
+        assert_eq!(created.tenant.as_ref(), Some(&tenant));
+
+        let discovered = crate::resume::discover_sessions(&root)?;
+        let found = discovered
+            .iter()
+            .find(|session| session.id == created.session_id)
+            .ok_or("the phone session is not discoverable from the TUI")?;
+        let meta = found.meta.as_ref().ok_or("the phone session has no meta")?;
+        assert_eq!(meta.project_key.as_deref(), Some(key.as_str()));
+        assert_eq!(meta.project_root.as_deref(), Some(project.as_path()));
+        drop(mobile);
+        ingress.shutdown().await;
+        Ok(())
+    }
+
+    /// Acceptance S4: the factory's per-session working directory is the
+    /// session's checked project root; unknown sessions fall back (`None`).
+    #[tokio::test]
+    async fn session_runs_in_project_dir() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("sessions");
+        std::fs::create_dir_all(&root)?;
+        let project = project_dir(temp.path(), "proj")?;
+        let id = SessionId::try_from_str("sess-a1")?;
+        seed_tui_session(&root, &id, &project, "work here").await?;
+        let index = Arc::new(FsProfileIndex::open(root, IndexOptions::default()));
+        let resolve = workdir_resolver(index);
+        assert_eq!(resolve(&id), Some(project));
+        assert_eq!(resolve(&SessionId::try_from_str("sess-unknown")?), None);
+        Ok(())
+    }
+
+    /// Regression guard: with sharing off the remote host keeps its private
+    /// store and never touches the profile's sessions directory.
+    #[tokio::test]
+    async fn share_off_keeps_remote_store() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let config = injected_config(dir);
+        assert!(matches!(config.share.mode, ShareMode::Off));
+        assert!(open_share(&config)?.is_none());
+        assert_eq!(
+            transcript_root(&config, None)?,
+            config.remote_dir().join(SESSIONS_DIR_NAME)
+        );
+        let gateway = node("gateway-off", 1)?;
+        let phone = node("phone-off", 2)?;
+        let ingress = start_remote_with_driver(
+            &config,
+            Arc::new(NoopDriver),
+            gateway.local.clone(),
+            Arc::new(pinned(&phone.identity)?),
+            TcpListener::bind("127.0.0.1:0").await?,
+        )
+        .await?;
+        assert!(config.remote_dir().join(SESSIONS_DIR_NAME).is_dir());
+        assert!(
+            !dir.join("profiles")
+                .join("default")
+                .join("sessions")
+                .exists(),
+            "share off must not create or use the profile store"
+        );
+        ingress.shutdown().await;
+        Ok(())
+    }
+
+    /// Sharing without a tenant is a startup error, never a panic.
+    #[test]
+    fn share_without_tenant_is_an_error() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let mut config = injected_config(temp.path());
+        config.share = SharePlan {
+            mode: ShareMode::Read,
+            tenant: None,
+            ..SharePlan::off()
+        };
+        assert!(open_share(&config).is_err());
         Ok(())
     }
 }

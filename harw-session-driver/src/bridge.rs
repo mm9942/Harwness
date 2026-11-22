@@ -132,6 +132,11 @@ pub trait CoreRuntime: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Drop the cached core of an established session; the next leg hydrates from the transcript again. No tombstone, admission stays.
+    fn forget_session(&self, _session_id: &SessionId) -> Result<(), DriverBridgeError> {
+        Ok(())
+    }
+
     /// Prepare the session (idempotent).
     fn open_session<'a>(
         &'a self,
@@ -642,6 +647,12 @@ impl TurnDriver for CoreTurnDriver {
             .map_err(HostError::from)
     }
 
+    fn forget_session(&self, session_id: &SessionId) -> Result<(), HostError> {
+        self.runtime
+            .forget_session(session_id)
+            .map_err(HostError::from)
+    }
+
     fn create_session(&self, session_id: &SessionId, title: Option<&str>) -> DriverFuture<'_, ()> {
         let session_id = session_id.clone();
         let title = title.map(str::to_owned);
@@ -1048,6 +1059,23 @@ impl CoreRuntime for HarwCoreRuntime {
         if let Ok(mut sinks) = self.live_sinks.lock() {
             sinks.remove(session_id);
         }
+        Ok(())
+    }
+
+    fn forget_session(&self, session_id: &SessionId) -> Result<(), DriverBridgeError> {
+        // Same lock order as prepare_execution: admissions before slots.
+        let mut admissions = self
+            .admissions
+            .lock()
+            .map_err(|_| DriverBridgeError::Runtime("admission table poisoned".into()))?;
+        // Bump the generation so an in-flight hydration cannot publish the
+        // forgotten core; the admission itself stays (no tombstone).
+        if let Some(state) = admissions.get_mut(session_id) {
+            state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                DriverBridgeError::Runtime("admission generation exhausted".into())
+            })?;
+        }
+        self.slots()?.remove(session_id);
         Ok(())
     }
 
@@ -1564,6 +1592,54 @@ mod live_events {
         wait_for(&sink_b, 1).await?;
         assert_eq!(sink_b.child_agents(), vec![child_three]);
         assert_eq!(sink_a.count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forget_session_drops_slot_without_tombstone() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let hub = AgentEventHub::default();
+        let runtime = HarwCoreRuntime::new(Arc::new(HubFactory { hub }), dir.path());
+        let sid = SessionId::new();
+        runtime.open_session(&sid, None).await?;
+        assert!(runtime.slots()?.get(&sid).is_some());
+        runtime.forget_session(&sid)?;
+        assert!(runtime.slots()?.get(&sid).is_none());
+        // No tombstone: the next leg hydrates lazily again.
+        assert!(
+            runtime
+                .admissions
+                .lock()
+                .map_err(|_| "admission table poisoned")?
+                .get(&sid)
+                .is_none()
+        );
+        runtime.open_session(&sid, None).await?;
+        assert!(runtime.slots()?.get(&sid).is_some());
+
+        // With a recorded admission state: the admission is kept unchanged,
+        // only the generation moves. `ExecutionAdmission::new` is crate-private
+        // to the host, so the state is seeded directly here.
+        let other = SessionId::new();
+        let seeded = AdmissionState {
+            generation: 3,
+            admission: None,
+        };
+        runtime
+            .admissions
+            .lock()
+            .map_err(|_| "admission table poisoned")?
+            .insert(other.clone(), seeded.clone());
+        runtime.forget_session(&other)?;
+        let after = runtime
+            .admissions
+            .lock()
+            .map_err(|_| "admission table poisoned")?
+            .get(&other)
+            .cloned()
+            .ok_or("admission state vanished")?;
+        assert_eq!(after.admission, seeded.admission);
+        assert!(after.generation > seeded.generation);
         Ok(())
     }
 
