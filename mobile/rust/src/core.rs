@@ -71,6 +71,15 @@ struct Shared {
     wake: tokio::sync::Notify,
     /// Pushes change signals to the platform listener.
     notifier: Notifier,
+    /// Platform shell and file access for the on-device agent's device tools.
+    device: Mutex<DeviceHandles>,
+}
+
+/// Platform implementations registered by Kotlin before the on-device host starts.
+#[derive(Default)]
+struct DeviceHandles {
+    shell: Option<Arc<dyn crate::ShellExecutor>>,
+    files: Option<Arc<dyn crate::FileAccess>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +112,18 @@ fn now_ms() -> u64 {
 }
 
 impl Shared {
+    /// The registered device-tool handles, for the on-device host assembly.
+    #[allow(dead_code)]
+    fn device_tools(
+        &self,
+    ) -> (
+        Option<Arc<dyn crate::ShellExecutor>>,
+        Option<Arc<dyn crate::FileAccess>>,
+    ) {
+        let handles = self.device.lock().unwrap_or_else(PoisonError::into_inner);
+        (handles.shell.clone(), handles.files.clone())
+    }
+
     fn state(&self) -> MutexGuard<'_, CoreState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -918,6 +939,22 @@ impl MobileCore {
             };
             Ok(ApprovalReceipt { outcome, detail })
         })
+    }
+
+    /// Registers the platform shell and file access used by the on-device agent's device
+    /// tools. Call it before `connect_local`; `None` removes a handle.
+    pub fn set_device_tools(
+        &self,
+        shell: Option<Arc<dyn crate::ShellExecutor>>,
+        files: Option<Arc<dyn crate::FileAccess>>,
+    ) {
+        let mut handles = self
+            .shared
+            .device
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        handles.shell = shell;
+        handles.files = files;
     }
 
     /// Registers the listener that hears pushed change signals.

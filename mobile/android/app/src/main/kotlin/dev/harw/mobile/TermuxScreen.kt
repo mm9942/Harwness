@@ -103,6 +103,31 @@ internal fun TermuxScreen(onBack: () -> Unit) {
                 )
                 OutlinedButton(onClick = { permission.launch(TERMUX_RUN_PERMISSION) }) { Text("Berechtigung anfragen") }
             }
+            Text("Interaktiv in Termux", style = MaterialTheme.typography.titleSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(
+                    "Terminal öffnen" to "exec bash -l",
+                    "claude" to "exec claude",
+                    "codex" to "exec codex",
+                ).forEach { (label, shell) ->
+                    OutlinedButton(
+                        enabled = installed && granted,
+                        onClick = {
+                            error = try {
+                                bridge.launchInteractive(shell)
+                                null
+                            } catch (e: Exception) {
+                                termuxFailure(e)
+                            }
+                        },
+                    ) { Text(label) }
+                }
+            }
+            Text(
+                "Claude Code und Codex laufen mit ihrer eigenen Anmeldung im Termux-Terminal und müssen dort " +
+                    "installiert sein. Das Abo ist kein API-Schlüssel für den Chat in harw.",
+                style = MaterialTheme.typography.bodySmall,
+            )
             OutlinedTextField(
                 value = command,
                 onValueChange = { command = it },
