@@ -268,6 +268,7 @@ fn open_share(config: &RemoteServeConfig) -> Result<Option<SharedProfile>, Strin
         IndexOptions {
             since: share.since,
             share_roots: share.roots.clone(),
+            new_project_root: share.new_project_root.clone(),
         },
     ));
     Ok(Some(SharedProfile {

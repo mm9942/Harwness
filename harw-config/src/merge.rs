@@ -1318,7 +1318,7 @@ fn merge_tools_doc(
     }
 }
 
-// `[session_listener]` — alle fünfzehn Felder `GlobalOnly` und
+// `[session_listener]` — alle sechzehn Felder `GlobalOnly` und
 // sicherheitskritisch: nur die Baseline (Home) setzt sie.
 fn merge_session_listener(
     trusted: &mut HarnessConfig,
@@ -1461,6 +1461,15 @@ fn merge_session_listener(
         present("share_roots"),
         role,
         "session_listener.share_roots",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_new_project_root,
+        incoming.share_new_project_root,
+        present("share_new_project_root"),
+        role,
+        "session_listener.share_new_project_root",
         layer_path,
         out,
     );

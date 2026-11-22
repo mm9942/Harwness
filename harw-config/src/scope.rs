@@ -387,6 +387,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "session_listener.share_legacy_rows", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.share_since", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.share_roots", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.share_new_project_root", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     // 1.9 [mode] (1)
     FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.10 [research] (5)
@@ -632,7 +633,8 @@ mod merge_rule_tests {
         // `session_listener.shared_socket_tenant`.
         // Onion-Connector: +2 für `session_listener.onion`, `session_listener.onion_dir`.
         // Sessions teilen (Plan §3.4): +5 für session_listener.share_*.
-        assert_eq!(FIELD_TABLE.len(), 228);
+        // Neue Projekte vom Handy: +1 (`session_listener.share_new_project_root`).
+        assert_eq!(FIELD_TABLE.len(), 229);
     }
 
     #[test]
@@ -672,7 +674,7 @@ mod merge_rule_tests {
         // +2 (`session_listener.provider_link_device`, `session_listener.shared_socket_tenant`).
         // +2 (`session_listener.onion`, `session_listener.onion_dir`).
         // Sessions teilen (Plan §3.4): +5 für session_listener.share_*.
-        assert_eq!(count(MergeRule::GlobalOnly), 30);
+        assert_eq!(count(MergeRule::GlobalOnly), 31);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1
         // (`permissions.auto_classifier_timeout_secs`).

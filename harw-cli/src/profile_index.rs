@@ -47,6 +47,8 @@ pub(crate) struct IndexOptions {
     pub since: Option<Timestamp>,
     /// Kanonische, existierende Wurzeln; leer = keine Einschränkung.
     pub share_roots: Vec<PathBuf>,
+    /// Elternordner für vom Client neu angelegte Projekte (`None` = aus).
+    pub new_project_root: Option<PathBuf>,
 }
 
 type FileSig = (SystemTime, u64);
@@ -91,6 +93,7 @@ impl FsProfileIndex {
         let options = IndexOptions {
             since: options.since,
             share_roots,
+            new_project_root: options.new_project_root,
         };
         let index = Self {
             sessions_root,
@@ -245,6 +248,46 @@ impl FsProfileIndex {
             .filter_map(|(_, entry)| entry.row.clone())
             .filter(|row| include_archived || !row.archived)
             .collect())
+    }
+
+    /// Legt `<new_project_root>/<slug>` an (nur wenn konfiguriert und `slug` ein sicherer
+    /// Slug ist) und gibt es mit dem regulären harw-home-Projektschlüssel zurück, damit TUI-
+    /// Sitzungen in diesem Ordner im selben Projekt landen. Jeder Fehler -> `None`.
+    fn create_new_project(&self, slug: &str) -> Option<ResolvedProject> {
+        let parent = self.options.new_project_root.as_deref()?;
+        let safe = (1..=40).contains(&slug.len())
+            && !slug.starts_with('-')
+            && slug
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !safe {
+            return None;
+        }
+        let parent = std::fs::canonicalize(parent).ok()?;
+        if !parent.is_dir() {
+            return None;
+        }
+        let target = parent.join(slug);
+        match std::fs::symlink_metadata(&target) {
+            Ok(found) if found.is_dir() => {}
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&target).ok()?;
+            }
+            Err(_) => return None,
+        }
+        let canonical = std::fs::canonicalize(&target).ok()?;
+        if canonical.parent() != Some(parent.as_path())
+            || !canonical.is_dir()
+            || !self.within_share_roots(&canonical)
+        {
+            return None;
+        }
+        Some(ResolvedProject {
+            project_key: harw_home::project::project_key(&canonical),
+            label: slug.to_owned(),
+            project_root: canonical,
+        })
     }
 
     fn within_share_roots(&self, path: &Path) -> bool {
@@ -441,7 +484,7 @@ impl ProfileIndex for FsProfileIndex {
             .filter(|(row, _)| row.project_key.as_deref() == Some(project_key))
             .max_by_key(|(row, _)| row.updated_at.as_millisecond());
         let Some((_, entry)) = newest else {
-            return Ok(None);
+            return Ok(self.create_new_project(project_key));
         };
         let Some(root) = entry.project_root.as_deref() else {
             return Ok(None);
@@ -823,6 +866,7 @@ mod tests {
             IndexOptions {
                 since: Some("2999-01-01T00:00:00Z".parse()?),
                 share_roots: Vec::new(),
+                ..IndexOptions::default()
             },
         );
         assert!(all(&index)?.is_empty());
@@ -1062,6 +1106,7 @@ mod tests {
                 IndexOptions {
                     since: None,
                     share_roots: roots,
+                    ..IndexOptions::default()
                 },
             )
         };

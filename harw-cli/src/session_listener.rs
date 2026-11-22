@@ -228,6 +228,8 @@ pub struct SharePlan {
     pub since: Option<jiff::Timestamp>,
     /// Syntactically checked (absolute, no `.`/`..`); canonicalised later.
     pub roots: Vec<PathBuf>,
+    /// `share_new_project_root` (absolute, no `.`/`..`); only set in mode `continue`.
+    pub new_project_root: Option<PathBuf>,
 }
 
 impl SharePlan {
@@ -240,6 +242,7 @@ impl SharePlan {
             legacy_rows: 100,
             since: None,
             roots: Vec::new(),
+            new_project_root: None,
         }
     }
 }
@@ -291,12 +294,26 @@ fn plan_share(section: &SessionListenerSection) -> Result<SharePlan, String> {
         }
         roots.push(path);
     }
+    let new_project_root = match section.share_new_project_root.as_deref() {
+        None => None,
+        Some(raw) => {
+            let path = PathBuf::from(raw);
+            if !path.is_absolute() || raw.split('/').any(|part| part == "." || part == "..") {
+                return Err(
+                    "[session_listener] share_new_project_root must be an absolute path without `.` or `..`"
+                        .to_owned(),
+                );
+            }
+            matches!(mode, ShareMode::Continue).then_some(path)
+        }
+    };
     Ok(SharePlan {
         mode,
         tenant,
         legacy_rows: section.share_legacy_rows as usize,
         since,
         roots,
+        new_project_root,
     })
 }
 

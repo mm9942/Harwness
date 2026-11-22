@@ -88,6 +88,10 @@ pub struct SessionListenerSection {
     /// Absolute paths that narrow the allowed working directories.
     #[serde(default)]
     pub share_roots: Vec<String>,
+    /// Absolute directory under which a remote client may create new projects as
+    /// `<dir>/<slug>` (only with `share_profile_sessions = "continue"`). `None` = off.
+    #[serde(default)]
+    pub share_new_project_root: Option<String>,
 }
 
 /// Default for `share_profile_sessions`.
@@ -129,6 +133,7 @@ impl Default for SessionListenerSection {
             share_legacy_rows: default_share_legacy_rows(),
             share_since: None,
             share_roots: Vec::new(),
+            share_new_project_root: None,
         }
     }
 }

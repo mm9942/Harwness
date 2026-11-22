@@ -32,11 +32,6 @@ use crate::command::{
     SubcommandHint,
 };
 
-use crate::command::{
-    BusyAvailability, CommandDomain, CommandScope, CommandSpec, OutputSurface, PermissionTier,
-    SubcommandHint,
-};
-
 use crate::i18n::tr;
 use harw_operations::operation::OperationDomain;
 use harw_ops::command_meta::{self, HintEntry};
