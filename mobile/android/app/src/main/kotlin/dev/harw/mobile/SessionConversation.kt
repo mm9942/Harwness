@@ -90,6 +90,7 @@ import uniffi.harw_mobile_ffi.ApprovalRisk
 import uniffi.harw_mobile_ffi.MobileApproval
 import uniffi.harw_mobile_ffi.MobileHolder
 import uniffi.harw_mobile_ffi.MobileHolderKind
+import uniffi.harw_mobile_ffi.MobileSessionState
 import uniffi.harw_mobile_ffi.MobileSession
 import uniffi.harw_mobile_ffi.MobileToolState
 import uniffi.harw_mobile_ffi.ManageEffect
@@ -154,7 +155,10 @@ internal fun SessionConversation(
     val approvalPending = SessionAction(sessionId, SessionActionKind.Decide) in state.pendingActions
     val interruptPending = SessionAction(sessionId, SessionActionKind.Interrupt) in state.pendingActions
     val sendPending = SessionAction(sessionId, SessionActionKind.Send) in state.pendingActions
-    val holder = view?.holder
+    // Ein veralteter Gateway-Halter bei ruhender Session zaehlt nicht (Holder-Frame kam nicht an).
+    val holder = view?.holder?.takeUnless {
+        it.kind == MobileHolderKind.GATEWAY && turnId == null && session?.state == MobileSessionState.IDLE
+    }
     val access = conversationAccess(
         active = active,
         canSubmit = snapshot?.canSubmit == true,
@@ -358,10 +362,12 @@ internal fun SessionConversation(
                 modifier = Modifier.weight(1f).fillMaxWidth(),
             )
             val head = snapshot?.head
-            val composerEnabled = access == ConversationAccess.Writable && head != null && !sendPending
+            // Tippen und Bilder anhaengen gehen immer (ausser echt nur lesend); nur Senden wartet.
+            val composerEnabled = access != ConversationAccess.Offline && access != ConversationAccess.ReadOnly
+            val sendEnabled = access == ConversationAccess.Writable && turnId == null && head != null && !sendPending
             val queuedFirst = window.firstMessage(sessionId)
-            LaunchedEffect(sessionId, queuedFirst, composerEnabled, generation) {
-                if (queuedFirst != null && composerEnabled && generation != null && head != null) {
+            LaunchedEffect(sessionId, queuedFirst, sendEnabled, generation) {
+                if (queuedFirst != null && sendEnabled && generation != null && head != null) {
                     window.takeFirstMessage(sessionId)
                     window.edit(sessionId, queuedFirst)
                     window.submit(connection, sessionId, generation, head)
@@ -376,6 +382,7 @@ internal fun SessionConversation(
                 onDetachImage = { index -> window.detachImage(sessionId, index) },
                 onImageError = { message -> window.failImage(sessionId, message) },
                 enabled = composerEnabled,
+                canSend = sendEnabled,
                 busy = sendPending,
                 onEdit = { window.edit(sessionId, it) },
                 onReview = { transcriptJump++ },
@@ -383,7 +390,7 @@ internal fun SessionConversation(
                 onSend = {
                     if (generation != null && head != null) window.submit(connection, sessionId, generation, head)
                 },
-                hint = composerHint(access),
+                hint = composerHint(access, turnId != null),
                 onCommands = if (manageOn) ({ commandsOpen = true }) else null,
             )
         }
@@ -505,11 +512,11 @@ internal fun conversationAccess(
     else -> ConversationAccess.Writable
 }
 
-internal fun composerHint(access: ConversationAccess): String = when (access) {
-    ConversationAccess.Writable -> "Nachricht an Harw"
+internal fun composerHint(access: ConversationAccess, turnRunning: Boolean = false): String = when (access) {
+    ConversationAccess.Writable -> if (turnRunning) "Nachricht schreiben, Senden nach der Antwort" else "Nachricht an Harw"
     ConversationAccess.Offline -> "Nur lesen, bis die Verbindung wieder steht"
-    ConversationAccess.HeldElsewhere -> "Nur lesen, die Session ist belegt"
-    ConversationAccess.RunningOnGateway -> "Nur lesen, ein Turn läuft auf dem Gateway"
+    ConversationAccess.HeldElsewhere -> "Nachricht schreiben, Senden sobald die Session frei ist"
+    ConversationAccess.RunningOnGateway -> "Nachricht schreiben, Senden nach der Antwort"
     ConversationAccess.ReadOnly -> "Nur lesen, der Server nimmt hier keine Eingaben an"
 }
 
@@ -559,6 +566,7 @@ private fun HolderBanner(access: ConversationAccess, holder: MobileHolder?, modi
 private fun PromptComposer(
     draft: SessionDraft,
     enabled: Boolean,
+    canSend: Boolean = enabled,
     busy: Boolean,
     hint: String,
     onEdit: (String) -> Unit,
@@ -624,7 +632,7 @@ private fun PromptComposer(
                 shape = RoundedCornerShape(17.dp),
                 maxLines = 4,
             )
-            FilledIconButton(onClick = onSend, enabled = enabled && (draft.text.isNotBlank() || draft.images.isNotEmpty()) && !draft.uncertain) {
+            FilledIconButton(onClick = onSend, enabled = enabled && canSend && (draft.text.isNotBlank() || draft.images.isNotEmpty()) && !draft.uncertain) {
                 if (busy) {
                     CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp)
                 } else {
