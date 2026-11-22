@@ -26,7 +26,7 @@ staging=$(mktemp -d "$generated/.native.XXXXXXXX")
 trap 'rm -rf -- "$staging"' EXIT
 cd -- "$rust_dir"
 cargo ndk --target arm64-v8a --platform 28 --output-dir "$staging/jniLibs" \
-    build --lib --release --locked --jobs "$jobs" "${cargo_network_flags[@]}"
+    build --lib --release --features local-host --locked --jobs "$jobs" "${cargo_network_flags[@]}"
 
 library="$staging/jniLibs/arm64-v8a/libharw_mobile_ffi.so"
 cargo run --locked --jobs "$jobs" "${cargo_network_flags[@]}" --features bindgen \

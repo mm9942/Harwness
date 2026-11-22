@@ -520,6 +520,38 @@ internal class HarwConnection(private val context: Context) {
         return true
     }
 
+    fun connectLocal(): Boolean {
+        val start = state.value
+        if (start.hasConnection || start.stopping || !start.canSetUp) return start.hasConnection
+        val request = ++lifecycle
+        change {
+            it.copy(
+                phase = ConnectionPhase.CONNECTING, detail = null, listError = null,
+                setupError = null, setupNotice = null,
+            )
+        }
+        connectJob = scope.launch {
+            try {
+                val native = loadCore()
+                if (request != lifecycle) return@launch
+                val status = withContext(Dispatchers.IO) {
+                    native.connectLocal(context.filesDir.path, AndroidPlatformKeystore(context))
+                    native.status()
+                }
+                if (request != lifecycle) return@launch
+                applyStatus(status)
+                if (request == lifecycle) startPolling(native, request)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (request == lifecycle) {
+                    closeGate()
+                    change { it.connectionStatus(ConnectionPhase.FAILED, error.displayMessage(), false, null) }
+                }
+            }
+        }
+        return true
+    }
+
     fun disconnect() {
         unwatchNetwork()
         if (!state.value.hasConnection) return

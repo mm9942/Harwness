@@ -72,6 +72,7 @@ internal fun ConnectionScreen(
     scanning: Boolean,
     onScanProfile: () -> Unit,
     onConnect: () -> Unit,
+    onConnectLocal: () -> Unit,
     onDisconnect: () -> Unit,
     onSelectRoute: (RoutePreference) -> Unit,
     onForgetSetup: () -> Unit,
@@ -205,6 +206,10 @@ internal fun ConnectionScreen(
                         }
                     }
                 }
+                OutlinedButton(
+                    enabled = state.canSetUp && !state.hasConnection && !state.stopping,
+                    onClick = onConnectLocal,
+                ) { Text("Auf diesem Gerät starten") }
                 if (wide) {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Box(Modifier.weight(1f)) { device() }

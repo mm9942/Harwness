@@ -231,6 +231,18 @@ internal open class MainActivity : ComponentActivity() {
             )
         } else if (settingsRoute == SettingsRoute.Models) {
             CloudModelsScreen(state, connection, sessionId, onBack = { openSettings(SettingsRoute.Hub) })
+        } else if (settingsRoute == SettingsRoute.Providers) {
+            val providerStore = remember {
+                uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
+            }
+            ProvidersScreen(providerStore, onBack = { openSettings(SettingsRoute.Hub) })
+        } else if (settingsRoute == SettingsRoute.Agents) {
+            AgentsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) })
+        } else if (settingsRoute == SettingsRoute.Jobs) {
+            JobsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) })
+        } else if (settingsRoute == SettingsRoute.LocalModels) {
+            val modelManager = remember { ModelManager(ModelStore(applicationContext)) }
+            ModelsScreen(modelManager, onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Commands) {
             CommandsScreen(
                 state = state,
@@ -268,6 +280,10 @@ internal open class MainActivity : ComponentActivity() {
                     } else {
                         startConnection()
                     }
+                },
+                onConnectLocal = {
+                    connectingFromSetup = true
+                    connection.connectLocal()
                 },
                 onDisconnect = connection::disconnect,
                 onSelectRoute = { connection.selectRoute(it) },

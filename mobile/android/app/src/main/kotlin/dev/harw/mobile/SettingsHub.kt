@@ -36,12 +36,13 @@ import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
 
-internal enum class SettingsRoute { Hub, Connection, Models, Commands }
+internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels }
 
 /** Eltern-Route fuer Zurueck; `null` = Einstellungen schliessen. */
 internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route) {
     SettingsRoute.Hub -> null
-    SettingsRoute.Connection, SettingsRoute.Models, SettingsRoute.Commands -> SettingsRoute.Hub
+    SettingsRoute.Connection, SettingsRoute.Models, SettingsRoute.Commands,
+    SettingsRoute.Providers, SettingsRoute.Agents, SettingsRoute.Jobs, SettingsRoute.LocalModels -> SettingsRoute.Hub
 }
 
 internal const val UI_PREFS = "harw_ui"
@@ -169,6 +170,10 @@ internal fun SettingsHub(
                 onOpen(SettingsRoute.Models)
             }
             HubRow("Befehle", "Alle Slash-Befehle des Servers", block) { onOpen(SettingsRoute.Commands) }
+            HubRow("Provider (auf diesem Gerät)", "Schlüssel und Routen für den Standalone-Betrieb", null) { onOpen(SettingsRoute.Providers) }
+            HubRow("Agents", "Agents der Sitzung", null) { onOpen(SettingsRoute.Agents) }
+            HubRow("Jobs", "Hintergrund-Jobs der Sitzung", null) { onOpen(SettingsRoute.Jobs) }
+            HubRow("Lokale Modelle", "GGUF-Modelle laden oder importieren", null) { onOpen(SettingsRoute.LocalModels) }
 
             if (support?.manage == true) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
