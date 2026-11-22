@@ -41,6 +41,7 @@ use std::sync::Arc;
 
 use harw_job_runtime::WorkId;
 use harw_macros::operation;
+use harw_operations::operation::{RemoteEffect, RemoteInvocation, RemotePolicy, RemoteVerb};
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
 use harw_session_store::{JobListQuery, JobStore};
 use harw_tool_job::logs::tail_of_file;
@@ -55,6 +56,42 @@ const DEFAULT_LOG_LINES: usize = 40;
 const MAX_LOG_LINES: usize = 400;
 /// Meldung ohne Job-Verwaltung.
 const NOT_AVAILABLE: &str = "Hintergrund-Jobs gibt es nur in der interaktiven TUI-Sitzung";
+
+/// Remote-Allowlist von `/jobs` (Vertrag K-W3a, Abschnitt 7): list/ls/show
+/// lesend, `stop <id> …` als Session-Steuerung. `logs`, `work`, `wait` und
+/// `permits` bleiben der TUI vorbehalten (fail-closed).
+pub const REMOTE: RemotePolicy = RemotePolicy {
+    path: "/jobs",
+    verbs: &[
+        RemoteVerb::read(&["-"]),
+        RemoteVerb::read(&["list", "-"]),
+        RemoteVerb::read(&["ls", "-"]),
+        RemoteVerb::read(&["show", "*"]),
+        RemoteVerb::steer(&["stop", "*"], RemoteEffect::Applied),
+    ],
+    denied_tokens: &[],
+};
+
+/// Stabiler Maschinenwert des Zustands, unabhängig von der deutschen
+/// Anzeige ([`state_label`]): `queued|running|suspended|succeeded|failed|
+/// stopped|detached|unknown`. Ein noch eingefrorener Job ist immer
+/// `suspended` ([`JobMeta::is_suspended`]).
+#[must_use]
+pub fn state_code(meta: &JobMeta) -> &'static str {
+    if meta.is_suspended() {
+        return "suspended";
+    }
+    match meta.state {
+        JobState::Queued => "queued",
+        JobState::Running => "running",
+        JobState::Suspended => "suspended",
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Stopped => "stopped",
+        JobState::Detached => "detached",
+        JobState::Unknown => "unknown",
+    }
+}
 
 /// Argument-Container für `/jobs`: rohe Tokens.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -160,11 +197,22 @@ async fn jobs(ctx: &OpContext, args: JobsArgs) -> Result<OpOutput, OpError> {
         .service::<Arc<JobManager>>()
         .ok_or_else(|| OpError::NotAvailable(NOT_AVAILABLE.to_owned()))?;
     match tokens.first().map(String::as_str) {
-        None | Some("list" | "ls") => Ok(OpOutput::from(list_text(manager))),
+        None | Some("list" | "ls") => Ok(OpOutput {
+            text: list_text(manager),
+            data: Some(list_data(manager)),
+        }),
         Some("show") => {
             let id = job_id_arg(&tokens, "show")?;
             let status = status_of(manager, &id)?;
-            Ok(OpOutput::from(show_text(&status)))
+            let text = if ctx.service::<RemoteInvocation>().is_some() {
+                show_text_remote(&status)
+            } else {
+                show_text(&status)
+            };
+            Ok(OpOutput {
+                text,
+                data: Some(show_data(&status)),
+            })
         }
         Some("stop") => {
             let id = job_id_arg(&tokens, "stop")?;
@@ -181,11 +229,19 @@ async fn jobs(ctx: &OpContext, args: JobsArgs) -> Result<OpOutput, OpError> {
                 .await
                 .map_err(|error| OpError::Execution(error.to_string()))?;
             tracing::info!(job_id = %id, signal = signal.name(), "ops.jobs.stop");
-            Ok(OpOutput::from(format!(
-                "{} an Job {id} gesendet: {}",
-                signal.name(),
-                job_line(&status)
-            )))
+            Ok(OpOutput {
+                text: format!(
+                    "{} an Job {id} gesendet: {}",
+                    signal.name(),
+                    job_line(&status)
+                ),
+                data: Some(serde_json::json!({
+                    "action": "stop",
+                    "id": id.to_string(),
+                    "signal": signal.name(),
+                    "state": state_code(&status.meta),
+                })),
+            })
         }
         Some("logs" | "log") => {
             let id = job_id_arg(&tokens, "logs")?;
@@ -358,6 +414,57 @@ fn list_text(manager: &JobManager) -> String {
     text
 }
 
+/// `progress_label` als JSON: `null` statt `—`.
+fn progress_value(status: &JobStatus) -> serde_json::Value {
+    if status.meta.progress.is_some() {
+        serde_json::Value::String(progress_label(status))
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+/// Strukturierte Liste (`data` von list/ls/bare).
+fn list_data(manager: &JobManager) -> serde_json::Value {
+    let jobs = manager.list(Caller::Operator);
+    let active = jobs
+        .iter()
+        .filter(|status| !status.meta.state.is_terminal())
+        .count();
+    let rows: Vec<serde_json::Value> = jobs
+        .iter()
+        .map(|status| {
+            serde_json::json!({
+                "id": status.meta.job_id.to_string(),
+                "name": status.meta.name,
+                "state": state_code(&status.meta),
+                "state_label": meta_state_label(&status.meta),
+                "runtime_secs": status.runtime_secs,
+                "progress": progress_value(status),
+                "terminal": status.meta.state.is_terminal(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "jobs": rows, "active": active })
+}
+
+/// Strukturierte Detailansicht (`data` von show): ohne Befehl, PID, Logpfad
+/// und Ausgabezeilen.
+fn show_data(status: &JobStatus) -> serde_json::Value {
+    let meta = &status.meta;
+    serde_json::json!({
+        "job": {
+            "id": meta.job_id.to_string(),
+            "name": meta.name,
+            "state": state_code(meta),
+            "state_label": meta_state_label(meta),
+            "runtime_secs": status.runtime_secs,
+            "progress": progress_value(status),
+            "exit_code": meta.exit_code,
+            "location": if meta.executed_on_host { "host" } else { "sandbox" },
+        }
+    })
+}
+
 /// Zeile der Detailansicht für ein ungeklärtes Anhalten
 /// ([`JobMeta::is_suspension_unresolved`], PL-100 WP 3.5): harw kann nicht
 /// belegen, dass ein Freeze der cgroup sein eigener ist.
@@ -366,6 +473,16 @@ const UNRESOLVED_SUSPENSION: &str = "Anhalten ungeklärt: nur die Absicht ist ve
      job.suspend erneut senden, nur solange die cgroup nicht eingefroren ist";
 
 fn show_text(status: &JobStatus) -> String {
+    show_text_with(status, false)
+}
+
+/// Gekürzter Text für Remote-Aufrufe: ohne `Befehl:`, PID, Logpfad und
+/// Ausgabe-Ende.
+fn show_text_remote(status: &JobStatus) -> String {
+    show_text_with(status, true)
+}
+
+fn show_text_with(status: &JobStatus, remote: bool) -> String {
     let meta = &status.meta;
     let mut lines = vec![
         format!("Job {} „{}“", meta.job_id, meta.name),
@@ -383,35 +500,41 @@ fn show_text(status: &JobStatus) -> String {
                 .map(|code| format!(" · Exit-Code {code}"))
                 .unwrap_or_default()
         ),
-        format!("Befehl: {}", meta.command),
-        format!(
-            "Ort: {} · PID: {}",
-            if meta.executed_on_host {
-                "Host"
-            } else {
-                "Sandbox"
-            },
+    ];
+    let location = if meta.executed_on_host {
+        "Host"
+    } else {
+        "Sandbox"
+    };
+    if remote {
+        lines.push(format!("Ort: {location}"));
+    } else {
+        lines.push(format!("Befehl: {}", meta.command));
+        lines.push(format!(
+            "Ort: {location} · PID: {}",
             meta.pid
                 .map_or_else(|| "—".to_owned(), |pid| pid.to_string())
-        ),
-        format!("Besitzer: {}", meta.owner.session),
-        format!(
-            "Fortschritt: {} · {} Warnungen · {} Fehler · {} Zeilen",
-            progress_label(status),
-            meta.warnings,
-            meta.errors,
-            status.stdout_lines + status.stderr_lines
-        ),
-        format!("Logs: {}", status.log_dir.display()),
-    ];
+        ));
+    }
+    lines.push(format!("Besitzer: {}", meta.owner.session));
+    lines.push(format!(
+        "Fortschritt: {} · {} Warnungen · {} Fehler · {} Zeilen",
+        progress_label(status),
+        meta.warnings,
+        meta.errors,
+        status.stdout_lines + status.stderr_lines
+    ));
+    if !remote {
+        lines.push(format!("Logs: {}", status.log_dir.display()));
+    }
     // PL-100 WP 3.5: nur die Absicht vermerkt, harws Freeze nicht belegt.
     if meta.is_suspension_unresolved() {
         lines.push(UNRESOLVED_SUSPENSION.to_owned());
     }
-    if let Some(error) = &meta.launch_error {
+    if let Some(error) = meta.launch_error.as_ref().filter(|_| !remote) {
         lines.push(format!("Startfehler: {error}"));
     }
-    if !status.last_lines.is_empty() {
+    if !remote && !status.last_lines.is_empty() {
         lines.push("Letzte Zeilen:".to_owned());
         lines.extend(status.last_lines.iter().map(|line| format!("  {line}")));
     }
@@ -439,7 +562,7 @@ fn logs_text(status: &JobStatus, lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestResult, ctx};
+    use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_operations::ServiceMap;
@@ -458,6 +581,20 @@ mod tests {
         dir: &std::path::Path,
         manager: Option<Arc<JobManager>>,
         store: Option<Arc<JobStore>>,
+    ) -> TestResult<OpContext> {
+        op_context_full(dir, manager, store, false)
+    }
+
+    /// Wie `op_context`, mit der Remote-Markierung im `ServiceMap`.
+    fn remote_context(dir: &std::path::Path, manager: Arc<JobManager>) -> TestResult<OpContext> {
+        op_context_full(dir, Some(manager), None, true)
+    }
+
+    fn op_context_full(
+        dir: &std::path::Path,
+        manager: Option<Arc<JobManager>>,
+        store: Option<Arc<JobStore>>,
+        remote: bool,
     ) -> TestResult<OpContext> {
         std::fs::create_dir_all(dir.join("ws")).map_err(ctx("workspace"))?;
         let registry = WorkspaceRegistry::build(
@@ -478,6 +615,19 @@ mod tests {
         }
         if let Some(store) = store {
             services.insert(store);
+        }
+        if remote {
+            use harw_operations::operation::RemoteGrant;
+            static VERB: RemoteVerb = RemoteVerb::read(&["show", "*"]);
+            services.insert(RemoteInvocation {
+                grant: RemoteGrant {
+                    observe: true,
+                    steer: false,
+                    control: false,
+                    tier: harw_operations::PermissionTier::Observer,
+                },
+                verb: &VERB,
+            });
         }
         Ok(OpContext::new(
             SessionId::new(),
@@ -840,5 +990,158 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    // -- Remote-Fläche (Vertrag K-W3a, Abschnitt 7) --------------------------
+
+    const STATES: [&str; 8] = [
+        "queued",
+        "running",
+        "suspended",
+        "succeeded",
+        "failed",
+        "stopped",
+        "detached",
+        "unknown",
+    ];
+
+    async fn marker_job(manager: &Arc<JobManager>) -> TestResult<JobStatus> {
+        manager
+            .start(
+                StartRequest {
+                    name: "marker".to_owned(),
+                    command: "echo fake-SECRET-marker; sleep 30".to_owned(),
+                    cwd: None,
+                    env_keys: Vec::new(),
+                    notify_every: Duration::ZERO,
+                    owner: JobOwner::new("some-agent", Vec::new()),
+                },
+                sleeper(),
+            )
+            .await
+            .map_err(ctx("start"))
+    }
+
+    fn new_manager(dir: &std::path::Path) -> TestResult<Arc<JobManager>> {
+        harw_command::install_host_default(
+            &std::env::temp_dir().join(format!("harw-ops-command-jobs-{}", std::process::id())),
+        );
+        JobManager::new(
+            harw_tool_job::JobManagerConfig::new(dir.join("state")),
+            Arc::new(NoopNotifier),
+        )
+        .map_err(ctx("manager"))
+    }
+
+    #[tokio::test]
+    async fn list_data_matches_text() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manager = new_manager(dir.path())?;
+        let op_ctx = op_context(dir.path(), Some(Arc::clone(&manager)))?;
+        let empty = run(&op_ctx, &[]).await.map_err(ctx("leer"))?;
+        assert_eq!(
+            empty.data,
+            Some(serde_json::json!({ "jobs": [], "active": 0 }))
+        );
+        let status = marker_job(&manager).await?;
+        let out = run(&op_ctx, &["ls"]).await.map_err(ctx("ls"))?;
+        let data = out.data.ok_or(TestError::Missing("data fehlt"))?;
+        let rows = data["jobs"].as_array().ok_or(TestError::Missing("jobs fehlt"))?;
+        let text_rows = out.text.lines().filter(|l| l.starts_with("  job-")).count();
+        assert_eq!(rows.len(), text_rows, "{}", out.text);
+        assert_eq!(data["active"], 1);
+        let state = rows[0]["state"].as_str().ok_or(TestError::Missing("state"))?;
+        assert!(STATES.contains(&state), "{state}");
+        assert_eq!(rows[0]["id"], status.meta.job_id.to_string());
+        assert_eq!(rows[0]["terminal"], false);
+        assert_eq!(rows[0]["state_label"], "läuft");
+        manager
+            .stop(&status.meta.job_id, Caller::Operator, JobSignal::Kill)
+            .await
+            .map_err(ctx("stop"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn show_data_has_no_command_or_paths() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manager = new_manager(dir.path())?;
+        let op_ctx = op_context(dir.path(), Some(Arc::clone(&manager)))?;
+        let status = marker_job(&manager).await?;
+        let id = status.meta.job_id.to_string();
+        let out = run(&op_ctx, &["show", &id]).await.map_err(ctx("show"))?;
+        let data = out.data.ok_or(TestError::Missing("data fehlt"))?;
+        assert!(!data.to_string().contains("fake-SECRET-marker"), "{data}");
+        assert!(!data.to_string().contains("state/"), "{data}");
+        assert_eq!(data["job"]["location"], "host");
+        assert_eq!(data["job"]["id"], id);
+        manager
+            .stop(&status.meta.job_id, Caller::Operator, JobSignal::Kill)
+            .await
+            .map_err(ctx("stop"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_show_text_hides_command() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manager = new_manager(dir.path())?;
+        let local = op_context(dir.path(), Some(Arc::clone(&manager)))?;
+        let remote = remote_context(dir.path(), Arc::clone(&manager))?;
+        let status = marker_job(&manager).await?;
+        let id = status.meta.job_id.to_string();
+        let tui = run(&local, &["show", &id]).await.map_err(ctx("tui"))?;
+        assert!(tui.text.contains("fake-SECRET-marker"), "{}", tui.text);
+        assert!(tui.text.contains("PID:"), "{}", tui.text);
+        let phone = run(&remote, &["show", &id]).await.map_err(ctx("remote"))?;
+        assert!(!phone.text.contains("fake-SECRET-marker"), "{}", phone.text);
+        assert!(!phone.text.contains("PID"), "{}", phone.text);
+        assert!(!phone.text.contains("Logs:"), "{}", phone.text);
+        assert!(phone.text.contains("Besitzer: some-agent"), "{}", phone.text);
+        manager
+            .stop(&status.meta.job_id, Caller::Operator, JobSignal::Kill)
+            .await
+            .map_err(ctx("stop"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_data_names_action_and_state() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let manager = new_manager(dir.path())?;
+        let op_ctx = op_context(dir.path(), Some(Arc::clone(&manager)))?;
+        let status = marker_job(&manager).await?;
+        let id = status.meta.job_id.to_string();
+        let out = run(&op_ctx, &["stop", &id, "KILL"])
+            .await
+            .map_err(ctx("stop"))?;
+        let data = out.data.ok_or(TestError::Missing("data fehlt"))?;
+        assert_eq!(data["action"], "stop");
+        assert_eq!(data["id"], id);
+        assert_eq!(data["signal"], "SIGKILL");
+        assert!(STATES.contains(&data["state"].as_str().ok_or(TestError::Missing("state"))?));
+        Ok(())
+    }
+
+    #[test]
+    fn jobs_remote_policy_shape() {
+        use harw_operations::operation::RemoteCap;
+        assert_eq!(REMOTE.path, "/jobs");
+        assert!(REMOTE.find_verb(&toks(&["logs", "x"])).is_none());
+        assert!(REMOTE.find_verb(&toks(&["work"])).is_none());
+        assert!(REMOTE.find_verb(&toks(&["wait", "x"])).is_none());
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["permits", "work_driver", "4"]))
+                .is_none()
+        );
+        assert!(REMOTE.find_verb(&toks(&["list", "x"])).is_none());
+        let bare = REMOTE.find_verb(&[]).map(|v| v.cap);
+        assert_eq!(bare, Some(RemoteCap::Observe));
+        let show = REMOTE.find_verb(&toks(&["show", "job-1"])).map(|v| v.cap);
+        assert_eq!(show, Some(RemoteCap::Observe));
+        let stop = REMOTE.find_verb(&toks(&["stop", "job-1"]));
+        assert_eq!(stop.map(|v| v.cap), Some(RemoteCap::Steer));
+        assert_eq!(stop.map(|v| v.stepup), Some(false));
     }
 }

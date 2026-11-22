@@ -8,8 +8,10 @@ use harw_core::{ModelError, StreamSink};
 use harw_oauth::chatgpt_plan::{ChatGptPlanError, ChatGptPlanStore};
 use serde_json::{Value, json};
 
-pub(crate) const API: &str = "openai-chatgpt-plan";
-pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
+/// API-Name der ChatGPT-Plan-Route.
+pub const API: &str = "openai-chatgpt-plan";
+/// Feste Basis-URL der ChatGPT-Plan-Route.
+pub const BASE_URL: &str = "https://api.openai.com/v1";
 const TOOL_NAMESPACE: &str = "harw";
 
 pub(crate) fn route(

@@ -272,6 +272,11 @@ impl SecretStoreWriter {
             .map_err(store_error_message)?;
         Ok(SecretRef::Secrets(id.to_string()))
     }
+
+    /// Write-only-Senke fuer `secret.put` und Rollback (Welle 3 S3). Keine Lese-Methode.
+    pub(crate) fn sink(&mut self) -> &mut dyn harw_secrets::write_only::WriteOnlySecretSink {
+        &mut self.store
+    }
 }
 
 /// Opens the store for writing and seals `value` once, see

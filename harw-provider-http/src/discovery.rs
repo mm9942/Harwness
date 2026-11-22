@@ -240,6 +240,46 @@ pub async fn list_models_with_home(
     api_key: Option<&str>,
     home: Option<&Path>,
 ) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let prepared = prepare_discovery(provider, home)?;
+    // Runde 7, Teil L8: Loopback-Endpunkte ohne Proxy ansprechen.
+    let client = crate::http_client_for_endpoint(&prepared.base).map_err(|error| {
+        DiscoveryError::Network {
+            detail: error.to_string(),
+        }
+    })?;
+    discover_prepared(provider_name, provider, api_key, prepared, client).await
+}
+
+/// Wie [`list_models_with_home`], aber mit vom Aufrufer gebautem Client
+/// (z. B. mit gepinnter Aufloesung durch den URL-Guard).
+///
+/// # Errors
+/// Returns a provider, credential, transport, or response decoding error.
+pub(crate) async fn list_models_with_client(
+    provider_name: &str,
+    provider: &harw_config::ProviderToml,
+    api_key: Option<&str>,
+    home: Option<&Path>,
+    client: reqwest::Client,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let prepared = prepare_discovery(provider, home)?;
+    discover_prepared(provider_name, provider, api_key, prepared, client).await
+}
+
+/// Vorbereitete Discovery-Daten: Plan, Codex-Route, Basis und Modell-URL.
+struct PreparedDiscovery {
+    plan: Option<harw_oauth::chatgpt_plan::ChatGptPlanStore>,
+    codex_route: Option<crate::codex::CodexRoute>,
+    base: String,
+    url: String,
+}
+
+/// Berechnet Route, Basis und URL; Fehlerreihenfolge wie bisher
+/// (Plan, Codex-Route, Unsupported) und vor jedem Client-Bau.
+fn prepare_discovery(
+    provider: &harw_config::ProviderToml,
+    home: Option<&Path>,
+) -> Result<PreparedDiscovery, DiscoveryError> {
     let plan =
         crate::chatgpt_plan::route(provider, home).map_err(|error| DiscoveryError::Decode {
             detail: error.to_string(),
@@ -272,12 +312,27 @@ pub async fn list_models_with_home(
             });
         }
     };
+    Ok(PreparedDiscovery {
+        plan,
+        codex_route,
+        base: base.to_owned(),
+        url,
+    })
+}
 
-    // Runde 7, Teil L8: Loopback-Endpunkte ohne Proxy ansprechen.
-    let client =
-        crate::http_client_for_endpoint(base).map_err(|error| DiscoveryError::Network {
-            detail: error.to_string(),
-        })?;
+async fn discover_prepared(
+    provider_name: &str,
+    provider: &harw_config::ProviderToml,
+    api_key: Option<&str>,
+    prepared: PreparedDiscovery,
+    client: reqwest::Client,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let PreparedDiscovery {
+        plan,
+        codex_route,
+        url,
+        ..
+    } = prepared;
 
     if provider.api == "anthropic-messages" {
         // `codex_route` ist für diese `api` immer `None` (siehe

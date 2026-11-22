@@ -15,6 +15,9 @@ pub enum ModelsAction {
     /// Standardmodell) und die internen Modellstellen samt Auflösung.
     List,
     /// Fragt die verfügbaren Modelle der konfigurierten Anbieter ab.
+    ///
+    /// Remote-Aufrufe prüfen die Adresse mit dem URL-Guard (https, keine
+    /// privaten Adressen, keine Weiterleitungen).
     Scan {
         /// Nur diesen Provider abfragen; ohne Angabe alle aktivierten
         /// Provider.
@@ -110,4 +113,69 @@ pub enum InternalAction {
         #[arg(value_enum)]
         state: OnOff,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::ModelsAction;
+    use crate::cli::{Cli, Command};
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    fn action(args: &[&str]) -> TestResult<Option<ModelsAction>> {
+        let cli = Cli::try_parse_from(args).map_err(ctx("models-Aufruf sollte parsen"))?;
+        match cli.command {
+            Some(Command::Model { action }) => Ok(action),
+            other => Err(TestError::Unexpected(format!(
+                "erwartete Model, bekam {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn scan_parses_provider_and_flags() -> TestResult {
+        let parsed = action(&[
+            "harw",
+            "models",
+            "scan",
+            "openrouter",
+            "--free-only",
+            "--prune",
+        ])?;
+        let Some(ModelsAction::Scan {
+            provider,
+            free_only,
+            prune,
+            add,
+        }) = parsed
+        else {
+            return Err(TestError::Unexpected("erwartete Scan".into()));
+        };
+        assert_eq!(provider.as_deref(), Some("openrouter"));
+        assert!(free_only);
+        assert!(prune);
+        assert!(!add);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_alias_delete_parses() -> TestResult {
+        let parsed = action(&["harw", "models", "delete", "openrouter/some-model"])?;
+        let Some(ModelsAction::Remove { target }) = parsed else {
+            return Err(TestError::Unexpected("erwartete Remove".into()));
+        };
+        assert_eq!(target, "openrouter/some-model");
+        Ok(())
+    }
+
+    #[test]
+    fn add_without_target_parses() -> TestResult {
+        let parsed = action(&["harw", "models", "add"])?;
+        let Some(ModelsAction::Add { target }) = parsed else {
+            return Err(TestError::Unexpected("erwartete Add".into()));
+        };
+        assert_eq!(target, None);
+        Ok(())
+    }
 }

@@ -339,6 +339,280 @@ pub enum CommandVisibility {
     ChannelReduced,
 }
 
+// ── Remote-Fläche (Handy) ───────────────────────────────────────────────────
+
+/// Recht, das ein Remote-Aufruf braucht. Abbild der Wire-Caps `observe|steer|control`
+/// (`harw-protocol` `ClientCaps`), ohne Abhängigkeit auf `harw-protocol`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCap {
+    /// Lesen und Beobachten.
+    Observe,
+    /// Laufende Session steuern.
+    Steer,
+    /// Einstellungen ändern (Stufe Voll).
+    Control,
+}
+
+/// Lieferscheibe (1 = lesen, 2 = Session-Steuerung, 3 = globale Schreibvorgänge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSlice {
+    /// Nur lesen.
+    Read = 1,
+    /// Session-Steuerung.
+    Session = 2,
+    /// Globale Schreibvorgänge.
+    Global = 3,
+}
+
+/// Wirkung eines erfolgreichen Aufrufs, für `command.run.effect`. `refused` ist keine
+/// Wirkung, sondern ein [`RemoteRefusal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteEffect {
+    /// Sofort wirksam.
+    Applied,
+    /// Vorgemerkt, noch nicht wirksam.
+    Staged,
+    /// Gilt ab der nächsten Session.
+    NextSession,
+}
+
+/// Eine erlaubte Aufrufform eines Befehls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteVerb {
+    /// Positionsmuster über die Argument-Tokens (ohne Befehlsnamen). Regeln:
+    /// - jedes Element außer dem letzten ist ein exaktes Token;
+    /// - das letzte Element ist `"-"` (danach keine Tokens mehr) oder `"*"` (beliebig viele, auch 0);
+    /// - `["-"]` = bare Form, `["*"]` = jede Form.
+    pub form: &'static [&'static str],
+    /// Benötigtes Wire-Recht.
+    pub cap: RemoteCap,
+    /// Mindeststufe des Aufrufers für genau diese Form.
+    pub tier: PermissionTier,
+    /// Lieferscheibe.
+    pub slice: RemoteSlice,
+    /// Wirkung eines erfolgreichen Aufrufs.
+    pub effect: RemoteEffect,
+    /// `true`: globaler Schreibvorgang, braucht Step-up. Der Adapter prüft das nicht;
+    /// der Aufrufer hält die Ausführung an, bis der Step-up bestätigt ist.
+    pub stepup: bool,
+}
+
+impl RemoteVerb {
+    /// Lesen: Observe, Observer, Read, Applied, kein Step-up.
+    #[must_use]
+    pub const fn read(form: &'static [&'static str]) -> Self {
+        Self {
+            form,
+            cap: RemoteCap::Observe,
+            tier: PermissionTier::Observer,
+            slice: RemoteSlice::Read,
+            effect: RemoteEffect::Applied,
+            stepup: false,
+        }
+    }
+
+    /// Session steuern: Steer, Operator, Session, kein Step-up.
+    #[must_use]
+    pub const fn steer(form: &'static [&'static str], effect: RemoteEffect) -> Self {
+        Self {
+            form,
+            cap: RemoteCap::Steer,
+            tier: PermissionTier::Operator,
+            slice: RemoteSlice::Session,
+            effect,
+            stepup: false,
+        }
+    }
+
+    /// Session-Einstellung: Control, Operator, Session, kein Step-up.
+    #[must_use]
+    pub const fn control(form: &'static [&'static str], effect: RemoteEffect) -> Self {
+        Self {
+            form,
+            cap: RemoteCap::Control,
+            tier: PermissionTier::Operator,
+            slice: RemoteSlice::Session,
+            effect,
+            stepup: false,
+        }
+    }
+
+    /// Globaler Schreibvorgang: Control, Operator, Global, Step-up nötig.
+    #[must_use]
+    pub const fn global(form: &'static [&'static str], effect: RemoteEffect) -> Self {
+        Self {
+            form,
+            cap: RemoteCap::Control,
+            tier: PermissionTier::Operator,
+            slice: RemoteSlice::Global,
+            effect,
+            stepup: true,
+        }
+    }
+
+    /// Prüft das Muster gegen die Argument-Tokens (Regeln siehe [`RemoteVerb::form`]).
+    #[must_use]
+    pub fn matches(&self, args: &[String]) -> bool {
+        let Some((last, exact)) = self.form.split_last() else {
+            return args.is_empty();
+        };
+        if args.len() < exact.len() {
+            return false;
+        }
+        if !exact.iter().zip(args).all(|(want, got)| *want == got.as_str()) {
+            return false;
+        }
+        match *last {
+            "*" => true,
+            "-" => args.len() == exact.len(),
+            // Ungültiges Endelement: wie exaktes Token behandeln und nichts danach zulassen.
+            other => args.len() == exact.len() + 1 && args[exact.len()] == other,
+        }
+    }
+}
+
+/// Remote-Allowlist eines Befehls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemotePolicy {
+    /// Befehlspfad exakt wie in `Surface::Command::path`, z. B. `"/models"`.
+    pub path: &'static str,
+    /// In Deklarationsreihenfolge; der erste Treffer gilt (Lese-Formen zuerst deklarieren).
+    pub verbs: &'static [RemoteVerb],
+    /// Tokens, die an keiner Position der Argumente stehen dürfen.
+    pub denied_tokens: &'static [&'static str],
+}
+
+impl RemotePolicy {
+    /// Erster passender Verb-Eintrag oder `None`.
+    #[must_use]
+    pub fn find_verb(&self, args: &[String]) -> Option<&'static RemoteVerb> {
+        self.verbs.iter().find(|v| v.matches(args))
+    }
+}
+
+/// Wirksame Rechte des Remote-Aufrufers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteGrant {
+    /// Wire-Recht Beobachten.
+    pub observe: bool,
+    /// Wire-Recht Steuern.
+    pub steer: bool,
+    /// Wire-Recht Einstellen.
+    pub control: bool,
+    /// Stufe des Geräts.
+    pub tier: PermissionTier,
+}
+
+impl RemoteGrant {
+    /// Ob das Recht `cap` gewährt ist.
+    #[must_use]
+    pub const fn has(&self, cap: RemoteCap) -> bool {
+        match cap {
+            RemoteCap::Observe => self.observe,
+            RemoteCap::Steer => self.steer,
+            RemoteCap::Control => self.control,
+        }
+    }
+}
+
+/// Warum ein Befehl oder eine Form remote nicht läuft. [`RemoteRefusal::code`] ist die stabile
+/// Maschinen-Id, [`RemoteRefusal::reason_de`] der Text für `commands.list.reason` und
+/// `command.run.text` bei `refused`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum RemoteRefusal {
+    /// Zeile leer, ohne `/`, zu lang (> 512 Byte), zu viele Tokens (> 32) oder Steuerzeichen.
+    LineInvalid,
+    /// Kein Befehl dieses Namens (auch kein Alias) auf diesem Gateway.
+    UnknownCommand {
+        /// Der angefragte Name.
+        name: String,
+    },
+    /// Befehl existiert, hat aber keine `RemotePolicy` (oder ist TUI-lokal).
+    NotRemote,
+    /// Befehl ist remote, diese Form nicht.
+    VerbNotRemote,
+    /// Ein Token aus `denied_tokens` kommt vor.
+    DeniedToken {
+        /// Das gesperrte Token.
+        token: String,
+    },
+    /// Wire-Recht fehlt.
+    MissingCap {
+        /// Das fehlende Recht.
+        cap: RemoteCap,
+    },
+    /// Stufe zu niedrig.
+    TierTooLow {
+        /// Benötigte Stufe.
+        need: PermissionTier,
+    },
+    /// Form gehört zu einer noch nicht freigeschalteten Scheibe.
+    SliceDisabled {
+        /// Die gesperrte Scheibe.
+        slice: RemoteSlice,
+    },
+}
+
+impl RemoteRefusal {
+    /// Stabile Maschinen-Id.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::LineInvalid => "line_invalid",
+            Self::UnknownCommand { .. } => "unknown_command",
+            Self::NotRemote => "not_remote",
+            Self::VerbNotRemote => "verb_not_remote",
+            Self::DeniedToken { .. } => "denied_token",
+            Self::MissingCap { .. } => "missing_cap",
+            Self::TierTooLow { .. } => "tier_too_low",
+            Self::SliceDisabled { .. } => "slice_disabled",
+        }
+    }
+
+    /// Deutscher Text für die Anzeige.
+    #[must_use]
+    pub fn reason_de(&self) -> String {
+        match self {
+            Self::LineInvalid => "ungültige Befehlszeile".to_owned(),
+            Self::UnknownCommand { name } => format!("unbekannter Befehl /{name}"),
+            Self::NotRemote => "nur in der TUI".to_owned(),
+            Self::VerbNotRemote => "diese Form nur in der TUI".to_owned(),
+            Self::DeniedToken { token } => format!("{token} ist remote gesperrt"),
+            Self::MissingCap { cap } => match cap {
+                RemoteCap::Observe => "braucht Recht Beobachten".to_owned(),
+                RemoteCap::Steer => "braucht Recht Steuern".to_owned(),
+                RemoteCap::Control => "braucht Stufe Voll".to_owned(),
+            },
+            Self::TierTooLow { need } => {
+                let name = match need {
+                    PermissionTier::Observer => "observer",
+                    PermissionTier::Operator => "operator",
+                    PermissionTier::Maintainer => "maintainer",
+                    PermissionTier::Owner => "owner",
+                };
+                format!("braucht Stufe {name}")
+            }
+            Self::SliceDisabled { slice } => {
+                format!("noch nicht freigeschaltet (Scheibe {})", *slice as u8)
+            }
+        }
+    }
+}
+
+/// Markierung im `ServiceMap` eines Remote-Aufrufs. Der Aufrufer fügt sie per
+/// `services.insert(RemoteInvocation { .. })` ein; Ops lesen `ctx.service::<RemoteInvocation>()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteInvocation {
+    /// Wirksame Rechte des Aufrufers.
+    pub grant: RemoteGrant,
+    /// Die zugelassene Aufrufform.
+    pub verb: &'static RemoteVerb,
+}
+
 /// Approval-Politik für einen Modell-Tool-Adapter.
 ///
 /// # Beschreibung
@@ -1176,7 +1450,8 @@ mod tests {
     use super::{
         ApprovalPolicy, ArgsSchemaProbe, BusyAvailability, CommandVisibility,
         DerivedArgsSchema as _, NoArgsSchema as _, OpInput, OpOutput, Operation, OperationCategory,
-        OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
+        OperationDomain, OperationMeta, PermissionTier, RemoteCap, RemoteEffect, RemoteGrant,
+        RemotePolicy, RemoteRefusal, RemoteSlice, RemoteVerb, Surface, WebMethod,
     };
     use crate::context::{OpContext, ServiceMap};
     use crate::error::OpError;
@@ -1188,6 +1463,160 @@ mod tests {
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::OnceLock;
+
+    // ── Remote-Fläche ─────────────────────────────────────────────────────────
+
+    fn toks(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn remote_slice_is_ordered() {
+        assert!(RemoteSlice::Read < RemoteSlice::Session);
+        assert!(RemoteSlice::Session < RemoteSlice::Global);
+        assert_eq!(RemoteSlice::Session as u8, 2);
+    }
+
+    #[test]
+    fn remote_verb_form_rules() {
+        let bare = RemoteVerb::read(&["-"]);
+        assert!(bare.matches(&toks(&[])));
+        assert!(!bare.matches(&toks(&["x"])));
+        let show = RemoteVerb::read(&["show", "-"]);
+        assert!(show.matches(&toks(&["show"])));
+        assert!(!show.matches(&toks(&["show", "x"])));
+        assert!(!show.matches(&toks(&[])));
+        let switch = RemoteVerb::read(&["switch", "*"]);
+        assert!(switch.matches(&toks(&["switch"])));
+        assert!(switch.matches(&toks(&["switch", "a", "b"])));
+        assert!(!switch.matches(&toks(&["show"])));
+        let any = RemoteVerb::read(&["*"]);
+        assert!(any.matches(&toks(&[])));
+        assert!(any.matches(&toks(&["a", "b"])));
+    }
+
+    #[test]
+    fn remote_policy_first_match_wins() -> TestResult {
+        static VERBS: [RemoteVerb; 3] = [
+            RemoteVerb::read(&["-"]),
+            RemoteVerb::read(&["worker", "-"]),
+            RemoteVerb::global(&["worker", "*"], RemoteEffect::NextSession),
+        ];
+        let policy = RemotePolicy { path: "/x", verbs: &VERBS, denied_tokens: &[] };
+        let v = policy
+            .find_verb(&toks(&["worker"]))
+            .ok_or(TestError::Missing("match"))?;
+        assert_eq!(v.slice, RemoteSlice::Read);
+        let v = policy
+            .find_verb(&toks(&["worker", "all", "uia"]))
+            .ok_or(TestError::Missing("match"))?;
+        assert_eq!(v.slice, RemoteSlice::Global);
+        assert!(policy.find_verb(&toks(&["other"])).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_verb_constructors() {
+        let r = RemoteVerb::read(&["-"]);
+        assert_eq!(
+            (r.cap, r.tier, r.slice, r.effect, r.stepup),
+            (
+                RemoteCap::Observe,
+                PermissionTier::Observer,
+                RemoteSlice::Read,
+                RemoteEffect::Applied,
+                false
+            )
+        );
+        let s = RemoteVerb::steer(&["-"], RemoteEffect::Staged);
+        assert_eq!(
+            (s.cap, s.tier, s.slice, s.effect, s.stepup),
+            (
+                RemoteCap::Steer,
+                PermissionTier::Operator,
+                RemoteSlice::Session,
+                RemoteEffect::Staged,
+                false
+            )
+        );
+        let c = RemoteVerb::control(&["-"], RemoteEffect::Applied);
+        assert_eq!(
+            (c.cap, c.tier, c.slice, c.stepup),
+            (RemoteCap::Control, PermissionTier::Operator, RemoteSlice::Session, false)
+        );
+        let g = RemoteVerb::global(&["-"], RemoteEffect::NextSession);
+        assert_eq!(
+            (g.cap, g.tier, g.slice, g.effect, g.stepup),
+            (
+                RemoteCap::Control,
+                PermissionTier::Operator,
+                RemoteSlice::Global,
+                RemoteEffect::NextSession,
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn remote_refusal_codes_and_texts_are_stable() {
+        let cases: Vec<(RemoteRefusal, &str, String)> = vec![
+            (RemoteRefusal::LineInvalid, "line_invalid", "ungültige Befehlszeile".into()),
+            (
+                RemoteRefusal::UnknownCommand { name: "foo".into() },
+                "unknown_command",
+                "unbekannter Befehl /foo".into(),
+            ),
+            (RemoteRefusal::NotRemote, "not_remote", "nur in der TUI".into()),
+            (RemoteRefusal::VerbNotRemote, "verb_not_remote", "diese Form nur in der TUI".into()),
+            (
+                RemoteRefusal::DeniedToken { token: "--x".into() },
+                "denied_token",
+                "--x ist remote gesperrt".into(),
+            ),
+            (
+                RemoteRefusal::MissingCap { cap: RemoteCap::Observe },
+                "missing_cap",
+                "braucht Recht Beobachten".into(),
+            ),
+            (
+                RemoteRefusal::MissingCap { cap: RemoteCap::Steer },
+                "missing_cap",
+                "braucht Recht Steuern".into(),
+            ),
+            (
+                RemoteRefusal::MissingCap { cap: RemoteCap::Control },
+                "missing_cap",
+                "braucht Stufe Voll".into(),
+            ),
+            (
+                RemoteRefusal::TierTooLow { need: PermissionTier::Maintainer },
+                "tier_too_low",
+                "braucht Stufe maintainer".into(),
+            ),
+            (
+                RemoteRefusal::SliceDisabled { slice: RemoteSlice::Global },
+                "slice_disabled",
+                "noch nicht freigeschaltet (Scheibe 3)".into(),
+            ),
+        ];
+        for (refusal, code, text) in cases {
+            assert_eq!(refusal.code(), code);
+            assert_eq!(refusal.reason_de(), text);
+        }
+    }
+
+    #[test]
+    fn remote_grant_has() {
+        let g = RemoteGrant {
+            observe: true,
+            steer: false,
+            control: true,
+            tier: PermissionTier::Operator,
+        };
+        assert!(g.has(RemoteCap::Observe));
+        assert!(!g.has(RemoteCap::Steer));
+        assert!(g.has(RemoteCap::Control));
+    }
 
     // ── Shared test fixtures ──────────────────────────────────────────────────
 

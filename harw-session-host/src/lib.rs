@@ -16,6 +16,7 @@
 //! - [`identity`]: who is calling and what they may do (never from payloads).
 //! - [`record`]: durable `HostedSessionRecord` files.
 //! - [`replay`]: transcript records → durable frames.
+//! - [`stepup`]: step-up for remote global writes (nonce, hash, expiry, audit).
 //! - [`live_ring`]: bounded live buffer of the running turn.
 //! - [`fanout`]: per-attachment bounded queues with coalescing and `Lagged`.
 //! - [`arbiter`]: per-session FIFO, compare-and-swap on the head, idempotency.
@@ -45,6 +46,7 @@ pub mod identity;
 pub mod live_ring;
 pub mod record;
 pub mod replay;
+pub mod stepup;
 pub mod tool_host;
 
 pub use agents::{AgentCredential, AgentRegistry, Delegation, ResolvedAgent};
