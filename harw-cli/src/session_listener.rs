@@ -68,6 +68,7 @@ const NODE_IDENTITY_NAMESPACE: &str = "harw.node-identity";
 /// Directory name of the onion state below the session-host state directory.
 pub const ONION_DIR: &str = "onion";
 /// File name of the canonical locator inside the onion directory.
+#[cfg(feature = "onion")]
 pub const ONION_LOCATOR_FILE: &str = "locator";
 /// How long to wait for the onion service to become reachable.
 #[cfg(feature = "onion")]

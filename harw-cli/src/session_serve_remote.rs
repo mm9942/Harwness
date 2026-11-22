@@ -519,6 +519,7 @@ pub async fn start_remote(
 ///
 /// # Errors
 /// See [`start_remote`].
+#[cfg(test)]
 pub async fn start_remote_with_driver(
     config: &RemoteServeConfig,
     driver: Arc<dyn TurnDriver>,

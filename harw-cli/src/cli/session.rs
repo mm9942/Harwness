@@ -12,6 +12,8 @@ pub enum SessionAction {
         #[arg(long)]
         all: bool,
     },
+    /// Ordnet alten Sitzungen einmalig ein Projekt zu (nur Server, offline).
+    BackfillProjects(super::BackfillProjectsArgs),
     /// Zeigt Details zu einer Sitzung an.
     Show {
         /// Sitzungs-ID.

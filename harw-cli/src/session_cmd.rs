@@ -44,6 +44,17 @@ pub fn run(g: &GlobalArgs, a: SessionAction) -> Result<Option<String>, String> {
             show(&printer, &sessions_root, &id)?;
             Ok(None)
         }
+        SessionAction::BackfillProjects(args) => {
+            let since = args
+                .since
+                .as_deref()
+                .map(crate::resume::parse_since_date)
+                .transpose()?;
+            let report = crate::resume::backfill_projects(&sessions_root, since, args.dry_run)
+                .map_err(|error| format!("Projekt-Zuordnung fehlgeschlagen: {error}"))?;
+            printer.value(&report.text(args.dry_run), report.json())?;
+            Ok(None)
+        }
         SessionAction::Resume { id } => {
             let sessions = load_sessions(&sessions_root)?;
             let resolved = resolve_session_selector(&sessions, &id)
