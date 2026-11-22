@@ -6,6 +6,8 @@
     <string name="notification_connecting">Connecting to your Harw server</string>
     <string name="notification_connected">Connection active</string>
     <string name="notification_reconnecting">Waiting to reconnect</string>
+    <string name="notification_reconnecting_attempt">Waiting to reconnect (attempt %1$d)</string>
+    <string name="notification_battery">Allow background</string>
     <string name="notification_disconnecting">Disconnecting</string>
     <string name="notification_forgetting">Removing saved phone setup</string>
     <string name="notification_stop">Disconnect</string>

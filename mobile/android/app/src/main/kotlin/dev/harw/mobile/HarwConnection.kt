@@ -3,6 +3,8 @@ package dev.harw.mobile
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.util.Log
 import java.io.File
@@ -43,6 +45,17 @@ import uniffi.harw_mobile_ffi.parseServerProfile
 internal fun normalizedPreference(preference: RoutePreference, hasOnion: Boolean): RoutePreference =
     if (preference == RoutePreference.ONION && !hasOnion) RoutePreference.AUTO else preference
 
+internal enum class NetworkSignal { None, Nudge, Restart }
+
+internal fun networkSignal(phase: ConnectionPhase, stopping: Boolean, forgetting: Boolean, hasProfile: Boolean): NetworkSignal {
+    if (stopping || forgetting || !hasProfile) return NetworkSignal.None
+    return when (phase) {
+        ConnectionPhase.CONNECTING, ConnectionPhase.RECONNECTING -> NetworkSignal.Nudge
+        ConnectionPhase.FAILED -> NetworkSignal.Restart
+        ConnectionPhase.CONNECTED, ConnectionPhase.DISCONNECTED, ConnectionPhase.REVOKED -> NetworkSignal.None
+    }
+}
+
 internal data class WorkspaceState(
     val profile: ServerProfile? = null,
     val deviceNodeId: String? = null,
@@ -69,6 +82,8 @@ internal data class WorkspaceState(
     val routePreference: RoutePreference = RoutePreference.AUTO,
     val activeRoute: ConnectionRoute? = null,
     val tor: TorBootstrap? = null,
+    val attempt: UInt = 0u,
+    val nextRetryAtMs: ULong? = null,
 ) {
     val online: Boolean get() = phase == ConnectionPhase.CONNECTED && !stopping
     val canSetUp: Boolean get() = !setupPending && !forgetRequired && cleanupError == null
@@ -91,11 +106,15 @@ internal data class WorkspaceState(
         pendingActions = emptySet(),
         chatgpt = ChatgptAccountState(),
         sessionResetEpoch = sessionResetEpoch + 1,
+        attempt = 0u,
+        nextRetryAtMs = null,
     )
 
     fun invalidated() = if (phase == ConnectionPhase.REVOKED) this else clearSessions().copy(
         phase = ConnectionPhase.REVOKED,
         detail = "The server stopped authorizing this connection. Check the server policy and connect again.",
+        attempt = 0u,
+        nextRetryAtMs = null,
     )
 
     fun forgetSetup(): WorkspaceState {
@@ -111,6 +130,8 @@ internal data class WorkspaceState(
             forgetRequired = true,
             forgetting = true,
             cleanupError = null,
+            attempt = 0u,
+            nextRetryAtMs = null,
         )
     }
 
@@ -179,6 +200,9 @@ internal class HarwConnection(private val context: Context) {
     private var refreshJob: Job? = null
     private var setupJob: Job? = null
     private var accountJob: Job? = null
+    private val connectivity = context.getSystemService(ConnectivityManager::class.java)
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var networkJob: Job? = null
     private val gate = SessionActionGate()
     private val observers = mutableMapOf<String, Int>()
     private val opened = mutableSetOf<String>()
@@ -370,10 +394,12 @@ internal class HarwConnection(private val context: Context) {
                 }
             }
         }
+        watchNetwork()
         return true
     }
 
     fun disconnect() {
+        unwatchNetwork()
         if (!state.value.hasConnection) return
         ++lifecycle
         closeGate()
@@ -726,6 +752,71 @@ internal class HarwConnection(private val context: Context) {
         return true
     }
 
+    private fun watchNetwork() {
+        if (networkCallback != null) return
+        val manager = connectivity ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                scope.launch { networkAvailable() }
+            }
+        }
+        try {
+            manager.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+        } catch (error: Exception) {
+            Log.w("HarwConnection", "network callback unavailable", error)
+        }
+    }
+
+    private fun unwatchNetwork() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        try {
+            connectivity?.unregisterNetworkCallback(callback)
+        } catch (_: Exception) {
+        }
+    }
+
+    internal fun networkAvailable() {
+        val s = state.value
+        when (networkSignal(s.phase, s.stopping, s.forgetting, s.profile != null)) {
+            NetworkSignal.None -> return
+            NetworkSignal.Nudge -> {
+                if (networkJob?.isActive == true) return
+                networkJob = scope.launch {
+                    val native = core ?: return@launch
+                    runCatching { withContext(Dispatchers.IO) { native.networkAvailable() } }
+                }
+            }
+            NetworkSignal.Restart -> {
+                if (networkJob?.isActive == true) return
+                networkJob = scope.launch {
+                    val native = core ?: return@launch
+                    val status = try {
+                        withContext(Dispatchers.IO) {
+                            native.networkAvailable()
+                            native.status()
+                        }
+                    } catch (error: Exception) {
+                        if (error is CancellationException) throw error
+                        if (error is MobileException.Revoked) invalidate()
+                        return@launch
+                    }
+                    if (status.phase in setOf(
+                            ConnectionPhase.CONNECTING, ConnectionPhase.CONNECTED, ConnectionPhase.RECONNECTING,
+                        )
+                    ) {
+                        val request = ++lifecycle
+                        applyStatus(status)
+                        startPolling(native, request)
+                    } else {
+                        applyStatus(status)
+                    }
+                }
+            }
+        }
+    }
+
     private fun startPolling(native: MobileCore, request: Long) {
         presenceJob = scope.launch {
             while (isActive && request == lifecycle) {
@@ -790,16 +881,19 @@ internal class HarwConnection(private val context: Context) {
         change {
             it.connectionStatus(status.phase, status.detail, status.canCreate, gate.generation)
                 .routeStatus(status.route, status.tor)
+                .copy(attempt = status.attempt, nextRetryAtMs = status.nextRetryAtMs)
         }
     }
 
     private fun invalidate() {
+        unwatchNetwork()
         if (state.value.phase == ConnectionPhase.REVOKED) return
         clearSessionActions()
         change { it.invalidated() }
     }
 
     private fun beginForgetSetup() {
+        unwatchNetwork()
         if (state.value.forgetting) return
         clearSessionActions()
         setupJob?.cancel()
