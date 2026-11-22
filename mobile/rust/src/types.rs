@@ -35,6 +35,20 @@ pub struct ServerProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[uniffi(default = None)]
     pub onion: Option<String>,
+    /// Public base URL of the gateway's admin service (self-service enrollment), from the
+    /// server's own `[admin] public_url`; absent when the server has none configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
+    pub admin_url: Option<String>,
+}
+
+/// Public enrollment fields plus the proof-of-possession signature for the admin service.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct AdminEnrollmentProof {
+    pub node_id: String,
+    pub public_key_hex: String,
+    pub label: String,
+    pub signature_hex: String,
 }
 
 /// Which network route a connection preference allows.

@@ -114,6 +114,15 @@ internal open class MainActivity : ComponentActivity() {
 
     // Deep-Link und Benachrichtigungs-Extra sind unvertrauene Eingabe: nur geprueft navigieren.
     private fun handleLink(intent: Intent?) {
+        val uri = intent?.data
+        if (uri != null && uri.scheme == "harw" && uri.host == "profile") {
+            // Rückweg der Admin-Einrichtung: unvertraute Eingabe, geprüft in installAdminProfile.
+            val req = try { uri.getQueryParameter("req") } catch (_: Exception) { null }
+            val data = try { uri.getQueryParameter("data") } catch (_: Exception) { null }
+            intent.data = null
+            cloud.installAdminProfile(req, data) { startConnection() }
+            return
+        }
         val link = linkFromIntent(intent) ?: return
         window.openLink(link)
         intent?.removeExtra(HarwConnectionService.ExtraOpenSession)
@@ -410,6 +419,16 @@ internal open class MainActivity : ComponentActivity() {
                 onExport = { enrollmentPicker.launch("harw-device-enrollment.json") },
                 onShowEnrollmentQr = { cloud.showEnrollmentQr { enrollmentQr = it } },
                 scanning = scannerOpen,
+                adminUrlSuggestion = cloudState.profile?.adminUrl ?: cloud.lastAdminUrl().orEmpty(),
+                onAdminSetup = { url ->
+                    cloud.startAdminEnrollment(url) { target ->
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, target).addCategory(Intent.CATEGORY_BROWSABLE))
+                        } catch (_: Exception) {
+                            Toast.makeText(this, "Kein Browser gefunden.", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                },
                 onScanProfile = {
                     if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                         scannerOpen = true

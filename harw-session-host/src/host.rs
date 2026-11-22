@@ -2077,6 +2077,15 @@ impl HostConnection {
         ))
     }
 
+    /// Tenant of a record created or adopted through the profile share. The
+    /// creator revalidation requires the record tenant to equal the creator's
+    /// own tenant, so a tenant-less local owner (which `tenant_admits` lets
+    /// see every tenant) gets a tenant-less record; a tenanted caller already
+    /// passed `steering_share`, so its tenant equals the share's.
+    fn record_tenant(&self) -> Option<TenantId> {
+        self.identity.tenant.clone()
+    }
+
     /// A fresh record owned by this caller (creator authority from the
     /// authenticated identity, never from the wire).
     fn new_record(
@@ -2430,7 +2439,7 @@ impl HostConnection {
             id.clone(),
             Some(&row.title),
             None,
-            Some(share.settings.tenant.clone()),
+            self.record_tenant(),
         );
         match self.host.records.create_if_absent(&record)? {
             CreateOutcome::Created => {
@@ -2761,7 +2770,7 @@ impl HostConnection {
             SessionId::new(),
             params.title.as_deref(),
             None,
-            Some(share.settings.tenant.clone()),
+            self.record_tenant(),
         );
         let mut publication = UnpublishedCreation {
             host: &self.host,

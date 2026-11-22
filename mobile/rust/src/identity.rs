@@ -10,7 +10,7 @@ use harw_session_remote::NodeEndpoint;
 use harw_types::NodeId;
 use zeroize::Zeroizing;
 
-use crate::{DeviceEnrollment, IdentityMaterial, MobileError, ServerProfile};
+use crate::{AdminEnrollmentProof, DeviceEnrollment, IdentityMaterial, MobileError, ServerProfile};
 
 const PROFILE_VERSION: u32 = 1;
 const SEED_BYTES: usize = 32;
@@ -155,6 +155,9 @@ impl ValidatedProfile {
             }
             None => None,
         };
+        if let Some(url) = profile.admin_url.as_deref() {
+            profile.admin_url = Some(check_admin_url(url).map_err(invalid_profile)?);
+        }
         let mut pins = PinnedPeers::new();
         pins.pin(expected_node.clone(), key)
             .map_err(|_| invalid_profile("invalid pinned ML-DSA-65 public key"))?;
@@ -168,6 +171,71 @@ impl ValidatedProfile {
             onion,
         })
     }
+}
+
+/// Validates and normalizes a public admin base URL: `https://host[:port][/path]` (or plain
+/// `http://` only for loopback), printable ASCII, no credentials, query or fragment.
+pub(crate) fn check_admin_url(value: &str) -> Result<String, &'static str> {
+    const BAD: &str = "admin URL must be https://host (http only for localhost)";
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty()
+        || value.len() > 256
+        || !value.bytes().all(|b| b.is_ascii_graphic())
+        || value.contains(['@', '?', '#', '\\'])
+    {
+        return Err(BAD);
+    }
+    let valid = if let Some(rest) = value.strip_prefix("https://") {
+        !rest.is_empty() && !rest.starts_with('/') && !rest.starts_with(':')
+    } else if let Some(rest) = value
+        .strip_prefix("http://127.0.0.1")
+        .or_else(|| value.strip_prefix("http://localhost"))
+    {
+        // Only a bare loopback host (optionally with port or path) counts as loopback.
+        rest.is_empty() || rest.starts_with(':') || rest.starts_with('/')
+    } else {
+        false
+    };
+    if !valid {
+        return Err(BAD);
+    }
+    Ok(value.to_owned())
+}
+
+/// Builds the enrollment fields and the proof-of-possession signature the admin service
+/// verifies: the key signs the server-issued nonce together with the public fields.
+#[uniffi::export]
+pub fn sign_admin_enrollment(
+    private_key: Vec<u8>,
+    label: String,
+    nonce_hex: String,
+) -> Result<AdminEnrollmentProof, MobileError> {
+    let seed = Zeroizing::new(private_key);
+    let (enrollment, _) = restore_identity(&seed, label)?;
+    let nonce = hex::decode(nonce_hex.trim())
+        .ok()
+        .filter(|bytes| bytes.len() == 32)
+        .ok_or_else(|| invalid_identity("the server nonce is invalid"))?;
+    let key = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, seed.as_ref())
+        .map_err(|_| invalid_identity("could not load ML-DSA-65 private key"))?;
+    let public_key = key.public_key().as_ref().to_vec();
+    let message = harw_node_transport::enrollment_proof_message(
+        &nonce,
+        &enrollment.node_id,
+        &public_key,
+        &enrollment.label,
+    );
+    let mut signature = vec![0_u8; ML_DSA_65_SIGNATURE_LEN];
+    let length = key
+        .sign(&message, &mut signature)
+        .map_err(|_| invalid_identity("enrollment signing failed"))?;
+    signature.truncate(length);
+    Ok(AdminEnrollmentProof {
+        node_id: enrollment.node_id,
+        public_key_hex: enrollment.public_key_hex,
+        label: enrollment.label,
+        signature_hex: hex::encode(signature),
+    })
 }
 
 fn check_node_id(value: &str) -> Result<NodeId, &'static str> {

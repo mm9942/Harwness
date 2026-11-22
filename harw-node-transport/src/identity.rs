@@ -52,6 +52,31 @@ impl fmt::Debug for NodeIdentity {
 /// Future returned by [`NodeSigner::sign`].
 pub type SignFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, SignerError>> + Send + 'a>>;
 
+/// Domain tag of the admin enrollment proof of possession (never a handshake
+/// transcript: it differs from [`crate::TRANSCRIPT_DOMAIN`]).
+pub const ENROLLMENT_PROOF_DOMAIN: &[u8] = b"harw-admin-enroll/v1\0";
+
+/// The exact bytes a device signs with its ML-DSA-65 node key to prove
+/// possession of the key it asks to enroll, bound to a server-issued `nonce`.
+/// Every variable field is length-prefixed (u32 big endian), so no two
+/// different field tuples share an encoding. Phone and admin service both
+/// build the message with this one function.
+#[must_use]
+pub fn enrollment_proof_message(
+    nonce: &[u8],
+    node_id: &str,
+    public_key: &[u8],
+    label: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ENROLLMENT_PROOF_DOMAIN.len() + 16 + nonce.len() + public_key.len() + node_id.len() + label.len());
+    out.extend_from_slice(ENROLLMENT_PROOF_DOMAIN);
+    for field in [nonce, node_id.as_bytes(), public_key, label.as_bytes()] {
+        out.extend_from_slice(&(u32::try_from(field.len()).unwrap_or(u32::MAX)).to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    out
+}
+
 /// Signs node-transport handshake transcripts with the node's long-term key.
 ///
 /// Every payload handed to [`NodeSigner::sign`] starts with

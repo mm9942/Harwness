@@ -32,7 +32,9 @@ pub use device::{
     ShellRequest, check_shell_request, device_limits, normalize_device_path,
 };
 pub use device_tools::{device_tools_enabled, set_device_tools_enabled};
-pub use identity::{generate_identity, parse_device_enrollment, parse_server_profile};
+pub use identity::{
+    generate_identity, parse_device_enrollment, parse_server_profile, sign_admin_enrollment,
+};
 pub use listener::CoreListener;
 pub use models::{
     CatalogModel, ImportCheck, ImportVerdict, LocalModel, ModelFileState, ModelOrigin,

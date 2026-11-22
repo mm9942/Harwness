@@ -45,6 +45,17 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:scheme="harw" android:host="open" />
             </intent-filter>
+            <!--
+                Rückweg der Admin-Einrichtung (harw://profile?req=<id>&data=<base64url>): kommt aus dem
+                Browser, deshalb BROWSABLE. Die App nimmt den Link nur an, wenn die Anfrage-ID zu einer
+                offenen, höchstens 15 Minuten alten Anfrage dieses Telefons passt; sonst wird er verworfen.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="harw" android:host="profile" />
+            </intent-filter>
         </activity>
         <activity
             android:name=".SessionWindowActivity"
