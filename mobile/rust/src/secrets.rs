@@ -219,6 +219,13 @@ pub(crate) mod test_support {
                 .cloned()
         }
 
+        pub(crate) fn is_empty(&self) -> bool {
+            self.slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        }
+
         /// Every call returns this error while it is set.
         pub(crate) fn fail_next(&self, e: KeystoreError) {
             *self.fail.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
@@ -326,11 +333,7 @@ mod tests {
         }
         assert!(is_valid_slot(&"a".repeat(64)));
         assert!(keystore.stored("").is_none());
-        assert!(keystore
-            .slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty());
+        assert!(keystore.is_empty());
     }
 
     #[test]

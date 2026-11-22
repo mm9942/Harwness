@@ -22,8 +22,10 @@ use crate::types::{
 /// Most routes the app keeps.
 pub const MAX_ROUTES: usize = 32;
 /// Most model ids returned to the UI.
+#[cfg_attr(not(feature = "local-host"), allow(dead_code))] // discovery needs the feature
 pub const MAX_LISTED_MODELS: usize = 200;
 /// Most distinct model ids counted from one discovery.
+#[cfg_attr(not(feature = "local-host"), allow(dead_code))] // discovery needs the feature
 pub const MAX_DISCOVERED_MODELS: usize = 2000;
 /// Largest secret accepted from the UI, in bytes.
 pub const MAX_SECRET_INPUT_BYTES: usize = 8 * 1024;
@@ -208,10 +210,12 @@ impl ProviderStore {
         }
     }
 
+    #[allow(dead_code)] // used by the local runtime in round 2
     pub(crate) fn home(&self) -> &AppHome {
         &self.home
     }
 
+    #[allow(dead_code)] // used by the local runtime in round 2
     pub(crate) fn resolver(&self) -> &KeystoreSecretResolver {
         &self.secrets
     }
@@ -239,6 +243,7 @@ impl ProviderStore {
         let mut paths: Vec<PathBuf> = entries
             .filter_map(Result::ok)
             .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
             .take(MAX_ROUTES * 2)
             .collect();
         paths.sort();
@@ -644,6 +649,7 @@ async fn discover(id: &str, provider: &ProviderToml, key: Option<&str>) -> Provi
 
 /// Builds the model provider of the active route.
 #[cfg(feature = "local-host")]
+#[allow(dead_code)] // used by the local runtime in round 2
 pub(crate) fn build_model_provider(
     home: &AppHome,
     resolver: &KeystoreSecretResolver,
@@ -688,7 +694,9 @@ mod tests {
         }
     }
 
-    fn store() -> Result<(tempfile::TempDir, Arc<MemoryKeystore>, Arc<ProviderStore>), Box<dyn std::error::Error + Send + Sync>> {
+    type Fixture = (tempfile::TempDir, Arc<MemoryKeystore>, Arc<ProviderStore>);
+
+    fn store() -> Result<Fixture, Box<dyn std::error::Error + Send + Sync>> {
         let dir = tempfile::tempdir()?;
         let keystore = MemoryKeystore::new();
         let files = dir.path().to_str().ok_or("non-utf8 temp path")?.to_owned();
@@ -752,7 +760,7 @@ mod tests {
         assert!(clean_secret(b"sk\r\n1").is_err());
         assert!(clean_secret(b"sk\x001").is_err());
         assert!(clean_secret(&[0xff, 0xfe]).is_err());
-        assert!(clean_secret(&vec![b'a'; MAX_SECRET_INPUT_BYTES + 1]).is_err());
+        assert!(clean_secret(&[b'a'; MAX_SECRET_INPUT_BYTES + 1]).is_err());
         Ok(())
     }
 

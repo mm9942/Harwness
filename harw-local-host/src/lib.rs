@@ -166,7 +166,12 @@ impl Default for HostRights {
 /// A [`RuntimeSpec`] without overrides (no embedded agent, no child backend,
 /// no mode, agent, effort, approval or model override).
 #[must_use]
-pub fn runtime_spec(entry: EntryKind, home: &Path, cwd: &Path, principal: Principal) -> RuntimeSpec {
+pub fn runtime_spec(
+    entry: EntryKind,
+    home: &Path,
+    cwd: &Path,
+    principal: Principal,
+) -> RuntimeSpec {
     RuntimeSpec {
         entry,
         home: home.to_path_buf(),
