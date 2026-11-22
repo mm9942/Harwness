@@ -135,6 +135,11 @@ internal open class MainActivity : ComponentActivity() {
             settingsRouteName = route?.name
         }
         var connectingFromSetup by rememberSaveable { mutableStateOf(false) }
+        var firstRunDone by remember { mutableStateOf(readFirstRunDone(this@MainActivity)) }
+        fun finishFirstRun() {
+            firstRunDone = true
+            markFirstRunDone(this@MainActivity)
+        }
         var notificationDenied by rememberSaveable { mutableStateOf(false) }
         val profilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
             if (it != null) connection.importProfile(it)
@@ -235,7 +240,12 @@ internal open class MainActivity : ComponentActivity() {
             val providerStore = remember {
                 uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
             }
-            ProvidersScreen(providerStore, onBack = { openSettings(SettingsRoute.Hub) })
+            ProvidersScreen(
+                providerStore,
+                onBack = { openSettings(SettingsRoute.Hub) },
+                onOpenConnection = { openSettings(SettingsRoute.Connection) },
+                onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
+            )
         } else if (settingsRoute == SettingsRoute.Agents) {
             AgentsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Jobs) {
@@ -243,6 +253,10 @@ internal open class MainActivity : ComponentActivity() {
         } else if (settingsRoute == SettingsRoute.LocalModels) {
             val modelManager = remember { ModelManager(ModelStore(applicationContext)) }
             ModelsScreen(modelManager, onBack = { openSettings(SettingsRoute.Hub) })
+        } else if (settingsRoute == SettingsRoute.Files) {
+            FilesScreen(onBack = { openSettings(SettingsRoute.Hub) })
+        } else if (settingsRoute == SettingsRoute.Termux) {
+            TermuxScreen(onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Commands) {
             CommandsScreen(
                 state = state,
@@ -250,6 +264,13 @@ internal open class MainActivity : ComponentActivity() {
                 sessionId = null,
                 onBack = { openSettings(SettingsRoute.Hub) },
                 onOpenModels = { openSettings(SettingsRoute.Models) },
+            )
+        } else if (showSetup && settingsRoute == null && state.profile == null && !firstRunDone) {
+            FirstRunScreen(
+                onConnect = { finishFirstRun(); openSettings(SettingsRoute.Connection) },
+                onProviders = { finishFirstRun(); openSettings(SettingsRoute.Providers) },
+                onLocalModels = { finishFirstRun(); openSettings(SettingsRoute.LocalModels) },
+                onSkip = { finishFirstRun() },
             )
         } else if (showSetup) {
             ConnectionScreen(

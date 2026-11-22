@@ -36,13 +36,14 @@ import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
 
-internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels }
+internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux }
 
 /** Eltern-Route fuer Zurueck; `null` = Einstellungen schliessen. */
 internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route) {
     SettingsRoute.Hub -> null
     SettingsRoute.Connection, SettingsRoute.Models, SettingsRoute.Commands,
-    SettingsRoute.Providers, SettingsRoute.Agents, SettingsRoute.Jobs, SettingsRoute.LocalModels -> SettingsRoute.Hub
+    SettingsRoute.Providers, SettingsRoute.Agents, SettingsRoute.Jobs, SettingsRoute.LocalModels,
+    SettingsRoute.Files, SettingsRoute.Termux -> SettingsRoute.Hub
 }
 
 internal const val UI_PREFS = "harw_ui"
@@ -174,6 +175,8 @@ internal fun SettingsHub(
             HubRow("Agents", "Agents der Sitzung", null) { onOpen(SettingsRoute.Agents) }
             HubRow("Jobs", "Hintergrund-Jobs der Sitzung", null) { onOpen(SettingsRoute.Jobs) }
             HubRow("Lokale Modelle", "GGUF-Modelle laden oder importieren", null) { onOpen(SettingsRoute.LocalModels) }
+            HubRow("Dateien", "Ordner dieses Geräts freigeben und durchsuchen", null) { onOpen(SettingsRoute.Files) }
+            HubRow("Termux", "Befehle in Termux ausführen", null) { onOpen(SettingsRoute.Termux) }
 
             if (support?.manage == true) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)

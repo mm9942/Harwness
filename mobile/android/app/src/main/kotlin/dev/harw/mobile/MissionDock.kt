@@ -264,16 +264,23 @@ private fun ReasoningPanel(lines: List<ReasoningLine>, active: Int) {
     val bodyHeight = with(LocalDensity.current) {
         MaterialTheme.typography.bodySmall.lineHeight.toDp() * REASONING_LINES
     }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // Echter Denktext, einklappbar; Startzustand folgt der Einstellung "Denkzusammenfassungen anzeigen".
+    var open by rememberSaveable { mutableStateOf(readShowReasoningPref(context)) }
     OutlinedCard(Modifier.fillMaxWidth(), shape = CARD_SHAPE) {
         Column(Modifier.padding(SPACING), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            CardTitle("Reasoning · $active active")
-            if (lines.isEmpty()) {
+            Text(
+                (if (open) "▾ " else "▸ ") + "Denkprozess · $active aktiv",
+                modifier = Modifier.fillMaxWidth().clickable { open = !open },
+                style = MaterialTheme.typography.labelLarge,
+            )
+            if (open && lines.isEmpty()) {
                 Text(
-                    "No activity yet",
+                    "Noch keine Aktivität",
                     modifier = Modifier.height(bodyHeight),
                     style = MaterialTheme.typography.bodySmall,
                 )
-            } else {
+            } else if (open) {
                 LazyColumn(Modifier.height(bodyHeight), state = state) {
                     items(lines, key = { it.seq.toLong() }) { ReasoningRow(it) }
                 }

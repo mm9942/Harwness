@@ -11,6 +11,11 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <!-- Termux-Brücke (TermuxBridge): Befehle in Termux ausführen, nur nach Schalter und Freigabe. -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+    <queries>
+        <package android:name="com.termux" />
+    </queries>
 
     <application
         android:name=".HarwApplication"
