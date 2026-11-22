@@ -213,6 +213,16 @@ impl AppHome {
         self.write_config(&table)
     }
 
+    /// Makes `id` the active UIA definition of the profile.
+    pub(crate) fn set_active_uia(&self, id: &str) -> Result<(), MobileError> {
+        if id.is_empty() || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(internal("invalid UIA definition id"));
+        }
+        let mut table = self.read_config()?;
+        table.insert(KEY_UIA.into(), toml::Value::String(id.into()));
+        self.write_config(&table)
+    }
+
     pub(crate) fn clear_active_route_if(&self, provider: &str) -> Result<(), MobileError> {
         let mut table = self.read_config()?;
         if table.get(KEY_PROVIDER).and_then(toml::Value::as_str) == Some(provider) {
