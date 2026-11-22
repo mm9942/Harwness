@@ -24,6 +24,7 @@ import kotlinx.coroutines.withContext
 import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ApprovalOutcome
 import uniffi.harw_mobile_ffi.ChatgptProviderCredential
+import uniffi.harw_mobile_ffi.ChatgptProviderStatus
 import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.ConnectionRoute
 import uniffi.harw_mobile_ffi.ConnectionStatus
@@ -154,7 +155,13 @@ internal data class ChatgptAccountState(
     val operation: ChatgptOperation? = null,
     val error: String? = null,
     val showPlanNotice: Boolean = false,
+    val unavailable: String? = null,
 )
+
+internal fun ChatgptProviderStatus.toAccountState(): ChatgptAccountState =
+    ChatgptAccountState(linked = linked, unavailable = chatgptUnavailableMessage(availability))
+
+internal fun ChatgptAccountState.canStartSignIn(): Boolean = linked == false && unavailable == null
 
 internal sealed interface DraftResult {
     data object Accepted : DraftResult
@@ -444,12 +451,12 @@ internal class HarwConnection(private val context: Context) {
         val generation = current.generation ?: return
         runChatgpt(ChatgptTarget(profile, generation), ChatgptOperation.Checking) { native, target ->
             val status = withContext(Dispatchers.IO) { native.chatgptProviderStatus(target.profile) }
-            ChatgptAccountState(linked = status.linked)
+            status.toAccountState()
         }
     }
 
     fun startChatgptSignIn(target: ChatgptTarget) {
-        if (state.value.chatgpt.linked != false) return
+        if (!state.value.chatgpt.canStartSignIn()) return
         runChatgpt(target, ChatgptOperation.Browser) { native, captured ->
             val key = captured.profile.windowKey()
             val (hostId, registration) = withContext(Dispatchers.IO) {
@@ -461,11 +468,15 @@ internal class HarwConnection(private val context: Context) {
                 expectedSubject = registration?.subject,
                 openBrowser = { url ->
                     ensureChatgptTarget(captured)
-                    context.startActivity(
-                        Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                            .addCategory(Intent.CATEGORY_BROWSABLE)
-                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                    )
+                    try {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                .addCategory(Intent.CATEGORY_BROWSABLE)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    } catch (_: android.content.ActivityNotFoundException) {
+                        throw SiwcFailure("No web browser is available to sign in to ChatGPT.")
+                    }
                 },
                 onVerifying = { changeChatgpt { it.copy(operation = ChatgptOperation.Validating) } },
             )
@@ -536,13 +547,8 @@ internal class HarwConnection(private val context: Context) {
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 if (isChatgptTarget(target)) {
-                    // Native and HTTP errors may include response details. Only
-                    // the app's fixed SIWC messages are safe in this view.
-                    val detail = if (error is SiwcFailure) error.message else when (operation) {
-                        ChatgptOperation.Checking -> "This server does not currently offer ChatGPT account access to this phone."
-                        ChatgptOperation.Unlinking -> "Harw could not confirm that the account was unlinked. Check the server’s account status."
-                        else -> "Harw could not finish linking ChatGPT. Check your browser and the server’s account status."
-                    }
+                    val detail = chatgptFailureMessage(operation, error)
+                    Log.w(LogTag, "ChatGPT ${operation.name} failed: ${error.javaClass.simpleName}")
                     changeChatgpt { it.copy(operation = null, error = detail) }
                 }
             }

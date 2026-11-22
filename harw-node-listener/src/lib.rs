@@ -91,6 +91,19 @@ fn status(code: StatusCode, reason: &'static str) -> Response<Full<Bytes>> {
     response
 }
 
+const PROVIDER_LINK_HEADER: &str = "x-harw-provider-link";
+const PROVIDER_LINK_UNAVAILABLE: &str = "unavailable";
+
+/// 404 with an empty body and a marker header: this listener has no provider link configured.
+fn provider_link_unavailable() -> Response<Full<Bytes>> {
+    let mut response = status(StatusCode::NOT_FOUND, "");
+    response.headers_mut().insert(
+        http::HeaderName::from_static(PROVIDER_LINK_HEADER),
+        http::HeaderValue::from_static(PROVIDER_LINK_UNAVAILABLE),
+    );
+    response
+}
+
 impl UpgradeHandler {
     /// Handler admitting through `host` with identities from `mapper`.
     #[must_use]
@@ -216,7 +229,10 @@ impl tower_service::Service<Request<Incoming>> for ListenerService {
         if request.uri().path() == "/v1/provider-link/chatgpt" {
             let link = self.provider_link.clone();
             return Box::pin(async move {
-                let (Some(link), Ok(peer)) = (link, peer) else {
+                let Some(link) = link else {
+                    return Ok(provider_link_unavailable());
+                };
+                let Ok(peer) = peer else {
                     return Ok(status(StatusCode::NOT_FOUND, ""));
                 };
                 let (parts, body) = request.into_parts();
@@ -374,5 +390,29 @@ impl StreamIntake {
                 UpgradeError::NotImplemented(what) => ListenerError::NotImplemented(what),
                 other => ListenerError::Io(other.to_string()),
             })
+    }
+}
+
+#[cfg(test)]
+mod provider_link_tests {
+    use super::*;
+    use hyper::body::Body as _;
+
+    #[test]
+    fn unavailable_is_404_with_header_and_empty_body() {
+        let response = provider_link_unavailable();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers().get(PROVIDER_LINK_HEADER),
+            Some(&http::HeaderValue::from_static(PROVIDER_LINK_UNAVAILABLE))
+        );
+        assert!(response.body().is_end_stream());
+    }
+
+    #[test]
+    fn plain_not_found_has_no_provider_link_header() {
+        let response = status(StatusCode::NOT_FOUND, "");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get(PROVIDER_LINK_HEADER).is_none());
     }
 }

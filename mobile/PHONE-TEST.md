@@ -89,6 +89,40 @@ STATE="/tmp/harw-phone-chatgpt-$(date +%s)"
 
 This sets `session_listener.provider_link_device` to the enrolled phone. The selected phone can manage the ChatGPT account used by sessions on this gateway. The HARW device enrollment and the user's ChatGPT plan consent are both required. Treat the test state directory as private once an account is linked.
 
+The helper writes `provider_link_device` and the `chatgpt-plan` provider only when it is started with `--chatgpt-model`, by design. A gateway started without it has no provider link.
+
+### ChatGPT plan on a permanent gateway
+
+Use this for a long-running gateway that was not started by the helper and whose global config already has `[session_listener]` with `enabled = true`, `tier` and `approval_device` set to the phone. The helper does not touch such a gateway, so the provider link is configured by hand.
+
+1. Find the phone device id. It is the value already used as `approval_device`, or it appears in the harw device registry under `<state>/session-host/remote`.
+2. In the global config `<harw home>/config.toml`, add `provider_link_device = "<phone device id>"` to `[session_listener]`. Keep `enabled = true`, `tier` and `approval_device`. Project configs cannot set this key.
+3. Create `<harw home>/providers/chatgpt-plan.toml`. It has no auth, `api_key` or headers.
+
+   ```toml
+   name = 'chatgpt-plan'
+   api = 'openai-chatgpt-plan'
+   base_url = 'https://api.openai.com/v1'
+   models = ['<eligible model id>']
+   stream = true
+   ```
+
+4. Create `<harw home>/models/chatgpt-plan.toml`.
+
+   ```toml
+   id = '<eligible model id>'
+   provider = 'chatgpt-plan'
+
+   [capabilities]
+   streaming = true
+   tool_calling = true
+   ```
+
+5. Restart the gateway. The config is read only at start.
+6. Check the server requirements. The harw home must be writable and owned by the server user. The credential file `<harw home>/secrets/chatgpt-plan.json` is created as a private file in a 0700 directory. The server needs outbound HTTPS to `auth.openai.com` (JWKS check) and `api.openai.com`. The link itself needs no AuthHub grant or namespace, because AuthHub only holds the node identity key for `[session_listener]`. Do not put the ChatGPT tokens in AuthHub.
+7. In the app, open Connection, then ChatGPT account, then Continue with ChatGPT. If the card says the server is not set up for ChatGPT plan linking, `provider_link_device` is missing (step 2) or the gateway was not restarted. If it says this phone is not the link device, `provider_link_device` holds a different device id.
+8. To actually use the plan, requests must route to the `chatgpt-plan` provider. Phone sessions cannot pick a provider, so the gateway default (`default_provider` and `default_model` in `config.toml`) must be `chatgpt-plan`. While `default_provider = "openai"`, the linked plan stays unused.
+
 ### Real model provider
 
 Select one existing provider TOML and its corresponding model TOML. The provider's `name` must match the model's `provider`. The launcher reads those two definitions and starts a new test home. The launcher supports an existing `auth = "env:NAME"` provider reference, or explicit `auth_header = "none"` for an unauthenticated provider endpoint. Set the referenced variable in the server shell through the usual credential manager. Literal `api_key`, custom headers, and credential references that depend on the production home are outside this launcher. The selected credential reaches only the local gateway process environment.

@@ -17,6 +17,9 @@ use crate::{ConnectionRoute, MobileError};
 const LINK_PATH: &str = "/v1/provider-link/chatgpt";
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const LINK_TIMEOUT: Duration = Duration::from_secs(20);
+/// Header the node listener sets on a 404 when it has no ChatGPT link device.
+pub const UNAVAILABLE_HEADER: &str = "x-harw-provider-link";
+pub const UNAVAILABLE_VALUE: &str = "unavailable";
 const REQUIRED_SCOPES: &[&str] = &[
     "openid",
     "offline_access",
@@ -52,9 +55,21 @@ impl Zeroize for ChatgptProviderCredential {
     }
 }
 
+/// Whether this server can link a ChatGPT account for this phone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ChatgptLinkAvailability {
+    /// The server offers linking, or the answer is not known (older server).
+    Available,
+    /// The server has no `provider_link_device` configured.
+    NotConfigured,
+    /// The server rejected this phone as its ChatGPT link device.
+    NotLinkDevice,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct ChatgptProviderStatus {
     pub linked: bool,
+    pub availability: ChatgptLinkAvailability,
 }
 
 impl ChatgptProviderCredential {
@@ -108,6 +123,67 @@ fn valid_token(value: &str, limit: usize) -> bool {
             .any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
+pub(crate) fn map_status(
+    method: &Method,
+    status: StatusCode,
+    unavailable: bool,
+) -> Result<ChatgptProviderStatus, MobileError> {
+    match status {
+        StatusCode::NO_CONTENT => Ok(ChatgptProviderStatus {
+            linked: *method != Method::DELETE,
+            availability: ChatgptLinkAvailability::Available,
+        }),
+        StatusCode::ACCEPTED if *method == Method::DELETE => Err(MobileError::Session {
+            detail: "The server removed its local ChatGPT link. Revocation at OpenAI was not confirmed. Review the agent in ChatGPT Settings.".into(),
+        }),
+        StatusCode::NOT_FOUND if *method == Method::GET => Ok(ChatgptProviderStatus {
+            linked: false,
+            availability: if unavailable {
+                ChatgptLinkAvailability::NotConfigured
+            } else {
+                ChatgptLinkAvailability::Available
+            },
+        }),
+        StatusCode::NOT_FOUND => Err(MobileError::Denied {
+            detail: if unavailable {
+                "This server is not set up for ChatGPT plan linking".into()
+            } else {
+                "This server does not offer ChatGPT linking".into()
+            },
+        }),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN if *method == Method::GET => {
+            Ok(ChatgptProviderStatus {
+                linked: false,
+                availability: ChatgptLinkAvailability::NotLinkDevice,
+            })
+        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(MobileError::Denied {
+            detail: "This phone is not the ChatGPT link device of this server".into(),
+        }),
+        StatusCode::CONFLICT => Err(MobileError::Denied {
+            detail: "Unlink the existing ChatGPT account before linking a different account"
+                .into(),
+        }),
+        StatusCode::SERVICE_UNAVAILABLE => Err(MobileError::Transport {
+            detail: "ChatGPT linking is temporarily unavailable on this server".into(),
+        }),
+        StatusCode::INTERNAL_SERVER_ERROR => Err(MobileError::Session {
+            detail: "The server could not update its ChatGPT credential store".into(),
+        }),
+        StatusCode::BAD_REQUEST
+        | StatusCode::PAYLOAD_TOO_LARGE
+        | StatusCode::UNPROCESSABLE_ENTITY => Err(MobileError::Denied {
+            detail: "The server refused the ChatGPT registration".into(),
+        }),
+        status => Err(MobileError::Transport {
+            detail: format!(
+                "The server could not complete the ChatGPT request (HTTP {})",
+                status.as_u16()
+            ),
+        }),
+    }
+}
+
 pub(crate) async fn request_provider(
     dialer: Dialer,
     route: ConnectionRoute,
@@ -133,44 +209,11 @@ pub(crate) async fn request_provider(
             .send_request(request)
             .await
             .map_err(|_| provider_interrupted(&method))?;
-        match response.status() {
-            StatusCode::NO_CONTENT => Ok(ChatgptProviderStatus {
-                linked: method != Method::DELETE,
-            }),
-            StatusCode::ACCEPTED if method == Method::DELETE => Err(MobileError::Session {
-                detail: "The server removed its local ChatGPT link. Revocation at OpenAI was not confirmed. Review the agent in ChatGPT Settings.".into(),
-            }),
-            StatusCode::NOT_FOUND if method == Method::GET => {
-                Ok(ChatgptProviderStatus { linked: false })
-            }
-            StatusCode::NOT_FOUND => Err(MobileError::Denied {
-                detail: "This server does not offer ChatGPT linking".into(),
-            }),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(MobileError::Denied {
-                detail: "This phone is not allowed to manage ChatGPT access on the server".into(),
-            }),
-            StatusCode::CONFLICT => Err(MobileError::Denied {
-                detail: "Unlink the existing ChatGPT account before linking a different account"
-                    .into(),
-            }),
-            StatusCode::SERVICE_UNAVAILABLE => Err(MobileError::Transport {
-                detail: "ChatGPT linking is temporarily unavailable on this server".into(),
-            }),
-            StatusCode::INTERNAL_SERVER_ERROR => Err(MobileError::Session {
-                detail: "The server could not update its ChatGPT credential store".into(),
-            }),
-            StatusCode::BAD_REQUEST
-            | StatusCode::PAYLOAD_TOO_LARGE
-            | StatusCode::UNPROCESSABLE_ENTITY => Err(MobileError::Denied {
-                detail: "The server refused the ChatGPT registration".into(),
-            }),
-            status => Err(MobileError::Transport {
-                detail: format!(
-                    "The server could not complete the ChatGPT request (HTTP {})",
-                    status.as_u16()
-                ),
-            }),
-        }
+        let unavailable = response
+            .headers()
+            .get(UNAVAILABLE_HEADER)
+            .is_some_and(|value| value.as_bytes() == UNAVAILABLE_VALUE.as_bytes());
+        map_status(&method, response.status(), unavailable)
     };
     let timeout = match route {
         ConnectionRoute::Direct => LINK_TIMEOUT,
@@ -198,5 +241,161 @@ fn provider_interrupted(method: &Method) -> MobileError {
         } else {
             "The server's ChatGPT connection may have changed. Check its status before trying again.".into()
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn map(
+        method: &Method,
+        code: u16,
+        unavailable: bool,
+    ) -> Result<Result<ChatgptProviderStatus, MobileError>, http::status::InvalidStatusCode> {
+        Ok(map_status(method, StatusCode::from_u16(code)?, unavailable))
+    }
+
+    fn ok(linked: bool, availability: ChatgptLinkAvailability) -> ChatgptProviderStatus {
+        ChatgptProviderStatus {
+            linked,
+            availability,
+        }
+    }
+
+    fn denied(result: &Result<ChatgptProviderStatus, MobileError>, text: &str) -> bool {
+        matches!(result, Err(MobileError::Denied { detail }) if detail == text)
+    }
+
+    #[test]
+    fn no_content_reports_link_state() -> TestResult {
+        for method in [Method::GET, Method::POST] {
+            let result = map(&method, 204, false)?;
+            assert!(matches!(
+                result,
+                Ok(status) if status == ok(true, ChatgptLinkAvailability::Available)
+            ));
+        }
+        let result = map(&Method::DELETE, 204, false)?;
+        assert!(matches!(
+            result,
+            Ok(status) if status == ok(false, ChatgptLinkAvailability::Available)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_delete_warns_and_other_accepted_is_transport() -> TestResult {
+        let result = map(&Method::DELETE, 202, false)?;
+        assert!(matches!(
+            result,
+            Err(MobileError::Session { detail })
+                if detail.contains("Revocation at OpenAI was not confirmed")
+        ));
+        let result = map(&Method::POST, 202, false)?;
+        assert!(matches!(
+            result,
+            Err(MobileError::Transport { detail }) if detail.contains("HTTP 202")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn not_found_get_distinguishes_unconfigured_servers() -> TestResult {
+        let result = map(&Method::GET, 404, true)?;
+        assert!(matches!(
+            result,
+            Ok(status) if status == ok(false, ChatgptLinkAvailability::NotConfigured)
+        ));
+        let result = map(&Method::GET, 404, false)?;
+        assert!(matches!(
+            result,
+            Ok(status) if status == ok(false, ChatgptLinkAvailability::Available)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn not_found_write_is_denied_with_cause() -> TestResult {
+        for method in [Method::POST, Method::DELETE] {
+            assert!(denied(
+                &map(&method, 404, true)?,
+                "This server is not set up for ChatGPT plan linking"
+            ));
+            assert!(denied(
+                &map(&method, 404, false)?,
+                "This server does not offer ChatGPT linking"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unauthorized_and_forbidden_name_the_link_device() -> TestResult {
+        for code in [401, 403] {
+            let result = map(&Method::GET, code, false)?;
+            assert!(matches!(
+                result,
+                Ok(status) if status == ok(false, ChatgptLinkAvailability::NotLinkDevice)
+            ));
+            for method in [Method::POST, Method::DELETE] {
+                assert!(denied(
+                    &map(&method, code, false)?,
+                    "This phone is not the ChatGPT link device of this server"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn server_errors_keep_their_classes() -> TestResult {
+        assert!(denied(
+            &map(&Method::POST, 409, false)?,
+            "Unlink the existing ChatGPT account before linking a different account"
+        ));
+        assert!(matches!(
+            map(&Method::POST, 503, false)?,
+            Err(MobileError::Transport { .. })
+        ));
+        assert!(matches!(
+            map(&Method::POST, 500, false)?,
+            Err(MobileError::Session { .. })
+        ));
+        for code in [400, 413, 422] {
+            assert!(denied(
+                &map(&Method::POST, code, false)?,
+                "The server refused the ChatGPT registration"
+            ));
+        }
+        assert!(matches!(
+            map(&Method::POST, 418, false)?,
+            Err(MobileError::Transport { detail }) if detail.contains("HTTP 418")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn all_details_are_fixed_and_leak_free() -> TestResult {
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for unavailable in [false, true] {
+                for code in [202, 204, 400, 401, 403, 404, 409, 413, 418, 422, 500, 503] {
+                    let detail = match map(&method, code, unavailable)? {
+                        Err(
+                            MobileError::Denied { detail }
+                            | MobileError::Session { detail }
+                            | MobileError::Transport { detail },
+                        ) => detail,
+                        _ => continue,
+                    };
+                    for forbidden in ["oaiapp_", "Bearer", "eyJ"] {
+                        assert!(!detail.contains(forbidden), "{detail}");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

@@ -59,7 +59,30 @@ Tor is only a transport. The pinned ML-DSA-65 handshake, `session.hello` and dev
 
 Android completes browser authorization and verifies the ID token, including the nonce for the current attempt. After the user approves the transfer, pass the same immutable server profile used for consent. The Rust bridge checks the active profile and proves the server key again before sending a bounded request to `/v1/provider-link/chatgpt`. The server manages later refreshes. [OpenAI guidance for self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
 
-Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` response confirms the operation. `GET 404` indicates there is no link available. A `404` on import or unlink indicates that the server lacks provider linking. `DELETE 202` means the server removed the local link while upstream revocation remains unconfirmed. Keep the ChatGPT Settings guidance visible and refresh provider status. The mobile core never retries the transfer automatically. Check status before retrying an import whose outcome is uncertain.
+Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` response confirms the operation. The status result is `ChatgptProviderStatus(linked, availability)`:
+
+- `GET 204` gives `linked` true and `AVAILABLE`.
+- `GET 404` carrying the response header `x-harw-provider-link: unavailable` means the server has no provider linking because its `provider_link_device` is unset. The result is `linked` false and `NOT_CONFIGURED`, and the app hides "Continue with ChatGPT".
+- `GET 401` or `403` means this phone is not the provider link device of the server. The result is `linked` false and `NOT_LINK_DEVICE`.
+- `GET 404` without the header means not linked. The result is `linked` false and `AVAILABLE`. Older servers cannot say more, so the app still offers the flow.
+
+The server sends the header only on a `404` and only when no provider link is configured. Old phones ignore it.
+
+Failures of import and unlink arrive as `MobileException` with these fixed details:
+
+| HTTP status / method | Exception | Detail |
+| --- | --- | --- |
+| `404` on `POST` or `DELETE`, with header `unavailable` | `Denied` | `This server is not set up for ChatGPT plan linking` |
+| `404` on `POST` or `DELETE`, without header | `Denied` | `This server does not offer ChatGPT linking` |
+| `401` or `403` on `POST` or `DELETE` | `Denied` | `This phone is not the ChatGPT link device of this server` |
+| `409` | `Denied` | `Unlink the existing ChatGPT account before linking a different account` |
+| `503` | `Transport` | `ChatGPT linking is temporarily unavailable on this server` |
+| `500` | `Session` | `The server could not update its ChatGPT credential store` |
+| `400`, `413` or `422` | `Denied` | `The server refused the ChatGPT registration` |
+| `DELETE 202` | `Session` | `The server removed its local ChatGPT link. Revocation at OpenAI was not confirmed. Review the agent in ChatGPT Settings.` |
+| any other status | `Transport` | `The server could not complete the ChatGPT request (HTTP {n})` |
+
+Details are fixed literals and never contain server bytes or token material. `DELETE 202` means the server removed the local link while upstream revocation remains unconfirmed. Keep the ChatGPT Settings guidance visible and refresh provider status. The mobile core never retries the transfer automatically. Check status before retrying an import whose outcome is uncertain.
 
 ## Kotlin records
 
@@ -78,7 +101,7 @@ Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` respo
 | `SubmitReceipt` | `outcome: SubmitOutcome`, `position: UInt?`, `head: SessionCursor?`, `detail: String?` |
 | `ApprovalReceipt` | `outcome: ApprovalOutcome`, `detail: String?` |
 | `ChatgptProviderCredential` | `clientId: String`, `accessToken: String`, `refreshToken: String`, `idToken: String`, `scope: String`, `expiresAt: ULong`, `earliestRefreshAt: ULong?`, `subject: String`, `email: String?` |
-| `ChatgptProviderStatus` | `linked: Boolean` |
+| `ChatgptProviderStatus` | `linked: Boolean`, `availability: ChatgptLinkAvailability` |
 
 | Enum | Kotlin values |
 | --- | --- |
@@ -92,6 +115,7 @@ Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` respo
 | `ApprovalOutcome` | `RESOLVED`, `ALREADY_RESOLVED`, `EXPIRED`, `DENIED` |
 | `RoutePreference` | `AUTO`, `ONION`, `DIRECT` |
 | `ConnectionRoute` | `DIRECT`, `ONION` |
+| `ChatgptLinkAvailability` | `AVAILABLE`, `NOT_CONFIGURED`, `NOT_LINK_DEVICE` |
 
 Fallible methods throw `MobileException`. Variants with `detail: String` are `InvalidIdentity`, `InvalidProfile`, `Connect`, `Session`, `Denied`, `Transport`, `Ambiguous`, and `Internal`. `Disconnected` and `Revoked` carry no fields.
 
