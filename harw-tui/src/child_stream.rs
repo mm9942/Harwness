@@ -41,6 +41,15 @@
 //! höchstens [`LIVE_MAX_CHARS`] Zeichen gehalten und mit höchstens
 //! [`LIVE_MAX_LINES`] Zeilen gezeigt.
 //!
+//! Ausnahme `root-orchestrator` ([`uncapped_role`], Owner-Entscheidung
+//! 2026-11-22): sein Block ist **ungedeckelt** und wächst im Chat mit —
+//! alle Einträge, der ganze Live-Schwanz und der ganze Assistententext sind
+//! sichtbar. Es bleiben nur Speichergrenzen ([`UNBOUNDED_MAX_ENTRIES`]
+//! Einträge, [`UNBOUNDED_LIVE_MAX_BYTES`] Live-Text je Art); was darüber
+//! hinausfällt, markiert der Block ehrlich als „ältere Einträge im
+//! /agent-Detail“. Verschachtelte Blöcke (Sub-Orchestratoren) und alle
+//! anderen Kinder behalten ihre kompakten Deckel.
+//!
 //! # Performance
 //! Kein Neuaufbau des Verlaufs pro Ereignis: der Block ist **eine** geteilte
 //! Verlaufszelle (`Arc<Mutex<ChildStreamBlock>>`), in die Ereignisse als
@@ -109,6 +118,15 @@ pub(crate) const LIVE_MAX_LINES: usize = 3;
 /// Maximale Zahl gezeigter Zeilen eines Assistententexts im Block.
 const ASSISTANT_MAX_LINES: usize = 12;
 
+/// Speichergrenze eines ungedeckelten Blocks: höchstens so viele Einträge;
+/// ältere fallen heraus und werden als „ältere Einträge im /agent-Detail“
+/// gezählt.
+pub(crate) const UNBOUNDED_MAX_ENTRIES: usize = 5000;
+
+/// Speichergrenze (Bytes) je Live-Schwanz (Text bzw. Reasoning) eines
+/// ungedeckelten Blocks; älterer Text fällt vorne heraus (Marke `…`).
+pub(crate) const UNBOUNDED_LIVE_MAX_BYTES: usize = 256 * 1024;
+
 /// Höchstens so viele Agenten mit vorgehaltenen (noch nicht zuordenbaren)
 /// Ereignissen.
 pub(crate) const PENDING_MAX_AGENTS: usize = 16;
@@ -124,6 +142,21 @@ const BLOCK_PREFIX: &str = "  │ ";
 
 /// Breite von [`BLOCK_PREFIX`] in Spalten.
 const BLOCK_PREFIX_WIDTH: u16 = 4;
+
+/// Ob der Live-Block eines direkten Kindes mit dieser Rolle ungedeckelt ist.
+///
+/// # Beschreibung
+/// Gilt genau für `root-orchestrator` (Owner-Entscheidung 2026-11-22: der
+/// Root-Orchestrator wächst im Chat vollständig mit). Dieselbe Regel nutzt
+/// die virtuelle Live-Zelle im Chat (`app/live_slots.rs`), damit Block und
+/// Live-Zelle nie unterschiedlich kürzen.
+///
+/// # Argumente
+/// - `role` (`&str`): Rollenname aus `TurnEvent::ChildSpawned` bzw. dem
+///   Agenten-Bus.
+pub(crate) fn uncapped_role(role: &str) -> bool {
+    role.trim() == harw_registry_defaults::profile::role_names::ROOT_ORCHESTRATOR
+}
 
 // ─── Modus ───────────────────────────────────────────────────────────────────
 
@@ -389,8 +422,12 @@ pub(crate) struct ChildStreamBlock {
     entries: VecDeque<BlockEntry>,
     /// Anzahl herausgefallener Einträge („… n frühere Schritte“).
     dropped: usize,
-    /// Deckel: höchstens so viele Einträge.
+    /// Deckel: höchstens so viele Einträge (im ungedeckelten Modus gilt
+    /// stattdessen [`UNBOUNDED_MAX_ENTRIES`]).
     cap: usize,
+    /// Ungedeckelter Modus (`root-orchestrator`): keine Anzeige-Deckel, nur
+    /// Speichergrenzen.
+    unbounded: bool,
     /// Offene Lese-Gruppe, solange erweiterbar.
     open_group: Option<Arc<Mutex<ToolGroupCell>>>,
     /// Offene Werkzeugaufrufe (`call_id` → Zelle) bis zum Abschluss.
@@ -401,6 +438,10 @@ pub(crate) struct ChildStreamBlock {
     live_text: String,
     /// Live gestreamtes Reasoning der laufenden Runde (Schwanz).
     live_reasoning: String,
+    /// Vom Live-Text fiel wegen der Speichergrenze vorne etwas heraus.
+    live_text_trimmed: bool,
+    /// Vom Live-Reasoning fiel wegen der Speichergrenze vorne etwas heraus.
+    live_reasoning_trimmed: bool,
     /// Das Kind ist beendet; weitere Ereignisse werden ignoriert.
     finished: bool,
     /// Locale of this historical block after it finishes.
@@ -417,11 +458,14 @@ impl ChildStreamBlock {
             entries: VecDeque::new(),
             dropped: 0,
             cap: cap.max(1),
+            unbounded: false,
             open_group: None,
             pending_tools: HashMap::new(),
             children: HashMap::new(),
             live_text: String::new(),
             live_reasoning: String::new(),
+            live_text_trimmed: false,
+            live_reasoning_trimmed: false,
             finished: false,
             language: crate::i18n::current_language(),
         }
@@ -445,6 +489,64 @@ impl ChildStreamBlock {
         self.dropped
     }
 
+    /// Schaltet den ungedeckelten Modus ein bzw. aus.
+    ///
+    /// # Beschreibung
+    /// Ungedeckelt gelten weder der Eintrags-Deckel (`cap`, Vorgabe
+    /// [`DEFAULT_VISIBLE_ENTRIES`]) noch [`LIVE_MAX_LINES`],
+    /// [`LIVE_MAX_CHARS`] oder [`ASSISTANT_MAX_LINES`]; es bleiben die
+    /// Speichergrenzen [`UNBOUNDED_MAX_ENTRIES`] und
+    /// [`UNBOUNDED_LIVE_MAX_BYTES`]. Wirkt auf künftig angehängte Einträge
+    /// bzw. Deltas und sofort auf die Darstellung; bereits herausgefallene
+    /// Einträge kommen nicht zurück. Verschachtelte Blöcke erben den Modus
+    /// nicht.
+    pub(crate) fn set_unbounded(&mut self, unbounded: bool) {
+        self.unbounded = unbounded;
+    }
+
+    /// Ob der Block ungedeckelt ist (siehe [`Self::set_unbounded`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_unbounded(&self) -> bool {
+        self.unbounded
+    }
+
+    /// Wirksame Höchstzahl gehaltener Einträge.
+    fn entry_limit(&self) -> usize {
+        if self.unbounded {
+            UNBOUNDED_MAX_ENTRIES
+        } else {
+            self.cap
+        }
+    }
+
+    /// Hängt ein Live-Delta an `live_text` bzw. `live_reasoning` an und
+    /// hält die (modusabhängige) Grenze ein.
+    fn push_live(&mut self, reasoning: bool, text: &str) {
+        let unbounded = self.unbounded;
+        let (buffer, trimmed) = if reasoning {
+            (&mut self.live_reasoning, &mut self.live_reasoning_trimmed)
+        } else {
+            (&mut self.live_text, &mut self.live_text_trimmed)
+        };
+        if unbounded {
+            *trimmed |= push_tail_bytes(buffer, text, UNBOUNDED_LIVE_MAX_BYTES);
+        } else {
+            push_tail(buffer, text);
+        }
+    }
+
+    /// Verwirft den Live-Text (samt Kürzungsmarke).
+    fn clear_live_text(&mut self) {
+        self.live_text.clear();
+        self.live_text_trimmed = false;
+    }
+
+    /// Verwirft das Live-Reasoning (samt Kürzungsmarke).
+    fn clear_live_reasoning(&mut self) {
+        self.live_reasoning.clear();
+        self.live_reasoning_trimmed = false;
+    }
+
     /// Ob der Block im aktuellen Modus sichtbar ist.
     fn is_streaming(&self) -> bool {
         self.mode.get().admits(self.orchestrator)
@@ -453,7 +555,8 @@ impl ChildStreamBlock {
     /// Hängt einen Eintrag an und hält den Deckel ein.
     fn push_entry(&mut self, entry: BlockEntry) {
         self.entries.push_back(entry);
-        while self.entries.len() > self.cap {
+        let limit = self.entry_limit();
+        while self.entries.len() > limit {
             let Some(old) = self.entries.pop_front() else {
                 break;
             };
@@ -518,8 +621,8 @@ impl ChildStreamBlock {
         let had_live = !self.live_text.is_empty() || !self.live_reasoning.is_empty();
         tracing::debug!(child = %self.child_id, "tui.child_stream.finished");
         self.finished = true;
-        self.live_text.clear();
-        self.live_reasoning.clear();
+        self.clear_live_text();
+        self.clear_live_reasoning();
         // Runde 5 (Integration I): noch laufende Werkzeugzellen des Kindes
         // nicht auf „läuft“ stehen lassen.
         let had_open_tools = !self.pending_tools.is_empty();
@@ -557,7 +660,7 @@ impl ChildStreamBlock {
                 arguments,
                 ..
             } => {
-                self.live_text.clear();
+                self.clear_live_text();
                 if self.pending_tools.contains_key(call_id) {
                     return false;
                 }
@@ -596,7 +699,7 @@ impl ChildStreamBlock {
                 item: TurnItem::Reasoning(reasoning),
                 ..
             } => {
-                self.live_reasoning.clear();
+                self.clear_live_reasoning();
                 let summary = reasoning.summary_text.join(" ");
                 if summary.trim().is_empty() {
                     return true;
@@ -612,7 +715,7 @@ impl ChildStreamBlock {
                 item: TurnItem::AssistantMessage(message),
                 ..
             } => {
-                self.live_text.clear();
+                self.clear_live_text();
                 let text = visible_text(&message.content);
                 if text.trim().is_empty() {
                     return true;
@@ -633,11 +736,11 @@ impl ChildStreamBlock {
                 true
             }
             TurnEvent::AssistantDelta { text, .. } => {
-                push_tail(&mut self.live_text, text);
+                self.push_live(false, text);
                 true
             }
             TurnEvent::ReasoningDelta { text, .. } => {
-                push_tail(&mut self.live_reasoning, text);
+                self.push_live(true, text);
                 true
             }
             TurnEvent::ChildSpawned {
@@ -702,8 +805,8 @@ impl ChildStreamBlock {
             | TurnEvent::TurnFailed { .. }
             | TurnEvent::TurnAborted { .. } => {
                 let had_live = !self.live_text.is_empty() || !self.live_reasoning.is_empty();
-                self.live_text.clear();
-                self.live_reasoning.clear();
+                self.clear_live_text();
+                self.clear_live_reasoning();
                 had_live
             }
             _ => false,
@@ -734,23 +837,47 @@ impl ChildStreamBlock {
         let dim = style::dim_style(theme);
         let mut body: Vec<Line<'static>> = Vec::new();
         if self.dropped > 0 {
-            body.push(Line::from(Span::styled(
+            let count = self.dropped.to_string();
+            let marker = if self.unbounded {
+                // Ehrlich: die Anzeige ist vollständig, nur die
+                // Speichergrenze schnitt ab; der Rest steht im Agent-Detail.
+                crate::i18n::tr_args(
+                    "agents.older_in_detail",
+                    "… {p0} older entries in /agent detail",
+                    &[("p0", &count)],
+                )
+            } else {
                 crate::i18n::tr_args(
                     "agents.earlier",
                     "… {p0} earlier steps",
-                    &[("p0", &(self.dropped).to_string())],
-                ),
-                dim,
-            )));
+                    &[("p0", &count)],
+                )
+            };
+            body.push(Line::from(Span::styled(marker, dim)));
         }
         for entry in &self.entries {
-            body.extend(render_entry(entry, inner, theme));
+            body.extend(render_entry(entry, inner, theme, self.unbounded));
         }
+        let live_limit = (!self.unbounded).then_some(LIVE_MAX_LINES);
         if !self.live_reasoning.is_empty() {
-            body.extend(live_lines(&self.live_reasoning, "∴ ", inner, dim));
+            body.extend(live_lines(
+                &self.live_reasoning,
+                "∴ ",
+                self.live_reasoning_trimmed,
+                inner,
+                dim,
+                live_limit,
+            ));
         }
         if !self.live_text.is_empty() {
-            body.extend(live_lines(&self.live_text, "● ", inner, dim));
+            body.extend(live_lines(
+                &self.live_text,
+                "● ",
+                self.live_text_trimmed,
+                inner,
+                dim,
+                live_limit,
+            ));
         }
         body.into_iter()
             .map(|line| prefix_line(line, dim))
@@ -759,7 +886,15 @@ impl ChildStreamBlock {
 }
 
 /// Rendert einen Block-Eintrag in der inneren Breite.
-fn render_entry(entry: &BlockEntry, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+///
+/// # Argumente
+/// - `unbounded`: Assistententext ungekürzt (ungedeckelter Block).
+fn render_entry(
+    entry: &BlockEntry,
+    width: u16,
+    theme: style::Theme,
+    unbounded: bool,
+) -> Vec<Line<'static>> {
     match entry {
         BlockEntry::Tool(cell) => match cell.lock() {
             Ok(guard) => guard.display_lines_with(width, theme, ToolVerbosity::Compact),
@@ -770,7 +905,7 @@ fn render_entry(entry: &BlockEntry, width: u16, theme: style::Theme) -> Vec<Line
             Err(_) => poisoned(theme),
         },
         BlockEntry::Reasoning(cell) => cell.display_lines(width, theme),
-        BlockEntry::Assistant(text) => render_assistant(text, width, theme),
+        BlockEntry::Assistant(text) => render_assistant(text, width, theme, unbounded),
         BlockEntry::Notice(text) => wrap_plain(&sanitize_inline(text), width)
             .into_iter()
             .map(|line| line.style(style::warning_style(theme)))
@@ -792,13 +927,19 @@ fn render_entry(entry: &BlockEntry, width: u16, theme: style::Theme) -> Vec<Line
 }
 
 /// Assistententext wie bei der Wurzel (`» `, Markdown), aber auf
-/// [`ASSISTANT_MAX_LINES`] Zeilen gekürzt.
-fn render_assistant(text: &str, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+/// [`ASSISTANT_MAX_LINES`] Zeilen gekürzt — außer im ungedeckelten Block
+/// (`unbounded`), dort vollständig.
+fn render_assistant(
+    text: &str,
+    width: u16,
+    theme: style::Theme,
+    unbounded: bool,
+) -> Vec<Line<'static>> {
     let cell = AssistantHistoryCell {
         source: text.to_owned(),
     };
     let mut lines = cell.display_lines(width, theme);
-    if lines.len() > ASSISTANT_MAX_LINES {
+    if !unbounded && lines.len() > ASSISTANT_MAX_LINES {
         let hidden = lines.len() - ASSISTANT_MAX_LINES;
         lines.truncate(ASSISTANT_MAX_LINES);
         lines.push(Line::from(Span::styled(
@@ -813,13 +954,31 @@ fn render_assistant(text: &str, width: u16, theme: style::Theme) -> Vec<Line<'st
     lines
 }
 
-/// Letzte (bis zu) [`LIVE_MAX_LINES`] umbrochene Zeilen eines Live-Schwanzes.
-fn live_lines(text: &str, marker: &str, width: u16, dim: Style) -> Vec<Line<'static>> {
+/// Letzte (bis zu) `max_lines` umbrochene Zeilen eines Live-Schwanzes.
+///
+/// # Argumente
+/// - `trimmed`: vorne fiel Text heraus (Speichergrenze); der Schwanz beginnt
+///   dann mit `…`.
+/// - `max_lines`: `Some(n)` zeigt nur die letzten `n` Zeilen
+///   ([`LIVE_MAX_LINES`] im kompakten Block), `None` alle.
+fn live_lines(
+    text: &str,
+    marker: &str,
+    trimmed: bool,
+    width: u16,
+    dim: Style,
+    max_lines: Option<usize>,
+) -> Vec<Line<'static>> {
     let sanitized = sanitize_inline(&redact_text(text));
+    let sanitized = if trimmed {
+        format!("… {}", sanitized.trim_start())
+    } else {
+        sanitized
+    };
     let lead = marker.chars().count();
     let lead_width = u16::try_from(lead).unwrap_or(u16::MAX);
     let wrapped = wrap_plain(sanitized.trim(), width.saturating_sub(lead_width).max(1));
-    let skip = wrapped.len().saturating_sub(LIVE_MAX_LINES);
+    let skip = max_lines.map_or(0, |max| wrapped.len().saturating_sub(max));
     wrapped
         .into_iter()
         .skip(skip)
@@ -863,6 +1022,24 @@ fn push_tail(buffer: &mut String, text: &str) {
     if count > LIVE_MAX_CHARS {
         *buffer = buffer.chars().skip(count - LIVE_MAX_CHARS).collect();
     }
+}
+
+/// Hängt `text` an und kappt auf die letzten (höchstens) `max_bytes` Bytes,
+/// geschnitten an einer Zeichengrenze.
+///
+/// # Rückgabe
+/// `true`, wenn dabei vorne Text herausfiel.
+fn push_tail_bytes(buffer: &mut String, text: &str, max_bytes: usize) -> bool {
+    buffer.push_str(text);
+    if buffer.len() <= max_bytes {
+        return false;
+    }
+    let mut cut = buffer.len() - max_bytes;
+    while !buffer.is_char_boundary(cut) {
+        cut += 1;
+    }
+    buffer.drain(..cut);
+    true
 }
 
 /// Sichtbarer Text einer Assistentennachricht (Bilder als Platzhalter).
@@ -1025,6 +1202,11 @@ impl ChildStreamRegistry {
     /// Aufrufer hängt den zurückgegebenen Block als geteilte Zelle direkt
     /// dahinter. Vorgehaltene Ereignisse des Kindes werden nachgespielt.
     ///
+    /// Ist die Rolle `root-orchestrator` ([`uncapped_role`]), ist der Block
+    /// ungedeckelt ([`ChildStreamBlock::set_unbounded`]) — schon bevor die
+    /// vorgehaltenen Ereignisse nachgespielt werden, damit früh eingetroffene
+    /// Schritte nicht am kompakten Deckel herausfallen.
+    ///
     /// # Rückgabe
     /// `Some(block)`, wenn das Kind im aktuellen Modus streamt und noch
     /// keinen Block hat; sonst `None` (dann bleibt es bei der Agent-Zeile).
@@ -1041,13 +1223,9 @@ impl ChildStreamRegistry {
         if self.blocks.contains_key(child_id) {
             return None;
         }
-        let block = Arc::new(Mutex::new(ChildStreamBlock::new(
-            child_id,
-            orchestrator,
-            1,
-            self.mode.clone(),
-            self.cap,
-        )));
+        let mut fresh = ChildStreamBlock::new(child_id, orchestrator, 1, self.mode.clone(), self.cap);
+        fresh.set_unbounded(uncapped_role(role));
+        let block = Arc::new(Mutex::new(fresh));
         self.blocks.insert(child_id.to_owned(), Arc::clone(&block));
         self.flush_pending(child_id, &block);
         Some(block)

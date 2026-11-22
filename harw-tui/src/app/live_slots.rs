@@ -51,7 +51,7 @@ use super::live_order_glue::{self, ChildActivity};
 use super::{ChatApp, Role, ToolCellHandle};
 use crate::agent_monitor::{AgentLive, AgentPhase};
 use crate::chat_scroll::{CellAnchor, CellId};
-use crate::child_stream::{ChildStreamMode, SharedChildBlock};
+use crate::child_stream::{ChildStreamMode, SharedChildBlock, uncapped_role};
 use crate::history_cell::{HistoryCell, ToolVerbosity};
 use crate::live_ranker::{ActivityTier, LiveActivityRanker, LiveCandidate, RankerConfig};
 use crate::sanitize::sanitize_inline;
@@ -539,8 +539,25 @@ fn body_rows(history_rows: u16) -> usize {
     (usize::from(history_rows) / 4).clamp(LIVE_CELL_MIN_BODY, LIVE_CELL_MAX_BODY)
 }
 
+/// Body rows of the virtual live cell of `slot`.
+///
+/// # Description
+/// A `root-orchestrator` run is uncapped (owner decision 2026-11-22): its
+/// cell grows with the chat and is scrolled by the normal chat scroll, so it
+/// never gets a `… N lines above` row. Its child block is uncapped by the
+/// same rule ([`crate::child_stream::uncapped_role`]). Every other run keeps
+/// the compact [`body_rows`] bound.
+fn slot_body_rows(slot: &LiveSlot, history_rows: u16) -> usize {
+    if uncapped_role(&slot.role) {
+        usize::MAX
+    } else {
+        body_rows(history_rows)
+    }
+}
+
 /// Lines of one virtual live cell: header (`◆ live · role · phase`, plus the
-/// pinned marker) and the bounded tail of the run's child block.
+/// pinned marker) and the tail of the run's child block, at most `max_body`
+/// rows (`usize::MAX`: all of it).
 fn live_cell_lines(
     slot: &LiveSlot,
     block: Option<&SharedChildBlock>,
@@ -619,6 +636,11 @@ impl ChatApp {
 
     /// Tracks a child block about to be appended as canonical cell (hook of
     /// the child stream glue).
+    ///
+    /// A `root-orchestrator` block arrives here already uncapped
+    /// ([`crate::child_stream::ChildStreamRegistry::attach_root_child`] sets
+    /// it before replaying early events); its live cell is uncapped by
+    /// [`slot_body_rows`].
     pub(super) fn track_live_child_block(
         &mut self,
         child_id: &str,
@@ -782,7 +804,7 @@ impl ChatApp {
                     self.agent_monitor.agent(&slot.run_id),
                     width,
                     theme,
-                    body_rows(history_rows),
+                    slot_body_rows(slot, history_rows),
                 ),
             });
         }
