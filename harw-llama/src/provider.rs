@@ -38,6 +38,10 @@ pub struct LocalGgufConfig {
     pub max_new_tokens: u32,
     /// Whether replies think when the request does not say.
     pub thinking_default: bool,
+    /// Text-only chat: a short system prompt and no tool specs. The host's
+    /// full prompt and tool catalogue run to tens of thousands of tokens,
+    /// which a phone-sized context cannot hold.
+    pub lean: bool,
 }
 
 impl Default for LocalGgufConfig {
@@ -47,6 +51,7 @@ impl Default for LocalGgufConfig {
             n_threads: 0,
             max_new_tokens: 4096,
             thinking_default: false,
+            lean: true,
         }
     }
 }
@@ -190,6 +195,10 @@ fn tool_result_text(result: &ToolCallResult) -> String {
     }
 }
 
+/// System prompt of lean (text-only) runs.
+const LEAN_SYSTEM_PROMPT: &str = "You are a helpful assistant running on the user's phone. \
+Answer concisely and in the language of the user. You have no tools: answer from your own knowledge.";
+
 fn tools_json(tools: &[ToolSpec]) -> Vec<Value> {
     tools
         .iter()
@@ -208,9 +217,13 @@ fn tools_json(tools: &[ToolSpec]) -> Vec<Value> {
 }
 
 /// Chat messages for the template; the second value is a `/think` override.
-fn chat_messages(request: &ModelRequest) -> (Vec<ChatMessage>, Option<bool>) {
-    let mut system = request.system_prompt.clone();
-    for fragment in &request.instruction_fragments {
+fn chat_messages(request: &ModelRequest, lean: bool) -> (Vec<ChatMessage>, Option<bool>) {
+    let mut system = if lean {
+        LEAN_SYSTEM_PROMPT.to_owned()
+    } else {
+        request.system_prompt.clone()
+    };
+    for fragment in request.instruction_fragments.iter().filter(|_| !lean) {
         if !fragment.trim().is_empty() {
             if !system.is_empty() {
                 system.push_str("\n\n");
@@ -289,9 +302,9 @@ impl LocalGgufProvider {
     }
 
     fn prepare(&self, request: &ModelRequest) -> Result<Job, ModelError> {
-        let (messages, switch) = chat_messages(request);
+        let (messages, switch) = chat_messages(request, self.config.lean);
         let thinking = thinking_for(request, switch, self.config.thinking_default);
-        let tools = tools_json(&request.tools);
+        let tools = if self.config.lean { Vec::new() } else { tools_json(&request.tools) };
         let prompt = render_prompt(
             self.engine.chat_template(),
             &RenderInput {

@@ -438,7 +438,8 @@ fn portrait_stack_fits(cols: u16, rows: u16) -> bool {
 /// square with cells of `aspect`: `round(width * aspect / 1000)`, halves
 /// rounded up.
 fn square_rows(width: u16, aspect: u16) -> u16 {
-    let rows = (u64::from(width) * u64::from(aspect) + PERMILLE / 2) / PERMILLE;
+    // Owner decision 2026-11-22: two thirds of a true square (windows were too tall).
+    let rows = (u64::from(width) * u64::from(aspect) * 2 + PERMILLE * 3 / 2) / (PERMILLE * 3);
     u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
@@ -1055,7 +1056,7 @@ mod tests {
     /// times the aspect over 1000, rounded half up, at least five rows.
     fn spec_square_target(input: MissionInput) -> u16 {
         let agents_width = u64::from(input.cols / 2);
-        let rows = (agents_width * spec_aspect(input) + 500) / 1000;
+        let rows = (agents_width * spec_aspect(input) * 2 + 1500) / 3000;
         u16::try_from(rows).unwrap_or(u16::MAX).max(5)
     }
 

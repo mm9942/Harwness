@@ -1691,6 +1691,12 @@ fn requested_features() -> Vec<String> {
 }
 
 fn link_supports_projects(link: &Link) -> bool {
+    // The on-device host grants the feature on the wire but holds no profile
+    // share, so every project call there ends in "Dieses Gateway teilt keine
+    // TUI-Sessions". Projects live on the gateway only.
+    if link.backend.kind() == crate::backend::BackendKind::Local {
+        return false;
+    }
     link.backend
         .ack()
         .features

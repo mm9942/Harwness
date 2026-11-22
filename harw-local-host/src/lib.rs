@@ -175,6 +175,20 @@ impl Default for HostRights {
     }
 }
 
+/// The model-visible tool surface of hosted sessions.
+///
+/// The registry profile of a session host is always `Full` and exposes the
+/// operation model tools, which alone run to ~20k tokens of schemas. A phone
+/// model has a small context window, so the host can narrow what the model
+/// *sees* per session: only `allow` stays visible and the schemas go compact.
+/// An empty `allow` is a text-only chat. This narrows the schema list only;
+/// sandbox and permissions are unchanged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolSurface {
+    /// Names of the tools that stay visible to the model.
+    pub allow: Vec<String>,
+}
+
 /// A [`RuntimeSpec`] without overrides (no embedded agent, no child backend,
 /// no mode, agent, effort, approval or model override).
 #[must_use]
@@ -210,6 +224,8 @@ pub struct LocalCoreFactory {
     /// Extra assembly contributors (e.g. the phone's device tools), applied to
     /// every hosted session after the default ones.
     contributors: Vec<Arc<dyn AssemblyContributor>>,
+    /// Model-visible tool surface; `None` = every registered tool.
+    surface: Option<ToolSurface>,
 }
 
 impl std::fmt::Debug for LocalCoreFactory {
@@ -262,7 +278,15 @@ impl LocalCoreFactory {
             rights: HostRights::operator(),
             actor: None,
             contributors: Vec::new(),
+            surface: None,
         }
+    }
+
+    /// Narrows the tools the model sees in every hosted session.
+    #[must_use]
+    pub fn with_tool_surface(mut self, surface: ToolSurface) -> Self {
+        self.surface = Some(surface);
+        self
     }
 
     /// Adds an assembly contributor (extra tools) to every hosted session.
@@ -348,7 +372,15 @@ impl LocalCoreFactory {
             .clone()
             .or_else(|| admission.map(|admission| admission.approval_actor().clone()))
             .unwrap_or_else(|| self.owner_actor.clone());
-        let session = with_operator_actor(root.session, actor)?;
+        let mut session = with_operator_actor(root.session, actor)?;
+        if let Some(surface) = &self.surface {
+            let activation = session.activation_mut();
+            activation.set_profile(harw_core::ToolProfile::Minimal);
+            for name in &surface.allow {
+                activation.enable_tool(harw_tools::ToolName::new(name.as_str()));
+            }
+            session.set_compact_tool_schemas(true);
+        }
         Ok(CoreSession {
             session,
             model: Arc::clone(&self.model),
@@ -544,6 +576,20 @@ impl LocalHost {
         model: Arc<dyn ModelProvider>,
         contributors: Vec<Arc<dyn AssemblyContributor>>,
     ) -> Result<Self, LocalHostError> {
+        Self::open_with_surface(config, model, contributors, None)
+    }
+
+    /// Like [`Self::open_with_contributors`], with the model-visible tool
+    /// surface narrowed to `surface` (`None` = every registered tool).
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    pub fn open_with_surface(
+        config: LocalHostConfig,
+        model: Arc<dyn ModelProvider>,
+        contributors: Vec<Arc<dyn AssemblyContributor>>,
+        surface: Option<ToolSurface>,
+    ) -> Result<Self, LocalHostError> {
         std::fs::create_dir_all(&config.workspace).map_err(|error| {
             LocalHostError::Setup(format!("{}: {error}", config.workspace.display()))
         })?;
@@ -557,6 +603,9 @@ impl LocalHost {
         let mut factory = config.core_factory(model);
         for contributor in contributors {
             factory = factory.with_contributor(contributor);
+        }
+        if let Some(surface) = surface {
+            factory = factory.with_tool_surface(surface);
         }
         let driver = CoreTurnDriver::with_factory(
             CoreDriverConfig::new(sessions_root),

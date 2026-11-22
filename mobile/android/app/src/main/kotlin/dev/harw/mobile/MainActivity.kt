@@ -222,46 +222,52 @@ internal open class MainActivity : ComponentActivity() {
             }
         }
         DeviceApprovalHost()
+        // Verwalten ist eine Server-Funktion: Hub, Modelle und Befehle sprechen immer mit der Cloud,
+        // auch wenn gerade die Lokal-Ansicht offen ist (der On-Device-Host kennt weder Verwaltung noch Projekte).
+        val manageRoute = settingsRoute == SettingsRoute.Hub || settingsRoute == SettingsRoute.Models ||
+            settingsRoute == SettingsRoute.Commands
+        val manageConnection = if (manageRoute) cloud else connection
+        val manageState = if (manageRoute) cloudState else state
         // Step-up-Host: immer ueber allen Zweigen, auch im Hub. Nichts davon ueberlebt Prozesstod.
-        state.manage.stepUp?.let { stepUp ->
+        manageState.manage.stepUp?.let { stepUp ->
             StepUpDialog(
                 stepUp = stepUp,
-                receivedAt = state.manage.stepUpReceivedAt,
-                authorizing = stepUpAuthorization.busy || state.manage.running == STEPUP_CONFIRM_RUNNING,
-                error = state.manage.stepUpError,
+                receivedAt = manageState.manage.stepUpReceivedAt,
+                authorizing = stepUpAuthorization.busy || manageState.manage.running == STEPUP_CONFIRM_RUNNING,
+                error = manageState.manage.stepUpError,
                 onConfirm = {
                     stepUpAuthorization.confirm(stepUp) { error ->
                         when (error) {
-                            null -> connection.confirmStepUp(stepUp)
+                            null -> manageConnection.confirmStepUp(stepUp)
                             STEPUP_CANCELED_TEXT -> Unit
-                            else -> connection.noteStepUpError(stepUp, error)
+                            else -> manageConnection.noteStepUpError(stepUp, error)
                         }
                     }
                 },
                 onCancel = { reason ->
                     stepUpAuthorization.cancel()
-                    connection.cancelStepUp(stepUp, reason)
+                    manageConnection.cancelStepUp(stepUp, reason)
                 },
             )
         }
-        val closedStepUpError = state.manage.stepUpError
-        if (state.manage.stepUp == null && closedStepUpError != null) {
+        val closedStepUpError = manageState.manage.stepUpError
+        if (manageState.manage.stepUp == null && closedStepUpError != null) {
             AlertDialog(
-                onDismissRequest = { connection.clearStepUpError() },
+                onDismissRequest = { manageConnection.clearStepUpError() },
                 title = { Text("Änderung bestätigen") },
                 text = { Text(closedStepUpError) },
-                confirmButton = { TextButton(onClick = { connection.clearStepUpError() }) { Text("OK") } },
+                confirmButton = { TextButton(onClick = { manageConnection.clearStepUpError() }) { Text("OK") } },
             )
         }
         if (settingsRoute == SettingsRoute.Hub) {
             SettingsHub(
-                state = state,
-                connection = connection,
+                state = manageState,
+                connection = manageConnection,
                 onBack = { openSettings(null) },
                 onOpen = ::openSettings,
             )
         } else if (settingsRoute == SettingsRoute.Models) {
-            CloudModelsScreen(state, connection, sessionId, onBack = { openSettings(SettingsRoute.Hub) })
+            CloudModelsScreen(manageState, manageConnection, if (manageConnection === connection) sessionId else null, onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Providers) {
             val providerStore = remember {
                 uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
@@ -288,8 +294,8 @@ internal open class MainActivity : ComponentActivity() {
             TermuxScreen(onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Commands) {
             CommandsScreen(
-                state = state,
-                connection = connection,
+                state = manageState,
+                connection = manageConnection,
                 sessionId = null,
                 onBack = { openSettings(SettingsRoute.Hub) },
                 onOpenModels = { openSettings(SettingsRoute.Models) },

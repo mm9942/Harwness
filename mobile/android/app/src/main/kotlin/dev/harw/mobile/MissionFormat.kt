@@ -17,7 +17,8 @@ private val TERMINAL_JOB_STATES = setOf(
 )
 
 internal fun missionCardHeightDp(sideDp: Float, availableHeightDp: Float, panelDp: Float, stripDp: Float, imeVisible: Boolean): Float =
-    if (!imeVisible) sideDp else min(sideDp, max(72f, availableHeightDp - panelDp - stripDp - 190f))
+    // Owner decision 2026-11-22: two thirds of a square, the cards were too tall.
+    (sideDp * 2f / 3f).let { target -> if (!imeVisible) target else min(target, max(72f, availableHeightDp - panelDp - stripDp - 190f)) }
 
 internal fun missionHeaderMaxHeightDp(availableHeightDp: Float): Float = max(0f, availableHeightDp - 184f)
 

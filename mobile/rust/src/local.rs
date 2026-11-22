@@ -58,8 +58,39 @@ pub(crate) async fn open_local(
             shell, files,
         )));
     }
-    open_local_with_tools(home, model, features, contributors).await
+    // A phone model has a small context window: the on-device GGUF is
+    // text-only ("nur Text, keine Werkzeuge"), a cloud route sees a lean set.
+    let surface = if home.active_local_model()?.is_some() {
+        harw_local_host::ToolSurface::default()
+    } else {
+        harw_local_host::ToolSurface {
+            allow: LEAN_TOOLS.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    };
+    open_local_with_tools(home, model, features, contributors, Some(surface)).await
 }
+
+/// Tools a cloud route on the phone keeps visible: the phone UIA's set and the
+/// device tools (the latter only exist when device tools are mounted).
+#[cfg(feature = "local-host")]
+const LEAN_TOOLS: &[&str] = &[
+    "fs.read",
+    "fs.list",
+    "fs.search",
+    "fs.glob",
+    "fs.grep",
+    "fs.write",
+    "fs.edit",
+    "plan.current",
+    "skills.search",
+    "skills.load",
+    "device_roots",
+    "device_list",
+    "device_read",
+    "device_write",
+    "device_search",
+    "termux_run",
+];
 
 /// The model of the active selection: the GGUF on this device when that is the
 /// active provider, else the HTTP route.
@@ -72,6 +103,25 @@ fn build_active_model(
         Some(model_id) => build_local_gguf(home, &model_id),
         None => crate::providers::build_model_provider(home, resolver),
     }
+}
+
+/// Settings of the on-device model: `HARW_LOCAL_N_CTX` sets the context
+/// window (default 16384), `HARW_LOCAL_LEAN=0` brings back the full host
+/// prompt and tool specs (text-only by default).
+#[cfg(feature = "local-host")]
+fn local_gguf_config() -> harw_llama::LocalGgufConfig {
+    let mut config = harw_llama::LocalGgufConfig::default();
+    if let Some(n) = std::env::var("HARW_LOCAL_N_CTX")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n >= 1024)
+    {
+        config.n_ctx = n;
+    }
+    if std::env::var("HARW_LOCAL_LEAN").is_ok_and(|v| v.trim() == "0") {
+        config.lean = false;
+    }
+    config
 }
 
 /// Loads the selected GGUF from the model store (memory-mapped, blocking).
@@ -94,7 +144,7 @@ fn build_local_gguf(
     let provider = harw_llama::LocalGgufProvider::open(
         std::path::Path::new(&path),
         model_id,
-        harw_llama::LocalGgufConfig::default(),
+        local_gguf_config(),
     )
     .map_err(|e| session(e.to_string()))?;
     Ok(Arc::new(provider))
@@ -107,7 +157,7 @@ pub(crate) async fn open_local_with_model(
     model: Arc<dyn harw_core::ModelProvider>,
     features: Vec<String>,
 ) -> Result<Backend, MobileError> {
-    open_local_with_tools(home, model, features, Vec::new()).await
+    open_local_with_tools(home, model, features, Vec::new(), None).await
 }
 
 /// Starts the host over `model` with extra tool contributors, connects as its
@@ -118,6 +168,7 @@ async fn open_local_with_tools(
     model: Arc<dyn harw_core::ModelProvider>,
     features: Vec<String>,
     contributors: Vec<Arc<dyn harw_local_host::ext::AssemblyContributor>>,
+    surface: Option<harw_local_host::ToolSurface>,
 ) -> Result<Backend, MobileError> {
     use harw_protocol::{
         SessionPort,
@@ -126,7 +177,7 @@ async fn open_local_with_tools(
 
     let config = home.local_host_config();
     let host = tokio::task::spawn_blocking(move || {
-        harw_local_host::LocalHost::open_with_contributors(config, model, contributors)
+        harw_local_host::LocalHost::open_with_surface(config, model, contributors, surface)
     })
     .await
     .map_err(|_| host_task_failed())?

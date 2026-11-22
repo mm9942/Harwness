@@ -23,7 +23,7 @@ pub use error::LlamaError;
 pub use provider::{LOCAL_PROVIDER_ID, LocalGgufConfig, LocalGgufProvider};
 
 /// Context size used when the caller does not choose one.
-pub const DEFAULT_N_CTX: u32 = 8192;
+pub const DEFAULT_N_CTX: u32 = 16384;
 
 /// Whether this build contains the llama.cpp engine.
 #[must_use]

@@ -32,7 +32,7 @@ const SIDECAR_MAX_BYTES: u64 = 65536;
 const OWN_ID_PREFIX: &str = "own-";
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GIB: u64 = 1024 * 1024 * 1024;
-const DEFAULT_N_CTX: u32 = 8192;
+const DEFAULT_N_CTX: u32 = 16384;
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CatalogModel {
@@ -1045,7 +1045,7 @@ mod tests {
             model.url,
             "https://huggingface.co/twoody/Qwen3.5-4B-GGUF/resolve/7e234459682a77fdae11b46591a6e6c37a45a495/Qwen3.5-4B-Q4_K_M.gguf"
         );
-        assert_eq!(model.default_n_ctx, 8192);
+        assert_eq!(model.default_n_ctx, 16384);
         assert_eq!(model.min_ram_bytes, 6 * GIB);
         assert!(model.recommended);
         Ok(())
