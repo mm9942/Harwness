@@ -353,6 +353,11 @@ impl App {
     fn origin_allowed(&self, headers: &HeaderMap) -> bool {
         match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
             None => true,
+            // Mit Referrer-Policy no-referrer senden manche Browser "null"; dann entscheidet Sec-Fetch-Site.
+            Some("null") => headers
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("same-origin")),
             Some(origin) => self.allowed_origins.iter().any(|o| o == &origin.to_ascii_lowercase()),
         }
     }
