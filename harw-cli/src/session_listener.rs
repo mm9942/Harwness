@@ -365,7 +365,10 @@ async fn start_onion(
     _dir: &Path,
     _intake: harw_node_listener::StreamIntake,
 ) -> Result<std::convert::Infallible, String> {
-    Err("[session_listener] onion = true needs a harw build with the `onion` cargo feature".to_owned())
+    Err(
+        "[session_listener] onion = true needs a harw build with the `onion` cargo feature"
+            .to_owned(),
+    )
 }
 
 /// Launches the onion service and feeds its streams into `intake`.
