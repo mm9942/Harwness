@@ -4,9 +4,10 @@
 //! [`crate::panes::classify_mission`] (every orientation) and lays out and
 //! draws everything between the overlays and the status line:
 //!
-//! - **Portrait stack** (C2): Active Agents | Active Jobs (one combined
-//!   window below 68 columns), the Finished / Failed strip and the LIVE strip
-//!   above the full-width chat.
+//! - **Portrait stack** (C2): Active Agents | Active Jobs (two square
+//!   windows, never combined), the bordered Reasoning window (the mixed,
+//!   time-ordered stream of all agents) and the Finished / Failed strip above
+//!   the full-width chat.
 //! - **Three-column landscape** (C3, PL-94 anchors): five separately
 //!   bordered windows -- the chat left and widest, Finished / Failed
 //!   top-centre with LIVE below it, Active Agents above Active Jobs in the far
@@ -100,9 +101,9 @@ struct MissionContent<'a> {
     source: Option<(&'a AgentLive, bool)>,
     /// Start of the source's current tool call.
     tool_started: Option<Instant>,
-    /// LIVE content for a strip as wide as the terminal (portrait stack and
-    /// the geometry input; the shallow strip and the landscape window build
-    /// their own for their width).
+    /// LIVE content for a strip as wide as the terminal (the geometry input;
+    /// the shallow strip and the landscape window build their own for their
+    /// width, the portrait stack draws the Reasoning feed instead).
     live: live_window::LiveView,
     /// Finished / Failed aggregate rows.
     finished: Vec<TerminalRow>,
@@ -140,6 +141,7 @@ impl<'a> MissionContent<'a> {
             composer: rows.input_height,
             live_body_lines,
             finished: finished_window::rows_wanted(&self.finished, app.mission.finished_expanded),
+            cell_aspect_permille: app.cell_aspect_permille.get(),
         }
     }
 }
@@ -325,11 +327,12 @@ fn draw_cards(
     }
 }
 
-/// Portrait stack (PL-97 C2, W02): Active Agents | Active Jobs (one combined
-/// window below 68 columns), the Finished / Failed strip, the LIVE strip and
-/// the chat over the full width. Modal dialogs and approval questions are
-/// drawn later into the status/composer areas, so they always lie over
-/// (after) the windows, never inside them.
+/// Portrait stack (PL-97 C2, W02): Active Agents | Active Jobs (two windows,
+/// never combined), the bordered Reasoning window (mixed stream of all
+/// agents, focusable and scrollable like the landscape LIVE window), the
+/// Finished / Failed strip below it and the chat over the full width. Modal
+/// dialogs and approval questions are drawn later into the status/composer
+/// areas, so they always lie over (after) the windows, never inside them.
 fn compose_portrait(
     frame: &mut Frame<'_>,
     app: &ChatApp,
@@ -342,15 +345,18 @@ fn compose_portrait(
     let history = split_queue(frame, areas.chat, queue_lines, rows.history_min, theme);
 
     let focus = app.panels.focus;
-    let buf = frame.buffer_mut();
     let (agents_region, jobs_region) = draw_cards(
         app,
         areas.agents,
         areas.jobs,
         areas.finished.is_some(),
-        buf,
+        frame.buffer_mut(),
         theme,
     );
+    if let Some(live_area) = areas.live {
+        render_reasoning_window(frame, app, live_area, focus == PaneFocus::Live);
+    }
+    let buf = frame.buffer_mut();
     if let Some(finished_area) = areas.finished {
         finished_window::render(
             &content.finished,
@@ -361,9 +367,6 @@ fn compose_portrait(
             focus == PaneFocus::Finished,
             app.dod_mark.visible(),
         );
-    }
-    if let Some(live_area) = areas.live {
-        live_window::render(&content.live, live_area, buf, theme);
     }
     if let Some(explorer_area) = areas.explorer {
         render_explorer_panel(app, explorer_area, buf, theme);
@@ -376,8 +379,9 @@ fn compose_portrait(
     let presence = MissionPresence {
         jobs: jobs_region.is_some(),
         finished: areas.finished.is_some(),
-        // Der LIVE-Streifen des Hochformats ist nie fokussierbar.
-        live: false,
+        // Das Reasoning-Fenster des Hochformats ist fokussier- und
+        // scrollbar; die Detailansicht (`Alt+L`) öffnet dort maximiert.
+        live: areas.live.is_some(),
         agents_hidden: areas.agents.is_none(),
     };
     app.last_regions.set(scroll_routing::FrameRegions {
@@ -390,8 +394,11 @@ fn compose_portrait(
         presence,
         // Sichtbar: nach dem Einblenden gilt dieselbe Lage (ohne die
         // Detailansicht, die beim Schließen das Jobs-Fenster freigibt).
+        // LIVE gilt dort nur im dreispaltigen Querformat (Detail an Ort und
+        // Stelle); im Hochformat öffnet `Alt+L` die maximierte Detailansicht.
         revealed: MissionPresence {
             jobs: areas.jobs.is_some(),
+            live: false,
             ..presence
         },
     });
@@ -638,6 +645,31 @@ fn render_live_window(
         app.theme,
         &app.mission.live_scroll,
         focused,
+    );
+}
+
+/// The portrait Reasoning window: the bordered, scrollable mixed stream of
+/// all agents (or only the agent pinned with `p`), scrolled by
+/// [`crate::mission::MissionUi::live_scroll`] like the landscape LIVE window.
+fn render_reasoning_window(frame: &mut Frame<'_>, app: &ChatApp, area: Rect, focused: bool) {
+    let pinned = app.mission.pinned_agent.as_deref();
+    let inner_width = area.width.saturating_sub(2);
+    let viewport = usize::from(area.height.saturating_sub(2));
+    // Wie der Chat-Verlauf: umbrochene Zeilen zählen, der Versatz zählt vom
+    // Ende (0 folgt der neuesten Zeile).
+    let total = app.reasoning_feed.line_count(inner_width, pinned);
+    let scroll_from_bottom = app
+        .mission
+        .live_scroll
+        .sync_layout(total, viewport, inner_width);
+    crate::mission::reasoning_feed::render(
+        frame,
+        area,
+        &app.reasoning_feed,
+        scroll_from_bottom,
+        focused,
+        pinned,
+        app.theme,
     );
 }
 

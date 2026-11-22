@@ -129,6 +129,8 @@ pub(crate) struct MissionRows {
     pub live_body_lines: u16,
     /// Finished/Failed rows: 1 collapsed, more when expanded.
     pub finished: u16,
+    /// Cell width/height x 1000 (0 = unknown -> layout default).
+    pub cell_aspect_permille: u16,
 }
 
 /// Ratatui form of [`harw_tui_layout::MissionLayout`]: the same placement,
@@ -167,9 +169,7 @@ pub(crate) fn classify_mission(area: Rect, state: &PanelState, rows: MissionRows
     let layout = harw_tui_layout::classify_mission(harw_tui_layout::MissionInput {
         cols: area.width,
         rows: area.height,
-        // 0 = default cell aspect (500); the measured value follows with the
-        // portrait integration.
-        cell_aspect_permille: 0,
+        cell_aspect_permille: rows.cell_aspect_permille,
         status_rows: rows.status,
         composer_rows: rows.composer,
         live_body_lines_wanted: rows.live_body_lines,
@@ -620,6 +620,7 @@ mod tests {
             composer: 3,
             live_body_lines,
             finished: 1,
+            cell_aspect_permille: 0,
         }
     }
 
@@ -735,6 +736,7 @@ mod tests {
                         composer,
                         live_body_lines: wanted,
                         finished: 1,
+                        cell_aspect_permille: 0,
                     };
                     let out = classify_mission(Rect::new(0, 0, 46, height), &state, rows);
                     let ctx = format!("h={height} c={composer} w={wanted}");
@@ -761,6 +763,7 @@ mod tests {
                 composer: 28 - 1 - body,
                 live_body_lines: 2,
                 finished: 1,
+                cell_aspect_permille: 0,
             };
             classify_mission(Rect::new(0, 0, 46, 28), &state, rows)
         };

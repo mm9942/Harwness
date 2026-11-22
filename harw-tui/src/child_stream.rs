@@ -1671,6 +1671,11 @@ mod tests {
         let block = reg
             .attach_root_child(orch.as_str(), role_names::ROOT_ORCHESTRATOR)
             .ok_or(TestError::Missing("Block"))?;
+        // root-orchestrator ist ungedeckelt; hier gilt der kompakte Deckel.
+        block
+            .lock()
+            .map_err(|_| TestError::Unexpected("Sperre vergiftet".into()))?
+            .set_unbounded(false);
         for index in 0..10 {
             let call = ToolCallId::new();
             reg.apply(
@@ -1689,6 +1694,146 @@ mod tests {
         }
         let rendered = text(&render(&block)?);
         assert!(rendered.contains("… 7 earlier steps"), "{rendered}");
+        Ok(())
+    }
+
+    /// Legt einen `root-orchestrator`-Block an; `unbounded` schaltet den
+    /// Modus danach explizit (`false` = kompakter Deckel).
+    fn root_block(
+        reg: &mut ChildStreamRegistry,
+        unbounded: bool,
+    ) -> TestResult<(SessionId, SessionId, SharedChildBlock)> {
+        let root = SessionId::from_str("root-uia");
+        let orch = SessionId::from_str("child-orch-unbounded");
+        let block = reg
+            .attach_root_child(orch.as_str(), role_names::ROOT_ORCHESTRATOR)
+            .ok_or(TestError::Missing("Block"))?;
+        block
+            .lock()
+            .map_err(|_| TestError::Unexpected("Sperre vergiftet".into()))?
+            .set_unbounded(unbounded);
+        Ok((root, orch, block))
+    }
+
+    /// Füllt einen Block mit 40 Werkzeugen, 30 Textzeilen und langem
+    /// Live-Reasoning.
+    fn fill_block(
+        reg: &mut ChildStreamRegistry,
+        root: &SessionId,
+        orch: &SessionId,
+    ) {
+        for index in 0..40 {
+            let call = ToolCallId::new();
+            reg.apply(
+                orch,
+                Some(root),
+                role_names::ROOT_ORCHESTRATOR,
+                &tool_requested(&call, "shell.exec", json!({"cmd": ["echo", index]})),
+            );
+        }
+        let body = (0..30)
+            .map(|index| format!("- zeile {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        reg.apply(
+            orch,
+            Some(root),
+            role_names::ROOT_ORCHESTRATOR,
+            &assistant(&body),
+        );
+        let words = (0..600)
+            .map(|index| format!("wort{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        reg.apply(
+            orch,
+            Some(root),
+            role_names::ROOT_ORCHESTRATOR,
+            &TurnEvent::ReasoningDelta {
+                turn_id: TurnId::new(),
+                text: words,
+            },
+        );
+    }
+
+    /// Ein ungedeckelter Block zeigt alle Einträge, den ganzen Text und das
+    /// ganze Live-Reasoning ohne Kürzungsmarke.
+    #[test]
+    fn unbounded_block_renders_everything() -> TestResult {
+        let mut reg = registry(ChildStreamMode::Orchestrators);
+        let (root, orch, block) = root_block(&mut reg, true)?;
+        fill_block(&mut reg, &root, &orch);
+        {
+            let guard = block
+                .lock()
+                .map_err(|_| TestError::Unexpected("Sperre vergiftet".into()))?;
+            assert!(guard.is_unbounded());
+            assert_eq!(guard.entry_count(), 41, "40 Werkzeuge + Text");
+            assert_eq!(guard.dropped(), 0);
+        }
+        let rendered = text(&render(&block)?);
+        assert!(!rendered.contains("earlier steps"), "{rendered}");
+        assert!(!rendered.contains("older entries"), "{rendered}");
+        assert!(!rendered.contains("more lines)"), "{rendered}");
+        assert!(rendered.contains("zeile 0"), "{rendered}");
+        assert!(rendered.contains("zeile 29"), "{rendered}");
+        assert!(rendered.contains("wort0 "), "{rendered}");
+        assert!(rendered.contains("wort599"), "{rendered}");
+        let live = rendered.lines().filter(|line| line.contains("wort")).count();
+        assert!(live > LIVE_MAX_LINES, "Live-Reasoning vollständig: {live}");
+        Ok(())
+    }
+
+    /// Ein normaler Block kürzt weiter auf Eintrags-, Live- und
+    /// Textzeilen-Deckel.
+    #[test]
+    fn capped_block_still_truncates() -> TestResult {
+        let mut reg = registry(ChildStreamMode::Orchestrators);
+        let (root, orch, block) = root_block(&mut reg, false)?;
+        fill_block(&mut reg, &root, &orch);
+        {
+            let guard = block
+                .lock()
+                .map_err(|_| TestError::Unexpected("Sperre vergiftet".into()))?;
+            assert!(!guard.is_unbounded());
+            assert_eq!(guard.entry_count(), DEFAULT_VISIBLE_ENTRIES);
+            assert_eq!(guard.dropped(), 41 - DEFAULT_VISIBLE_ENTRIES);
+        }
+        let rendered = text(&render(&block)?);
+        assert!(rendered.contains("earlier steps"), "{rendered}");
+        assert!(rendered.contains("more lines)"), "{rendered}");
+        assert!(!rendered.contains("zeile 29"), "{rendered}");
+        let live = rendered.lines().filter(|line| line.contains("wort")).count();
+        assert_eq!(live, LIVE_MAX_LINES, "{rendered}");
+        Ok(())
+    }
+
+    /// Die Speichergrenzen gelten auch ungedeckelt und werden ehrlich
+    /// markiert.
+    #[test]
+    fn unbounded_memory_bounds_are_marked() -> TestResult {
+        let mut reg = registry(ChildStreamMode::Orchestrators);
+        let (_root, _orch, block) = root_block(&mut reg, true)?;
+        let mut guard = block
+            .lock()
+            .map_err(|_| TestError::Unexpected("Sperre vergiftet".into()))?;
+        for index in 0..UNBOUNDED_MAX_ENTRIES + 3 {
+            guard.push_entry(BlockEntry::Notice(format!("hinweis {index}")));
+        }
+        guard.push_live(true, &"x".repeat(UNBOUNDED_LIVE_MAX_BYTES + 10));
+        assert_eq!(guard.entry_count(), UNBOUNDED_MAX_ENTRIES);
+        assert_eq!(guard.dropped(), 3);
+        assert_eq!(guard.live_reasoning.len(), UNBOUNDED_LIVE_MAX_BYTES);
+        assert!(guard.live_reasoning_trimmed);
+        let rendered = text(&guard.display_lines(WIDTH, style::Theme::Dark));
+        assert!(
+            rendered.contains("… 3 older entries in /agent detail"),
+            "{}",
+            rendered.lines().next().unwrap_or_default()
+        );
+        assert!(!rendered.contains("hinweis 2\n"), "ältester fiel heraus");
+        assert!(rendered.contains(&format!("hinweis {}", UNBOUNDED_MAX_ENTRIES + 2)));
+        assert!(rendered.contains("∴ … "), "Live-Kürzungsmarke");
         Ok(())
     }
 

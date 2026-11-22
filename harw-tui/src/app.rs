@@ -1256,6 +1256,15 @@ pub struct ChatApp {
     /// Fußzeile mit Agentenzahlen unter dem Composer. Standardmäßig aus: die
     /// zusätzliche Zeile verschiebt die zellgenauen Fensteranker (PL-97 C2/C3).
     footer_counts_enabled: bool,
+    /// Hochformat-Fenster „Reasoning“: zeitlich geordneter Strom aller
+    /// Agenten (Root und Kinder), je Zeile mit der Rolle davor.
+    pub(crate) reasoning_feed: crate::mission::reasoning_feed::ReasoningFeed,
+    /// Seitenverhältnis einer Terminalzelle (Breite/Höhe ×1000) für die
+    /// quadratischen Agents/Jobs-Fenster; `0` = unbekannt (Vorgabe 500).
+    /// Gesetzt von [`Self::refresh_cell_aspect`].
+    pub(crate) cell_aspect_permille: Cell<u16>,
+    /// Feste Vorgabe aus `[harness.tui] cell_aspect` (schlägt die Messung).
+    cell_aspect_override: Option<u16>,
     /// Nächstes Bild zeichnet den ganzen Bildschirm neu (`Terminal::clear`
     /// vor `draw`): nach einer Größenänderung und auf `Ctrl+L`. ratatui
     /// schreibt sonst nur geänderte Zellen; zählt der Terminal-Emulator eine
@@ -1605,6 +1614,9 @@ impl ChatApp {
             last_history_visible_rows: Cell::new(20),
             last_regions: Cell::new(scroll_routing::FrameRegions::default()),
             footer_counts_enabled: false,
+            reasoning_feed: crate::mission::reasoning_feed::ReasoningFeed::new(),
+            cell_aspect_permille: Cell::new(0),
+            cell_aspect_override: None,
             full_redraw: Cell::new(false),
             managed_spawner: None,
             historic_agent_events: Vec::new(),
@@ -1865,6 +1877,41 @@ impl ChatApp {
     pub fn with_footer_counts(mut self, enabled: bool) -> Self {
         self.footer_counts_enabled = enabled;
         self
+    }
+
+    /// Feste Zellproportion aus `[harness.tui] cell_aspect` (Breite/Höhe,
+    /// z. B. `0.48`); `None` lässt [`Self::refresh_cell_aspect`] messen.
+    #[must_use]
+    pub fn with_cell_aspect(mut self, cell_aspect: Option<f32>) -> Self {
+        self.cell_aspect_override = cell_aspect
+            .filter(|value| value.is_finite() && *value > 0.0)
+            // Nach dem Klemmen liegt der Wert sicher in `u16`.
+            .map(|value| (f64::from(value) * 1000.0).round().clamp(200.0, 1500.0) as u16);
+        if let Some(permille) = self.cell_aspect_override {
+            self.cell_aspect_permille.set(permille);
+        }
+        self
+    }
+
+    /// Misst die Zellproportion über `TIOCGWINSZ` (Pixel- und Zellmaße),
+    /// sofern keine Vorgabe gesetzt ist. Liefert das Terminal keine
+    /// Pixelmaße (oder gar nichts, etwa unter `TestBackend`), bleibt `0`.
+    fn refresh_cell_aspect(&self) {
+        if let Some(permille) = self.cell_aspect_override {
+            self.cell_aspect_permille.set(permille);
+            return;
+        }
+        let permille = crossterm::terminal::window_size()
+            .ok()
+            .filter(|size| {
+                size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0
+            })
+            .map_or(0, |size| {
+                let num = u64::from(size.width) * u64::from(size.rows) * 1000;
+                let den = u64::from(size.height) * u64::from(size.columns);
+                u16::try_from((num / den).clamp(200, 1500)).unwrap_or(0)
+            });
+        self.cell_aspect_permille.set(permille);
     }
 
     /// Hides the named commands from this session's palette, tab-completion
@@ -2613,7 +2660,7 @@ impl ChatApp {
 
     /// PL-97 C2 (`Alt+L`): öffnet die Detailansicht des Agenten, den das
     /// LIVE-Fenster gerade zeigt (Fokus: Agenten-Panel), bzw. schließt sie
-    /// wieder. Im Hochformat ist LIVE selbst nie fokussiert.
+    /// wieder. Im Hochformat (Kasten „Reasoning“) immer maximiert.
     /// PL-97 C3: mit dem LIVE-Fenster der Querformat-Mittelspalte erscheinen
     /// die Details dort an Ort und Stelle, LIVE bekommt den Fokus.
     fn toggle_live_detail(&mut self) -> bool {
@@ -2918,6 +2965,14 @@ impl ChatApp {
                                 turn,
                             );
                         }
+                        // Vor `apply`: der Monitor kennt so noch das laufende
+                        // Werkzeug und die Phase vor dem Ereignis.
+                        feed_agent_event(
+                            &mut self.reasoning_feed,
+                            &self.agent_monitor,
+                            &self.session_id,
+                            &event,
+                        );
                         changed |= self.agent_monitor.apply(&event);
                         touched_agents.push(event.agent.as_str().to_owned());
                     }
@@ -3946,6 +4001,7 @@ impl ChatApp {
         self.ctrl_o_expand_last_armed = false;
         self.live_stream.clear();
         self.live_reasoning.clear();
+        self.reasoning_feed.clear();
         self.scroll.force_follow();
     }
 
@@ -5130,6 +5186,65 @@ fn export_tool_error(result: &ToolCallResult) -> Option<String> {
     }
 }
 
+/// Hochformat-„Reasoning“: Ausgang und einzeilige Kurzfassung eines
+/// abgeschlossenen Aufrufs (erste Zeile der Fehlermeldung, sonst leer).
+fn feed_tool_outcome(result: &ToolCallResult) -> (bool, String) {
+    match result {
+        ToolCallResult::Success { .. } => (true, String::new()),
+        ToolCallResult::Error { message } => (
+            false,
+            message.lines().next().unwrap_or_default().trim().to_owned(),
+        ),
+    }
+}
+
+/// Hochformat-„Reasoning“: überträgt ein Bus-Ereignis eines Kind-Agenten in
+/// den gemeinsamen Strom. Root-Ereignisse kommen über `handle_turn_event`
+/// (und den Turn-Lebenszyklus) und werden hier übersprungen, sonst stünden
+/// sie doppelt da. Muss **vor** [`crate::agent_monitor::AgentMonitor::apply`]
+/// laufen: der Werkzeugname eines Abschlusses stammt aus `current_tool`.
+fn feed_agent_event(
+    feed: &mut crate::mission::reasoning_feed::ReasoningFeed,
+    monitor: &crate::agent_monitor::AgentMonitor,
+    root: &SessionId,
+    event: &harw_core::AgentEvent,
+) {
+    if event.agent == *root {
+        return;
+    }
+    let agent = event.agent.as_str();
+    let role = event.role.as_str();
+    match &event.kind {
+        harw_core::AgentEventKind::Turn(TurnEvent::ReasoningDelta { text, .. }) => {
+            feed.push_reasoning(agent, role, text);
+        }
+        harw_core::AgentEventKind::Turn(TurnEvent::ToolCallRequested { tool_name, .. }) => {
+            feed.push_tool_start(agent, role, tool_name);
+        }
+        harw_core::AgentEventKind::Turn(TurnEvent::ToolCallCompleted { result, .. }) => {
+            let tool = monitor
+                .agent(agent)
+                .and_then(|live| live.current_tool.clone())
+                .unwrap_or_else(|| "tool".to_owned());
+            let (ok, summary) = feed_tool_outcome(result);
+            feed.push_tool_end(agent, role, &tool, ok, &summary);
+        }
+        harw_core::AgentEventKind::Orchestration(orch) => {
+            let ok = match orch.status {
+                AgentOrchestrationStatus::Completed => true,
+                AgentOrchestrationStatus::Failed | AgentOrchestrationStatus::Cancelled => false,
+                _ => return,
+            };
+            // Nur der Übergang zählt: wiederholte Endmeldungen desselben
+            // Laufs erzeugen keine zweite Zeile.
+            if monitor.agent(agent).is_some_and(|live| live.phase.is_active()) {
+                feed.push_finished(agent, role, ok);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn export_trust(trust: ResultTrust) -> String {
     match trust {
         ResultTrust::Untrusted => "untrusted".to_owned(),
@@ -5625,6 +5740,8 @@ pub(crate) async fn run_loop(
     app.operator_shell.set_waker(frame_req.clone());
     // PL-97 D5: ein fertiger DoD-Markenabruf weckt die Schleife.
     app.dod_mark_waker = Some(frame_req.clone());
+    // Hochformat: Zellproportion für die quadratischen Mission-Fenster.
+    app.refresh_cell_aspect();
 
     loop {
         // Runde 5, Teil B: außerhalb eines Turns darf kein sudo-Fenster offen
@@ -5818,6 +5935,7 @@ pub(crate) async fn run_loop(
                         }
                         TuiEvent::Resize(_, _) => {
                             app.full_redraw.set(true);
+                            app.refresh_cell_aspect();
                             frame_req.schedule_frame();
                         }
                     }
@@ -6540,6 +6658,7 @@ fn handle_turn_event_scoped(
             let surface_root_id = app.session_id().as_str().to_owned();
             app.agent_monitor
                 .surface_root_tool(&surface_root_id, "assistant", Some(&tool_name));
+            app.reasoning_feed.push_tool_start(&surface_root_id, "assistant", &tool_name);
             // PL-97 M3: Turn-Kennung für die Turn-Grenze des Reducers.
             let turn_key = turn_id.as_str().to_owned();
             // Runde 5, Teil O: Turn des Aufrufs für die Abbruch-Markierung.
@@ -6623,6 +6742,14 @@ fn handle_turn_event_scoped(
             let surface_root_id = app.session_id().as_str().to_owned();
             app.agent_monitor
                 .surface_root_tool(&surface_root_id, "assistant", None);
+            let (feed_ok, feed_summary) = feed_tool_outcome(&result);
+            app.reasoning_feed.push_tool_end(
+                &surface_root_id,
+                "assistant",
+                tool_name.as_deref().unwrap_or("tool.result"),
+                feed_ok,
+                &feed_summary,
+            );
             if !state.export_tool_calls.contains_key(&call_id) {
                 app.export_entries.push(export_tool_call_entry(
                     &call_id,
@@ -6721,6 +6848,8 @@ fn handle_turn_event_scoped(
         }
         TurnEvent::ReasoningDelta { text, .. } => {
             app.live_reasoning.push_str(&text);
+            let surface_root_id = app.session_id().as_str().to_owned();
+            app.reasoning_feed.push_reasoning(&surface_root_id, "assistant", &text);
             // Nur ein Schwanz bleibt vorgehalten — genug für die letzten
             // acht umbrochenen Zeilen auch auf breiten Terminals.
             let count = app.live_reasoning.chars().count();
@@ -6731,7 +6860,6 @@ fn handle_turn_event_scoped(
                     .skip(count - LIVE_REASONING_MAX_CHARS)
                     .collect();
             }
-            let surface_root_id = app.session_id().as_str().to_owned();
             app.agent_monitor.sync_surface_root_stream(
                 &surface_root_id,
                 "assistant",
@@ -7925,12 +8053,13 @@ fn handle_panel_key(app: &mut ChatApp, key: KeyEvent) -> Option<bool> {
             crate::panes::PaneFocus::Agents => handle_agents_list_key(app, key),
             crate::panes::PaneFocus::Jobs => handle_jobs_window_key(app, key),
             crate::panes::PaneFocus::Finished => handle_finished_window_key(app, key),
-            // PL-97 C3: LIVE ist nur als Fenster der Querformat-Mittelspalte
-            // fokussierbar; dort scrollt es, Enter zeigt/schließt die Details.
+            // PL-97 C3: LIVE scrollt; Enter zeigt/schließt die Details — in
+            // der Querformat-Mittelspalte an Ort und Stelle, im Hochformat
+            // (Kasten „Reasoning“) maximiert wie `Alt+L`.
             crate::panes::PaneFocus::Live
                 if key.code == KeyCode::Enter && key.modifiers.is_empty() =>
             {
-                app.toggle_live_detail_in_place()
+                app.toggle_live_detail()
             }
             crate::panes::PaneFocus::Live => {
                 crate::mission::live_window::handle_key(&mut app.mission, key)
@@ -8720,6 +8849,11 @@ async fn run_turn_streaming(
     let surface_failed = reply.is_err() && !surface_cancelled;
     app.agent_monitor
         .finish_surface_root(&surface_root_id, surface_cancelled, surface_failed);
+    app.reasoning_feed.push_finished(
+        &surface_root_id,
+        "assistant",
+        !surface_cancelled && !surface_failed,
+    );
     // Runde 5, Teil O: Abbruchgrund für spät verarbeitete `TurnAborted` merken.
     turn_safety::end_turn(app);
     app.active_cancel = None;
@@ -10364,6 +10498,7 @@ async fn drive_pauses_to_completion(
                     }
                     Some(TuiEvent::Resize(_, _)) => {
                         app.full_redraw.set(true);
+                        app.refresh_cell_aspect();
                         draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                     Some(TuiEvent::Draw) => {
