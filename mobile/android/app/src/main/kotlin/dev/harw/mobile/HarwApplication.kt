@@ -15,5 +15,6 @@ internal class HarwApplication : Application() {
         applyImageParallelEnv(readImageParallelPref(this))
         // Lokal startet von selbst, sobald ein Modell oder eine Netzwerk-Route nutzbar ist.
         localAutostart.start()
+        AppUpdates.schedule(this)
     }
 }

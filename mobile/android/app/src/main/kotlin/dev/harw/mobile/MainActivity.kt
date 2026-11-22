@@ -65,6 +65,7 @@ internal open class MainActivity : ComponentActivity() {
     private val approvalAuthorization = ApprovalAuthorization(this)
     private val stepUpAuthorization = StepUpAuthorization(this)
     private var themePref by mutableStateOf("system")
+    private var openUpdate by mutableStateOf(false)
     private val themeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == PREF_THEME) themePref = readThemePref(this)
     }
@@ -95,12 +96,14 @@ internal open class MainActivity : ComponentActivity() {
         }
         if (savedInstanceState == null) handleLink(intent)
         enableEdgeToEdge()
+        openUpdate = intent?.getBooleanExtra(ExtraOpenUpdate, false) == true
         themePref = readThemePref(this)
         getSharedPreferences(UI_PREFS, MODE_PRIVATE).registerOnSharedPreferenceChangeListener(themeListener)
         setContent {
             HarwTheme(dark = themeDarkOverride(themePref)) {
                 Surface(Modifier.fillMaxSize()) {
                     Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) { Workspace() }
+                    UpdateHost(openRequested = openUpdate)
                 }
             }
         }
@@ -109,6 +112,7 @@ internal open class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (intent.getBooleanExtra(ExtraOpenUpdate, false)) openUpdate = true
         handleLink(intent)
     }
 
