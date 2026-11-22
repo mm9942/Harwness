@@ -113,13 +113,7 @@ fn now_ms() -> u64 {
 
 impl Shared {
     /// The registered device-tool handles, for the on-device host assembly.
-    #[allow(dead_code)]
-    fn device_tools(
-        &self,
-    ) -> (
-        Option<Arc<dyn crate::ShellExecutor>>,
-        Option<Arc<dyn crate::FileAccess>>,
-    ) {
+    fn device_tools(&self) -> crate::device_tools::DeviceHandles {
         let handles = self.device.lock().unwrap_or_else(PoisonError::into_inner);
         (handles.shell.clone(), handles.files.clone())
     }
@@ -1019,7 +1013,14 @@ impl MobileCore {
                 tokio::time::sleep(LOCAL_STOP_POLL).await;
             }
             let backend =
-                match open_local(PathBuf::from(files_dir), keystore, requested_features()).await {
+                match open_local(
+                PathBuf::from(files_dir),
+                keystore,
+                requested_features(),
+                shared.device_tools(),
+            )
+            .await
+            {
                     Ok(backend) => backend,
                     Err(error) => {
                         fail_local(&shared, &run, error.to_string());

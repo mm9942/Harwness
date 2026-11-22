@@ -59,16 +59,16 @@ private const val ShaPreviewChars = 16
 private const val LegacyStorageMaxSdk = 29
 private const val NotificationPermissionMinSdk = 33
 
-private const val TextNotDownloaded = "Not downloaded"
-private const val TextVerifiedModel = "Pinned version, checksum verified"
-private const val TextNotChecked = "Downloaded, not checked"
-private const val TextInvalid = "Invalid file, delete and download again"
-private const val TextUnreadable = "Belongs to an earlier install, re-import"
-private const val TextInUse = "Active provider on this device"
-private const val TextUseHint = "Runs offline in standalone mode"
-private const val TextImportCancelled = "Import cancelled"
+private const val TextNotDownloaded = "Nicht heruntergeladen"
+private const val TextVerifiedModel = "Feste Version, Prüfsumme geprüft"
+private const val TextNotChecked = "Heruntergeladen, nicht geprüft"
+private const val TextInvalid = "Ungültige Datei, löschen und erneut herunterladen"
+private const val TextUnreadable = "Stammt aus einer früheren Installation, erneut importieren"
+private const val TextInUse = "Aktiver Provider auf diesem Gerät"
+private const val TextUseHint = "Läuft offline im Standalone-Modus"
+private const val TextImportCancelled = "Import abgebrochen"
 private const val TextOldFileKept =
-    "The old file could not be removed and still uses space. Delete it in a file manager."
+    "Die alte Datei konnte nicht entfernt werden und belegt noch Speicher. Lösche sie in einem Dateimanager."
 
 private fun gb(bytes: Long): String = String.format(Locale.US, "%.1f GB", bytes / BytesPerGb)
 
@@ -76,14 +76,14 @@ private fun downloadFraction(done: Long, total: Long): Float =
     if (total <= 0L) 0f else (done.toFloat() / total.toFloat()).coerceIn(0f, 1f)
 
 private fun noSpaceText(neededBytes: Long, freeBytes: Long): String =
-    "Not enough storage: needs ${neededBytes / BytesPerMb} MB, ${freeBytes / BytesPerMb} MB free"
+    "Nicht genug Speicher: benötigt ${neededBytes / BytesPerMb} MB, frei sind ${freeBytes / BytesPerMb} MB"
 
 private fun stateText(model: CatalogModel, local: LocalModel?): String =
     when (local?.state ?: ModelFileState.MISSING) {
         ModelFileState.MISSING -> TextNotDownloaded
         ModelFileState.PARTIAL -> {
             val done = local?.bytesOnDisk?.toLong() ?: 0L
-            "Partial, ${downloadPercent(done, model.sizeBytes.toLong())}%"
+            "Teilweise, ${downloadPercent(done, model.sizeBytes.toLong())}%"
         }
         ModelFileState.COMPLETE ->
             if (local?.verification == ModelVerification.VERIFIED) TextVerifiedModel else TextNotChecked
@@ -93,35 +93,35 @@ private fun stateText(model: CatalogModel, local: LocalModel?): String =
 
 private fun ownStateText(local: LocalModel): String = when (local.state) {
     ModelFileState.MISSING -> TextNotDownloaded
-    ModelFileState.PARTIAL -> "Partial, ${downloadPercent(local.bytesOnDisk.toLong(), local.sizeBytes.toLong())}%"
-    ModelFileState.COMPLETE -> "Ready"
+    ModelFileState.PARTIAL -> "Teilweise, ${downloadPercent(local.bytesOnDisk.toLong(), local.sizeBytes.toLong())}%"
+    ModelFileState.COMPLETE -> "Bereit"
     ModelFileState.INVALID -> TextInvalid
     ModelFileState.UNREADABLE -> TextUnreadable
 }
 
 private fun importPhaseText(phase: ImportPhase): String = when (phase) {
-    ImportPhase.Copying -> "Copying…"
-    ImportPhase.Verifying -> "Verifying…"
-    ImportPhase.Replacing -> "Replacing…"
+    ImportPhase.Copying -> "Kopiere …"
+    ImportPhase.Verifying -> "Prüfe …"
+    ImportPhase.Replacing -> "Ersetze …"
 }
 
 /** Message text and error flag for one import result. */
 private fun importResultText(result: ImportResult, fromReimport: Boolean): Pair<String, Boolean> = when (result) {
     is ImportResult.Imported -> {
-        val base = "${result.model.label} imported"
+        val base = "${result.model.label} importiert"
         if (fromReimport && !result.originalDeleted) "$base\n$TextOldFileKept" to false else base to false
     }
-    is ImportResult.AlreadyPresent -> "This model is already on the device" to false
+    is ImportResult.AlreadyPresent -> "Dieses Modell ist bereits auf dem Gerät" to false
     is ImportResult.Mismatch -> String.format(
         Locale.US,
-        "File does not match catalog entry %1\$s (size %2\$s instead of %3\$s)",
+        "Datei passt nicht zum Katalogeintrag %1\$s (Größe %2\$s statt %3\$s)",
         result.label,
         gb(result.actualSize),
         gb(result.expectedSize),
     ) to true
     is ImportResult.NoSpace -> noSpaceText(result.neededBytes, result.freeBytes) to true
-    ImportResult.NotGguf -> "Not a GGUF file" to true
-    ImportResult.Busy -> "A download is running, try again when it is done" to false
+    ImportResult.NotGguf -> "Keine GGUF-Datei" to true
+    ImportResult.Busy -> "Ein Download läuft, versuche es danach erneut" to false
     ImportResult.Cancelled -> TextImportCancelled to false
     is ImportResult.Failed -> result.message to true
 }
@@ -174,7 +174,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
             locals = manager.local()
             activeLocalId = manager.activeLocal(context.filesDir.path)
         } catch (e: MobileException) {
-            show(e.message ?: "Could not read models", error = true)
+            show(e.message ?: "Modelle konnten nicht gelesen werden", error = true)
         }
     }
 
@@ -195,9 +195,9 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
             try {
                 manager.useLocal(context.filesDir.path, modelId)
                 activeLocalId = modelId
-                show("Active provider is now the model on this device")
+                show("Aktiver Provider ist jetzt das Modell auf diesem Gerät")
             } catch (e: MobileException) {
-                show(e.message ?: "Could not select the model", error = true)
+                show(e.message ?: "Modell konnte nicht ausgewählt werden", error = true)
             }
         }
     }
@@ -205,9 +205,9 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
     fun startDownload(modelId: String) {
         when (ModelDownloads.start(context, modelId)) {
             StartResult.Started -> show(null)
-            StartResult.AlreadyRunning -> show("A download is already running", error = true)
-            StartResult.Refused -> show("The system did not allow the download to start", error = true)
-            StartResult.UnknownModel -> show("Unknown model", error = true)
+            StartResult.AlreadyRunning -> show("Ein Download läuft bereits", error = true)
+            StartResult.Refused -> show("Das System hat den Download nicht gestartet", error = true)
+            StartResult.UnknownModel -> show("Unbekanntes Modell", error = true)
         }
     }
 
@@ -237,7 +237,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
             } catch (_: CancellationException) {
                 show(TextImportCancelled)
             } catch (e: MobileException) {
-                show(e.message ?: "Import failed", error = true)
+                show(e.message ?: "Import fehlgeschlagen", error = true)
             } finally {
                 importJob = null
                 importProgress = null
@@ -250,7 +250,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
         runImport {
             val found = modelImport.findForeignModels(treeUri)
             if (found.isEmpty()) {
-                show("No models found in this folder")
+                show("In diesem Ordner wurden keine Modelle gefunden")
                 showDocumentsFallback = true
                 return@runImport
             }
@@ -301,11 +301,11 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
         when (val state = downloads) {
             is ModelDownloadState.Finished -> {
                 when (val result = state.result) {
-                    is DownloadResult.Done -> show("${result.model.label} downloaded. $TextVerifiedModel")
+                    is DownloadResult.Done -> show("${result.model.label} heruntergeladen. $TextVerifiedModel")
                     is DownloadResult.NoSpace -> show(noSpaceText(result.neededBytes, result.freeBytes), error = true)
                     is DownloadResult.Failed -> show(result.message, error = true)
-                    DownloadResult.Cancelled -> show("Download paused")
-                    DownloadResult.WaitingForNetwork -> show("Waiting for Wi-Fi")
+                    DownloadResult.Cancelled -> show("Download pausiert")
+                    DownloadResult.WaitingForNetwork -> show("Warte auf WLAN")
                 }
                 reload()
             }
@@ -317,8 +317,8 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
     pendingDelete?.let { target ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("Delete model?") },
-            text = { Text("${target.label} will be removed from this device.") },
+            title = { Text("Modell löschen?") },
+            text = { Text("${target.label} wird von diesem Gerät entfernt.") },
             confirmButton = {
                 TextButton(onClick = {
                     pendingDelete = null
@@ -327,13 +327,13 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                             manager.delete(target.id)
                             show(null)
                         } catch (e: MobileException) {
-                            show(e.message ?: "Could not delete model", error = true)
+                            show(e.message ?: "Modell konnte nicht gelöscht werden", error = true)
                         }
                         reload()
                     }
-                }) { Text("Delete") }
+                }) { Text("Löschen") }
             },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Keep") } },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Behalten") } },
         )
     }
 
@@ -344,7 +344,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
     val ownModels = locals.filter { it.origin == ModelOrigin.IMPORTED }
 
     Column(Modifier.fillMaxSize()) {
-        HarwHeader(title = "Models", onBack = onBack) {}
+        HarwHeader(title = "Modelle", onBack = onBack) {}
         if (!ready) return@Column
         LazyColumn(
             Modifier.fillMaxSize(),
@@ -354,7 +354,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Wi-Fi only", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                        Text("Nur im WLAN", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
                         Switch(
                             checked = wifiOnly,
                             enabled = !downloadActive,
@@ -366,15 +366,15 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(enabled = !busy, onClick = { treeLauncher.launch(modelImport.reimportTreeIntent()) }) {
-                            Text("Re-import models")
+                            Text("Modelle erneut importieren")
                         }
                         OutlinedButton(enabled = !busy, onClick = { fileLauncher.launch(modelImport.importFileIntent()) }) {
-                            Text("Import GGUF")
+                            Text("GGUF importieren")
                         }
                     }
                     if (showDocumentsFallback) {
                         OutlinedButton(enabled = !busy, onClick = { treeLauncher.launch(modelImport.documentsTreeIntent()) }) {
-                            Text("Choose Documents folder")
+                            Text("Ordner „Dokumente“ wählen")
                         }
                     }
                 }
@@ -384,7 +384,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             val progress = importProgress
-                            Text(progress?.let { importPhaseText(it.phase) } ?: "Copying…", style = MaterialTheme.typography.bodyMedium)
+                            Text(progress?.let { importPhaseText(it.phase) } ?: "Kopiere …", style = MaterialTheme.typography.bodyMedium)
                             if (progress != null && progress.phase == ImportPhase.Copying && progress.total > 0L) {
                                 LinearProgressIndicator(
                                     progress = { downloadFraction(progress.done, progress.total) },
@@ -393,7 +393,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                             } else {
                                 LinearProgressIndicator(Modifier.fillMaxWidth())
                             }
-                            OutlinedButton(onClick = { importJob?.cancel() }) { Text("Cancel") }
+                            OutlinedButton(onClick = { importJob?.cancel() }) { Text("Abbrechen") }
                         }
                     }
                 }
@@ -412,7 +412,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                             if (model.recommended) {
                                 Surface(shape = MaterialTheme.shapes.small, color = MaterialTheme.colorScheme.primaryContainer) {
                                     Text(
-                                        "Recommended",
+                                        "Empfohlen",
                                         Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -430,7 +430,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                             )
                         }
                         Text(
-                            "Needs ${gb(model.minRamBytes.toLong())} RAM, device has ${gb(totalRam)}",
+                            "Benötigt ${gb(model.minRamBytes.toLong())} RAM, Gerät hat ${gb(totalRam)}",
                             style = MaterialTheme.typography.bodySmall,
                             color = if (totalRam in 1 until model.minRamBytes.toLong()) {
                                 MaterialTheme.colorScheme.error
@@ -442,44 +442,44 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                             current is ModelDownloadState.Running && current.modelId == model.id -> {
                                 if (current.phase == DownloadPhase.Verifying) {
                                     LinearProgressIndicator(Modifier.fillMaxWidth())
-                                    Text("Verifying…", style = MaterialTheme.typography.bodySmall)
+                                    Text("Prüfe …", style = MaterialTheme.typography.bodySmall)
                                 } else {
                                     LinearProgressIndicator(
                                         progress = { downloadFraction(current.done, current.total) },
                                         modifier = Modifier.fillMaxWidth(),
                                     )
                                     Text(
-                                        "Downloading ${downloadPercent(current.done, current.total)}%",
+                                        "Lade herunter ${downloadPercent(current.done, current.total)}%",
                                         style = MaterialTheme.typography.bodySmall,
                                     )
                                 }
-                                OutlinedButton(onClick = { ModelDownloads.pause(context) }) { Text("Pause") }
+                                OutlinedButton(onClick = { ModelDownloads.pause(context) }) { Text("Pausieren") }
                             }
                             current is ModelDownloadState.WaitingForNetwork && current.modelId == model.id -> {
-                                Text("Waiting for Wi-Fi", style = MaterialTheme.typography.bodySmall)
+                                Text("Warte auf WLAN", style = MaterialTheme.typography.bodySmall)
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Button(enabled = !importing, onClick = { requestDownload(model.id) }) { Text("Resume") }
-                                    OutlinedButton(onClick = { ModelDownloads.pause(context) }) { Text("Pause") }
+                                    Button(enabled = !importing, onClick = { requestDownload(model.id) }) { Text("Fortsetzen") }
+                                    OutlinedButton(onClick = { ModelDownloads.pause(context) }) { Text("Pausieren") }
                                 }
                             }
                             current is ModelDownloadState.Paused && current.modelId == model.id -> {
-                                Text("Paused", style = MaterialTheme.typography.bodySmall)
-                                Button(enabled = !busy, onClick = { requestDownload(model.id) }) { Text("Resume") }
+                                Text("Pausiert", style = MaterialTheme.typography.bodySmall)
+                                Button(enabled = !busy, onClick = { requestDownload(model.id) }) { Text("Fortsetzen") }
                             }
                             else -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 if (state == ModelFileState.UNREADABLE) {
                                     Button(enabled = !busy, onClick = { treeLauncher.launch(modelImport.reimportTreeIntent()) }) {
-                                        Text("Re-import")
+                                        Text("Erneut importieren")
                                     }
                                 } else if (state != ModelFileState.COMPLETE) {
                                     Button(enabled = !busy, onClick = { requestDownload(model.id) }) {
-                                        Text(if (state == ModelFileState.PARTIAL) "Resume" else "Download")
+                                        Text(if (state == ModelFileState.PARTIAL) "Fortsetzen" else "Herunterladen")
                                     }
                                 } else if (activeLocalId != model.id) {
-                                    Button(enabled = !busy, onClick = { useModel(model.id) }) { Text("Use") }
+                                    Button(enabled = !busy, onClick = { useModel(model.id) }) { Text("Verwenden") }
                                 }
                                 if (state != ModelFileState.MISSING && local != null) {
-                                    OutlinedButton(enabled = !busy, onClick = { pendingDelete = local }) { Text("Delete") }
+                                    OutlinedButton(enabled = !busy, onClick = { pendingDelete = local }) { Text("Löschen") }
                                 }
                             }
                         }
@@ -491,7 +491,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(local.label, style = MaterialTheme.typography.titleMedium)
                         Text(gb(local.sizeBytes.toLong()), style = MaterialTheme.typography.bodyMedium)
-                        Text("Own model, not verified", style = MaterialTheme.typography.bodyMedium)
+                        Text("Eigenes Modell, nicht geprüft", style = MaterialTheme.typography.bodyMedium)
                         Text(ownStateText(local), style = MaterialTheme.typography.bodyMedium)
                         local.sha256?.let { sha ->
                             val expanded = expandedSha == local.id
@@ -507,10 +507,10 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                                 if (activeLocalId == local.id) {
                                     Text(TextInUse, style = MaterialTheme.typography.bodySmall)
                                 } else {
-                                    Button(enabled = !busy, onClick = { useModel(local.id) }) { Text("Use") }
+                                    Button(enabled = !busy, onClick = { useModel(local.id) }) { Text("Verwenden") }
                                 }
                             }
-                            OutlinedButton(enabled = !busy, onClick = { pendingDelete = local }) { Text("Delete") }
+                            OutlinedButton(enabled = !busy, onClick = { pendingDelete = local }) { Text("Löschen") }
                         }
                     }
                 }

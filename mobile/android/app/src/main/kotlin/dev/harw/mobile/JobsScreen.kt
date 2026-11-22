@@ -68,9 +68,9 @@ internal fun JobsScreen(
         HarwHeader(title = "Jobs", onBack = onBack) {}
         failure?.let { StatusMessage("Job abbrechen: $it", Modifier.padding(horizontal = 12.dp, vertical = 4.dp), error = true) }
         if (snapshot == null) {
-            StatusMessage("Not connected to this session.", Modifier.padding(12.dp))
+            StatusMessage("Nicht mit dieser Session verbunden.", Modifier.padding(12.dp))
         } else if (snapshot.jobs.isEmpty()) {
-            StatusMessage("No jobs in this session.", Modifier.padding(12.dp))
+            StatusMessage("Keine Jobs in dieser Session.", Modifier.padding(12.dp))
         } else {
             val rows = remember(snapshot.jobs) { jobRows(snapshot.jobs) }
             val now = System.currentTimeMillis()

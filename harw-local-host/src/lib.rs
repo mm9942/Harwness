@@ -48,7 +48,7 @@ use harw_authority::FileWriteScope;
 use harw_core::{AgentSession, ModelProvider, StateStore, TranscriptStateStore};
 use harw_registry_defaults::{IdentityOverrides, RegistryProfile};
 use harw_runtime::{
-    EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeSpec, RuntimeStores,
+    AssemblyContributor, EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeSpec, RuntimeStores,
     permissions_for_tier,
 };
 use harw_session_driver::{CoreDriverConfig, CoreTurnDriver, DriverBridgeError};
@@ -131,6 +131,18 @@ impl LocalOwner {
     }
 }
 
+/// Types an embedder needs to write an extra tool contributor, so it does not
+/// need its own dependencies on the runtime crates.
+pub mod ext {
+    pub use harw_extension_api::ToolProvider;
+    pub use harw_runtime::{AssemblyContributor, AssemblyInputs, AssemblyParts, RuntimeResult};
+    pub use harw_tools::{
+        FunctionToolSpec, JsonSchema, JsonSchemaType, ToolCall, ToolExecutionContext,
+        ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput, ToolSpec, ToolsError,
+        serde_json,
+    };
+}
+
 /// Rights ceiling for hosted sessions. The registry profile is always
 /// `RegistryProfile::Full`: `EntryKind::SessionHost` exposes operation model
 /// tools, and `harw-runtime/src/assembly.rs:1065` rejects any narrower profile.
@@ -195,6 +207,9 @@ pub struct LocalCoreFactory {
     /// Approval actor override (remote ingress: the one device allowed to
     /// resolve approvals). `None` = the creator's actor, else the owner's.
     actor: Option<ApprovalActor>,
+    /// Extra assembly contributors (e.g. the phone's device tools), applied to
+    /// every hosted session after the default ones.
+    contributors: Vec<Arc<dyn AssemblyContributor>>,
 }
 
 impl std::fmt::Debug for LocalCoreFactory {
@@ -246,7 +261,15 @@ impl LocalCoreFactory {
             owner_actor,
             rights: HostRights::operator(),
             actor: None,
+            contributors: Vec::new(),
         }
+    }
+
+    /// Adds an assembly contributor (extra tools) to every hosted session.
+    #[must_use]
+    pub fn with_contributor(mut self, contributor: Arc<dyn AssemblyContributor>) -> Self {
+        self.contributors.push(contributor);
+        self
     }
 
     /// Binds the sessions' approval actor to `actor` (designated approver of
@@ -287,7 +310,7 @@ impl LocalCoreFactory {
             principal,
             ..self.base_spec.clone()
         };
-        let assembly = RuntimeAssembly::builder(spec)
+        let mut builder = RuntimeAssembly::builder(spec)
             .model(ModelSource::Override(Arc::clone(&self.model)))
             .stores(RuntimeStores {
                 state_store: Arc::clone(&self.store),
@@ -307,7 +330,11 @@ impl LocalCoreFactory {
                     |admission| self.rights.tier.min(admission.maximum_tier()),
                 )),
                 workspace_root: self.rights.workspace_root.clone(),
-            })
+            });
+        for contributor in &self.contributors {
+            builder = builder.contributor(Arc::clone(contributor));
+        }
+        let assembly = builder
             .build()
             .map_err(|error| runtime(error.to_string()))?;
         let root = assembly
@@ -504,6 +531,19 @@ impl LocalHost {
         config: LocalHostConfig,
         model: Arc<dyn ModelProvider>,
     ) -> Result<Self, LocalHostError> {
+        Self::open_with_contributors(config, model, Vec::new())
+    }
+
+    /// Like [`Self::open`], with extra assembly contributors (extra tools)
+    /// mounted on every hosted session.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    pub fn open_with_contributors(
+        config: LocalHostConfig,
+        model: Arc<dyn ModelProvider>,
+        contributors: Vec<Arc<dyn AssemblyContributor>>,
+    ) -> Result<Self, LocalHostError> {
         std::fs::create_dir_all(&config.workspace).map_err(|error| {
             LocalHostError::Setup(format!("{}: {error}", config.workspace.display()))
         })?;
@@ -514,7 +554,10 @@ impl LocalHost {
         private_dir(&host_state_dir).map_err(LocalHostError::Setup)?;
         let stores =
             open_durable_stores(&sessions_root, &host_state_dir).map_err(LocalHostError::Setup)?;
-        let factory = config.core_factory(model);
+        let mut factory = config.core_factory(model);
+        for contributor in contributors {
+            factory = factory.with_contributor(contributor);
+        }
         let driver = CoreTurnDriver::with_factory(
             CoreDriverConfig::new(sessions_root),
             Arc::new(factory),

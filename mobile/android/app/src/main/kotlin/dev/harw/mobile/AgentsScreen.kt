@@ -81,11 +81,11 @@ internal fun AgentsScreen(
         )
     }
     Column(Modifier.fillMaxSize()) {
-        HarwHeader(title = "Agents", onBack = onBack) {}
+        HarwHeader(title = "Agenten", onBack = onBack) {}
         failure?.let { StatusMessage("Agent stoppen: $it", Modifier.padding(horizontal = 12.dp, vertical = 4.dp), error = true) }
         when {
-            snapshot == null -> StatusMessage("Not connected to this session.")
-            snapshot.agents.isEmpty() -> StatusMessage("No agents in this session.")
+            snapshot == null -> StatusMessage("Nicht mit dieser Session verbunden.")
+            snapshot.agents.isEmpty() -> StatusMessage("Keine Agenten in dieser Session.")
             else -> {
                 val rows = remember(snapshot.agents) { agentRows(snapshot.agents) }
                 val nowMs = System.currentTimeMillis()

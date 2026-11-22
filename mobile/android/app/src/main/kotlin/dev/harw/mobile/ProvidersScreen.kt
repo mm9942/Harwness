@@ -160,6 +160,10 @@ internal fun ProvidersScreen(
             }
             if (mode == ProviderMode.ChatGpt) {
                 ChatgptDirectCard(store)
+            } else if (mode == ProviderMode.Codex) {
+                CodexDirectCard(store, onOpenConnection)
+            } else if (mode == ProviderMode.Claude) {
+                ClaudeDirectCard(store, onOpenConnection)
             } else if (mode != ProviderMode.Api) {
                 ModeInfo(mode, onOpenConnection, onOpenLocalModels)
             }
@@ -388,7 +392,8 @@ private enum class ProviderMode(val label: String) {
     ChatGpt("ChatGPT direkt"),
     Api("API"),
     Device("Auf diesem Gerät"),
-    Runtime("Codex / Claude"),
+    Codex("Codex"),
+    Claude("Claude"),
 }
 
 @Composable
@@ -413,15 +418,7 @@ private fun ModeInfo(mode: ProviderMode, onOpenConnection: () -> Unit, onOpenLoc
                     )
                     Button(onClick = onOpenLocalModels) { Text("Lokale Modelle öffnen") }
                 }
-                ProviderMode.Runtime -> {
-                    Text("Codex / Claude auf dem Rechner", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "Verbinde die App mit der harw-Instanz auf deinem Rechner, auf der Codex oder Claude " +
-                            "laufen. Anbieter und Modelle des Rechners verwaltest du danach unter " +
-                            "„Modelle & Provider“.",
-                    )
-                    Button(onClick = onOpenConnection) { Text("Mit Rechner verbinden") }
-                }
+                ProviderMode.Codex, ProviderMode.Claude -> Unit
                 ProviderMode.Api -> Unit
             }
         }

@@ -49,12 +49,12 @@ class ConnectionRouteTest {
 
     @Test
     fun badgeTextNamesTheRoute() {
-        assertEquals("Live · onion", connectionBadgeText(ConnectionPhase.CONNECTED, false, ConnectionRoute.ONION))
-        assertEquals("Live · direct", connectionBadgeText(ConnectionPhase.CONNECTED, false, ConnectionRoute.DIRECT))
-        assertEquals("Connecting · onion", connectionBadgeText(ConnectionPhase.CONNECTING, false, ConnectionRoute.ONION))
+        assertEquals("Live · Onion", connectionBadgeText(ConnectionPhase.CONNECTED, false, ConnectionRoute.ONION))
+        assertEquals("Live · direkt", connectionBadgeText(ConnectionPhase.CONNECTED, false, ConnectionRoute.DIRECT))
+        assertEquals("Verbinde · Onion", connectionBadgeText(ConnectionPhase.CONNECTING, false, ConnectionRoute.ONION))
         assertEquals("Live", connectionBadgeText(ConnectionPhase.CONNECTED, false, null))
-        assertEquals("Stopping", connectionBadgeText(ConnectionPhase.CONNECTED, true, ConnectionRoute.ONION))
-        assertEquals("Failed", connectionBadgeText(ConnectionPhase.FAILED, false, ConnectionRoute.ONION))
+        assertEquals("Wird beendet", connectionBadgeText(ConnectionPhase.CONNECTED, true, ConnectionRoute.ONION))
+        assertEquals("Fehlgeschlagen", connectionBadgeText(ConnectionPhase.FAILED, false, ConnectionRoute.ONION))
     }
 
     @Test
@@ -72,7 +72,7 @@ class ConnectionRouteTest {
         assertTrue(loading!!.contains("45%"))
         assertTrue(loading.contains("loading directory"))
         assertEquals(
-            "Tor ready · reaching the .onion service",
+            "Tor bereit · erreiche den .onion-Dienst",
             torProgressText(tor(100U, true), ConnectionPhase.CONNECTING, ConnectionRoute.ONION),
         )
         assertNull(torProgressText(tor(100U, true), ConnectionPhase.CONNECTED, ConnectionRoute.ONION))

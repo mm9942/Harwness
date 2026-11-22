@@ -11,17 +11,18 @@ rust-version.workspace = true
 [dependencies]
 harw-authority = { path = "../harw-authority" }
 harw-core = { path = "../harw-core" }
+harw-extension-api = { path = "../harw-extension-api" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 # Phone-portable: no `browser` default feature (concept AP 1.1).
 harw-runtime = { path = "../harw-runtime", default-features = false }
 harw-session-driver = { path = "../harw-session-driver" }
 harw-session-host = { path = "../harw-session-host" }
 harw-session-store = { path = "../harw-session-store" }
+harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 thiserror = "2"
 
 [dev-dependencies]
-harw-extension-api = { path = "../harw-extension-api" }
 harw-protocol = { path = "../harw-protocol" }
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

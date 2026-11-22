@@ -211,9 +211,9 @@ internal fun SessionConversation(
     if (confirmingInterrupt) {
         AlertDialog(
             onDismissRequest = { confirmingInterrupt = false },
-            title = { Text("Interrupt this session?") },
-            text = { Text("The server stops whichever execution is active in this session when it receives the request.") },
-            dismissButton = { TextButton(onClick = { confirmingInterrupt = false }) { Text("Cancel") } },
+            title = { Text("Diese Session unterbrechen?") },
+            text = { Text("Der Server stoppt die gerade aktive Ausführung dieser Session, sobald er die Anfrage erhält.") },
+            dismissButton = { TextButton(onClick = { confirmingInterrupt = false }) { Text("Abbrechen") } },
             confirmButton = {
                 Button(
                     enabled = active && snapshot?.canInterrupt == true && turnId != null && !interruptPending,
@@ -221,7 +221,7 @@ internal fun SessionConversation(
                         confirmingInterrupt = false
                         if (generation != null && turnId != null) connection.interrupt(sessionId, generation, turnId)
                     },
-                ) { Text("Interrupt session") }
+                ) { Text("Session unterbrechen") }
             },
         )
     }
@@ -232,7 +232,7 @@ internal fun SessionConversation(
             when (sessionFreshness(state.online, state.generation, view?.generation)) {
                 SessionFreshness.Live -> Unit
                 SessionFreshness.Stale -> StatusMessage(
-                    "Showing an older state – waiting for the server to resync",
+                    "Älterer Stand wird angezeigt – warte auf den Abgleich mit dem Server",
                     Modifier.padding(horizontal = 15.dp, vertical = 4.dp),
                 )
                 SessionFreshness.Offline -> StatusMessage(
@@ -325,9 +325,9 @@ internal fun SessionConversation(
                 liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
                 jumpToLatest = transcriptJump,
                 emptyMessage = when {
-                    snapshot == null && state.online -> "Opening session…"
-                    !active -> "Waiting for a live session."
-                    else -> "No messages yet."
+                    snapshot == null && state.online -> "Session wird geöffnet …"
+                    !active -> "Warte auf eine aktive Session."
+                    else -> "Noch keine Nachrichten."
                 },
                 modifier = Modifier.weight(1f).fillMaxWidth(),
             )
@@ -396,10 +396,10 @@ private fun ConversationFeed(
         }
         items(reversed, key = { "entry-${it.id}" }) { entry ->
             val label = when (entry.kind) {
-                TranscriptKind.USER -> "You"
+                TranscriptKind.USER -> "Du"
                 TranscriptKind.ASSISTANT -> "Harw"
-                TranscriptKind.TOOL -> entry.toolState?.let { "Tool · ${it.displayName()}" } ?: "Tool"
-                TranscriptKind.ERROR -> "Error"
+                TranscriptKind.TOOL -> entry.toolState?.let { "Werkzeug · ${it.displayName()}" } ?: "Werkzeug"
+                TranscriptKind.ERROR -> "Fehler"
             }
             MessageBlock(label, entry.text, entry.kind)
         }
@@ -553,10 +553,10 @@ private fun PromptComposer(
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         draft.error?.let { StatusMessage(it, error = true) }
         if (draft.uncertain) {
-            StatusMessage("Delivery unknown – check the transcript before resending", error = true)
+            StatusMessage("Zustellung unbekannt – prüfe den Verlauf, bevor du erneut sendest", error = true)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                OutlinedButton(onClick = onReview) { Text("Review latest transcript") }
-                TextButton(enabled = !draft.sending, onClick = onDiscard) { Text("Discard draft") }
+                OutlinedButton(onClick = onReview) { Text("Neuesten Verlauf ansehen") }
+                TextButton(enabled = !draft.sending, onClick = onDiscard) { Text("Entwurf verwerfen") }
             }
         }
         if (draft.images.isNotEmpty()) {
@@ -594,7 +594,7 @@ private fun PromptComposer(
                 if (busy) {
                     CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp)
                 } else {
-                    Icon(Icons.AutoMirrored.Outlined.Send, "Send message")
+                    Icon(Icons.AutoMirrored.Outlined.Send, "Nachricht senden")
                 }
             }
         }
@@ -618,10 +618,10 @@ private fun ApprovalStrip(count: Int, canDecide: Boolean, onClick: () -> Unit, m
         ) {
             Icon(Icons.Outlined.Security, contentDescription = null, Modifier.size(18.dp))
             Text(
-                if (count == 1) "Approval requested" else "$count approvals requested",
+                if (count == 1) "Freigabe angefragt" else "$count Freigaben angefragt",
                 modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelLarge,
             )
-            Text(if (canDecide) "Review" else "View", style = MaterialTheme.typography.labelMedium)
+            Text(if (canDecide) "Prüfen" else "Ansehen", style = MaterialTheme.typography.labelMedium)
         }
     }
 }
@@ -643,7 +643,7 @@ private fun ApprovalScreen(
     ) {
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
-                HarwHeader("Approval", onBack = onClose) {}
+                HarwHeader("Freigabe", onBack = onClose) {}
                 val now by rememberTicker(true)
                 val remainingMs = approvalRemainingMs(approval.timeoutAt, now)
                 val expired = remainingMs != null && remainingMs <= 0L
@@ -653,10 +653,10 @@ private fun ApprovalScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     item {
-                        Text("Review the request", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                        Text("Anfrage prüfen", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                     }
                     item {
-                        Text("${approval.risk.displayName()} risk", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleSmall)
+                        Text("Risiko: ${approval.risk.displayName()}", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleSmall)
                     }
                     item {
                         SelectionContainer { Text(approval.summary, style = MaterialTheme.typography.bodyLarge) }
@@ -664,13 +664,13 @@ private fun ApprovalScreen(
                     remainingMs?.let { ms ->
                         item {
                             if (ms <= 0L) {
-                                Text("Expired", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+                                Text("Abgelaufen", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
                             } else {
-                                Text("Expires in ${formatRemaining(ms)}", style = MaterialTheme.typography.bodySmall)
+                                Text("Läuft ab in ${formatRemaining(ms)}", style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
-                    if (!allowed) item { StatusMessage("This device cannot decide this approval in the current connection.") }
+                    if (!allowed) item { StatusMessage("Dieses Gerät kann diese Freigabe in der aktuellen Verbindung nicht entscheiden.") }
                     failure?.let { failureText -> item { StatusMessage(failureText, error = true) } }
                     item {
                         Column(Modifier.selectableGroup(), verticalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -701,11 +701,11 @@ private fun ApprovalScreen(
                     horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    TextButton(onClick = onClose) { Text("Close") }
+                    TextButton(onClick = onClose) { Text("Schließen") }
                     Button(
                         enabled = allowed && !busy && !expired && choice != null,
                         onClick = { if (choice != null) onDecide(choice) },
-                    ) { Text(if (busy) "Confirming…" else "Confirm decision") }
+                    ) { Text(if (busy) "Wird bestätigt …" else "Entscheidung bestätigen") }
                 }
             }
         }
@@ -720,12 +720,12 @@ internal fun SessionActivityPanel(state: WorkspaceState, session: MobileSession?
         modifier, contentPadding = PaddingValues(13.dp),
         verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
-        item { Text("Activity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold) }
+        item { Text("Aktivität", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold) }
         item { StatusMessage(sessionStatus(state, session, view)) }
         snapshot?.lastSyncMillis?.let { millis ->
             item {
                 val time = Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).format(ShortTime)
-                Text("Last synced $time", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Zuletzt abgeglichen $time", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         items(tools, key = { it.id }) { tool ->
@@ -738,33 +738,33 @@ internal fun SessionActivityPanel(state: WorkspaceState, session: MobileSession?
 }
 
 private fun sessionStatus(state: WorkspaceState, session: MobileSession?, view: WindowState?): String = when {
-    !state.online -> "Offline · Read-only"
-    view?.snapshot?.online != true -> "Attaching…"
-    view.snapshot.approvals.isNotEmpty() -> "Waiting for approval"
-    view.snapshot.runningTurnId != null -> "Turn running"
-    else -> session?.state?.displayName() ?: "Ready"
+    !state.online -> "Offline · Nur lesen"
+    view?.snapshot?.online != true -> "Verbinde mit Session …"
+    view.snapshot.approvals.isNotEmpty() -> "Wartet auf Freigabe"
+    view.snapshot.runningTurnId != null -> "Antwort läuft"
+    else -> session?.state?.displayName() ?: "Bereit"
 }
 
 private fun toolSummary(entry: TranscriptEntry): String = listOfNotNull(entry.toolState?.displayName(), entry.text.takeIf { it.isNotBlank() })
     .joinToString(" · ")
 
 private fun MobileToolState.displayName() = when (this) {
-    MobileToolState.RUNNING -> "Running"
-    MobileToolState.DONE -> "Finished"
-    MobileToolState.FAILED -> "Failed"
+    MobileToolState.RUNNING -> "Läuft"
+    MobileToolState.DONE -> "Fertig"
+    MobileToolState.FAILED -> "Fehlgeschlagen"
 }
 
 private fun ApprovalRisk.displayName() = when (this) {
-    ApprovalRisk.LOW -> "Low"
-    ApprovalRisk.MEDIUM -> "Medium"
-    ApprovalRisk.HIGH -> "High"
-    ApprovalRisk.CRITICAL -> "Critical"
+    ApprovalRisk.LOW -> "Niedrig"
+    ApprovalRisk.MEDIUM -> "Mittel"
+    ApprovalRisk.HIGH -> "Hoch"
+    ApprovalRisk.CRITICAL -> "Kritisch"
 }
 
 internal fun ApprovalDecision.displayName() = when (this) {
-    ApprovalDecision.APPROVED_ONCE -> "Allow once"
-    ApprovalDecision.APPROVED -> "Approve"
-    ApprovalDecision.REJECTED -> "Deny"
+    ApprovalDecision.APPROVED_ONCE -> "Einmal erlauben"
+    ApprovalDecision.APPROVED -> "Genehmigen"
+    ApprovalDecision.REJECTED -> "Ablehnen"
 }
 
 private val ShortTime = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT)

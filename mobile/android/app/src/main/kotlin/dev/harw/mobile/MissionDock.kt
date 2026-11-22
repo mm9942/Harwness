@@ -146,9 +146,9 @@ private fun CardTitle(text: String) {
 private fun AgentsCard(agents: List<MobileAgent>, now: State<Long>, modifier: Modifier) {
     OutlinedCard(modifier, shape = CARD_SHAPE) {
         Column(Modifier.padding(SPACING), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            CardTitle("Agents · ${activeAgents(agents)} active")
+            CardTitle("Agenten · ${activeAgents(agents)} aktiv")
             if (agents.isEmpty()) {
-                Text("No agents yet", style = MaterialTheme.typography.bodySmall)
+                Text("Noch keine Agenten", style = MaterialTheme.typography.bodySmall)
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     items(agents, key = { it.id }) { AgentRow(it, now) }
@@ -202,9 +202,9 @@ private fun AgentRow(agent: MobileAgent, now: State<Long>) {
 private fun JobsCard(jobs: List<MobileJob>, modifier: Modifier) {
     OutlinedCard(modifier, shape = CARD_SHAPE) {
         Column(Modifier.padding(SPACING), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            CardTitle("Jobs · ${activeJobs(jobs)} active")
+            CardTitle("Jobs · ${activeJobs(jobs)} aktiv")
             if (jobs.isEmpty()) {
-                Text("No jobs yet", style = MaterialTheme.typography.bodySmall)
+                Text("Noch keine Jobs", style = MaterialTheme.typography.bodySmall)
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     items(jobs, key = { it.workId }) { JobRow(it) }

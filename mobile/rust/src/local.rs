@@ -17,8 +17,9 @@ pub(crate) async fn open_local(
     files_dir: PathBuf,
     keystore: Arc<dyn PlatformKeystore>,
     features: Vec<String>,
+    device: crate::device_tools::DeviceHandles,
 ) -> Result<Backend, MobileError> {
-    let _ = (files_dir, keystore, features);
+    let _ = (files_dir, keystore, features, device);
     Err(MobileError::Session {
         detail: LOCAL_HOST_UNAVAILABLE.into(),
     })
@@ -37,6 +38,7 @@ pub(crate) async fn open_local(
     files_dir: PathBuf,
     keystore: Arc<dyn PlatformKeystore>,
     features: Vec<String>,
+    device: crate::device_tools::DeviceHandles,
 ) -> Result<Backend, MobileError> {
     use crate::{home::AppHome, providers::ProviderStore};
 
@@ -48,7 +50,15 @@ pub(crate) async fn open_local(
     let model = tokio::task::spawn_blocking(move || build_active_model(&model_home, &resolver))
         .await
         .map_err(|_| host_task_failed())??;
-    open_local_with_model(home, model, features).await
+    // The device tools follow the profile switch (off by default for the on-device model).
+    let (shell, files) = device;
+    let mut contributors: Vec<Arc<dyn harw_local_host::ext::AssemblyContributor>> = Vec::new();
+    if (shell.is_some() || files.is_some()) && home.device_tools_enabled()? {
+        contributors.push(Arc::new(crate::device_tools::DeviceToolsContributor::new(
+            shell, files,
+        )));
+    }
+    open_local_with_tools(home, model, features, contributors).await
 }
 
 /// The model of the active selection: the GGUF on this device when that is the
@@ -90,12 +100,24 @@ fn build_local_gguf(
     Ok(Arc::new(provider))
 }
 
-/// Starts the host over `model`, connects as its owner and says hello.
+/// Starts the host over `model` without device tools.
 #[cfg(feature = "local-host")]
 pub(crate) async fn open_local_with_model(
     home: crate::home::AppHome,
     model: Arc<dyn harw_core::ModelProvider>,
     features: Vec<String>,
+) -> Result<Backend, MobileError> {
+    open_local_with_tools(home, model, features, Vec::new()).await
+}
+
+/// Starts the host over `model` with extra tool contributors, connects as its
+/// owner and says hello.
+#[cfg(feature = "local-host")]
+async fn open_local_with_tools(
+    home: crate::home::AppHome,
+    model: Arc<dyn harw_core::ModelProvider>,
+    features: Vec<String>,
+    contributors: Vec<Arc<dyn harw_local_host::ext::AssemblyContributor>>,
 ) -> Result<Backend, MobileError> {
     use harw_protocol::{
         SessionPort,
@@ -103,8 +125,10 @@ pub(crate) async fn open_local_with_model(
     };
 
     let config = home.local_host_config();
-    let host = tokio::task::spawn_blocking(move || harw_local_host::LocalHost::open(config, model))
-        .await
+    let host = tokio::task::spawn_blocking(move || {
+        harw_local_host::LocalHost::open_with_contributors(config, model, contributors)
+    })
+    .await
         .map_err(|_| host_task_failed())?
         .map_err(|e| MobileError::Internal {
             detail: e.to_string(),
@@ -227,6 +251,7 @@ mod tests {
             PathBuf::from("/nonexistent"),
             MemoryKeystore::new(),
             Vec::new(),
+            (None, None),
         )
         .await;
         assert!(matches!(

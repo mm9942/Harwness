@@ -1,5 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="app_name">Harw</string>
+    <string name="connection_channel">Harw-Verbindung</string>
+    <string name="notification_title">Harw-Arbeitsbereich</string>
+    <string name="notification_connecting">Verbinde mit deinem Harw-Server</string>
+    <string name="notification_connected">Verbindung aktiv</string>
+    <string name="notification_reconnecting">Warte auf Wiederverbindung</string>
+    <string name="notification_reconnecting_attempt">Warte auf Wiederverbindung (Versuch %1$d)</string>
+    <string name="notification_battery">Hintergrund erlauben</string>
+    <string name="notification_disconnecting">Verbindung wird getrennt</string>
+    <string name="notification_forgetting">Gespeicherte Telefon-Einrichtung wird entfernt</string>
+    <string name="notification_stop">Trennen</string>
+
     <!-- Projects screen (ProjectsScreen.kt) -->
     <string name="projects_title">Projekte</string>
     <string name="projects_search_hint">Projekte suchen</string>
@@ -48,4 +60,5 @@
     <string name="notification_approval_text">Eine Session wartet auf deine Freigabe</string>
     <string name="notification_turn_done_title">Antwort fertig</string>
     <string name="notification_turn_done_text">Eine Session hat ihre Antwort fertig geschrieben</string>
+    <string name="model_download_channel">Modell-Downloads</string>
 </resources>

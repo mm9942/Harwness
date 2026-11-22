@@ -148,21 +148,21 @@ internal fun QrScanDialog(onDismiss: () -> Unit, onImport: (ScannedProfile) -> U
     ) {
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
-                HarwHeader("Pair with server", onBack = onDismiss) {}
+                HarwHeader("Mit Server koppeln", onBack = onDismiss) {}
                 StepRow(phase)
                 when (val current = scanned) {
                     null -> Column(
                         Modifier.weight(1f).fillMaxWidth().padding(horizontal = 20.dp, vertical = 17.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Text("Scan the pairing code", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+                        Text("Kopplungscode scannen", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                         QrScanner(
                             modifier = Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(22.dp)),
                             onScanned = { scanned = it; lastRejection = null },
                             onRejected = { lastRejection = it },
                         )
-                        StatusMessage("Point the camera at the QR code shown by your harw server.")
-                        lastRejection?.let { StatusMessage("Not a valid pairing code: $it", error = true) }
+                        StatusMessage("Richte die Kamera auf den QR-Code deines harw-Servers.")
+                        lastRejection?.let { StatusMessage("Kein gültiger Kopplungscode: $it", error = true) }
                     }
                     else -> ConfirmContent(
                         scanned = current,
@@ -205,14 +205,14 @@ private fun ConfirmContent(scanned: ScannedProfile, modifier: Modifier, onRescan
         contentPadding = PaddingValues(horizontal = 20.dp, vertical = 17.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        item { Text("Confirm the server", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold) }
-        item { Field("Label", profile.label) }
-        item { Field("Endpoint", profile.endpoint, mono = true) }
+        item { Text("Server bestätigen", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold) }
+        item { Field("Bezeichnung", profile.label) }
+        item { Field("Endpunkt", profile.endpoint, mono = true) }
         profile.onion?.let { onion -> item { Field("Onion", onion, mono = true) } }
-        item { Field("Server node ID", profile.serverNodeId, mono = true) }
+        item { Field("Server-Knoten-ID", profile.serverNodeId, mono = true) }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Fingerprint", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleSmall)
+                Text("Fingerabdruck", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.titleSmall)
                 Text(
                     scanned.fingerprint,
                     style = MaterialTheme.typography.headlineSmall,
@@ -221,11 +221,11 @@ private fun ConfirmContent(scanned: ScannedProfile, modifier: Modifier, onRescan
                 )
             }
         }
-        item { StatusMessage("Compare this fingerprint with the one shown on your server.") }
+        item { StatusMessage("Vergleiche diesen Fingerabdruck mit dem auf deinem Server.") }
         item {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedButton(onClick = onRescan, modifier = Modifier.weight(1f)) { Text("Scan again") }
-                Button(onClick = onImport, modifier = Modifier.weight(1f)) { Text("Import") }
+                OutlinedButton(onClick = onRescan, modifier = Modifier.weight(1f)) { Text("Erneut scannen") }
+                Button(onClick = onImport, modifier = Modifier.weight(1f)) { Text("Importieren") }
             }
         }
     }

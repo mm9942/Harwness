@@ -179,6 +179,11 @@ pub use workbench_tools::{
 ///   Fan-out-Deckung gilt deshalb nur noch für Werkzeuge, die **dieses Crate**
 ///   selbst registriert (`read_only_profile_tools_registered_here_stay_auto_approved`).
 pub const AUTO_APPROVED_TOOLS: &[&str] = &[
+    // Lesende Geraete-Werkzeuge der Handy-App (nur in freigegebenen SAF-Ordnern).
+    "device_roots",
+    "device_list",
+    "device_read",
+    "device_search",
     // Lesende Dateisystem-Werkzeuge (`harw-tool-fs`).
     //
     // `fs.search` bleibt vorerst auto-freigegeben: der Symlink-Escape-Befund
@@ -541,6 +546,9 @@ pub const ALWAYS_ASK_TOOLS: &[&str] = &[
     // mit Nachfrage, auch gegen eine Allow-Regel (`harw-tool-job`).
     "job.suspend",
     "job.resume",
+    // Android app: one Termux command on the phone (`mobile/rust/src/device_tools.rs`).
+    // The owner confirms every call; an allow rule never skips the question.
+    "termux_run",
 ];
 
 /// Werkzeug, dessen Remote-OCR-Versand eine eigene Freigabe braucht.

@@ -88,9 +88,9 @@ internal fun ConnectionScreen(
     if (confirmForget) {
         AlertDialog(
             onDismissRequest = { confirmForget = false },
-            title = { Text("Forget phone setup?") },
-            text = { Text("Harw will remove this phone’s saved identity and server profile. Set up the phone again before reconnecting.") },
-            dismissButton = { TextButton(onClick = { confirmForget = false }) { Text("Cancel") } },
+            title = { Text("Telefon-Einrichtung vergessen?") },
+            text = { Text("Harw entfernt die gespeicherte Identität und das Serverprofil dieses Telefons. Richte das Telefon neu ein, bevor du dich wieder verbindest.") },
+            dismissButton = { TextButton(onClick = { confirmForget = false }) { Text("Abbrechen") } },
             confirmButton = {
                 Button(
                     enabled = state.canForget,
@@ -98,12 +98,12 @@ internal fun ConnectionScreen(
                         confirmForget = false
                         onForgetSetup()
                     },
-                ) { Text("Forget setup") }
+                ) { Text("Einrichtung vergessen") }
             },
         )
     }
     Column(Modifier.fillMaxSize()) {
-        HarwHeader(title = "Connection", onBack = onBack.takeIf { canGoBack }) {
+        HarwHeader(title = "Verbindung", onBack = onBack.takeIf { canGoBack }) {
             ConnectionBadge(state)
         }
         BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
@@ -115,9 +115,9 @@ internal fun ConnectionScreen(
             ) {
                 if (state.profile == null && state.canSetUp) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Pair this phone", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+                        Text("Dieses Telefon koppeln", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Use a public enrollment code or file to register this phone, then scan or import the profile from your server operator.",
+                            "Registriere dieses Telefon mit einem öffentlichen Anmeldecode oder einer Anmeldedatei und scanne oder importiere dann das Profil von deinem Server-Betreiber.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -125,36 +125,36 @@ internal fun ConnectionScreen(
                 }
                 val device: @Composable () -> Unit = {
                     val node = state.deviceNodeId
-                    SetupCard(Icons.Outlined.Key, "This phone") {
+                    SetupCard(Icons.Outlined.Key, "Dieses Telefon") {
                         Text(
-                            if (node == null) "Create and save the phone’s public enrollment file."
-                            else "Enrollment key ${node.take(16)}",
+                            if (node == null) "Erstelle und speichere die öffentliche Anmeldedatei des Telefons."
+                            else "Anmeldeschlüssel ${node.take(16)}",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(enabled = state.canSetUp, onClick = onShowEnrollmentQr) {
-                                Text("Show enrollment QR")
+                                Text("Anmelde-QR anzeigen")
                             }
                             OutlinedButton(enabled = state.canSetUp, onClick = onExport) {
-                                Text("Export enrollment")
+                                Text("Anmeldedatei exportieren")
                             }
                         }
                     }
                 }
                 val profile: @Composable () -> Unit = {
                     val saved = state.profile
-                    SetupCard(Icons.Outlined.Dns, saved?.label ?: "Harw server") {
+                    SetupCard(Icons.Outlined.Dns, saved?.label ?: "Harw-Server") {
                         if (saved == null) {
                             Text(
-                                "Import the server profile to set the address and verify its identity.",
+                                "Importiere das Serverprofil, um die Adresse festzulegen und die Identität zu prüfen.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Text(
-                                    "Direct  ${saved.endpoint}",
+                                    "Direkt  ${saved.endpoint}",
                                     style = MaterialTheme.typography.bodyMedium,
                                     fontFamily = FontFamily.Monospace,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -184,22 +184,22 @@ internal fun ConnectionScreen(
                             OutlinedButton(
                                 enabled = state.canSetUp && !state.hasConnection && !state.stopping && !scanning,
                                 onClick = onScanProfile,
-                            ) { Text("Scan server QR") }
+                            ) { Text("Server-QR scannen") }
                             OutlinedButton(
                                 enabled = state.canSetUp && !state.hasConnection && !state.stopping,
                                 onClick = onImport,
                             ) {
                                 Icon(Icons.Outlined.Description, contentDescription = null, Modifier.size(17.dp))
-                                Text(if (saved == null) "Import profile" else "Replace profile", Modifier.padding(start = 7.dp))
+                                Text(if (saved == null) "Profil importieren" else "Profil ersetzen", Modifier.padding(start = 7.dp))
                             }
                             if (state.hasConnection || state.stopping) {
-                                Button(onClick = onDisconnect, enabled = !state.stopping) { Text("Disconnect") }
+                                Button(onClick = onDisconnect, enabled = !state.stopping) { Text("Trennen") }
                             } else {
                                 Button(onClick = onConnect, enabled = saved != null && state.canSetUp) {
                                     Text(when (state.phase) {
-                                        ConnectionPhase.FAILED -> "Try again"
-                                        ConnectionPhase.REVOKED -> "Connect again"
-                                        else -> "Connect"
+                                        ConnectionPhase.FAILED -> "Erneut versuchen"
+                                        ConnectionPhase.REVOKED -> "Erneut verbinden"
+                                        else -> "Verbinden"
                                     })
                                 }
                             }
@@ -228,7 +228,7 @@ internal fun ConnectionScreen(
                 if (state.setupPending) {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                        Text("Preparing setup", style = MaterialTheme.typography.bodyMedium)
+                        Text("Einrichtung wird vorbereitet", style = MaterialTheme.typography.bodyMedium)
                     }
                 }
                 state.setupNotice?.let { StatusMessage(it) }
@@ -240,14 +240,14 @@ internal fun ConnectionScreen(
                 state.cleanupError?.let {
                     StatusMessage(it, error = true)
                     OutlinedButton(enabled = !state.setupPending, onClick = onRetryCleanup) {
-                        Text(if (state.forgetRequired) "Retry cleanup" else "Retry check")
+                        Text(if (state.forgetRequired) "Bereinigung wiederholen" else "Prüfung wiederholen")
                     }
                 }
                 if (state.canForget) {
-                    OutlinedButton(onClick = { confirmForget = true }) { Text("Forget phone setup") }
+                    OutlinedButton(onClick = { confirmForget = true }) { Text("Telefon-Einrichtung vergessen") }
                 }
                 if (notificationDenied) {
-                    StatusMessage("Notifications are off. You can disconnect from this screen.")
+                    StatusMessage("Benachrichtigungen sind aus. Du kannst die Verbindung auf diesem Bildschirm trennen.")
                 }
             }
         }
@@ -265,12 +265,12 @@ internal fun EnrollmentQrDialog(bitmap: android.graphics.Bitmap, onClose: () -> 
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text("Phone enrollment QR", style = MaterialTheme.typography.titleMedium)
+                    Text("Anmelde-QR des Telefons", style = MaterialTheme.typography.titleMedium)
                     Image(
-                        bitmap.asImageBitmap(), contentDescription = "Public Harw phone enrollment code",
+                        bitmap.asImageBitmap(), contentDescription = "Öffentlicher Harw-Anmeldecode des Telefons",
                         modifier = Modifier.size(imageSize), filterQuality = FilterQuality.None,
                     )
-                    TextButton(onClick = onClose) { Text("Done") }
+                    TextButton(onClick = onClose) { Text("Fertig") }
                 }
             }
         }
@@ -299,14 +299,14 @@ private fun ChatgptAccountCard(
     consent?.let { selected ->
         AlertDialog(
             onDismissRequest = { consent = null },
-            title = { Text("Link ChatGPT to ${selected.label}?") },
+            title = { Text("ChatGPT mit ${selected.label} verknüpfen?") },
             text = {
                 Text(
-                    "Continue only if you control ${selected.label} (${selected.endpoint}). " +
-                        "Harw will send the approved ChatGPT credentials to this verified server so it can run your eligible requests.",
+                    "Fahre nur fort, wenn du ${selected.label} (${selected.endpoint}) kontrollierst. " +
+                        "Harw sendet die freigegebenen ChatGPT-Zugangsdaten an diesen geprüften Server, damit er deine berechtigten Anfragen ausführen kann.",
                 )
             },
-            dismissButton = { TextButton(onClick = { consent = null }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { consent = null }) { Text("Abbrechen") } },
             confirmButton = {
                 ContinueWithChatgpt(target == selected && account.operation == null) {
                     consent = null
@@ -318,9 +318,9 @@ private fun ChatgptAccountCard(
     unlink?.let { selected ->
         AlertDialog(
             onDismissRequest = { unlink = null },
-            title = { Text("Unlink ChatGPT from ${selected.label}?") },
-            text = { Text("This removes the linked account from the selected Harw server.") },
-            dismissButton = { TextButton(onClick = { unlink = null }) { Text("Cancel") } },
+            title = { Text("ChatGPT von ${selected.label} trennen?") },
+            text = { Text("Das entfernt das verknüpfte Konto vom ausgewählten Harw-Server.") },
+            dismissButton = { TextButton(onClick = { unlink = null }) { Text("Abbrechen") } },
             confirmButton = {
                 Button(
                     enabled = target == selected && account.operation == null,
@@ -328,54 +328,54 @@ private fun ChatgptAccountCard(
                         unlink = null
                         onUnlink(selected)
                     },
-                ) { Text("Unlink account") }
+                ) { Text("Konto trennen") }
             },
         )
     }
     if (account.showPlanNotice) {
         AlertDialog(
             onDismissRequest = onDismissNotice,
-            title = { Text("ChatGPT plan available") },
+            title = { Text("ChatGPT-Abo verfügbar") },
             text = {
                 Text(
-                    "Eligible Harw requests on ${profile.label} can use your ChatGPT plan. " +
-                        "You can manage access and limits in ChatGPT settings.",
+                    "Berechtigte Harw-Anfragen auf ${profile.label} können dein ChatGPT-Abo nutzen. " +
+                        "Zugriff und Limits verwaltest du in den ChatGPT-Einstellungen.",
                 )
             },
-            confirmButton = { Button(onClick = onDismissNotice) { Text("Got it") } },
+            confirmButton = { Button(onClick = onDismissNotice) { Text("Verstanden") } },
         )
     }
 
-    SetupCard(Icons.Outlined.AccountCircle, "ChatGPT account") {
+    SetupCard(Icons.Outlined.AccountCircle, "ChatGPT-Konto") {
         val unavailable = account.unavailable
         val status = when (account.operation) {
-            ChatgptOperation.Checking -> "Checking account on ${profile.label}…"
-            ChatgptOperation.Browser -> "Complete sign-in and review access in your browser."
-            ChatgptOperation.Validating -> "Verifying your ChatGPT authorization…"
-            ChatgptOperation.Linking -> "Linking your account to ${profile.label}…"
-            ChatgptOperation.Unlinking -> "Unlinking your account from ${profile.label}…"
+            ChatgptOperation.Checking -> "Konto auf ${profile.label} wird geprüft …"
+            ChatgptOperation.Browser -> "Schließe die Anmeldung ab und prüfe den Zugriff in deinem Browser."
+            ChatgptOperation.Validating -> "ChatGPT-Autorisierung wird geprüft …"
+            ChatgptOperation.Linking -> "Konto wird mit ${profile.label} verknüpft …"
+            ChatgptOperation.Unlinking -> "Konto wird von ${profile.label} getrennt …"
             null -> when {
-                target == null -> "Connect to ${profile.label} to manage ChatGPT access."
+                target == null -> "Verbinde dich mit ${profile.label}, um den ChatGPT-Zugriff zu verwalten."
                 unavailable != null -> unavailable
-                account.linked == true -> "Linked to ${profile.label}"
-                account.linked == false -> "Use your ChatGPT plan for eligible Harw requests on ${profile.label}."
-                else -> "Check whether ${profile.label} can link a ChatGPT account."
+                account.linked == true -> "Verknüpft mit ${profile.label}"
+                account.linked == false -> "Nutze dein ChatGPT-Abo für berechtigte Harw-Anfragen auf ${profile.label}."
+                else -> "Prüfe, ob ${profile.label} ein ChatGPT-Konto verknüpfen kann."
             }
         }
         Text(status, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         account.error?.let { StatusMessage(it, error = true) }
         if (account.operation in setOf(ChatgptOperation.Browser, ChatgptOperation.Validating)) {
-            OutlinedButton(onClick = onCancel) { Text("Cancel sign-in") }
+            OutlinedButton(onClick = onCancel) { Text("Anmeldung abbrechen") }
         } else if (target != null && account.operation == null) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (account.canStartSignIn()) {
                     ContinueWithChatgpt { consent = target }
                 } else if (account.linked == true) {
-                    OutlinedButton(onClick = { unlink = target }) { Text("Unlink account") }
-                    TextButton(onClick = onManage) { Text("Manage usage") }
+                    OutlinedButton(onClick = { unlink = target }) { Text("Konto trennen") }
+                    TextButton(onClick = onManage) { Text("Nutzung verwalten") }
                 }
                 if (account.linked != false || account.error != null || unavailable != null) {
-                    TextButton(onClick = onCheck) { Text("Check account") }
+                    TextButton(onClick = onCheck) { Text("Konto prüfen") }
                 }
             }
         }
@@ -390,7 +390,7 @@ private fun ContinueWithChatgpt(enabled: Boolean = true, onClick: () -> Unit) {
         enabled = enabled,
         colors = ButtonDefaults.buttonColors(containerColor = colors.onSurface, contentColor = colors.surface),
     ) {
-        Text("Continue with ChatGPT")
+        Text("Weiter mit ChatGPT")
     }
 }
 
@@ -406,7 +406,7 @@ internal fun HarwHeader(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         if (onBack != null) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Back") }
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Zurück") }
         } else {
             Surface(shape = RoundedCornerShape(11.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
                 Image(painterResource(R.drawable.harw_mark), contentDescription = null, Modifier.padding(6.dp).size(27.dp))
@@ -475,7 +475,7 @@ private fun SetupCard(icon: ImageVector, title: String, content: @Composable () 
 private val ROUTE_CHOICES = listOf(
     RoutePreference.AUTO to "Auto",
     RoutePreference.ONION to "Tor (.onion)",
-    RoutePreference.DIRECT to "Direct",
+    RoutePreference.DIRECT to "Direkt",
 )
 
 /** Routes a saved profile offers, in display order; empty without a profile. */
@@ -494,31 +494,31 @@ internal fun routeChoiceEnabled(choice: RoutePreference, profile: ServerProfile?
 
 /** Badge label for the connection phase, with the active route while a link is being made or live. */
 internal fun connectionBadgeText(phase: ConnectionPhase, stopping: Boolean, route: ConnectionRoute?): String {
-    if (stopping) return "Stopping"
+    if (stopping) return "Wird beendet"
     val base = when (phase) {
         ConnectionPhase.DISCONNECTED -> "Offline"
-        ConnectionPhase.CONNECTING -> "Connecting"
+        ConnectionPhase.CONNECTING -> "Verbinde"
         ConnectionPhase.CONNECTED -> "Live"
-        ConnectionPhase.RECONNECTING -> "Reconnecting"
-        ConnectionPhase.FAILED -> "Failed"
-        ConnectionPhase.REVOKED -> "Access stopped"
+        ConnectionPhase.RECONNECTING -> "Verbinde erneut"
+        ConnectionPhase.FAILED -> "Fehlgeschlagen"
+        ConnectionPhase.REVOKED -> "Zugriff beendet"
     }
     val routed = phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.CONNECTED ||
         phase == ConnectionPhase.RECONNECTING
     if (!routed || route == null) return base
     return base + when (route) {
-        ConnectionRoute.ONION -> " · onion"
-        ConnectionRoute.DIRECT -> " · direct"
+        ConnectionRoute.ONION -> " · Onion"
+        ConnectionRoute.DIRECT -> " · direkt"
     }
 }
 
 /** Tor bootstrap status line, or null when there is nothing to show. */
 internal fun torProgressText(tor: TorBootstrap?, phase: ConnectionPhase, route: ConnectionRoute?): String? {
     if (tor == null) return null
-    tor.blocked?.let { return "Tor blocked: $it" }
-    if (!tor.ready) return "Tor bootstrap ${tor.percent}% · ${tor.summary}"
+    tor.blocked?.let { return "Tor blockiert: $it" }
+    if (!tor.ready) return "Tor-Start ${tor.percent}% · ${tor.summary}"
     val dialing = phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.RECONNECTING
-    return if (route == ConnectionRoute.ONION && dialing) "Tor ready · reaching the .onion service" else null
+    return if (route == ConnectionRoute.ONION && dialing) "Tor bereit · erreiche den .onion-Dienst" else null
 }
 
 /** Shortened display form of an onion locator: first 6 characters, then the port. */

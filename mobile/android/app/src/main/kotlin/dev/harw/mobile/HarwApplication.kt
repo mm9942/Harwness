@@ -4,4 +4,10 @@ import android.app.Application
 
 internal class HarwApplication : Application() {
     val connection by lazy { HarwConnection(applicationContext) }
+
+    override fun onCreate() {
+        super.onCreate()
+        // Der Codex-Provider liest $HOME/.codex/auth.json (siehe CodexDirect.kt).
+        ensureCodexHome(this)
+    }
 }

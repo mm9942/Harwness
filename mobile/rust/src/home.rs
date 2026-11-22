@@ -24,6 +24,8 @@ const KEY_MODEL: &str = "default_model";
 pub(crate) const LOCAL_ROUTE_ID: &str = "local-gguf";
 /// File in the state dir that holds the models directory of the on-device model.
 const LOCAL_MODELS_DIR_FILE: &str = "local-gguf-dir";
+/// File in the state dir that holds the explicit device-tools switch ("on"/"off").
+const DEVICE_TOOLS_FILE: &str = "device-tools";
 
 fn internal(detail: impl Into<String>) -> MobileError {
     MobileError::Internal {
@@ -246,6 +248,35 @@ impl AppHome {
             .active_route()?
             .filter(|(provider, model)| provider == LOCAL_ROUTE_ID && !model.is_empty())
             .map(|(_, model)| model))
+    }
+
+    /// Whether the agent's device tools are mounted: an explicit choice wins, else
+    /// off while the on-device model is the active provider and on otherwise.
+    pub(crate) fn device_tools_enabled(&self) -> Result<bool, MobileError> {
+        let explicit = fs::read_to_string(self.state_dir().join(DEVICE_TOOLS_FILE))
+            .ok()
+            .and_then(|text| match text.trim() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            });
+        match explicit {
+            Some(enabled) => Ok(enabled),
+            None => Ok(self.active_local_model()?.is_none()),
+        }
+    }
+
+    /// Sets (`Some`) or clears (`None`) the explicit device-tools choice.
+    pub(crate) fn set_device_tools_setting(&self, enabled: Option<bool>) -> Result<(), MobileError> {
+        let path = self.state_dir().join(DEVICE_TOOLS_FILE);
+        match enabled {
+            Some(on) => write_private_atomic(&path, if on { b"on" } else { b"off" }),
+            None => match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(io_error(&path, &e)),
+            },
+        }
     }
 
     pub(crate) fn clear_active_route_if(&self, provider: &str) -> Result<(), MobileError> {

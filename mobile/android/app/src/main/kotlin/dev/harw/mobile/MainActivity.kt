@@ -369,7 +369,7 @@ internal open class MainActivity : ComponentActivity() {
         try {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://chatgpt.com/settings/usage")))
         } catch (_: Exception) {
-            Toast.makeText(this, "Android could not open ChatGPT usage settings.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Android konnte die ChatGPT-Nutzungseinstellungen nicht öffnen.", Toast.LENGTH_SHORT).show()
         }
     }
 

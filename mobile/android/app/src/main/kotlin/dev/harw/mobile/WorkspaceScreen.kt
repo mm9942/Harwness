@@ -103,10 +103,10 @@ internal fun WorkspaceScreen(
                 ConnectionBadge(state)
                 if (sessionId != null) {
                     IconButton(onClick = { onNewWindow(sessionId) }) {
-                        Icon(Icons.Outlined.OpenInNew, "Open session in a new window")
+                        Icon(Icons.Outlined.OpenInNew, "Session in neuem Fenster öffnen")
                     }
                 }
-                IconButton(onClick = onOpenSettings) { Icon(Icons.Outlined.Settings, "Connection settings") }
+                IconButton(onClick = onOpenSettings) { Icon(Icons.Outlined.Settings, "Verbindungseinstellungen") }
             }
             Row(Modifier.fillMaxSize()) {
                 if ((split || sessionId == null) && projectView != null && projectActions != null) {
@@ -160,7 +160,7 @@ internal fun WorkspaceScreen(
                     }
                 } else if (split) {
                     Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
-                        DirectoryEmpty("Select a session to open its chat.")
+                        DirectoryEmpty("Wähle eine Session, um den Chat zu öffnen.")
                     }
                 }
             }
@@ -194,13 +194,13 @@ private fun SessionDirectory(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            IconButton(onClick = onRefresh, enabled = state.online) { Icon(Icons.Outlined.Refresh, "Refresh sessions") }
+            IconButton(onClick = onRefresh, enabled = state.online) { Icon(Icons.Outlined.Refresh, "Sessions aktualisieren") }
             val canCreate = state.online && state.canCreate && !state.creating
             val newIcon: @Composable () -> Unit = {
                 if (state.creating) {
                     CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
                 } else {
-                    Icon(Icons.Outlined.Add, contentDescription = if (narrow) "New session" else null, Modifier.size(18.dp))
+                    Icon(Icons.Outlined.Add, contentDescription = if (narrow) "Neue Session" else null, Modifier.size(18.dp))
                 }
             }
             if (narrow) {
@@ -208,7 +208,7 @@ private fun SessionDirectory(
             } else {
                 Button(onClick = onNew, enabled = canCreate) {
                     newIcon()
-                    Text("New", Modifier.padding(start = 4.dp))
+                    Text("Neu", Modifier.padding(start = 4.dp))
                 }
             }
         }
@@ -221,7 +221,7 @@ private fun SessionDirectory(
                     ) {
                         CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
                         Text(
-                            "Loading sessions…",
+                            "Sessions werden geladen …",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyMedium,
                         )
@@ -230,12 +230,12 @@ private fun SessionDirectory(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        StatusMessage("Could not load sessions: ${state.listError}", error = true)
-                        if (state.online) TextButton(onClick = onRefresh) { Text("Try again") }
+                        StatusMessage("Sessions konnten nicht geladen werden: ${state.listError}", error = true)
+                        if (state.online) TextButton(onClick = onRefresh) { Text("Erneut versuchen") }
                     }
                     !state.online -> DirectoryEmpty(offlineMessage(state, hasSessions = false))
-                    state.canCreate -> DirectoryEmpty("No sessions yet. Use New to start one.")
-                    else -> DirectoryEmpty("No sessions are visible to this device.")
+                    state.canCreate -> DirectoryEmpty("Noch keine Sessions. Mit „Neu“ startest du eine.")
+                    else -> DirectoryEmpty("Für dieses Gerät sind keine Sessions sichtbar.")
                 }
             }
         } else {
@@ -247,10 +247,10 @@ private fun SessionDirectory(
                     item { StatusMessage(offlineMessage(state, hasSessions = true), error = state.phase.isFailure()) }
                 }
                 state.listError?.let { message ->
-                    item { StatusMessage("Could not refresh sessions: $message", error = true) }
+                    item { StatusMessage("Sessions konnten nicht aktualisiert werden: $message", error = true) }
                 }
                 if (state.online && !state.canCreate) {
-                    item { StatusMessage("This device has no permission to create sessions.") }
+                    item { StatusMessage("Dieses Gerät darf keine Sessions anlegen.") }
                 }
                 items(state.sessions, key = { it.sessionId }) { session ->
                     SessionRow(
@@ -295,7 +295,7 @@ private fun SessionRow(
             }
             if (onNewWindow != null) {
                 IconButton(onClick = onNewWindow) {
-                    Icon(Icons.Outlined.OpenInNew, "Open ${session.displayName()} in a new window", Modifier.size(19.dp))
+                    Icon(Icons.Outlined.OpenInNew, "${session.displayName()} in neuem Fenster öffnen", Modifier.size(19.dp))
                 }
             }
         }
@@ -319,18 +319,18 @@ private fun NewSessionDialog(enabled: Boolean, onDismiss: () -> Unit, onCreate: 
     var title by rememberSaveable { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("New session") },
+        title = { Text("Neue Session") },
         text = {
             OutlinedTextField(
                 value = title, onValueChange = { title = it },
-                label = { Text("Title (optional)") },
+                label = { Text("Titel (optional)") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } },
         confirmButton = {
-            Button(onClick = { onCreate(title.trim().ifBlank { null }) }, enabled = enabled) { Text("Create") }
+            Button(onClick = { onCreate(title.trim().ifBlank { null }) }, enabled = enabled) { Text("Anlegen") }
         },
     )
 }
@@ -340,31 +340,31 @@ private fun ConnectionPhase.isFailure(): Boolean =
 
 private fun offlineMessage(state: WorkspaceState, hasSessions: Boolean): String {
     val base = when {
-        state.stopping -> "Disconnecting…"
+        state.stopping -> "Verbindung wird getrennt …"
         else -> when (state.phase) {
-            ConnectionPhase.CONNECTING -> "Connecting to the server…"
-            ConnectionPhase.RECONNECTING -> "Connection lost. Reconnecting…"
-            ConnectionPhase.FAILED -> "Connection failed."
-            ConnectionPhase.REVOKED -> "Access to this server was stopped."
+            ConnectionPhase.CONNECTING -> "Verbinde mit dem Server …"
+            ConnectionPhase.RECONNECTING -> "Verbindung verloren. Verbinde erneut …"
+            ConnectionPhase.FAILED -> "Verbindung fehlgeschlagen."
+            ConnectionPhase.REVOKED -> "Der Zugriff auf diesen Server wurde beendet."
             ConnectionPhase.DISCONNECTED, ConnectionPhase.CONNECTED -> "Offline."
         }
     }
     val detail = state.detail?.takeUnless { it.isBlank() }
-    val tail = if (hasSessions) "Showing the last loaded sessions." else "Connect to load sessions."
+    val tail = if (hasSessions) "Zeige die zuletzt geladenen Sessions." else "Verbinde dich, um Sessions zu laden."
     return listOfNotNull(base, detail, tail).joinToString(" ")
 }
 
 internal fun MobileSession.displayName(): String = title?.takeUnless { it.isBlank() } ?: "Session ${sessionId.take(8)}"
 
 internal fun MobileSessionState.displayName(): String = when (this) {
-    MobileSessionState.IDLE -> "Ready"
-    MobileSessionState.RUNNING -> "Running"
-    MobileSessionState.WAITING_FOR_APPROVAL -> "Waiting for approval"
-    MobileSessionState.WAITING_FOR_CHILD -> "Waiting for child"
-    MobileSessionState.QUEUED -> "Queued"
-    MobileSessionState.INTERRUPTED -> "Interrupted"
-    MobileSessionState.FAILED -> "Failed"
-    MobileSessionState.CLOSED -> "Closed"
+    MobileSessionState.IDLE -> "Bereit"
+    MobileSessionState.RUNNING -> "Läuft"
+    MobileSessionState.WAITING_FOR_APPROVAL -> "Wartet auf Freigabe"
+    MobileSessionState.WAITING_FOR_CHILD -> "Wartet auf Unter-Session"
+    MobileSessionState.QUEUED -> "In der Warteschlange"
+    MobileSessionState.INTERRUPTED -> "Unterbrochen"
+    MobileSessionState.FAILED -> "Fehlgeschlagen"
+    MobileSessionState.CLOSED -> "Geschlossen"
 }
 
 // ---- Projektansicht (Paket A4) ----

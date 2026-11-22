@@ -2,8 +2,11 @@
 
 mod backend;
 mod chatgpt_local;
+mod claude_local;
+mod codex_local;
 mod core;
 mod device;
+mod device_tools;
 mod home;
 mod identity;
 mod listener;
@@ -20,11 +23,14 @@ mod types;
 mod uia;
 
 pub use chatgpt_local::{ChatgptLocal, ChatgptLocalStatus};
+pub use claude_local::{ClaudeLocal, ClaudeLocalStatus};
+pub use codex_local::{CodexLocal, CodexLocalStatus, CodexSignInStart};
 pub use core::MobileCore;
 pub use device::{
     DeviceError, DeviceLimits, FileAccess, SafEntry, SafRoot, ShellExecutor, ShellOutput,
     ShellRequest, check_shell_request, device_limits, normalize_device_path,
 };
+pub use device_tools::{device_tools_enabled, set_device_tools_enabled};
 pub use identity::{generate_identity, parse_device_enrollment, parse_server_profile};
 pub use listener::CoreListener;
 pub use models::{
