@@ -597,12 +597,32 @@ impl OpsPort for HostedOps {
             {
                 return Err(HostError::Protocol("too many config keys".to_owned()));
             }
-            let config = self.load_config()?;
-            let rows = harw_ops::settings::config_view(&config, params.keys.as_deref())
-                .map_err(op_host_error)?;
-            Ok(ConfigGetResult {
-                entries: rows.iter().map(config_entry).collect(),
-            })
+            // Virtual read-only key: the gateway's own onion locator, so a paired
+            // phone learns its Tor route without re-pairing. Only on explicit request.
+            let mut keys = params.keys;
+            let mut onion_entry = None;
+            if let Some(list) = keys.as_mut()
+                && list.iter().any(|key| key == crate::session_listener::ONION_LOCATOR_KEY)
+            {
+                list.retain(|key| key != crate::session_listener::ONION_LOCATOR_KEY);
+                onion_entry = Some(ConfigEntry {
+                    key: crate::session_listener::ONION_LOCATOR_KEY.to_owned(),
+                    value: crate::session_listener::onion_locator().unwrap_or_default(),
+                    choices: Vec::new(),
+                    scope: "profile".to_owned(),
+                    apply: "now".to_owned(),
+                });
+            }
+            let mut entries = if onion_entry.is_some() && keys.as_ref().is_some_and(Vec::is_empty) {
+                Vec::new()
+            } else {
+                let config = self.load_config()?;
+                let rows = harw_ops::settings::config_view(&config, keys.as_deref())
+                    .map_err(op_host_error)?;
+                rows.iter().map(config_entry).collect()
+            };
+            entries.extend(onion_entry);
+            Ok(ConfigGetResult { entries })
         })
     }
 

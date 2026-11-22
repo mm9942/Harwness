@@ -320,6 +320,7 @@ impl GatewayCoreFactory {
             session,
             model: Arc::clone(&self.model),
             store: Arc::clone(&self.store),
+            spawner: assembly.spawner().cloned(),
         })
     }
 }

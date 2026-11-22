@@ -119,6 +119,9 @@ pub mod features {
     pub const IMAGES: &str = "images";
     /// The host serves `media.get`: the stored bytes of a prompt image of a session the caller may observe. A client calls it only when the host granted this feature.
     pub const MEDIA: &str = "media";
+    /// Global jobs and agents views (`jobs.list`, `jobs.get`, `jobs.cancel`, `jobs.retry`,
+    /// `agents.list`, `agents.stop`). Additive; needs no session.
+    pub const OVERVIEW: &str = "overview";
 }
 
 /// Position in a session stream.
@@ -1634,6 +1637,160 @@ pub struct ConfigEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigGetResult {
     pub entries: Vec<ConfigEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// Feature `overview`: global jobs and agents views (additive, no session needed)
+// ---------------------------------------------------------------------------
+
+/// Upper bound for [`JobsListParams::limit`] and the row count of an answer.
+pub const MAX_OVERVIEW_ROWS: u32 = 200;
+
+/// `jobs.list` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsListParams {
+    /// State codes to keep (`queued|running|blocked|succeeded|failed|timed_out|cancelled`);
+    /// empty keeps every state.
+    #[serde(default)]
+    pub states: Vec<String>,
+    /// At most [`MAX_OVERVIEW_ROWS`]; `None` = the maximum.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// One durable job of the profile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRow {
+    pub work_id: String,
+    /// `worker`, `dream` or a custom kind name.
+    pub kind: String,
+    /// `queued|running|blocked|succeeded|failed|timed_out|cancelled`.
+    pub state: String,
+    /// Short title taken from the job input, else the kind.
+    pub title: String,
+    /// First line of the reason or result, when known.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Session the job belongs to, when its input names one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Unix milliseconds.
+    pub submitted_ms: u64,
+    #[serde(default)]
+    pub started_ms: Option<u64>,
+    #[serde(default)]
+    pub finished_ms: Option<u64>,
+    /// Run time (finished or still running).
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub attempts: u32,
+    /// `cancel` would be accepted by the store.
+    pub can_cancel: bool,
+    /// `retry` would be accepted by the store.
+    pub can_retry: bool,
+}
+
+/// `jobs.list` result: newest first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobsListResult {
+    pub jobs: Vec<JobRow>,
+    /// More jobs matched than were returned.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// `jobs.get`, `jobs.cancel`, `jobs.retry` parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobTargetParams {
+    pub work_id: String,
+    /// Idempotency key of the mutating calls (`jobs.cancel`, `jobs.retry`); at most
+    /// [`MAX_CLIENT_MSG_ID_BYTES`].
+    #[serde(default)]
+    pub client_msg_id: String,
+}
+
+/// One step of the status history of a job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobHistoryEntry {
+    pub at_ms: u64,
+    /// `submitted|claimed|heartbeat|cancelled|succeeded|failed|blocked`.
+    pub event: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// `jobs.get` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobDetail {
+    pub job: JobRow,
+    /// Bounded `key: value` lines of the job input (secret-looking keys left out).
+    pub spec_summary: String,
+    pub history: Vec<JobHistoryEntry>,
+    /// Holder of the active lease.
+    #[serde(default)]
+    pub holder: Option<String>,
+    /// Tail of the stored result or failure reason.
+    #[serde(default)]
+    pub output_tail: Option<String>,
+}
+
+/// `agents.list` parameters (none yet; keeps the shape extensible).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsListParams {}
+
+/// A running child agent of a hosted session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningAgent {
+    pub agent_id: String,
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub parent: Option<String>,
+    pub role: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `running|waiting|done|failed`.
+    pub state: String,
+    #[serde(default)]
+    pub current_tool: Option<String>,
+    pub started_ms: u64,
+    pub tool_calls: u32,
+    pub can_stop: bool,
+}
+
+/// A startable agent definition (built-in roster entry or custom definition).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDefinition {
+    pub name: String,
+    pub role: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `builtin` or `custom`.
+    pub source: String,
+    pub read_only: bool,
+    /// The profile starts new sessions with this definition.
+    pub active: bool,
+}
+
+/// `agents.list` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsListResult {
+    pub running: Vec<RunningAgent>,
+    pub library: Vec<AgentDefinition>,
+}
+
+/// `agents.stop` parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStopParams {
+    pub session_id: SessionId,
+    pub agent_id: String,
+    #[serde(default)]
+    pub client_msg_id: String,
 }
 
 /// `config.set` (feature `stepup`). Result: [`CommandRunResult`].

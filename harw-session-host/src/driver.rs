@@ -295,4 +295,44 @@ pub trait TurnDriver: Send + Sync + 'static {
 
     /// Model name for summaries, when known.
     fn model_name(&self, session_id: &SessionId) -> Option<String>;
+
+    /// Child agents that are currently admitted below any hosted session
+    /// (global `agents.list`). Default: none known.
+    fn live_agents(&self) -> Vec<LiveAgent> {
+        Vec::new()
+    }
+
+    /// Requests cancellation of one child agent of `session_id`. `Ok(true)`
+    /// when a running agent was signalled, `Ok(false)` when no such agent
+    /// exists. Default: not supported.
+    fn stop_agent(&self, _session_id: &SessionId, _agent_id: &str) -> DriverFuture<'_, bool> {
+        Box::pin(async {
+            Err(HostError::Denied(
+                "driver does not support stopping agents".into(),
+            ))
+        })
+    }
+}
+
+/// One admitted child agent as the driver reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveAgent {
+    /// Id of the child agent (its session id).
+    pub agent_id: String,
+    /// Hosted session whose subtree the agent belongs to.
+    pub session_id: SessionId,
+    /// Direct parent, when known.
+    pub parent: Option<String>,
+    /// Role label.
+    pub role: String,
+    /// Model route, when pinned.
+    pub model: Option<String>,
+    /// `running|waiting|done|failed`.
+    pub state: String,
+    /// Name of the tool in flight, when known.
+    pub current_tool: Option<String>,
+    /// Admission time in Unix milliseconds.
+    pub started_ms: u64,
+    /// Tool calls made so far.
+    pub tool_calls: u32,
 }

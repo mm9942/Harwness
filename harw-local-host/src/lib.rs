@@ -405,6 +405,7 @@ impl LocalCoreFactory {
             session,
             model: Arc::clone(&self.model),
             store: Arc::clone(&self.store),
+            spawner: assembly.spawner().cloned(),
         })
     }
 }
@@ -560,6 +561,52 @@ pub enum LocalHostError {
     Host(String),
 }
 
+/// The agent library of a profile: the built-in roster plus the custom
+/// definitions found in the config `layers` (home layer, then profile layer).
+/// A config that cannot be read leaves the built-in roster alone. `active`
+/// marks `harness.active_agent_definition`. Shared by the gateway and the app.
+#[must_use]
+pub fn agent_library(layers: &[PathBuf]) -> Vec<harw_protocol::session_wire::AgentDefinition> {
+    use harw_registry_defaults::RosterSource;
+    let config = harw_config::discover_config(layers).ok();
+    let agents = config
+        .as_ref()
+        .and_then(|config| harw_registry_defaults::ConfigAgents::from_config(config).ok())
+        .unwrap_or_default();
+    let active = config
+        .as_ref()
+        .and_then(|config| config.harness.active_agent_definition.clone());
+    let roster = harw_registry_defaults::embedded_agents::builtin_agent_definitions(
+        &agents.executable_agents,
+    )
+    .ok()
+    .and_then(|builtin| harw_registry_defaults::AgentRoster::from_config(&builtin, &agents).ok());
+    let Some(roster) = roster else {
+        return Vec::new();
+    };
+    let mut rows: Vec<_> = roster
+        .entries()
+        .map(|entry| harw_protocol::session_wire::AgentDefinition {
+            name: entry.name.clone(),
+            role: harw_core::delegation_visibility::role_label(entry.role).to_owned(),
+            description: entry
+                .description
+                .as_deref()
+                .and_then(|text| text.lines().next())
+                .map(str::to_owned),
+            model: None,
+            source: match entry.source {
+                RosterSource::BuiltIn => "builtin".to_owned(),
+                RosterSource::Custom { .. } => "custom".to_owned(),
+            },
+            read_only: entry.read_only,
+            active: active.as_deref() == Some(entry.name.as_str()),
+        })
+        .collect();
+    rows.sort_by(|a, b| (a.source.as_str(), a.name.as_str()).cmp(&(b.source.as_str(), b.name.as_str())));
+    rows
+}
+
 /// A running in-process session host.
 pub struct LocalHost {
     host: SessionHost,
@@ -687,6 +734,14 @@ impl LocalHost {
                 },
             ),
         }
+        .map_err(|error| LocalHostError::Host(error.to_string()))?;
+        let library_layers = vec![config.home.clone()];
+        let library: harw_session_host::overview::AgentLibrary =
+            Arc::new(move || agent_library(&library_layers));
+        host.install_overview(Arc::new(harw_session_host::overview::Overview::new(
+            Some(Arc::new(harw_session_store::JobStore::new(&config.state_dir))),
+            Some(library),
+        )))
         .map_err(|error| LocalHostError::Host(error.to_string()))?;
         Ok(Self {
             host,

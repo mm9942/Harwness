@@ -40,7 +40,7 @@ help:
 	@echo "HARW — available targets:"
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
-	@echo "Variables: CARGO, PREFIX, BINDIR (default $(HOME)/.local/bin)"
+	@echo "Variables: CARGO, PREFIX, BINDIR (default $(HOME)/.local/bin), HARW_FEATURES (default: onion)"
 
 clippy-tests: ## Canonical verification: clippy (incl. tests, -D warnings) + test suite + gates
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
@@ -72,8 +72,15 @@ HOST_BINS = --bin harw $(if $(HOST_IS_ANDROID),,--bin killer --bin harw-job-exec
 # A literal comma inside $(if ...) arguments.
 comma := ,
 
-build: ## Release-build harw, killer and harw-job-exec (both not on Android) and the agent runner
-	$(CARGO) build --release $(HOST_BINS)
+# Optional harw-cli cargo features of the gateway. `onion` (embedded arti) lets the
+# gateway publish a Tor onion service for the phone's "Tor (.onion)" route; it is on
+# by default off Android. `make install HARW_FEATURES=` builds without it.
+HARW_FEATURES ?= $(if $(HOST_IS_ANDROID),,onion)
+HARW_FEATURE_FLAGS = $(if $(strip $(HARW_FEATURES)),--features $(subst $(space),$(comma),$(foreach f,$(strip $(HARW_FEATURES)),harw-cli/$(f))))
+space := $() $()
+
+build: ## Release-build harw (HARW_FEATURES, default onion), killer, harw-job-exec and the agent runner
+	$(CARGO) build --release $(HOST_BINS) $(HARW_FEATURE_FLAGS)
 	$(CARGO) build --profile release-runner --bin harw-agent-runner
 
 # HARW_HOME follows the same default the Rust side uses (harw-home::paths,

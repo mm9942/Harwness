@@ -1313,6 +1313,14 @@ impl MobileCore {
         self.run(async move { link.request(call(link.backend.port())).await })
     }
 
+    /// Hat der Host `feature` bei `session.hello` gewaehrt? Ohne Verbindung `false`. Nie ein Fehler.
+    pub(crate) fn feature_granted(&self, feature: &str) -> bool {
+        self.shared
+            .state()
+            .active()
+            .is_ok_and(|link| link.backend.features().iter().any(|f| f == feature))
+    }
+
     /// Features/Caps der aktiven Verbindung, ohne Verbindung Default. Nie ein Fehler.
     pub(crate) fn manage_support_now(&self) -> ManageSupport {
         let Ok(link) = self.shared.state().active() else {
@@ -1764,6 +1772,7 @@ fn requested_features() -> Vec<String> {
         features::STEPUP,
         features::IMAGES,
         features::MEDIA,
+        features::OVERVIEW,
     ]
     .iter()
     .map(|feature| (*feature).to_owned())

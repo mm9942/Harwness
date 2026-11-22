@@ -521,6 +521,11 @@ internal class HarwConnection(private val context: Context, private val localBac
                 if (request != lifecycle) return@launch
                 applyStatus(status)
                 if (request == lifecycle) startPolling(native, request)
+                if (request == lifecycle && status.phase == ConnectionPhase.CONNECTED &&
+                    status.route == ConnectionRoute.DIRECT && profile.onion == null
+                ) {
+                    learnOnionLocator(native, profile, request)
+                }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 if (request == lifecycle) {
@@ -535,6 +540,39 @@ internal class HarwConnection(private val context: Context, private val localBac
         }
         watchNetwork()
         return true
+    }
+
+    /**
+     * Asks the gateway (over the already authenticated direct link) for its onion locator and
+     * stores it in the profile, so the Tor route becomes selectable without re-pairing.
+     * Best effort: an old gateway, one without onion, or any error just leaves the profile as is.
+     */
+    private fun learnOnionLocator(native: MobileCore, profile: ServerProfile, request: Long) {
+        scope.launch {
+            try {
+                val locator = withContext(Dispatchers.IO) {
+                    native.configGet(listOf(OnionLocatorKey)).firstOrNull { it.key == OnionLocatorKey }?.value?.trim()
+                }
+                if (locator.isNullOrEmpty() || request != lifecycle) return@launch
+                val updated = withContext(Dispatchers.IO) {
+                    storageLock.withLock {
+                        val saved = store.readProfile() ?: return@withLock null
+                        val document = org.json.JSONObject(saved).put("onion", locator).toString()
+                        val parsed = parseServerProfile(document)
+                        if (parsed.windowKey() != profile.windowKey()) return@withLock null
+                        store.saveProfile(document)
+                        parsed
+                    }
+                } ?: return@launch
+                change {
+                    if (it.profile?.windowKey() != updated.windowKey()) it
+                    else it.copy(profile = updated, setupNotice = "Tor-Adresse vom Gateway übernommen.")
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                Log.i(LogTag, "Onion locator not learned: ${error.message}")
+            }
+        }
     }
 
     fun connectLocal(force: Boolean = false): Boolean {
@@ -1522,6 +1560,25 @@ internal class HarwConnection(private val context: Context, private val localBac
     fun cancelJob(sessionId: String, workId: String, onDone: (String?) -> Unit) =
         stopTarget(onDone) { it.cancelJob(sessionId, workId, newMsgId()) }
 
+    /**
+     * Globale Jobs-/Agenten-Uebersicht (Wire-Feature `overview`): fuehrt `call` auf einem IO-Thread gegen den
+     * nativen Kern dieser Verbindung aus. Fehler kommen als `Result.failure` mit deutschem Text zurueck.
+     */
+    suspend fun <T> overviewCall(call: (MobileCore) -> T): Result<T> {
+        val native = core ?: return Result.failure(IllegalStateException("Nicht verbunden."))
+        return withContext(Dispatchers.IO) {
+            try {
+                Result.success(call(native))
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                Result.failure(IllegalStateException(error.displayMessage()))
+            }
+        }
+    }
+
+    /** Neue Idempotenz-Kennung fuer eine schreibende Uebersichts-Aktion. */
+    fun overviewMsgId(): String = newMsgId()
+
     private fun stopTarget(onDone: (String?) -> Unit, call: (MobileCore) -> ManageRunResult) {
         val generation = gate.generation
         val native = core
@@ -1885,6 +1942,7 @@ internal class HarwConnection(private val context: Context, private val localBac
         // This fixed label is part of the persisted enrollment format.
         const val DeviceLabel = "Harw Android"
         const val LogTag = "HarwConnection"
+        const val OnionLocatorKey = "gateway.onion_locator"
         const val RoutePrefsName = "harw_connection"
         const val RoutePrefKey = "route_preference"
         const val ChatgptUnlinkWarning = "The server removed its local ChatGPT link. Revocation at OpenAI was not confirmed. Review the agent in ChatGPT Settings."

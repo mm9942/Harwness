@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 harw-authority = { path = "../harw-authority" }
+harw-config = { path = "../harw-config" }
 harw-core = { path = "../harw-core" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }

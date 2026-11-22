@@ -48,8 +48,8 @@ use harw_protocol::approvals::ApprovalKind;
 use harw_protocol::{AgentOrchestrationStatus, ApprovalRequest, SessionEvent, TurnEvent};
 use harw_session_host::HostError;
 use harw_session_host::driver::{
-    CancelSignal, DriverEvent, DriverFuture, EventSink, ExecutionAdmission, Setting, TurnDriver,
-    TurnInput, TurnOutcome,
+    CancelSignal, DriverEvent, DriverFuture, EventSink, ExecutionAdmission, LiveAgent, Setting,
+    TurnDriver, TurnInput, TurnOutcome,
 };
 use harw_session_store::{
     ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, SessionStoreError,
@@ -184,6 +184,17 @@ pub trait CoreRuntime: Send + Sync + 'static {
     /// with that leg's sink; the runtime keeps using the most recent sink
     /// until the next call. Default: ignored.
     fn bind_live_sink(&self, _session_id: &SessionId, _sink: Arc<dyn EventSink>) {}
+
+    /// Child agents admitted below any hosted session. Default: none.
+    fn live_agents(&self) -> Vec<LiveAgent> {
+        Vec::new()
+    }
+
+    /// Requests cancellation of a child agent below `session_id`; `true` when
+    /// a running agent was signalled. Default: no agent known.
+    fn stop_agent(&self, _session_id: &SessionId, _agent_id: &str) -> bool {
+        false
+    }
 }
 
 /// Runtime of a driver built by [`CoreTurnDriver::new`]: nothing composed
@@ -792,6 +803,15 @@ impl TurnDriver for CoreTurnDriver {
     fn model_name(&self, session_id: &SessionId) -> Option<String> {
         self.runtime.model_name(session_id)
     }
+
+    fn live_agents(&self) -> Vec<LiveAgent> {
+        self.runtime.live_agents()
+    }
+
+    fn stop_agent(&self, session_id: &SessionId, agent_id: &str) -> DriverFuture<'_, bool> {
+        let stopped = self.runtime.stop_agent(session_id, agent_id);
+        Box::pin(async move { Ok(stopped) })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +835,9 @@ pub struct CoreSession {
     pub model: Arc<dyn ModelProvider>,
     /// Durable state store (transcript) for its turns.
     pub store: Arc<dyn StateStore>,
+    /// The session's child-agent spawner, when the assembly has one. Lets the
+    /// driver list and stop child agents across sessions.
+    pub spawner: Option<Arc<harw_core::ManagedAgentSpawner>>,
 }
 
 /// Gateway-supplied assembly of one core session (registry, sandbox,
@@ -874,6 +897,8 @@ pub struct HarwCoreRuntime {
     slots: Mutex<SlotMap>,
     models: Mutex<HashMap<SessionId, String>>,
     live_sinks: Mutex<HashMap<SessionId, LiveSink>>,
+    /// Child-agent spawner of every built session (global agent views).
+    spawners: Mutex<HashMap<SessionId, Arc<harw_core::ManagedAgentSpawner>>>,
 }
 
 impl std::fmt::Debug for HarwCoreRuntime {
@@ -893,6 +918,20 @@ impl HarwCoreRuntime {
             slots: Mutex::new(HashMap::new()),
             models: Mutex::new(HashMap::new()),
             live_sinks: Mutex::new(HashMap::new()),
+            spawners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn note_spawner(&self, session: &SessionId, spawner: Option<Arc<harw_core::ManagedAgentSpawner>>) {
+        if let Ok(mut spawners) = self.spawners.lock() {
+            match spawner {
+                Some(spawner) => {
+                    spawners.insert(session.clone(), spawner);
+                }
+                None => {
+                    spawners.remove(session);
+                }
+            }
         }
     }
 
@@ -967,6 +1006,7 @@ impl HarwCoreRuntime {
             .await
             .map_err(|error| DriverBridgeError::Core(format!("hydrate: {error}")))?;
         self.note_model(session_id, core.session.active_model());
+        self.note_spawner(session_id, core.spawner.clone());
         let live = core.session.agent_events().map(|hub| {
             LiveForwarder(
                 tokio::spawn(forward_live(
@@ -1075,6 +1115,7 @@ impl CoreRuntime for HarwCoreRuntime {
             .checked_add(1)
             .ok_or_else(|| DriverBridgeError::Runtime("admission generation exhausted".into()))?;
         self.slots()?.remove(session_id);
+        self.note_spawner(session_id, None);
         admissions.insert(
             session_id.clone(),
             AdmissionState {
@@ -1096,6 +1137,7 @@ impl CoreRuntime for HarwCoreRuntime {
             .checked_add(1)
             .ok_or_else(|| DriverBridgeError::Runtime("admission generation exhausted".into()))?;
         self.slots()?.remove(session_id);
+        self.note_spawner(session_id, None);
         // Keep a tombstone so an older asynchronous hydration cannot publish
         // after rollback (including the None -> scoped -> None ABA case).
         admissions.insert(
@@ -1129,6 +1171,7 @@ impl CoreRuntime for HarwCoreRuntime {
             })?;
         }
         self.slots()?.remove(session_id);
+        self.note_spawner(session_id, None);
         Ok(())
     }
 
@@ -1274,6 +1317,48 @@ impl CoreRuntime for HarwCoreRuntime {
         self.models.lock().ok()?.get(session_id).cloned()
     }
 
+    fn live_agents(&self) -> Vec<LiveAgent> {
+        let Ok(spawners) = self.spawners.lock() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (session, spawner) in spawners.iter() {
+            for record in spawner.list_descendants_for(session) {
+                let state = match record.status {
+                    harw_core::child_controller::ChildStatus::Running => "running",
+                    harw_core::child_controller::ChildStatus::Admitted | harw_core::child_controller::ChildStatus::Paused => "waiting",
+                    harw_core::child_controller::ChildStatus::Completed => "done",
+                    harw_core::child_controller::ChildStatus::Failed | harw_core::child_controller::ChildStatus::Cancelled => "failed",
+                };
+                out.push(LiveAgent {
+                    agent_id: record.child.as_str().to_owned(),
+                    session_id: session.clone(),
+                    parent: Some(record.parent.as_str().to_owned()),
+                    role: record.role.clone(),
+                    model: record.model_route(),
+                    state: state.to_owned(),
+                    current_tool: None,
+                    started_ms: u64::try_from(record.admitted_at.as_millisecond()).unwrap_or(0),
+                    tool_calls: record.live.tool_calls,
+                });
+            }
+        }
+        out
+    }
+
+    fn stop_agent(&self, session_id: &SessionId, agent_id: &str) -> bool {
+        let spawner = self
+            .spawners
+            .lock()
+            .ok()
+            .and_then(|spawners| spawners.get(session_id).cloned());
+        let Some(spawner) = spawner else {
+            return false;
+        };
+        let child = SessionId::from_str(agent_id.to_owned());
+        spawner.owns_descendant(session_id, &child) && spawner.request_cancellation(&child)
+    }
+
     fn bind_live_sink(&self, session_id: &SessionId, sink: Arc<dyn EventSink>) {
         let cell = self.live_sink(session_id);
         if let Ok(mut bound) = cell.lock() {
@@ -1370,6 +1455,7 @@ mod admission_races {
                 ),
                 model: Arc::new(harw_core::EchoModelProvider::new("unused")),
                 store: Arc::clone(&self.0) as Arc<dyn StateStore>,
+                spawner: None,
             })
         }
     }
@@ -1600,6 +1686,7 @@ mod live_events {
                 .with_agent_events(self.hub.clone()),
                 model: Arc::new(harw_core::EchoModelProvider::new("unused")),
                 store: Arc::new(InstantStore),
+                spawner: None,
             })
         }
     }

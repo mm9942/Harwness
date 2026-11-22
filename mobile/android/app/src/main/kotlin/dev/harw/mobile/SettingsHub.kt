@@ -175,8 +175,8 @@ internal fun SettingsHub(
             HubRow("Befehle", "Alle Slash-Befehle des Servers", block) { onOpen(SettingsRoute.Commands) }
             HubRow("Provider (auf diesem Gerät)", "Schlüssel und Routen für den Standalone-Betrieb", null) { onOpen(SettingsRoute.Providers) }
             HubRow("Agenten-Profile", "UI-Agenten (UIA) anlegen und aktivieren", null) { onOpen(SettingsRoute.Uias) }
-            HubRow("Agents", "Agents der Sitzung", null) { onOpen(SettingsRoute.Agents) }
-            HubRow("Jobs", "Hintergrund-Jobs der Sitzung", null) { onOpen(SettingsRoute.Jobs) }
+            HubRow("Agenten", "Laufende Agenten und Agentenbibliothek (Lokal und Cloud)", null) { onOpen(SettingsRoute.Agents) }
+            HubRow("Jobs", "Alle Jobs des Profils mit Verlauf (Lokal und Cloud)", null) { onOpen(SettingsRoute.Jobs) }
             HubRow("Lokale Modelle", "GGUF-Modelle laden oder importieren", null) { onOpen(SettingsRoute.LocalModels) }
             HubRow("Ordner für lokale Modelle", modelsFolderLabel(context, modelsFolderRevision), null) { modelsFolderOpen = true }
             HubRow("Dateien", "Ordner dieses Geräts freigeben und durchsuchen", null) { onOpen(SettingsRoute.Files) }

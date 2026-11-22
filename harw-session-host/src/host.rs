@@ -32,12 +32,14 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use harw_protocol::methods::{
-    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_AGENTS_LIST, METHOD_AGENTS_STOP, METHOD_JOBS_CANCEL, METHOD_JOBS_GET, METHOD_JOBS_LIST,
+    METHOD_JOBS_RETRY, METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
     METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
     METHOD_STEPUP_CONFIRM,
 };
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
+    AgentStopParams, AgentsListParams, AgentsListResult, JobDetail, JobTargetParams,
+    JobsListParams, JobsListResult, ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
     CommandEffect, CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult,
     ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams,
     CreateParams, DEFAULT_PAGE_LIMIT, GatewayConnectionInfo, GatewayConnectionsResult,
@@ -134,6 +136,7 @@ const HOST_FEATURES: &[&str] = &[
     features::STEPUP,
     features::IMAGES,
     features::MEDIA,
+    features::OVERVIEW,
 ];
 
 /// Features that exist only from [`TOOL_GATEWAY_WIRE_MINOR`] on.
@@ -146,7 +149,7 @@ const PROJECT_FEATURES: &[&str] = &[features::PROJECTS];
 /// Features that exist only from [`MANAGE_WIRE_MINOR`] on (contract K-W3c
 /// §8.2 no. 9). `manage` needs installed ops, `stepup` additionally
 /// `manage` and [`OpsPort::stepup_enabled`].
-const MANAGE_FEATURES: &[&str] = &[features::MANAGE, features::STEPUP];
+const MANAGE_FEATURES: &[&str] = &[features::MANAGE, features::STEPUP, features::OVERVIEW];
 
 /// Answer of a session action on a profile session without a host record.
 const TEXT_SESSION_NOT_HOSTED: &str = "Session läuft nicht auf dem Gateway; erst übernehmen";
@@ -260,6 +263,9 @@ struct HostInner {
     /// Minor-4 operations backend (`manage`/`stepup`); empty until
     /// [`SessionHost::install_ops`].
     ops: std::sync::OnceLock<Arc<dyn OpsPort>>,
+    /// Backend of the `overview` feature (global jobs and agents views); empty
+    /// until [`SessionHost::install_overview`].
+    overview: std::sync::OnceLock<Arc<crate::overview::Overview>>,
 }
 
 /// The persistent session host. Cheap to clone.
@@ -354,6 +360,7 @@ impl SessionHost {
                 listeners: Mutex::new(Vec::new()),
                 profile,
                 ops: std::sync::OnceLock::new(),
+                overview: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -372,6 +379,16 @@ impl SessionHost {
             .ops
             .set(ops)
             .map_err(|_| HostError::Protocol("ops already installed".into()))
+    }
+
+    /// Install the backend of the `overview` feature (`jobs.*`, `agents.*`).
+    /// Without it hello never grants the feature and the methods are denied.
+    /// Installing twice is refused.
+    pub fn install_overview(&self, overview: Arc<crate::overview::Overview>) -> Result<(), HostError> {
+        self.inner
+            .overview
+            .set(overview)
+            .map_err(|_| HostError::Protocol("overview already installed".into()))
     }
 
     /// A port bound to one authenticated client. The identity is fixed for
@@ -411,6 +428,7 @@ impl SessionHost {
             projects: AtomicBool::new(false),
             manage: AtomicBool::new(false),
             stepup: AtomicBool::new(false),
+            overview: AtomicBool::new(false),
         })
     }
 
@@ -1622,6 +1640,8 @@ pub struct HostConnection {
     manage: AtomicBool,
     /// Feature `stepup` was granted at hello (minor 4).
     stepup: AtomicBool,
+    /// Feature `overview` was granted at hello.
+    overview: AtomicBool,
 }
 
 impl Drop for HostConnection {
@@ -1736,6 +1756,13 @@ impl HostConnection {
         let stepup = granted_features
             .iter()
             .any(|feature| feature.as_str() == features::STEPUP);
+        if self.host.overview.get().is_none() {
+            granted_features.retain(|feature| feature.as_str() != features::OVERVIEW);
+        }
+        let overview = granted_features
+            .iter()
+            .any(|feature| feature.as_str() == features::OVERVIEW);
+        self.overview.store(overview, Ordering::SeqCst);
         self.manage.store(manage, Ordering::SeqCst);
         self.stepup.store(stepup, Ordering::SeqCst);
         self.wire_minor.store(wire_minor, Ordering::SeqCst);
@@ -3166,6 +3193,8 @@ enum ManageFeature {
 const NEED_CONTROL_APPROVE: &[Need] = &[Need::Control, Need::Approve];
 /// Caps of the read-only manage methods and `stepup.cancel`.
 const NEED_OBSERVE: &[Need] = &[Need::Observe];
+/// Caps of the mutating `overview` methods.
+const NEED_STEER: &[Need] = &[Need::Steer];
 
 /// Why the attached images of a `turn.submit` are refused, `None` when fine.
 fn refuse_images(images: &[harw_protocol::session_wire::SubmitImage]) -> Option<String> {
@@ -3311,6 +3340,138 @@ impl HostConnection {
             SessionAction::SetEffort(effort) => self.set(id, Setting::Effort(effort)).await?,
         }
         Ok(result)
+    }
+
+    /// Admission of the `overview` methods: hello, negotiated feature,
+    /// installed backend, profile tenant, caps. Returns the backend and the
+    /// tenant the job records are filtered by. Logs only the method.
+    fn overview_admit(
+        &self,
+        method: &'static str,
+        needs: &[Need],
+    ) -> Result<(&Arc<crate::overview::Overview>, Option<TenantId>), HostError> {
+        let granted = self.granted()?;
+        tracing::debug!(
+            method,
+            connection = self.identity.connection.0,
+            "overview call"
+        );
+        if !self.overview.load(Ordering::SeqCst) {
+            return Err(HostError::Denied("feature `overview` not negotiated".into()));
+        }
+        let overview = self
+            .host
+            .overview
+            .get()
+            .ok_or_else(|| HostError::Denied("overview not offered by this host".into()))?;
+        let share = self.host.share_for(self.identity.tenant.as_ref());
+        if self.identity.tenant.is_some() && share.is_none() {
+            return Err(HostError::Denied(
+                "overview not offered for this tenant".into(),
+            ));
+        }
+        for need in needs {
+            need.require(granted)?;
+        }
+        Ok((overview, self.identity.tenant.clone()))
+    }
+
+    async fn jobs_list_inner(&self, params: JobsListParams) -> Result<JobsListResult, HostError> {
+        let (overview, tenant) = self.overview_admit(METHOD_JOBS_LIST, NEED_OBSERVE)?;
+        overview.jobs_list(tenant.as_ref(), &params)
+    }
+
+    async fn jobs_get_inner(&self, params: JobTargetParams) -> Result<JobDetail, HostError> {
+        let (overview, tenant) = self.overview_admit(METHOD_JOBS_GET, NEED_OBSERVE)?;
+        overview.jobs_get(tenant.as_ref(), &params.work_id)
+    }
+
+    async fn jobs_cancel_inner(
+        &self,
+        params: JobTargetParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (overview, tenant) = self.overview_admit(METHOD_JOBS_CANCEL, NEED_STEER)?;
+        overview.jobs_cancel(tenant.as_ref(), &self.identity.actor, &params.work_id)
+    }
+
+    async fn jobs_retry_inner(
+        &self,
+        params: JobTargetParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (overview, tenant) = self.overview_admit(METHOD_JOBS_RETRY, NEED_STEER)?;
+        overview.jobs_retry(tenant.as_ref(), &self.identity.actor, &params.work_id)
+    }
+
+    async fn agents_list_inner(
+        &self,
+        _params: AgentsListParams,
+    ) -> Result<AgentsListResult, HostError> {
+        let (overview, _tenant) = self.overview_admit(METHOD_AGENTS_LIST, NEED_OBSERVE)?;
+        let can_stop = self.granted()?.steer;
+        let mut running = Vec::new();
+        for agent in self.host.driver.live_agents() {
+            let slot = self
+                .host
+                .slots
+                .lock()
+                .ok()
+                .and_then(|slots| slots.get(&agent.session_id).cloned());
+            let Some(slot) = slot else {
+                continue;
+            };
+            let tenant = slot.lock()?.record.tenant.clone();
+            if !crate::identity::tenant_admits(self.identity.tenant.as_ref(), tenant.as_ref()) {
+                continue;
+            }
+            running.push(harw_protocol::session_wire::RunningAgent {
+                agent_id: agent.agent_id,
+                session_id: agent.session_id,
+                parent: agent.parent,
+                role: agent.role,
+                model: agent.model,
+                state: agent.state,
+                current_tool: agent.current_tool,
+                started_ms: agent.started_ms,
+                tool_calls: agent.tool_calls,
+                can_stop,
+            });
+        }
+        Ok(AgentsListResult {
+            running,
+            library: overview.library(),
+        })
+    }
+
+    async fn agents_stop_inner(
+        &self,
+        params: AgentStopParams,
+    ) -> Result<CommandRunResult, HostError> {
+        self.overview_admit(METHOD_AGENTS_STOP, NEED_STEER)?;
+        // Session admission: tenant and `steer` on the owning session.
+        let _slot = self.admitted_slot(&params.session_id, Need::Steer)?;
+        if params.agent_id.is_empty() || params.agent_id.len() > 200 {
+            return Err(HostError::Protocol("invalid agent_id".into()));
+        }
+        let stopped = self
+            .host
+            .driver
+            .stop_agent(&params.session_id, &params.agent_id)
+            .await?;
+        Ok(if stopped {
+            CommandRunResult {
+                ok: true,
+                text: format!("Agent {} wird gestoppt.", params.agent_id),
+                data: None,
+                effect: CommandEffect::Applied,
+                reason_code: None,
+                stepup: None,
+            }
+        } else {
+            refused_run(
+                refusal_codes::OP_FAILED,
+                "Kein laufender Agent mit dieser Kennung.",
+            )
+        })
     }
 
     async fn commands_list_inner(
@@ -3630,6 +3791,30 @@ impl SessionPort for HostConnection {
 
     fn stepup_cancel(&self, params: StepUpCancelParams) -> PortFuture<'_, ()> {
         Box::pin(self.stepup_cancel_inner(params).map_err_port())
+    }
+
+    fn jobs_list(&self, params: JobsListParams) -> PortFuture<'_, JobsListResult> {
+        Box::pin(self.jobs_list_inner(params).map_err_port())
+    }
+
+    fn jobs_get(&self, params: JobTargetParams) -> PortFuture<'_, JobDetail> {
+        Box::pin(self.jobs_get_inner(params).map_err_port())
+    }
+
+    fn jobs_cancel(&self, params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.jobs_cancel_inner(params).map_err_port())
+    }
+
+    fn jobs_retry(&self, params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.jobs_retry_inner(params).map_err_port())
+    }
+
+    fn agents_list(&self, params: AgentsListParams) -> PortFuture<'_, AgentsListResult> {
+        Box::pin(self.agents_list_inner(params).map_err_port())
+    }
+
+    fn agents_stop(&self, params: AgentStopParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.agents_stop_inner(params).map_err_port())
     }
 }
 

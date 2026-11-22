@@ -601,6 +601,19 @@ async fn start_remote_composed(
     if manage {
         host.install_ops(Arc::new(crate::session_ops::HostedOps::open(config.home.clone())?))
             .map_err(|error| format!("remote ops: {error}"))?;
+        // Global jobs and agents views over the profile's durable job store and
+        // agent library (feature `overview`); tenants are checked by the host.
+        let profile = harw_home::active_profile_name(&config.home);
+        let profile_dir = harw_home::profile_dir(&config.home, &profile)
+            .map_err(|error| format!("remote overview: profile directory: {error}"))?;
+        let layers = vec![config.home.clone(), profile_dir.clone()];
+        let library: harw_session_host::overview::AgentLibrary =
+            Arc::new(move || harw_local_host::agent_library(&layers));
+        host.install_overview(Arc::new(harw_session_host::overview::Overview::new(
+            Some(Arc::new(harw_session_store::JobStore::new(&profile_dir))),
+            Some(library),
+        )))
+        .map_err(|error| format!("remote overview: {error}"))?;
     }
     let addr = listener
         .local_addr()

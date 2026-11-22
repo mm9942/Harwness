@@ -18,13 +18,16 @@ use std::pin::Pin;
 use harw_types::SessionId;
 
 use crate::methods::{
+    METHOD_AGENTS_LIST, METHOD_AGENTS_STOP, METHOD_JOBS_CANCEL, METHOD_JOBS_GET, METHOD_JOBS_LIST,
+    METHOD_JOBS_RETRY,
     METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
     METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_MEDIA_GET, METHOD_SECRET_PUT, METHOD_SESSION_ADOPT,
     METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS,
     METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT, METHOD_STEPUP_CANCEL, METHOD_STEPUP_CONFIRM,
 };
 use crate::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
+    AgentStopParams, AgentsListParams, AgentsListResult, JobDetail, JobTargetParams, JobsListParams,
+    JobsListResult, ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
     CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams,
     ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams, CreateParams,
     FrameEnvelope, GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo,
@@ -137,6 +140,30 @@ pub trait SessionPort: Send + Sync {
     /// `stepup.cancel` (own step-ups only; an unknown id answers `NotFound`, never `Ok(())`).
     fn stepup_cancel(&self, _params: StepUpCancelParams) -> PortFuture<'_, ()> {
         unsupported(METHOD_STEPUP_CANCEL)
+    }
+    /// `jobs.list` (observe, feature `overview`): the durable jobs of the profile.
+    fn jobs_list(&self, _params: JobsListParams) -> PortFuture<'_, JobsListResult> {
+        unsupported(METHOD_JOBS_LIST)
+    }
+    /// `jobs.get` (observe): detail of one job.
+    fn jobs_get(&self, _params: JobTargetParams) -> PortFuture<'_, JobDetail> {
+        unsupported(METHOD_JOBS_GET)
+    }
+    /// `jobs.cancel` (steer): cancels a pending, ready or running job.
+    fn jobs_cancel(&self, _params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_JOBS_CANCEL)
+    }
+    /// `jobs.retry` (steer): requeues a failed or cancelled job.
+    fn jobs_retry(&self, _params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_JOBS_RETRY)
+    }
+    /// `agents.list` (observe): running child agents across sessions and the agent library.
+    fn agents_list(&self, _params: AgentsListParams) -> PortFuture<'_, AgentsListResult> {
+        unsupported(METHOD_AGENTS_LIST)
+    }
+    /// `agents.stop` (steer): stops a running child agent of a session.
+    fn agents_stop(&self, _params: AgentStopParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_AGENTS_STOP)
     }
 }
 

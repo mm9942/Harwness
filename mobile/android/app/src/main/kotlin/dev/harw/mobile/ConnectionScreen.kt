@@ -168,6 +168,13 @@ internal fun ConnectionScreen(
                                     )
                                 }
                             }
+                            routeHint(saved, state.routePreference)?.let {
+                                Text(
+                                    it,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 for ((choice, name) in ROUTE_CHOICES) {
                                     val enabled = routeChoiceEnabled(choice, saved) &&
@@ -477,6 +484,18 @@ private val ROUTE_CHOICES = listOf(
     RoutePreference.ONION to "Tor (.onion)",
     RoutePreference.DIRECT to "Direkt",
 )
+
+/** German hint under the route chips; null when nothing needs explaining. */
+internal fun routeHint(profile: ServerProfile?, preference: RoutePreference): String? = when {
+    profile == null -> null
+    profile.onion == null ->
+        "Tor ist nicht verfügbar: Das Gateway hat noch keine .onion-Adresse gemeldet. " +
+            "Verbinde dich einmal direkt – die Adresse wird dann automatisch übernommen " +
+            "(das Gateway braucht dafür onion = true und einen Build mit Tor-Unterstützung)."
+    preference == RoutePreference.AUTO -> "Auto verbindet zuerst direkt und weicht bei Fehlschlag auf Tor aus."
+    preference == RoutePreference.ONION -> "Nur über Tor. Der erste Start kann bis zu zwei Minuten dauern."
+    else -> null
+}
 
 /** Routes a saved profile offers, in display order; empty without a profile. */
 internal fun profileRoutes(profile: ServerProfile?): List<ConnectionRoute> = when {

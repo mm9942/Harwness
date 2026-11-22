@@ -3303,6 +3303,7 @@ name = "harw-local-host"
 version = "0.10.0"
 dependencies = [
  "harw-authority",
+ "harw-config",
  "harw-core",
  "harw-extension-api",
  "harw-protocol",
@@ -3901,6 +3902,7 @@ dependencies = [
  "getrandom 0.4.3",
  "harw-authority",
  "harw-fsutil",
+ "harw-job-core",
  "harw-media",
  "harw-protocol",
  "harw-sandbox",

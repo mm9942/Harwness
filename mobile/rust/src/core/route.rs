@@ -27,7 +27,7 @@ pub(crate) fn route_plan(
 ) -> Result<Vec<ConnectionRoute>, MobileError> {
     match preference {
         RoutePreference::Auto if profile.onion.is_some() => {
-            Ok(vec![ConnectionRoute::Onion, ConnectionRoute::Direct])
+            Ok(vec![ConnectionRoute::Direct, ConnectionRoute::Onion])
         }
         RoutePreference::Auto | RoutePreference::Direct => Ok(vec![ConnectionRoute::Direct]),
         RoutePreference::Onion if profile.onion.is_some() => Ok(vec![ConnectionRoute::Onion]),

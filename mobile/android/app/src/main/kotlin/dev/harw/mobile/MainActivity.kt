@@ -299,9 +299,36 @@ internal open class MainActivity : ComponentActivity() {
             val uiaStore = remember { uniffi.harw_mobile_ffi.UiaStore(filesDir.path) }
             UiaScreen(uiaStore, onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Agents) {
-            AgentsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) }, connection = connection)
+            AgentsOverviewScreen(
+                cloudState = cloudState,
+                cloud = cloud,
+                localState = localState,
+                local = onDevice,
+                initialTarget = if (cloudState.profile == null) OverviewTarget.Local else OverviewTarget.Cloud,
+                onBack = { openSettings(SettingsRoute.Hub) },
+                onOpenSession = { id, local ->
+                    viewChosen = true
+                    viewLocal = local
+                    openSettings(null)
+                    window.select(id)
+                },
+                onOpenUias = { openSettings(SettingsRoute.Uias) },
+            )
         } else if (settingsRoute == SettingsRoute.Jobs) {
-            JobsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) }, connection = connection)
+            JobsOverviewScreen(
+                cloudState = cloudState,
+                cloud = cloud,
+                localState = localState,
+                local = onDevice,
+                initialTarget = if (cloudState.profile == null) OverviewTarget.Local else OverviewTarget.Cloud,
+                onBack = { openSettings(SettingsRoute.Hub) },
+                onOpenSession = { id, local ->
+                    viewChosen = true
+                    viewLocal = local
+                    openSettings(null)
+                    window.select(id)
+                },
+            )
         } else if (settingsRoute == SettingsRoute.LocalModels) {
             val modelManager = remember { ModelManager(ModelStore(applicationContext)) }
             ModelsScreen(modelManager, onBack = { openSettings(SettingsRoute.Hub) })

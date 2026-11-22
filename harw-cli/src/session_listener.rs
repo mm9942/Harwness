@@ -69,6 +69,17 @@ const NODE_IDENTITY_NAMESPACE: &str = "harw.node-identity";
 pub const ONION_DIR: &str = "onion";
 /// File name of the canonical locator inside the onion directory.
 pub const ONION_LOCATOR_FILE: &str = "locator";
+/// Virtual `config.get` key that carries the gateway's onion locator (empty without onion).
+pub const ONION_LOCATOR_KEY: &str = "gateway.onion_locator";
+
+static ONION_LOCATOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The canonical locator of this process's onion service, once it is published.
+#[must_use]
+pub fn onion_locator() -> Option<String> {
+    ONION_LOCATOR.get().cloned()
+}
+
 /// How long to wait for the onion service to become reachable.
 #[cfg(feature = "onion")]
 const ONION_REACHABLE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -530,6 +541,7 @@ async fn start_onion(
         .await
         .map_err(|error| format!("[session_listener] onion: {error}"))?;
     write_locator(&dir.join(ONION_LOCATOR_FILE), server.locator())?;
+    let _ = ONION_LOCATOR.set(server.locator().to_string());
     if server.wait_reachable(ONION_REACHABLE_TIMEOUT).await {
         eprintln!("  session onion  : reachable");
     } else {

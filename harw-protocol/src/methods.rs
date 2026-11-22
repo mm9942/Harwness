@@ -56,6 +56,14 @@ pub const METHOD_SECRET_PUT: &str = "secret.put";
 pub const METHOD_STEPUP_CONFIRM: &str = "stepup.confirm";
 pub const METHOD_STEPUP_CANCEL: &str = "stepup.cancel";
 
+// Feature `overview`: global jobs and agents views.
+pub const METHOD_JOBS_LIST: &str = "jobs.list";
+pub const METHOD_JOBS_GET: &str = "jobs.get";
+pub const METHOD_JOBS_CANCEL: &str = "jobs.cancel";
+pub const METHOD_JOBS_RETRY: &str = "jobs.retry";
+pub const METHOD_AGENTS_LIST: &str = "agents.list";
+pub const METHOD_AGENTS_STOP: &str = "agents.stop";
+
 pub const NOTIF_SESSION_EVENT: &str = "event.session";
 pub const NOTIF_TURN_EVENT: &str = "event.turn";
 pub const NOTIF_APPROVAL_REQ: &str = "approval.request";
@@ -113,6 +121,16 @@ pub const STEPUP_METHODS: &[&str] = &[
     METHOD_STEPUP_CANCEL,
 ];
 
+/// Feature `overview`: global jobs and agents views. Own table.
+pub const OVERVIEW_METHODS: &[&str] = &[
+    METHOD_JOBS_LIST,
+    METHOD_JOBS_GET,
+    METHOD_JOBS_CANCEL,
+    METHOD_JOBS_RETRY,
+    METHOD_AGENTS_LIST,
+    METHOD_AGENTS_STOP,
+];
+
 /// R18 D-A: the closed `tool.*` method table.
 pub const TOOL_METHODS: &[&str] = &[METHOD_TOOL_LIST, METHOD_TOOL_CALL, METHOD_TOOL_CANCEL];
 
@@ -148,6 +166,7 @@ mod tests {
             .chain(MEDIA_METHODS)
             .chain(MANAGE_METHODS)
             .chain(STEPUP_METHODS)
+            .chain(OVERVIEW_METHODS)
             .chain(TOOL_METHODS)
             .chain(GATEWAY_READ_METHODS)
             .chain(GATEWAY_ADMIN_METHODS)

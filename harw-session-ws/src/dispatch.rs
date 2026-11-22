@@ -53,6 +53,13 @@ use harw_protocol::session_wire::{
 use harw_protocol::session_wire::{
     ArchiveParams, CreateInParams, MediaGetParams, PageParams, ProjectsParams, RenameParams, SetProjectParams,
 };
+use harw_protocol::methods::{
+    METHOD_AGENTS_LIST, METHOD_AGENTS_STOP, METHOD_JOBS_CANCEL, METHOD_JOBS_GET, METHOD_JOBS_LIST,
+    METHOD_JOBS_RETRY,
+};
+use harw_protocol::session_wire::{
+    AgentStopParams, AgentsListParams, JobTargetParams, JobsListParams,
+};
 use harw_protocol::session_wire::{
     CatalogGetParams, CommandRunParams, CommandsListParams, ConfigGetParams, ConfigResetParams,
     ConfigSetParams, SecretPutParams, StepUpCancelParams, StepUpConfirmParams,
@@ -449,6 +456,30 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
         },
         METHOD_STEPUP_CANCEL => match decode::<StepUpCancelParams>(&id, params) {
             Ok(params) => encode(id, port.stepup_cancel(params).await),
+            Err(response) => *response,
+        },
+        METHOD_JOBS_LIST => match decode::<JobsListParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.jobs_list(params).await),
+            Err(response) => *response,
+        },
+        METHOD_JOBS_GET => match decode::<JobTargetParams>(&id, params) {
+            Ok(params) => encode(id, port.jobs_get(params).await),
+            Err(response) => *response,
+        },
+        METHOD_JOBS_CANCEL => match decode::<JobTargetParams>(&id, params) {
+            Ok(params) => encode(id, port.jobs_cancel(params).await),
+            Err(response) => *response,
+        },
+        METHOD_JOBS_RETRY => match decode::<JobTargetParams>(&id, params) {
+            Ok(params) => encode(id, port.jobs_retry(params).await),
+            Err(response) => *response,
+        },
+        METHOD_AGENTS_LIST => match decode::<AgentsListParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.agents_list(params).await),
+            Err(response) => *response,
+        },
+        METHOD_AGENTS_STOP => match decode::<AgentStopParams>(&id, params) {
+            Ok(params) => encode(id, port.agents_stop(params).await),
             Err(response) => *response,
         },
         _ => error_response(

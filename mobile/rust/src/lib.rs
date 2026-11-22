@@ -14,6 +14,7 @@ mod local;
 mod manage;
 mod mission;
 mod models;
+mod overview;
 mod projection;
 mod provider;
 mod providers;
@@ -37,6 +38,10 @@ pub use models::{
     CatalogModel, ImportCheck, ImportVerdict, LocalModel, ModelFileState, ModelOrigin,
     ModelProgress, ModelVerification, commit_import, delete_model, discard_import, finalize_model,
     import_model, local_models, model_catalog, model_path,
+};
+pub use overview::{
+    OverviewAgent, OverviewAgentDef, OverviewAgents, OverviewJob, OverviewJobDetail,
+    OverviewJobEvent, OverviewJobs,
 };
 pub use provider::{ChatgptLinkAvailability, ChatgptProviderCredential, ChatgptProviderStatus};
 pub use providers::{ProviderStore, activate_local_model, active_local_model};

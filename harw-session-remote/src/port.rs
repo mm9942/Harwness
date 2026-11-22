@@ -15,6 +15,14 @@ use harw_protocol::methods::{
     METHOD_SESSION_SET_MODEL, METHOD_SESSION_SET_PROJECT, METHOD_STEPUP_CANCEL,
     METHOD_STEPUP_CONFIRM, METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT,
 };
+use harw_protocol::methods::{
+    METHOD_AGENTS_LIST, METHOD_AGENTS_STOP, METHOD_JOBS_CANCEL, METHOD_JOBS_GET, METHOD_JOBS_LIST,
+    METHOD_JOBS_RETRY,
+};
+use harw_protocol::session_wire::{
+    AgentStopParams, AgentsListParams, AgentsListResult, JobDetail, JobTargetParams, JobsListParams,
+    JobsListResult,
+};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
     CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams,
@@ -338,6 +346,54 @@ impl SessionPort for RemotePort {
         Box::pin(async move {
             self.connection
                 .call(METHOD_STEPUP_CANCEL, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn jobs_list(&self, params: JobsListParams) -> PortFuture<'_, JobsListResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_JOBS_LIST, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn jobs_get(&self, params: JobTargetParams) -> PortFuture<'_, JobDetail> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_JOBS_GET, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn jobs_cancel(&self, params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_JOBS_CANCEL, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn jobs_retry(&self, params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_JOBS_RETRY, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn agents_list(&self, params: AgentsListParams) -> PortFuture<'_, AgentsListResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_AGENTS_LIST, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn agents_stop(&self, params: AgentStopParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_AGENTS_STOP, &params, Effect::None)
                 .await
         })
     }
