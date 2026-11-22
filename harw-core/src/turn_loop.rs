@@ -4001,8 +4001,12 @@ fn transition_after_turn_failure(
         error,
         CoreError::Model(model_error) if model_error.is_retryable()
     );
+    // Jeder Modellfehler (auch HTTP 400/401) beendet nur diesen Turn: Die Session kehrt nach
+    // `Idle` zurück, damit die nächste Nachricht normal läuft, statt als „session not idle:
+    // Failed" abgewiesen zu werden. Die Fehlermeldung bleibt trotzdem sichtbar.
+    let recover_to_idle = retryable || matches!(error, CoreError::Model(_));
 
-    if retryable {
+    if recover_to_idle {
         // `transition_after_turn_failure` liefert `()` zurück, ein `?` ist
         // hier also nicht möglich — der Fehler wird stattdessen mit vollem
         // Kontext protokolliert. Die Session bleibt in diesem seltenen Fall

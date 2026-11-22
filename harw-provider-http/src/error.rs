@@ -195,6 +195,11 @@ impl HttpProviderError {
                     .pointer("/error/message")
                     .or_else(|| value.get("message"))
                     .or_else(|| value.pointer("/error/detail"))
+                    // xAI/Azure-Foundry: {"code":"…","error":"Text"} bzw. {"detail":"…"}
+                    .or_else(|| value.get("error").filter(|v| v.is_string()))
+                    .or_else(|| value.get("detail"))
+                    .or_else(|| value.pointer("/error/code"))
+                    .or_else(|| value.get("code"))
                     .and_then(serde_json::Value::as_str)
                     .and_then(sanitize_diagnostic);
                 let error_type = value

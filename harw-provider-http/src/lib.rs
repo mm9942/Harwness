@@ -4344,6 +4344,7 @@ impl OpenAiResponsesProvider {
         // kein zweiter Refresh-Versuch nach erneutem 401 (siehe
         // `codex::CodexRoute::refresh`).
         let mut codex_refreshed_after_401 = false;
+        let mut degraded_after_400 = false;
         let response = loop {
             let builder = self.authorized_request(&url, api_key, identity).await?;
             // Runde 7, Teil L4: gestreamt begrenzt `request_timeout` nur die
@@ -4355,6 +4356,25 @@ impl OpenAiResponsesProvider {
             )
             .await?;
 
+            // Selbstheilung bei HTTP 400 (z. B. Azure/xAI-Gateways lehnen optionale Felder wie
+            // `reasoning_effort` oder `stream_options` ab): einmal ohne diese Zusatzfelder wiederholen.
+            if response.status() == reqwest::StatusCode::BAD_REQUEST
+                && self.transport == Transport::Chat
+                && !degraded_after_400
+                && self.codex_route.is_none()
+                && self.chatgpt_plan.is_none()
+                && let Some(map) = wire.as_object_mut()
+                && ["reasoning_effort", "stream_options", "parallel_tool_calls", "temperature", "top_p", "thinking", "reasoning"]
+                    .iter()
+                    .any(|key| map.contains_key(*key))
+            {
+                degraded_after_400 = true;
+                for key in ["reasoning_effort", "stream_options", "parallel_tool_calls", "temperature", "top_p", "thinking", "reasoning"] {
+                    map.remove(key);
+                }
+                tracing::warn!(model, "provider returned HTTP 400; retrying once without optional request fields");
+                continue;
+            }
             if response.status() == reqwest::StatusCode::UNAUTHORIZED
                 && !codex_refreshed_after_401
                 && let Some(route) = &self.codex_route
