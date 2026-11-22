@@ -355,9 +355,13 @@ internal open class MainActivity : ComponentActivity() {
                 },
                 onConnectLocal = {
                     connectingFromSetup = true
+                    (application as HarwApplication).localAutostart.resume()
                     onDevice.connectLocal()
                 },
-                onDisconnect = { cloud.disconnect(); onDevice.disconnect() },
+                onDisconnect = {
+                    (application as HarwApplication).localAutostart.suppress()
+                    cloud.disconnect(); onDevice.disconnect()
+                },
                 onSelectRoute = { cloud.selectRoute(it) },
                 onForgetSetup = cloud::forgetSetup,
                 onRetryCleanup = cloud::retryCleanup,
@@ -493,6 +497,7 @@ internal open class MainActivity : ComponentActivity() {
     }
 
     private fun startConnection() {
+        (application as HarwApplication).localAutostart.resume()
         try {
             HarwConnectionService.startFrom(this)
         } catch (error: Exception) {

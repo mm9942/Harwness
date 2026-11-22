@@ -47,6 +47,8 @@ pub struct CatalogModel {
     pub min_ram_bytes: u64,
     pub recommended: bool,
     pub default_n_ctx: u32,
+    /// Short German hint shown next to the entry; empty if none.
+    pub note: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -135,10 +137,76 @@ struct CatalogRow {
     min_ram_bytes: u64,
     recommended: bool,
     default_n_ctx: u32,
+    note: &'static str,
 }
 
 /// Display order. Exactly one row is recommended.
 const CATALOG: &[CatalogRow] = &[
+    CatalogRow {
+        id: "qwen3.5-9b-iq4xs",
+        label: "Qwen3.5 9B \u{b7} IQ4_XS",
+        repo: "unsloth/Qwen3.5-9B-GGUF",
+        revision: "3885219b6810b007914f3a7950a8d1b469d598a5",
+        file_name: "Qwen3.5-9B-IQ4_XS.gguf",
+        size_bytes: 5168653536,
+        sha256: "7e918aeca06c52bcb528ea6b04b4ec957e75ee8c0a73138854c0dfcf371ea429",
+        min_ram_bytes: 8 * GIB,
+        recommended: true,
+        default_n_ctx: DEFAULT_N_CTX,
+        note: "Erste Wahl",
+    },
+    CatalogRow {
+        id: "qwen3.5-9b-iq4nl",
+        label: "Qwen3.5 9B \u{b7} IQ4_NL",
+        repo: "unsloth/Qwen3.5-9B-GGUF",
+        revision: "3885219b6810b007914f3a7950a8d1b469d598a5",
+        file_name: "Qwen3.5-9B-IQ4_NL.gguf",
+        size_bytes: 5371028704,
+        sha256: "12fd6b43e298ae4c8d374e64e8c2406c252d109ead47dffb46e75be3566ed0e5",
+        min_ram_bytes: 8 * GIB,
+        recommended: false,
+        default_n_ctx: DEFAULT_N_CTX,
+        note: "Interessant für ARM-CPU",
+    },
+    CatalogRow {
+        id: "qwen3.5-9b-q4km",
+        label: "Qwen3.5 9B \u{b7} Q4_K_M",
+        repo: "unsloth/Qwen3.5-9B-GGUF",
+        revision: "3885219b6810b007914f3a7950a8d1b469d598a5",
+        file_name: "Qwen3.5-9B-Q4_K_M.gguf",
+        size_bytes: 5680522464,
+        sha256: "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
+        min_ram_bytes: 8 * GIB,
+        recommended: false,
+        default_n_ctx: DEFAULT_N_CTX,
+        note: "Klassische 4-Bit-Quantisierung",
+    },
+    CatalogRow {
+        id: "qwen3.5-9b-ud-q4kxl",
+        label: "Qwen3.5 9B \u{b7} UD-Q4_K_XL",
+        repo: "unsloth/Qwen3.5-9B-GGUF",
+        revision: "3885219b6810b007914f3a7950a8d1b469d598a5",
+        file_name: "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+        size_bytes: 5966095584,
+        sha256: "6f5d30666c2d8ae16a306e616d95341dcf3cc46810df84d7e6f5a7d1e4c1b293",
+        min_ram_bytes: 9 * GIB,
+        recommended: false,
+        default_n_ctx: DEFAULT_N_CTX,
+        note: "Unsloth Dynamic, mehr RAM nötig",
+    },
+    CatalogRow {
+        id: "qwen3.5-4b-q6k",
+        label: "Qwen3.5 4B \u{b7} Q6_K",
+        repo: "unsloth/Qwen3.5-4B-GGUF",
+        revision: "e87f176479d0855a907a41277aca2f8ee7a09523",
+        file_name: "Qwen3.5-4B-Q6_K.gguf",
+        size_bytes: 3525956768,
+        sha256: "fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66",
+        min_ram_bytes: 6 * GIB,
+        recommended: false,
+        default_n_ctx: DEFAULT_N_CTX,
+        note: "Schneller, höhere Präzision",
+    },
     CatalogRow {
         id: "qwen3.5-4b-q4km",
         label: "Qwen3.5 4B \u{b7} Q4_K_M",
@@ -148,8 +216,9 @@ const CATALOG: &[CatalogRow] = &[
         size_bytes: 2_783_446_880,
         sha256: "b7508d8b4a652bc020a439aafdd4ce1527d49774865ce3334a43b16dbeaa90ca",
         min_ram_bytes: 6 * GIB,
-        recommended: true,
+        recommended: false,
         default_n_ctx: DEFAULT_N_CTX,
+        note: "",
     },
     CatalogRow {
         id: "qwen3-4b-q4km",
@@ -162,6 +231,7 @@ const CATALOG: &[CatalogRow] = &[
         min_ram_bytes: 6 * GIB,
         recommended: false,
         default_n_ctx: DEFAULT_N_CTX,
+        note: "",
     },
     CatalogRow {
         id: "qwen3-1.7b-q8",
@@ -174,6 +244,7 @@ const CATALOG: &[CatalogRow] = &[
         min_ram_bytes: 4 * GIB,
         recommended: false,
         default_n_ctx: DEFAULT_N_CTX,
+        note: "",
     },
 ];
 
@@ -195,6 +266,7 @@ fn catalog_entries() -> Vec<CatalogModel> {
             min_ram_bytes: row.min_ram_bytes,
             recommended: row.recommended,
             default_n_ctx: row.default_n_ctx,
+            note: row.note.to_owned(),
         })
         .collect()
 }
@@ -1003,6 +1075,7 @@ mod tests {
             min_ram_bytes: 0,
             recommended: false,
             default_n_ctx: DEFAULT_N_CTX,
+            note: String::new(),
         }
     }
 
@@ -1047,7 +1120,7 @@ mod tests {
         );
         assert_eq!(model.default_n_ctx, 16384);
         assert_eq!(model.min_ram_bytes, 6 * GIB);
-        assert!(model.recommended);
+        assert!(!model.recommended);
         Ok(())
     }
 

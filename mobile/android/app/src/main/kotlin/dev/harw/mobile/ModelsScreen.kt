@@ -421,6 +421,13 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                             }
                         }
                         Text(gb(model.sizeBytes.toLong()), style = MaterialTheme.typography.bodyMedium)
+                        if (model.note.isNotEmpty()) {
+                            Text(
+                                model.note,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                         Text(stateText(model, local), style = MaterialTheme.typography.bodyMedium)
                         if (state == ModelFileState.COMPLETE) {
                             Text(
