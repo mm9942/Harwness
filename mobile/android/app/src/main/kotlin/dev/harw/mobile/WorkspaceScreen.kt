@@ -47,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import uniffi.harw_mobile_ffi.ApprovalDecision
+import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.MobileSession
 import uniffi.harw_mobile_ffi.MobileSessionState
 
@@ -185,25 +186,44 @@ private fun SessionDirectory(
             }
         }
         if (state.sessions.isEmpty()) {
-            val message = when {
-                state.listError != null -> state.listError
-                !state.online -> state.detail ?: "Connect to load sessions."
-                !state.sessionsLoaded -> "Loading sessions…"
-                state.canCreate -> "No sessions yet. Use New to start one."
-                else -> "No sessions are visible to this device."
+            Box(Modifier.fillMaxSize().padding(inset), contentAlignment = Alignment.Center) {
+                when {
+                    state.online && !state.sessionsLoaded && state.listError == null -> Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                        Text(
+                            "Loading sessions…",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    state.listError != null -> Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        StatusMessage("Could not load sessions: ${state.listError}", error = true)
+                        if (state.online) TextButton(onClick = onRefresh) { Text("Try again") }
+                    }
+                    !state.online -> DirectoryEmpty(offlineMessage(state, hasSessions = false))
+                    state.canCreate -> DirectoryEmpty("No sessions yet. Use New to start one.")
+                    else -> DirectoryEmpty("No sessions are visible to this device.")
+                }
             }
-            Box(Modifier.fillMaxSize().padding(inset), contentAlignment = Alignment.Center) { DirectoryEmpty(message) }
         } else {
             LazyColumn(
                 contentPadding = PaddingValues(start = inset, end = inset, top = 9.dp, bottom = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                state.listError?.let { message -> item { StatusMessage(message, error = true) } }
+                if (!state.online) {
+                    item { StatusMessage(offlineMessage(state, hasSessions = true), error = state.phase.isFailure()) }
+                }
+                state.listError?.let { message ->
+                    item { StatusMessage("Could not refresh sessions: $message", error = true) }
+                }
                 if (state.online && !state.canCreate) {
                     item { StatusMessage("This device has no permission to create sessions.") }
-                }
-                if (!state.online) {
-                    item { StatusMessage(state.detail ?: "Showing the last loaded sessions.") }
                 }
                 items(state.sessions, key = { it.sessionId }) { session ->
                     SessionRow(
@@ -286,6 +306,25 @@ private fun NewSessionDialog(enabled: Boolean, onDismiss: () -> Unit, onCreate: 
             Button(onClick = { onCreate(title.trim().ifBlank { null }) }, enabled = enabled) { Text("Create") }
         },
     )
+}
+
+private fun ConnectionPhase.isFailure(): Boolean =
+    this == ConnectionPhase.FAILED || this == ConnectionPhase.REVOKED
+
+private fun offlineMessage(state: WorkspaceState, hasSessions: Boolean): String {
+    val base = when {
+        state.stopping -> "Disconnecting…"
+        else -> when (state.phase) {
+            ConnectionPhase.CONNECTING -> "Connecting to the server…"
+            ConnectionPhase.RECONNECTING -> "Connection lost. Reconnecting…"
+            ConnectionPhase.FAILED -> "Connection failed."
+            ConnectionPhase.REVOKED -> "Access to this server was stopped."
+            ConnectionPhase.DISCONNECTED, ConnectionPhase.CONNECTED -> "Offline."
+        }
+    }
+    val detail = state.detail?.takeUnless { it.isBlank() }
+    val tail = if (hasSessions) "Showing the last loaded sessions." else "Connect to load sessions."
+    return listOfNotNull(base, detail, tail).joinToString(" ")
 }
 
 internal fun MobileSession.displayName(): String = title?.takeUnless { it.isBlank() } ?: "Session ${sessionId.take(8)}"

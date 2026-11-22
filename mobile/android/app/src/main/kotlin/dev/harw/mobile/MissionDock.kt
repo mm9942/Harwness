@@ -1,5 +1,6 @@
 package dev.harw.mobile
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -27,6 +28,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.delay
@@ -67,6 +69,21 @@ internal fun MissionHeader(
     } + PANEL_CHROME
     val imeVisible = WindowInsets.isImeVisible
     val now = rememberTicker(activeAgents(agents) > 0)
+    val agentCount = activeAgents(agents)
+    val jobCount = activeJobs(jobs)
+    var expanded by rememberSaveable { mutableStateOf(agentCount > 0 || jobCount > 0) }
+    val summary = missionSummary(agentCount, jobCount)
+    if (!expanded) {
+        Text(
+            "▸ $summary",
+            modifier = modifier.fillMaxWidth().clickable { expanded = true }.padding(vertical = 4.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        return
+    }
     Column(
         modifier
             .fillMaxWidth()
@@ -74,6 +91,14 @@ internal fun MissionHeader(
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+        Text(
+            "▾ $summary",
+            modifier = Modifier.fillMaxWidth().clickable { expanded = false },
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             val side = (maxWidth - SPACING) / 2
             val cardHeight = missionCardHeightDp(
@@ -95,7 +120,7 @@ internal fun MissionHeader(
 
 /** Wall clock that ticks once a second only while [running]; read it only where the time is shown. */
 @Composable
-private fun rememberTicker(running: Boolean): State<Long> {
+internal fun rememberTicker(running: Boolean): State<Long> {
     val now = remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(running) {
         while (running) {
@@ -123,7 +148,7 @@ private fun AgentsCard(agents: List<MobileAgent>, now: State<Long>, modifier: Mo
         Column(Modifier.padding(SPACING), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             CardTitle("Agents · ${activeAgents(agents)} active")
             if (agents.isEmpty()) {
-                Text("No agents", style = MaterialTheme.typography.bodySmall)
+                Text("No agents yet", style = MaterialTheme.typography.bodySmall)
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     items(agents, key = { it.id }) { AgentRow(it, now) }
@@ -179,7 +204,7 @@ private fun JobsCard(jobs: List<MobileJob>, modifier: Modifier) {
         Column(Modifier.padding(SPACING), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             CardTitle("Jobs · ${activeJobs(jobs)} active")
             if (jobs.isEmpty()) {
-                Text("No jobs", style = MaterialTheme.typography.bodySmall)
+                Text("No jobs yet", style = MaterialTheme.typography.bodySmall)
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     items(jobs, key = { it.workId }) { JobRow(it) }

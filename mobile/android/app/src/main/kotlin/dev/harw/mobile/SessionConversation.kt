@@ -135,6 +135,21 @@ internal fun SessionConversation(
     BoxWithConstraints(modifier.imePadding()) {
         val availableHeight = maxHeight
         Column(Modifier.fillMaxSize()) {
+            when (sessionFreshness(state.online, state.generation, view?.generation)) {
+                SessionFreshness.Live -> Unit
+                SessionFreshness.Stale -> StatusMessage(
+                    "Showing an older state – waiting for the server to resync",
+                    Modifier.padding(horizontal = 15.dp, vertical = 4.dp),
+                )
+                SessionFreshness.Offline -> StatusMessage(
+                    listOfNotNull(
+                        state.phase.name.lowercase().replace('_', ' ').replaceFirstChar { it.uppercase() },
+                        state.detail?.takeIf { it.isNotBlank() },
+                    ).joinToString(" · "),
+                    Modifier.padding(horizontal = 15.dp, vertical = 4.dp),
+                    error = true,
+                )
+            }
             if (inlineActivity || turnId != null) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 5.dp),
@@ -322,6 +337,7 @@ private fun PromptComposer(
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         draft.error?.let { StatusMessage(it, error = true) }
         if (draft.uncertain) {
+            StatusMessage("Delivery unknown – check the transcript before resending", error = true)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                 OutlinedButton(onClick = onReview) { Text("Review latest transcript") }
                 TextButton(enabled = !draft.sending, onClick = onDiscard) { Text("Discard draft") }
@@ -391,6 +407,9 @@ private fun ApprovalScreen(
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
                 HarwHeader("Approval", onBack = onClose) {}
+                val now by rememberTicker(true)
+                val remainingMs = approvalRemainingMs(approval.timeoutAt, now)
+                val expired = remainingMs != null && remainingMs <= 0L
                 LazyColumn(
                     Modifier.weight(1f).fillMaxWidth(),
                     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 17.dp),
@@ -405,8 +424,14 @@ private fun ApprovalScreen(
                     item {
                         SelectionContainer { Text(approval.summary, style = MaterialTheme.typography.bodyLarge) }
                     }
-                    if (approval.timeoutAt.isNotBlank()) {
-                        item { Text("Expires ${approval.timeoutAt}", style = MaterialTheme.typography.bodySmall) }
+                    remainingMs?.let { ms ->
+                        item {
+                            if (ms <= 0L) {
+                                Text("Expired", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+                            } else {
+                                Text("Expires in ${formatRemaining(ms)}", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
                     }
                     if (!allowed) item { StatusMessage("This device cannot decide this approval in the current connection.") }
                     failure?.let { failureText -> item { StatusMessage(failureText, error = true) } }
@@ -420,13 +445,13 @@ private fun ApprovalScreen(
                                     color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer,
                                 ) {
                                     Row(
-                                        Modifier.selectable(selected, enabled = allowed && !busy, role = Role.RadioButton) {
+                                        Modifier.selectable(selected, enabled = allowed && !busy && !expired, role = Role.RadioButton) {
                                             selection = decision.name
                                         }.padding(horizontal = 11.dp, vertical = 8.dp),
                                         horizontalArrangement = Arrangement.spacedBy(13.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
-                                        RadioButton(selected, onClick = null, enabled = allowed && !busy)
+                                        RadioButton(selected, onClick = null, enabled = allowed && !busy && !expired)
                                         Text(decision.displayName(), modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
                                     }
                                 }
@@ -441,7 +466,7 @@ private fun ApprovalScreen(
                 ) {
                     TextButton(onClick = onClose) { Text("Close") }
                     Button(
-                        enabled = allowed && !busy && choice != null,
+                        enabled = allowed && !busy && !expired && choice != null,
                         onClick = { if (choice != null) onDecide(choice) },
                     ) { Text(if (busy) "Confirming…" else "Confirm decision") }
                 }
