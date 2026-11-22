@@ -7,6 +7,8 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.outlined.AddPhotoAlternate
 import androidx.compose.material3.InputChip
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -276,7 +278,7 @@ internal fun SessionConversation(
             }
             if (state.local) {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 2.dp)) {
-                    LocalModelChip()
+                    LocalModelChip(hasImages = window.draft(sessionId).images.isNotEmpty())
                 }
             } else if (manageSupport != null) {
                 val block = modelChipBlock(manageSupport, active)
@@ -337,7 +339,7 @@ internal fun SessionConversation(
             }
             val scope = rememberCoroutineScope()
             HolderBanner(
-                access, holder, Modifier.padding(horizontal = 15.dp, vertical = 4.dp),
+                access, holder, Modifier.padding(horizontal = 15.dp, vertical = 4.dp), state.local,
                 onResume = { scope.launch { connection.resumeSession(sessionId) } },
             )
             if (approvals.isNotEmpty()) {
@@ -556,22 +558,23 @@ internal fun composerHint(access: ConversationAccess, turnRunning: Boolean = fal
 }
 
 /** Abzeichen-Text für den aktuellen Halter; `null` = frei. */
-internal fun holderBadge(holder: MobileHolder?): String? = holder?.let {
+internal fun holderBadge(holder: MobileHolder?, local: Boolean = false): String? = holder?.let {
     when (it.kind) {
-        MobileHolderKind.GATEWAY -> "Läuft auf Gateway"
+        MobileHolderKind.GATEWAY -> if (local) "Läuft auf diesem Gerät" else "Läuft auf Gateway"
         MobileHolderKind.TUI -> "Belegt im Terminal"
         MobileHolderKind.JOB -> "Belegt durch Job"
         MobileHolderKind.UNKNOWN -> "Belegt"
     }
 }
 
-internal fun holderBannerText(access: ConversationAccess, holder: MobileHolder?): String? = when (access) {
+internal fun holderBannerText(access: ConversationAccess, holder: MobileHolder?, local: Boolean = false): String? = when (access) {
     ConversationAccess.HeldElsewhere -> when (holder?.kind) {
         MobileHolderKind.TUI -> "Die Session ist im Terminal geöffnet. Senden ist pausiert, bis sie dort frei wird."
         MobileHolderKind.JOB -> "Ein Job schreibt gerade in diese Session. Senden ist pausiert."
         else -> "Die Session ist gerade belegt. Senden ist pausiert."
     }
-    ConversationAccess.RunningOnGateway -> "Auf dem Gateway läuft gerade ein Turn. Du kannst mitlesen."
+    ConversationAccess.RunningOnGateway ->
+        if (local) "Auf diesem Gerät läuft gerade eine Antwort." else "Auf dem Gateway läuft gerade ein Turn. Du kannst mitlesen."
     ConversationAccess.ReadOnly -> "Nur lesen: Der Server nimmt in dieser Session keine Eingaben an."
     else -> null
 }
@@ -580,9 +583,9 @@ internal fun holderBannerText(access: ConversationAccess, holder: MobileHolder?)
 internal fun rendersMarkdown(kind: TranscriptKind): Boolean = kind == TranscriptKind.ASSISTANT
 
 @Composable
-private fun HolderBanner(access: ConversationAccess, holder: MobileHolder?, modifier: Modifier, onResume: () -> Unit) {
-    val text = holderBannerText(access, holder) ?: return
-    val badge = holderBadge(holder)
+private fun HolderBanner(access: ConversationAccess, holder: MobileHolder?, modifier: Modifier, local: Boolean, onResume: () -> Unit) {
+    val text = holderBannerText(access, holder, local) ?: return
+    val badge = holderBadge(holder, local)
     Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
         if (badge != null) {
             Surface(
@@ -952,7 +955,7 @@ internal fun ModelSwitchSheet(
 /** Modell-Knopf des On-Device-Hosts: zeigt Provider/Modell, öffnet die Auswahl, Wechsel gilt ab der nächsten Antwort. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun LocalModelChip() {
+internal fun LocalModelChip(hasImages: Boolean = false) {
     val context = LocalContext.current
     var open by rememberSaveable { mutableStateOf(false) }
     var refresh by remember { mutableIntStateOf(0) }
@@ -975,6 +978,7 @@ internal fun LocalModelChip() {
         onClick = { open = true },
         label = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
     )
+    LocalVisionHint(hasImages = hasImages, refresh = refresh, onActivated = { refresh++ })
     if (open) {
         ModalBottomSheet(
             onDismissRequest = { open = false },
@@ -982,6 +986,101 @@ internal fun LocalModelChip() {
         ) {
             LocalModelSheet(onChanged = { refresh++ })
         }
+    }
+}
+
+/** Button "Bildverständnis laden" für das aktive On-Device-Modell ohne Projektor; lädt, zeigt Fortschritt, aktiviert neu. */
+@Composable
+private fun LocalVisionHint(hasImages: Boolean, refresh: Int, onActivated: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var tick by remember { mutableIntStateOf(0) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val download by ModelDownloads.state.collectAsState()
+    // Aktives Modell + Add-on; `null` = nichts anzubieten (kein Gerätemodell, kein Add-on, schon geladen).
+    val addon by produceState<uniffi.harw_mobile_ffi.VisionAddon?>(null, refresh, tick, download) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                val info = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
+                val id = info.activeModel
+                if (info.activeProvider != "local-gguf" || id.isNullOrBlank() || localModelSeesImages(context, id)) {
+                    null
+                } else {
+                    uniffi.harw_mobile_ffi.visionCatalog().firstOrNull { id in it.modelIds }
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+    val current = addon ?: return
+    val fileId = current.file.id
+    var lastFinished by remember { mutableStateOf<ModelDownloadState?>(null) }
+    LaunchedEffect(download) {
+        val d = download
+        if (d is ModelDownloadState.Finished && d.modelId == fileId && d != lastFinished) {
+            lastFinished = d
+            when (val r = d.result) {
+                is DownloadResult.Done -> try {
+                    val modelId = current.modelIds.firstOrNull() ?: return@LaunchedEffect
+                    val info = withContext(Dispatchers.IO) {
+                        ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
+                    }
+                    val active = info.activeModel?.takeIf { it in current.modelIds } ?: modelId
+                    ModelManager(ModelStore(context.applicationContext)).useLocal(context.filesDir.path, active)
+                    error = null
+                    onActivated()
+                } catch (e: Exception) {
+                    error = e.message ?: "Modell konnte nicht neu aktiviert werden"
+                }
+                is DownloadResult.Failed -> error = r.message
+                is DownloadResult.NoSpace -> error = "Nicht genug freier Speicher"
+                else -> Unit
+            }
+        }
+    }
+    fun start() {
+        error = null
+        when (ModelDownloads.start(context, fileId)) {
+            StartResult.Started -> tick++
+            StartResult.AlreadyRunning -> error = "Ein Download läuft bereits"
+            StartResult.Refused -> error = "Das System hat den Download nicht gestartet"
+            StartResult.UnknownModel -> error = "Unbekanntes Modell"
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        when {
+            download is ModelDownloadState.Running && (download as ModelDownloadState.Running).modelId == fileId -> {
+                val run = download as ModelDownloadState.Running
+                if (run.phase == DownloadPhase.Verifying) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Text("Bildverständnis: prüfe …", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    LinearProgressIndicator(progress = { downloadFraction(run.done, run.total) }, modifier = Modifier.fillMaxWidth())
+                    Text(
+                        "Bildverständnis: lade ${downloadPercent(run.done, run.total)}%",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            download is ModelDownloadState.WaitingForNetwork && (download as ModelDownloadState.WaitingForNetwork).modelId == fileId -> {
+                Text("Bildverständnis: warte auf WLAN", style = MaterialTheme.typography.bodySmall)
+                OutlinedButton(onClick = { start() }) { Text("Fortsetzen") }
+            }
+            else -> {
+                if (hasImages) {
+                    Text(
+                        "Dieses Modell ignoriert Bilder, bis das Bildverständnis geladen ist.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                OutlinedButton(onClick = { start() }) {
+                    Text("Bildverständnis laden (${gb(current.file.sizeBytes.toLong())})")
+                }
+            }
+        }
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
     }
 }
 

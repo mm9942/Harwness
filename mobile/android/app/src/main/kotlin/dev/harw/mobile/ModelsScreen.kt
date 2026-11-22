@@ -71,9 +71,9 @@ private const val TextImportCancelled = "Import abgebrochen"
 private const val TextOldFileKept =
     "Die alte Datei konnte nicht entfernt werden und belegt noch Speicher. Lösche sie in einem Dateimanager."
 
-private fun gb(bytes: Long): String = String.format(Locale.US, "%.1f GB", bytes / BytesPerGb)
+internal fun gb(bytes: Long): String = String.format(Locale.US, "%.1f GB", bytes / BytesPerGb)
 
-private fun downloadFraction(done: Long, total: Long): Float =
+internal fun downloadFraction(done: Long, total: Long): Float =
     if (total <= 0L) 0f else (done.toFloat() / total.toFloat()).coerceIn(0f, 1f)
 
 private fun noSpaceText(neededBytes: Long, freeBytes: Long): String =
