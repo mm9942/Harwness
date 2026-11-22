@@ -8,6 +8,14 @@ parent: ../README.md
 
 # W00 Contract — portrait top agent/jobs dock
 
+> **Superseded in part, 2026-11-22 (owner decision, PL-97 §3.3.1/§7).** The
+> pinned top dock of this contract (invariant 6 "about one third of usable
+> height", combined dock on narrow panes) is replaced in portrait by two square
+> Agents|Jobs windows that are never combined, a boxed Reasoning window (8 rows,
+> all agents, role prefix) and a FINISHED strip below it; portrait now starts at
+> 30×20 and also applies to physically portrait terminals. Invariants 4, 5, 7-11
+> stay in force.
+
 Pinned baseline: `dev@79b471d9b64544714d74306b3356711daf8c0f7a`.
 
 This is a handoff contract for implementation. It fixes the behavior that

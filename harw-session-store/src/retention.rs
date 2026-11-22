@@ -1366,7 +1366,7 @@ mod tests {
 
     // Every entry of `dir` (any kind, dot files such as `.lock` included),
     // sorted: an unchanged listing means nothing was created or removed.
-    fn listing(dir: &Path) -> TestResult<Vec<PathBuf>> {
+    fn dir_listing(dir: &Path) -> TestResult<Vec<PathBuf>> {
         let mut out = fs::read_dir(dir)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1546,12 +1546,16 @@ mod tests {
     fn dod_verdicts_dry_run_predicts_the_apply() -> TestResult {
         let temp = tempfile::tempdir()?;
         let store = verdict_store(temp.path())?;
-        let before = listing(store.root())?;
+        let before = dir_listing(store.root())?;
 
         let dry = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::DryRun)
             .map_err(ctx("dry run"))?;
         assert!(dry.errors.is_empty(), "{:?}", dry.errors);
-        assert_eq!(listing(store.root())?, before, "the dry run wrote nothing");
+        assert_eq!(
+            dir_listing(store.root())?,
+            before,
+            "the dry run wrote nothing"
+        );
 
         let applied = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::Apply)
             .map_err(ctx("apply"))?;
@@ -1661,7 +1665,7 @@ mod tests {
         let tampered = text.replacen("reason-1", "reason-X", 1);
         assert_ne!(tampered, text, "the rationale must be found");
         fs::write(&second, tampered)?;
-        let before = listing(store.root())?;
+        let before = dir_listing(store.root())?;
         let longer = ClassConfig {
             max_age_secs: Some(365 * 86_400),
             ..verdicts_enabled()
@@ -1686,7 +1690,11 @@ mod tests {
         assert!(fault.message.contains("segment 2"), "{}", fault.message);
         assert!(!fault.message.contains("reason"), "content-free");
         assert_eq!(fault.path, store.root());
-        assert_eq!(listing(store.root())?, before, "the dry run wrote nothing");
+        assert_eq!(
+            dir_listing(store.root())?,
+            before,
+            "the dry run wrote nothing"
+        );
 
         let applied =
             sweep_verdicts(temp.path(), &longer, SweepMode::Apply).map_err(ctx("apply"))?;
@@ -1698,7 +1706,11 @@ mod tests {
         );
         assert_eq!(applied.removed_segments, 0);
         assert_eq!(applied.removed_records, 0);
-        assert_eq!(listing(store.root())?, before, "the apply deleted nothing");
+        assert_eq!(
+            dir_listing(store.root())?,
+            before,
+            "the apply deleted nothing"
+        );
         Ok(())
     }
 
@@ -1714,7 +1726,7 @@ mod tests {
         let elsewhere = temp.path().join("elsewhere");
         fs::rename(&root, &elsewhere)?;
         std::os::unix::fs::symlink(&elsewhere, &root)?;
-        let before = listing(&elsewhere)?;
+        let before = dir_listing(&elsewhere)?;
 
         let dry = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::DryRun)
             .map_err(ctx("dry run"))?;
@@ -1737,14 +1749,22 @@ mod tests {
             refusal.message
         );
         assert_eq!(refusal.path, root);
-        assert_eq!(listing(&elsewhere)?, before, "the dry run touched nothing");
+        assert_eq!(
+            dir_listing(&elsewhere)?,
+            before,
+            "the dry run touched nothing"
+        );
 
         let applied = sweep_verdicts(temp.path(), &verdicts_enabled(), SweepMode::Apply);
         assert!(
             matches!(applied, Err(RetentionError::Io { .. })),
             "{applied:?}"
         );
-        assert_eq!(listing(&elsewhere)?, before, "the apply touched nothing");
+        assert_eq!(
+            dir_listing(&elsewhere)?,
+            before,
+            "the apply touched nothing"
+        );
         Ok(())
     }
 }

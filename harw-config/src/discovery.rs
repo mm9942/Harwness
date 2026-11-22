@@ -154,6 +154,7 @@ impl ResolvedConfig {
     /// actually selected/used (`harw-runtime`), not at load time.
     pub fn validate(&self) -> ConfigResult<()> {
         validate_mcp_listener(&self.harness)?;
+        self.harness.tui.validate().map_err(ConfigError::Invalid)?;
         // `active_agent_definition`/`active_uia_definition` prüft der
         // Konsument gegen die gesenkten Definitionen
         // (`harw_registry_defaults::config_agents::ConfigAgents::validate_selection`):
@@ -2263,6 +2264,21 @@ job_capabilities = ["cancel_workspace"]
                 if field == "headers.authorization"),
             "{error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_rejects_an_out_of_range_tui_cell_aspect() -> TestResult {
+        let mut config = ResolvedConfig::default();
+        config.harness.tui.cell_aspect = Some(2.0);
+        let Err(error) = config.validate() else {
+            return Err(TestError::Unexpected(
+                "expected validate() to reject tui.cell_aspect = 2.0".to_owned(),
+            ));
+        };
+        assert!(error.to_string().contains("tui.cell_aspect"), "{error}");
+        config.harness.tui.cell_aspect = Some(0.48);
+        assert!(config.validate().is_ok());
         Ok(())
     }
 

@@ -4,7 +4,7 @@
 # by harw-dod/scripts/install.sh (LIBEXECDIR).
 #
 # Pulled in by harw-dod.target (PL-100 WP1.6). The watch scope comes from
-# [probe_fs] in @SYSCONFDIR@/config.toml; without that table the built-in
+# [probe_fs] in SYSCONFDIR/config.toml; without that table the built-in
 # defaults apply: /etc, the cron and at spools, the systemd and udev
 # directories below /usr and /lib, and below /home, /var/home, /root and
 # /var/roothome only .ssh, the systemd user units, autostart, environment.d
@@ -44,7 +44,7 @@ StartLimitBurst=5
 Type=simple
 User=harw-probe-fs
 Group=harw-probe-fs
-# harw-dod-config: read access to @SYSCONFDIR@/config.toml ([probe_fs]); the
+# harw-dod-config: read access to SYSCONFDIR/config.toml ([probe_fs]); the
 # same group the sentinel and the eBPF probe use. CAP_SYS_ADMIN does not
 # bypass file permissions.
 SupplementaryGroups=harw-ipc harw-dod-config

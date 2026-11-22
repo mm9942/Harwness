@@ -2151,7 +2151,22 @@ mod tests {
     /// checking which model windows still carry the root. The 32,768-token
     /// fallback window for unknown models does not carry it any more (see
     /// [`FIXTURE_MODEL_CONTEXT_WINDOW_TOKENS`]).
-    const FULL_ROOT_TOOL_SPEC_BUDGET_BYTES: u64 = 96 * 1024;
+    ///
+    /// Raised from 96 KiB to 100 KiB on purpose (2026-11 consolidation): the
+    /// root now sends 101 tool specs in 98,635 bytes (about 32,900 estimated
+    /// tokens), i.e. +2 tools and +4,092 bytes over the PL-97 measurement
+    /// above (99 in 94,543). Measured per family, the counts of `fsread` (16),
+    /// `sys` (12), `git` (6) and `dod` (3) are unchanged; `sys.*` grew from
+    /// 14,345 to 15,971 bytes (+1,626) through larger specs, and
+    /// `agents.catalog` (481 bytes) is on the surface. `job.suspend` and
+    /// `job.resume` are NOT on the root surface (no `job.*` tools are sent),
+    /// and the other new tool was not individually attributed; the net +2 may
+    /// hide renames or removals, so re-measure by name when raising the bound
+    /// again. All of that surface is intended; the root already needs a window
+    /// well above the 32k fallback, so 100 KiB (102,400 bytes) keeps about
+    /// 3.7 KB (3,765 bytes) of headroom, the same margin the PL-97 baseline
+    /// had, without changing which model windows carry the root.
+    const FULL_ROOT_TOOL_SPEC_BUDGET_BYTES: u64 = 100 * 1024;
 
     /// Records the name and serialized size of every tool spec of each
     /// request and answers with plain text, so the turn ends after one round.

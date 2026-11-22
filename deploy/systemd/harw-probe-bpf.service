@@ -16,7 +16,7 @@
 #
 # BPF object integrity (PL-100 Phase 4, THREAT-MODEL B23): before Landlock and
 # before any load, every object is checked against the SHA-256 entries of
-# @BPFDIR@/manifest.json (harw-probe-bpf/src/bpf_manifest.rs). The manifest and
+# BPFDIR/manifest.json (harw-probe-bpf/src/bpf_manifest.rs). The manifest and
 # every directory above it must be root-owned and not group/world-writable
 # (install.sh installs it 0644 root). A missing --bpf-manifest, an untrusted,
 # unreadable or malformed manifest, a missing entry or a digest mismatch

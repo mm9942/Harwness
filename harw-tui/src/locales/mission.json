@@ -11,6 +11,18 @@
     "vi": " Công việc · {running} đang chạy ",
     "hi": " जॉब · {running} सक्रिय "
   },
+  "mission.reasoning_title": {
+    "en": " Reasoning · {count} active ",
+    "de": " Reasoning · {count} aktiv ",
+    "es": " Razonamiento · {count} activos ",
+    "fr": " Raisonnement · {count} actifs ",
+    "pt": " Raciocínio · {count} ativos ",
+    "ja": " 推論 · {count} 実行中 ",
+    "zh-CN": " 推理 · {count} 个活动 ",
+    "ko": " 추론 · {count}개 활성 ",
+    "vi": " Suy luận · {count} đang chạy ",
+    "hi": " तर्क · {count} सक्रिय "
+  },
   "mission.no_jobs": {
     "en": "No jobs.",
     "de": "Keine Jobs.",

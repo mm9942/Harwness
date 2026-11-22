@@ -18,7 +18,7 @@
 //! | `harw-probe-fs` | fanotify | genau `CAP_SYS_ADMIN` |
 //! | `harw-probe-bpf` | eBPF | genau `CAP_BPF CAP_PERFMON` |
 //! | `harw-probe-netlink` | Audit-Netlink (lesend) | genau `CAP_AUDIT_READ` |
-//! | `harw-warden` | systemd-Socket, kein IP | genau `CAP_DAC_OVERRIDE CAP_NET_ADMIN` |
+//! | `harw-warden` | systemd-Socket, kein IP | genau `CAP_DAC_OVERRIDE` (`CAP_NET_ADMIN` nur per Isolations-Drop-in) |
 //!
 //! **H10-Entscheidungen** (jeweils die strengere Variante der beiden
 //! früheren Quellen, am Code begründet):
@@ -32,6 +32,13 @@
 //!   für die Netzisolation `/usr/sbin/nft` als Kindprozess auf
 //!   (`harw-warden/src/isolation.rs` → `CAP_NET_ADMIN`, über die
 //!   Ambient-Menge vererbt). Die frühere Annahme `CAP_SYS_ADMIN` entfällt.
+//! - `harw-warden` seit PL-100 WP3.1: Die Vorgabe-`warden.toml` erlaubt nur
+//!   Freeze/Thaw, deshalb trägt die ausgelieferte Unit **nur**
+//!   `CAP_DAC_OVERRIDE` (geringste Rechte). `CAP_NET_ADMIN` kommt allein über
+//!   das Drop-in `harw-warden.service.d/isolation.conf`, wenn die Policy
+//!   `isolate-network`/`lift-isolation` erlaubt; fehlt es dann, startet der
+//!   Warden nicht (`WardenBinError::NetAdminMissing`, fail closed). Die
+//!   Basis-Unit darf `CAP_NET_ADMIN` daher nicht selbst gewähren.
 //!
 //! **PL-100 WP1.8** (Entscheidung O11): `harw-probe-netlink` tritt nur der
 //! lesenden Audit-Multicast-Gruppe bei (`AUDIT_NLGRP_READLOG`) und braucht
@@ -129,7 +136,8 @@ pub const UNIT_CLASSES: &[UnitClass] = &[
     UnitClass {
         binary: "harw-warden",
         service_file: "harw-warden.service",
-        expected_capabilities: &["CAP_DAC_OVERRIDE", "CAP_NET_ADMIN"],
+        // `CAP_NET_ADMIN` nur über das Isolations-Drop-in (PL-100 WP3.1).
+        expected_capabilities: &["CAP_DAC_OVERRIDE"],
     },
 ];
 

@@ -11,7 +11,15 @@
 //! 1. `bottom = status_rows + composer_rows`, `body = rows - bottom`
 //!    (saturating; the composer keeps its rows first when the terminal is
 //!    lower than `bottom`).
-//! 2. Not [`Orientation::Portrait`], `body >= LANDSCAPE_MIN_ROWS_BODY` and
+//! 2. Physically portrait, `rows * 1000 > cols * aspect` with `aspect` the
+//!    cell aspect of [`MissionInput::cell_aspect_permille`] (0 means
+//!    [`DEFAULT_CELL_ASPECT_PERMILLE`]): [`MissionPlacement::PortraitStack`]
+//!    when the terminal has at least [`PORTRAIT_MIN_COLS`] columns and
+//!    [`PORTRAIT_MIN_ROWS`] rows, otherwise
+//!    [`MissionPlacement::CompactSummary`]. This holds from 100 columns as
+//!    well: a physically portrait screen never gets the three columns or the
+//!    side column.
+//! 3. Not [`Orientation::Portrait`], `body >= LANDSCAPE_MIN_ROWS_BODY` and
 //!    enough columns for the full (`64 + 38 + 30`) or the dense
 //!    (`48 + 34 + 26`) profile: [`MissionPlacement::LandscapeThreeColumns`].
 //!    Both profiles size the columns alike, `center = clamp(cols / 4, 34..=60)`
@@ -25,30 +33,45 @@
 //!    │                    │                   ├ WORKBENCH ────┤ (optional)
 //!    └────────────────────┴───────────────────┴───────────────┘
 //!    ```
-//! 3. [`crate::classify`] says [`crate::Placement::WideSide`]:
+//! 4. [`crate::classify`] says [`crate::Placement::WideSide`]:
 //!    [`MissionPlacement::ShallowLandscape`] -- today's side-column geometry,
 //!    agents stacked above jobs in the right column, and a one-row finished
 //!    strip plus a header-only LIVE strip on top of the chat column (via
 //!    [`crate::chat_first`] without its cards row).
-//! 4. [`crate::classify`] says [`crate::Placement::PortraitDock`]:
-//!    [`MissionPlacement::PortraitStack`] -- [`crate::chat_first`] over the
-//!    whole body (cards row split by [`crate::split_dock`], finished strip,
-//!    LIVE strip, chat).
-//! 5. Otherwise [`MissionPlacement::CompactSummary`]: no status windows at all.
+//! 5. At least [`PORTRAIT_MIN_COLS`] columns and [`PORTRAIT_MIN_ROWS`] rows:
+//!    [`MissionPlacement::PortraitStack`] -- the square stack over the whole
+//!    body, top to bottom:
+//!
+//!    ```text
+//!    ┌ AGENTS ────┐┌ JOBS ──────┐  cols / 2 | rest, square: round(agents
+//!    │            ││            │  width * aspect / 1000) rows incl. borders
+//!    └────────────┘└────────────┘
+//!    ┌ LIVE (reasoning) ────────┐  bordered, 8 content rows (10 rows)
+//!    └──────────────────────────┘
+//!    FINISHED / FAILED ···········  1 row, expandable to 3..=8 rows
+//!    CHAT ························  at least MINI_LIVE_MIN_CHAT_ROWS rows
+//!    ```
+//!
+//!    Rows go out in this order of priority: chat 8, squares 5, LIVE 3,
+//!    finished 1, LIVE up to 10, squares up to their target, then the
+//!    expanded finished window. When not even the minimums fit, the finished
+//!    strip goes first, then LIVE, then the squares. Agents and jobs are
+//!    always two windows side by side, never one combined list.
+//! 6. Otherwise [`MissionPlacement::CompactSummary`]: no status windows at all.
 //!
 //! Invariants (for every input, checked exhaustively in the tests): all rects
 //! lie inside the terminal, are pairwise disjoint and together cover it
 //! exactly; every `Some` rect is at least three columns wide and, except for
-//! the header-led strips of the strip placements, at least three rows high.
+//! the header-led strips (finished in the portrait stack and the shallow
+//! landscape, LIVE in the shallow landscape), at least three rows high.
 //! `jobs` is `None` while `agents` is `Some` exactly when the agents rect holds
-//! the combined agents-and-jobs list (see [`MissionLayout::agents`]).
-//! The result depends on the input only, so a resize that flips the
-//! orientation simply re-classifies.
+//! the combined agents-and-jobs list (see [`MissionLayout::agents`]); that only
+//! happens in the shallow landscape. The result depends on the input only, so
+//! a resize that flips the orientation simply re-classifies.
 //!
 //! No I/O, no panics, saturating arithmetic only, `std` only.
 
 use crate::Rect;
-use crate::dock::DockSplit;
 use crate::mini_live::{
     CARDS_ROWS, ChatFirstInput, LiveMode, MINI_LIVE_MAX_BODY_LINES, MINI_LIVE_MIN_CHAT_ROWS,
     chat_first,
@@ -85,10 +108,30 @@ pub const FINISHED_COLLAPSED_ROWS: u16 = 1;
 pub const FINISHED_EXPANDED_MIN_ROWS: u16 = 3;
 /// Most content rows of the expanded finished/failed window.
 pub const FINISHED_EXPANDED_MAX_ROWS: u16 = 8;
+/// Narrowest terminal (in columns) that gets the portrait stack.
+pub const PORTRAIT_MIN_COLS: u16 = 30;
+/// Lowest terminal (in rows, status and composer included) that gets the
+/// portrait stack.
+pub const PORTRAIT_MIN_ROWS: u16 = 20;
+/// Cell aspect (cell width / cell height x 1000) assumed when
+/// [`MissionInput::cell_aspect_permille`] is 0: a cell about twice as high
+/// as wide, as with most terminal fonts.
+pub const DEFAULT_CELL_ASPECT_PERMILLE: u16 = 500;
+/// Fewest rows of the agents and jobs squares in the portrait stack, borders
+/// included (two borders plus three content rows).
+pub const PORTRAIT_SQUARE_MIN_ROWS: u16 = 5;
+/// Fewest rows of the bordered LIVE window in the portrait stack, borders
+/// included (one content row).
+pub const PORTRAIT_LIVE_MIN_ROWS: u16 = 3;
+/// Content rows of the bordered LIVE (reasoning) window in the portrait stack
+/// once it has its full height (plus two border rows).
+pub const PORTRAIT_LIVE_CONTENT_ROWS: u16 = 8;
 
 // `u16::clamp` panics for min > max; the bounds are constants, so prove the
 // order at compile time instead of at run time.
 const _: () = assert!(FINISHED_EXPANDED_MIN_ROWS <= FINISHED_EXPANDED_MAX_ROWS);
+// The minimum of the portrait LIVE window must stay below its full height.
+const _: () = assert!(PORTRAIT_LIVE_MIN_ROWS <= PORTRAIT_LIVE_CONTENT_ROWS + BORDER_ROWS);
 const _: () = assert!(LANDSCAPE_DENSE_CENTER_MIN_COLS <= LANDSCAPE_CENTER_MAX_COLS);
 const _: () = assert!(LANDSCAPE_DENSE_RIGHT_MIN_COLS <= LANDSCAPE_RIGHT_MAX_COLS);
 
@@ -123,6 +166,8 @@ const SIDE_CHAT_MIN_COLS: u16 = 48;
 /// Fewest workbench rows when it shares the side column (shallow landscape);
 /// deliberate mirror of `WORKBENCH_MIN_ROWS` in `harw-tui/src/panes.rs`.
 const SIDE_WORKBENCH_MIN_ROWS: u16 = 8;
+/// Denominator of the permille cell aspect.
+const PERMILLE: u64 = 1000;
 
 /// Aspect of the terminal in cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,9 +194,12 @@ pub fn orientation(cols: u16, rows: u16) -> Orientation {
 /// the decision order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissionPlacement {
-    /// Cards row (agents | jobs, combined below
-    /// [`crate::PHONE_DOCK_SPLIT_MIN_COLS`]), finished strip, LIVE strip and
-    /// chat stacked over the full width.
+    /// Agents | jobs as two square windows side by side (never combined),
+    /// the bordered LIVE window, the finished strip and the chat stacked over
+    /// the full width. Chosen for every physically portrait terminal of at
+    /// least [`PORTRAIT_MIN_COLS`] x [`PORTRAIT_MIN_ROWS`] cells and for
+    /// narrower-than-[`crate::WIDE_AGENT_PANEL_MIN_COLS`] terminals of that
+    /// size that do not get the three columns.
     PortraitStack,
     /// Chat left and widest, finished/failed top-centre with LIVE below it,
     /// agents above jobs far right.
@@ -159,7 +207,8 @@ pub enum MissionPlacement {
     /// Today's wide side column (agents above jobs, or one combined list when
     /// the column is too low for two windows) next to the chat, with a
     /// one-row finished strip and a header-only LIVE strip above the chat.
-    /// Also chosen for portrait terminals that are at least
+    /// Also chosen for terminals that are portrait in cells but not
+    /// physically (only with a cell aspect above 1000) and at least
     /// [`crate::WIDE_AGENT_PANEL_MIN_COLS`] wide.
     ShallowLandscape,
     /// Today's one-line summary or compact fallback: no status windows.
@@ -173,12 +222,22 @@ pub struct MissionInput {
     pub cols: u16,
     /// Terminal height in cells.
     pub rows: u16,
+    /// Cell aspect: cell width divided by cell height, times 1000 (about 500
+    /// for most terminal fonts); 0 means [`DEFAULT_CELL_ASPECT_PERMILLE`].
+    /// Decides whether the terminal is physically portrait
+    /// (`rows * 1000 > cols * aspect`) and how high the agents and jobs
+    /// squares of the portrait stack are (`round(agents width * aspect /
+    /// 1000)` rows, borders included).
+    pub cell_aspect_permille: u16,
     /// Rows reserved for the status line(s) above the composer.
     pub status_rows: u16,
     /// Rows reserved for the composer at the bottom.
     pub composer_rows: u16,
-    /// Wanted LIVE body lines below its header in the portrait stack
-    /// (clamped to [`crate::MINI_LIVE_MAX_BODY_LINES`]; 0 means header only).
+    /// Wanted LIVE body lines below a LIVE header. No placement reads it any
+    /// more: the portrait stack draws a bordered LIVE window of fixed height
+    /// ([`PORTRAIT_LIVE_CONTENT_ROWS`] content rows when it fits), the shallow
+    /// landscape a header-only strip and the three-column landscape a window
+    /// that fills its column. Kept so that existing callers keep compiling.
     pub live_body_lines_wanted: u16,
     /// Wanted finished/failed rows: [`FINISHED_COLLAPSED_ROWS`] (or 0) is
     /// collapsed, larger values are expanded and clamped to
@@ -208,35 +267,37 @@ pub struct MissionLayout {
     ///
     /// One rule holds in every placement: `jobs == None` while
     /// `agents == Some` means this rect holds the combined agents-and-jobs
-    /// list (one window, like today's wide side panel and the legacy combined
-    /// dock), so a renderer must draw both lists into it. That happens in the
-    /// portrait stack below [`crate::PHONE_DOCK_SPLIT_MIN_COLS`] (combined
-    /// cards row) and in the shallow landscape when the side stack is lower
-    /// than two bordered windows (six rows), e.g. on a low terminal or when a
-    /// visible workbench takes most of the side column. The three-column
-    /// landscape always places both windows.
+    /// list (one window, like today's wide side panel), so a renderer must
+    /// draw both lists into it. That happens only in the shallow landscape
+    /// when the side stack is lower than two bordered windows (six rows), e.g.
+    /// on a low terminal or when a visible workbench takes most of the side
+    /// column. The three-column landscape always places both windows, and the
+    /// portrait stack places both squares or neither.
     pub agents: Option<Rect>,
     /// Active-jobs window; `None` next to `Some` agents means the jobs are
     /// listed in the combined agents rect (see [`MissionLayout::agents`]).
     pub jobs: Option<Rect>,
     /// Finished/failed window (three-column landscape, bordered) or strip
-    /// (portrait stack and shallow landscape, header-led).
+    /// (portrait stack, directly below the LIVE window, and shallow
+    /// landscape; header-led).
     pub finished: Option<Rect>,
-    /// LIVE window (three-column landscape, bordered and scrollable) or strip
-    /// (portrait stack and shallow landscape, header plus body lines).
+    /// LIVE window (three-column landscape and portrait stack, bordered and
+    /// scrollable; in the portrait stack it holds the reasoning feed) or strip
+    /// (shallow landscape, header plus body lines).
     pub live: Option<Rect>,
     /// Stage of the LIVE area in [`LiveMode`]'s own terms, in every
     /// placement: `Hidden` exactly when `live` is `None`, otherwise `Header`
     /// or `Body { lines }` with `lines` in
     /// `1..=`[`crate::MINI_LIVE_MAX_BODY_LINES`].
     ///
-    /// In the strip placements this is the [`crate::chat_first`] stage and
+    /// In the shallow landscape this is the [`crate::chat_first`] stage and
     /// the strip is exactly `lines + 1` rows (header plus body). In the
-    /// three-column landscape the LIVE area is a bordered window instead: its
-    /// unscrolled view shows the full body (`lines` is
-    /// `min(content rows, MINI_LIVE_MAX_BODY_LINES)`), and its content rows
-    /// are [`MissionLayout::live_content_rows`] (`live.height - 2`), which
-    /// can be more than `lines` because that window scrolls.
+    /// three-column landscape and the portrait stack the LIVE area is a
+    /// bordered window instead: its unscrolled view shows the full body
+    /// (`lines` is `min(content rows, MINI_LIVE_MAX_BODY_LINES)`), and its
+    /// content rows are [`MissionLayout::live_content_rows`]
+    /// (`live.height - 2`), which can be more than `lines` because that
+    /// window scrolls.
     pub live_mode: LiveMode,
     /// Explorer column left of the chat.
     pub explorer: Option<Rect>,
@@ -250,18 +311,20 @@ pub struct MissionLayout {
 
 impl MissionLayout {
     /// Rows the LIVE content gets, in every placement: below the header in
-    /// the strip placements (`live.height - 1`, so the `lines` of
+    /// the shallow landscape's strip (`live.height - 1`, so the `lines` of
     /// [`MissionLayout::live_mode`] and 0 for a header-only strip), inside
-    /// both borders in the three-column landscape (`live.height - 2`, which
-    /// can exceed [`crate::MINI_LIVE_MAX_BODY_LINES`] because that window
-    /// scrolls), and 0 without a LIVE area.
+    /// both borders in the three-column landscape and the portrait stack
+    /// (`live.height - 2`, which can exceed
+    /// [`crate::MINI_LIVE_MAX_BODY_LINES`] because those windows scroll;
+    /// [`PORTRAIT_LIVE_CONTENT_ROWS`] in a roomy portrait stack), and 0
+    /// without a LIVE area.
     pub fn live_content_rows(&self) -> u16 {
         match (self.placement, self.live) {
             (_, None) => 0,
-            (MissionPlacement::LandscapeThreeColumns, Some(live)) => {
-                live.height.saturating_sub(BORDER_ROWS)
+            (MissionPlacement::ShallowLandscape, Some(live)) => {
+                live.height.saturating_sub(STRIP_HEADER_ROWS)
             }
-            (_, Some(live)) => live.height.saturating_sub(STRIP_HEADER_ROWS),
+            (_, Some(live)) => live.height.saturating_sub(BORDER_ROWS),
         }
     }
 }
@@ -270,11 +333,12 @@ impl MissionLayout {
 /// the decision order and the invariants).
 ///
 /// Pure function: no I/O, no panics, saturating arithmetic only; it reuses
-/// [`crate::classify`], [`crate::split_dock`] (through the cards row) and
-/// [`crate::chat_first`].
+/// [`crate::classify`] (side-column geometry) and [`crate::chat_first`]
+/// (header strips of the shallow landscape).
 pub fn classify_mission(input: MissionInput) -> MissionLayout {
     let cols = input.cols;
     let rows = input.rows;
+    let aspect = cell_aspect(input.cell_aspect_permille);
 
     // 1. Bottom rows: the composer first, then the status rows, the rest is
     //    the body. Equal to `rows - (status_rows + composer_rows)` whenever the
@@ -314,7 +378,16 @@ pub fn classify_mission(input: MissionInput) -> MissionLayout {
         },
     };
 
-    // 2. Three columns.
+    // 2. Physically portrait: the stack or nothing, also from 100 columns.
+    if physically_portrait(cols, rows, aspect) {
+        return if portrait_stack_fits(cols, rows) {
+            portrait_stack(base, input, aspect)
+        } else {
+            compact_summary(base, input)
+        };
+    }
+
+    // 3. Three columns.
     if base.orientation != Orientation::Portrait
         && body >= LANDSCAPE_MIN_ROWS_BODY
         && let Some(chat_min) = landscape_chat_min(cols)
@@ -322,18 +395,51 @@ pub fn classify_mission(input: MissionInput) -> MissionLayout {
         return landscape_three_columns(base, input, chat_min);
     }
 
-    // 3.-5. Today's classification decides the rest.
+    // 4. Today's side column from 100 columns.
     let screen = classify(LayoutInput {
         cols,
         rows,
         status_rows: input.status_rows,
         composer_rows: input.composer_rows,
     });
-    match screen.placement {
-        Placement::WideSide => shallow_landscape(base, input, screen.chat, screen.agents),
-        Placement::PortraitDock { .. } => portrait_stack(base, input),
-        Placement::Summary | Placement::Compact => compact_summary(base, input),
+    if screen.placement == Placement::WideSide {
+        return shallow_landscape(base, input, screen.chat, screen.agents);
     }
+
+    // 5.-6. The stack below 100 columns, with its own (lower) minimum size.
+    if portrait_stack_fits(cols, rows) {
+        portrait_stack(base, input, aspect)
+    } else {
+        compact_summary(base, input)
+    }
+}
+
+/// Cell aspect in permille; 0 means [`DEFAULT_CELL_ASPECT_PERMILLE`].
+fn cell_aspect(permille: u16) -> u16 {
+    if permille == 0 {
+        DEFAULT_CELL_ASPECT_PERMILLE
+    } else {
+        permille
+    }
+}
+
+/// Whether `cols` x `rows` cells of `aspect` (cell width / cell height x
+/// 1000) are higher than wide on screen: `rows * 1000 > cols * aspect`.
+fn physically_portrait(cols: u16, rows: u16, aspect: u16) -> bool {
+    u64::from(rows) * PERMILLE > u64::from(cols) * u64::from(aspect)
+}
+
+/// Whether the terminal reaches the portrait stack's minimum size.
+fn portrait_stack_fits(cols: u16, rows: u16) -> bool {
+    cols >= PORTRAIT_MIN_COLS && rows >= PORTRAIT_MIN_ROWS
+}
+
+/// Rows (borders included) that make a window `width` columns wide look
+/// square with cells of `aspect`: `round(width * aspect / 1000)`, halves
+/// rounded up.
+fn square_rows(width: u16, aspect: u16) -> u16 {
+    let rows = (u64::from(width) * u64::from(aspect) + PERMILLE / 2) / PERMILLE;
+    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 /// Chat minimum of the three-column profile that `cols` reaches: the full
@@ -351,7 +457,7 @@ fn landscape_chat_min(cols: u16) -> Option<u16> {
     }
 }
 
-/// Step 2: chat | finished over LIVE | agents over jobs (over workbench).
+/// Step 3: chat | finished over LIVE | agents over jobs (over workbench).
 ///
 /// Column widths exactly as in §3.3.2 and the same for both profiles:
 /// `center = clamp(cols / 4, 34..=60)`, `right = clamp(cols / 5, 26..=44)`,
@@ -470,7 +576,7 @@ fn window_live_mode(content_rows: u16) -> LiveMode {
     }
 }
 
-/// Step 3: today's side-column geometry from [`crate::classify`] (`chat_column`
+/// Step 4: today's side-column geometry from [`crate::classify`] (`chat_column`
 /// left, `side_column` right), agents stacked above jobs in the side column
 /// (with the workbench below them when visible) and the header strips on top
 /// of the chat column.
@@ -522,58 +628,23 @@ fn shallow_landscape(
     layout
 }
 
-/// Step 4: [`crate::chat_first`] over the whole body, then the expanded
-/// finished strip (taken from the chat, which keeps
-/// [`MINI_LIVE_MIN_CHAT_ROWS`]), then the explorer left of the chat.
-fn portrait_stack(base: MissionLayout, input: MissionInput) -> MissionLayout {
+/// Steps 2 and 5: [`portrait_square_stack`] over the whole body, then the
+/// explorer left of the chat.
+fn portrait_stack(base: MissionLayout, input: MissionInput, aspect: u16) -> MissionLayout {
     let mut layout = MissionLayout {
         placement: MissionPlacement::PortraitStack,
         ..base
     };
     if input.agents_visible {
-        let stack = chat_first(ChatFirstInput {
-            area: base.chat,
-            live_body_lines_wanted: input.live_body_lines_wanted,
-            min_chat_rows: MINI_LIVE_MIN_CHAT_ROWS,
-        });
-        match stack.cards {
-            Some(DockSplit::Split { agents, jobs }) => {
-                layout.agents = Some(agents);
-                layout.jobs = Some(jobs);
-            }
-            Some(DockSplit::Combined(cards)) => layout.agents = Some(cards),
-            None => {}
-        }
-        layout.finished = stack.finished;
+        let stack = portrait_square_stack(base.chat, aspect, input.finished_rows_wanted);
+        layout.agents = stack.agents;
+        layout.jobs = stack.jobs;
         layout.live = stack.live;
-        layout.live_mode = stack.live_mode;
+        layout.live_mode = stack.live.map_or(LiveMode::Hidden, |live| {
+            window_live_mode(live.height.saturating_sub(BORDER_ROWS))
+        });
+        layout.finished = stack.finished;
         layout.chat = stack.chat;
-
-        if let Some(strip) = stack.finished {
-            let target = finished_strip_rows(input.finished_rows_wanted);
-            let spare = stack.chat.height.saturating_sub(MINI_LIVE_MIN_CHAT_ROWS);
-            let granted = target.min(FINISHED_COLLAPSED_ROWS.saturating_add(spare));
-            let extra = if granted >= FINISHED_EXPANDED_MIN_ROWS {
-                granted.saturating_sub(FINISHED_COLLAPSED_ROWS)
-            } else {
-                0
-            };
-            if extra > 0 {
-                layout.finished = Some(Rect {
-                    height: strip.height.saturating_add(extra),
-                    ..strip
-                });
-                layout.live = stack.live.map(|live| Rect {
-                    y: live.y.saturating_add(extra),
-                    ..live
-                });
-                layout.chat = Rect {
-                    y: stack.chat.y.saturating_add(extra),
-                    height: stack.chat.height.saturating_sub(extra),
-                    ..stack.chat
-                };
-            }
-        }
     }
     let (explorer, chat) = carve_explorer(layout.chat, input.explorer_visible, SIDE_CHAT_MIN_COLS);
     layout.explorer = explorer;
@@ -581,7 +652,131 @@ fn portrait_stack(base: MissionLayout, input: MissionInput) -> MissionLayout {
     layout
 }
 
-/// Step 5: no status windows; the explorer follows today's side-panel rule.
+/// Rects of [`portrait_square_stack`], top to bottom; the squares are both
+/// `Some` or both `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SquareStack {
+    /// Left square: `area.width / 2` columns.
+    agents: Option<Rect>,
+    /// Right square: the rest of the width, same rows as `agents`.
+    jobs: Option<Rect>,
+    /// Bordered LIVE window below the squares.
+    live: Option<Rect>,
+    /// Finished strip directly below the LIVE window.
+    finished: Option<Rect>,
+    /// The rest of `area`.
+    chat: Rect,
+}
+
+/// Square portrait stack over `area`: agents | jobs side by side with the
+/// same height `round(agents width * aspect / 1000)` (borders included), the
+/// bordered LIVE window ([`PORTRAIT_LIVE_CONTENT_ROWS`] content rows), the
+/// finished strip and the chat, in that order from top to bottom.
+///
+/// Rows go out by priority: chat [`MINI_LIVE_MIN_CHAT_ROWS`], squares
+/// [`PORTRAIT_SQUARE_MIN_ROWS`], LIVE [`PORTRAIT_LIVE_MIN_ROWS`], finished
+/// [`FINISHED_COLLAPSED_ROWS`], LIVE up to its full height, squares up to
+/// their target, finished expanded (only once it reaches
+/// [`FINISHED_EXPANDED_MIN_ROWS`], as `finished_rows_wanted` asks). When the
+/// minimums do not all fit, the finished strip goes first, then LIVE, then
+/// the squares; the chat keeps every row nobody else gets.
+fn portrait_square_stack(area: Rect, aspect: u16, finished_rows_wanted: u16) -> SquareStack {
+    let agents_width = area.width / 2;
+    let jobs_width = area.width.saturating_sub(agents_width);
+    let mut stack = SquareStack {
+        agents: None,
+        jobs: None,
+        live: None,
+        finished: None,
+        chat: area,
+    };
+    if agents_width < WINDOW_MIN_COLS || area.height == 0 {
+        return stack;
+    }
+
+    // 1.-4. The minimums: chat first, then squares, LIVE and finished as long
+    //       as each one still fits together with all before it.
+    let budget = area.height.saturating_sub(MINI_LIVE_MIN_CHAT_ROWS);
+    let minimums = [
+        PORTRAIT_SQUARE_MIN_ROWS,
+        PORTRAIT_LIVE_MIN_ROWS,
+        FINISHED_COLLAPSED_ROWS,
+    ];
+    let mut heights = [0u16; 3];
+    let mut used = 0u16;
+    for (height, minimum) in heights.iter_mut().zip(minimums) {
+        let next = used.saturating_add(minimum);
+        if next > budget {
+            break;
+        }
+        *height = minimum;
+        used = next;
+    }
+    let [mut square, mut live, mut finished] = heights;
+    let mut spare = budget.saturating_sub(used);
+
+    // 5. LIVE up to its full height.
+    if live > 0 {
+        let full = PORTRAIT_LIVE_CONTENT_ROWS.saturating_add(BORDER_ROWS);
+        let grow = full.saturating_sub(live).min(spare);
+        live = live.saturating_add(grow);
+        spare = spare.saturating_sub(grow);
+    }
+    // 6. Squares up to their target.
+    if square > 0 {
+        let target = square_rows(agents_width, aspect).max(PORTRAIT_SQUARE_MIN_ROWS);
+        let grow = target.saturating_sub(square).min(spare);
+        square = square.saturating_add(grow);
+        spare = spare.saturating_sub(grow);
+    }
+    // 7. Expanded finished window, only when it reaches its minimum.
+    if finished > 0 {
+        let granted = finished_strip_rows(finished_rows_wanted)
+            .min(FINISHED_COLLAPSED_ROWS.saturating_add(spare));
+        if granted >= FINISHED_EXPANDED_MIN_ROWS {
+            finished = granted;
+        }
+    }
+
+    let mut y = area.y;
+    let mut next_row = |height: u16| {
+        let rect = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height,
+        };
+        y = y.saturating_add(height);
+        rect
+    };
+    if square > 0 {
+        let row = next_row(square);
+        stack.agents = Some(Rect {
+            width: agents_width,
+            ..row
+        });
+        stack.jobs = Some(Rect {
+            x: row.x.saturating_add(agents_width),
+            width: jobs_width,
+            ..row
+        });
+    }
+    if live > 0 {
+        stack.live = Some(next_row(live));
+    }
+    if finished > 0 {
+        stack.finished = Some(next_row(finished));
+    }
+    let chat_y = y;
+    stack.chat = Rect {
+        y: chat_y,
+        height: area.y.saturating_add(area.height).saturating_sub(chat_y),
+        ..area
+    };
+    stack
+}
+
+/// Steps 2 and 6: no status windows; the explorer follows today's side-panel rule.
 fn compact_summary(base: MissionLayout, input: MissionInput) -> MissionLayout {
     let (explorer, chat) = carve_explorer(base.chat, input.explorer_visible, SIDE_CHAT_MIN_COLS);
     MissionLayout {
@@ -760,12 +955,14 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// Reference input: one status row, three composer rows, LIVE body
-    /// wanted, finished collapsed, only the mission windows visible.
+    /// Reference input: default cell aspect (0, i.e. 500), one status row,
+    /// three composer rows, LIVE body wanted, finished collapsed, only the
+    /// mission windows visible.
     fn input(cols: u16, rows: u16) -> MissionInput {
         MissionInput {
             cols,
             rows,
+            cell_aspect_permille: 0,
             status_rows: 1,
             composer_rows: 3,
             live_body_lines_wanted: 4,
@@ -813,8 +1010,17 @@ mod tests {
         ]
     }
 
-    /// Placement and orientation oracle: §3.3.1/§3.3.2 restated with their
-    /// literal numbers, independent of the module's constants and helpers.
+    /// Cell aspect oracle: 0 means 500.
+    fn spec_aspect(input: MissionInput) -> u64 {
+        match input.cell_aspect_permille {
+            0 => 500,
+            aspect => u64::from(aspect),
+        }
+    }
+
+    /// Placement and orientation oracle: §3.3.1/§3.3.2 plus the portrait
+    /// decision of 2026-11-22 restated with their literal numbers,
+    /// independent of the module's constants and helpers.
     fn spec_placement(input: MissionInput) -> (Orientation, MissionPlacement) {
         let (cols, rows) = (input.cols, input.rows);
         let orientation = if rows > cols {
@@ -825,16 +1031,41 @@ mod tests {
             Orientation::Balanced
         };
         let body = rows.saturating_sub(input.status_rows.saturating_add(input.composer_rows));
-        let placement = if orientation != Orientation::Portrait && body >= 20 && cols >= 108 {
+        let physically_portrait = u64::from(rows) * 1000 > u64::from(cols) * spec_aspect(input);
+        let stack = cols >= 30 && rows >= 20;
+        let placement = if physically_portrait {
+            if stack {
+                MissionPlacement::PortraitStack
+            } else {
+                MissionPlacement::CompactSummary
+            }
+        } else if orientation != Orientation::Portrait && body >= 20 && cols >= 108 {
             MissionPlacement::LandscapeThreeColumns
         } else if cols >= 100 {
             MissionPlacement::ShallowLandscape
-        } else if cols >= 40 && rows >= 28 {
+        } else if stack {
             MissionPlacement::PortraitStack
         } else {
             MissionPlacement::CompactSummary
         };
         (orientation, placement)
+    }
+
+    /// Square target of the portrait stack (literal numbers): agents width
+    /// times the aspect over 1000, rounded half up, at least five rows.
+    fn spec_square_target(input: MissionInput) -> u16 {
+        let agents_width = u64::from(input.cols / 2);
+        let rows = (agents_width * spec_aspect(input) + 500) / 1000;
+        u16::try_from(rows).unwrap_or(u16::MAX).max(5)
+    }
+
+    /// Finished rows the portrait stack aims for (literal numbers): 1
+    /// collapsed, otherwise the wanted rows clamped to 3..=8.
+    fn spec_finished_target(input: MissionInput) -> u16 {
+        match input.finished_rows_wanted {
+            0 | 1 => 1,
+            wanted => wanted.clamp(3, 8),
+        }
     }
 
     /// Column oracle of the three-column landscape (§3.3.2, literal numbers):
@@ -862,7 +1093,7 @@ mod tests {
         let ctx = format!("{}x{} {input:?}", input.cols, input.rows);
         let (cols, rows) = (input.cols, input.rows);
 
-        // The spec's decision order 1-5.
+        // The spec's decision order 1-6.
         let (orientation, placement) = spec_placement(input);
         if layout.orientation != orientation || layout.placement != placement {
             return Err(format!(
@@ -880,13 +1111,16 @@ mod tests {
             ("status", layout.status),
             ("composer", layout.composer),
         ];
-        let strip_placement = matches!(
-            layout.placement,
-            MissionPlacement::PortraitStack | MissionPlacement::ShallowLandscape
-        );
+        // Header-led strips: finished in the portrait stack, finished and
+        // LIVE in the shallow landscape. Everything else is bordered.
+        let live_strip = layout.placement == MissionPlacement::ShallowLandscape;
         for (name, slot) in named(layout) {
             let Some(rect) = slot else { continue };
-            let strip = strip_placement && matches!(name, "finished" | "live");
+            let strip = match layout.placement {
+                MissionPlacement::PortraitStack => name == "finished",
+                MissionPlacement::ShallowLandscape => matches!(name, "finished" | "live"),
+                MissionPlacement::LandscapeThreeColumns | MissionPlacement::CompactSummary => false,
+            };
             let min_rows = if strip { 1 } else { WINDOW_MIN_ROWS };
             if rect.width < WINDOW_MIN_COLS || rect.height < min_rows {
                 return Err(format!("{ctx}: {name} too small: {rect:?}"));
@@ -922,37 +1156,34 @@ mod tests {
         // LIVE stage in `LiveMode`'s own terms, consistent with its rect.
         match (layout.live, layout.live_mode) {
             (None, LiveMode::Hidden) => {}
-            (Some(live), LiveMode::Header) if strip_placement && live.height == 1 => {}
+            (Some(live), LiveMode::Header) if live_strip && live.height == 1 => {}
             (Some(live), LiveMode::Body { lines })
-                if strip_placement
+                if live_strip
                     && (1..=MINI_LIVE_MAX_BODY_LINES).contains(&lines)
                     && live.height == lines + 1 => {}
             (Some(live), LiveMode::Body { lines })
-                if !strip_placement
+                if !live_strip
                     && live.height > BORDER_ROWS
                     && lines == (live.height - BORDER_ROWS).min(MINI_LIVE_MAX_BODY_LINES) => {}
             other => return Err(format!("{ctx}: inconsistent LIVE state {other:?}")),
         }
         let content_rows = match (layout.placement, layout.live) {
             (_, None) => 0,
-            (MissionPlacement::LandscapeThreeColumns, Some(live)) => live.height - BORDER_ROWS,
-            (_, Some(live)) => live.height - 1,
+            (MissionPlacement::ShallowLandscape, Some(live)) => live.height - 1,
+            (_, Some(live)) => live.height - BORDER_ROWS,
         };
         if layout.live_content_rows() != content_rows {
             return Err(format!("{ctx}: LIVE content rows are not {content_rows}"));
         }
 
         // `jobs == None` next to `Some` agents means the combined list, and
-        // only where the docs allow it.
+        // only where the docs allow it: never in the portrait stack.
         match (layout.agents, layout.jobs) {
             (None, None) => {}
             (None, Some(_)) => return Err(format!("{ctx}: jobs without agents")),
             (Some(agents), None) => {
-                let combined = match layout.placement {
-                    MissionPlacement::PortraitStack => cols < 68,
-                    MissionPlacement::ShallowLandscape => agents.height < 6,
-                    _ => false,
-                };
+                let combined =
+                    layout.placement == MissionPlacement::ShallowLandscape && agents.height < 6;
                 if !combined {
                     return Err(format!("{ctx}: agents without jobs is not a combined case"));
                 }
@@ -960,9 +1191,9 @@ mod tests {
             (Some(agents), Some(jobs)) => {
                 let split = match layout.placement {
                     MissionPlacement::PortraitStack => {
-                        cols >= 68
+                        (agents.x, agents.width) == (0, cols / 2)
+                            && (jobs.x, jobs.width) == (cols / 2, cols - cols / 2)
                             && (jobs.y, jobs.height) == (agents.y, agents.height)
-                            && jobs.x == agents.x + agents.width
                     }
                     MissionPlacement::ShallowLandscape
                     | MissionPlacement::LandscapeThreeColumns => {
@@ -992,7 +1223,10 @@ mod tests {
             MissionPlacement::LandscapeThreeColumns => {
                 check_columns(&ctx, input, layout)?;
             }
-            MissionPlacement::PortraitStack | MissionPlacement::ShallowLandscape => {}
+            MissionPlacement::PortraitStack => {
+                check_portrait_stack(&ctx, input, layout, body)?;
+            }
+            MissionPlacement::ShallowLandscape => {}
         }
         // Chat ends on the body's last row, status and composer follow.
         if u32::from(layout.chat.y) + u32::from(layout.chat.height) != u32::from(layout.status.y)
@@ -1050,6 +1284,131 @@ mod tests {
         Ok(())
     }
 
+    /// Portrait stack against the owner's decision of 2026-11-22 (literal
+    /// numbers): squares, LIVE, finished and chat from top to bottom, never a
+    /// combined list, the minimums with their drop order, the growth order
+    /// and the chat floor.
+    fn check_portrait_stack(
+        ctx: &str,
+        input: MissionInput,
+        layout: &MissionLayout,
+        body: u16,
+    ) -> Result<(), String> {
+        // The explorer shares the chat rows on its left.
+        let explorer_width = layout.explorer.map_or(0, |rect| rect.width);
+        if layout.chat.width + explorer_width != input.cols {
+            return Err(format!("{ctx}: chat and explorer are not the full width"));
+        }
+        if let Some(explorer) = layout.explorer
+            && ((explorer.x, explorer.y, explorer.height) != (0, layout.chat.y, layout.chat.height)
+                || layout.chat.x != explorer.width)
+        {
+            return Err(format!("{ctx}: explorer {explorer:?} not left of the chat"));
+        }
+        if !input.agents_visible {
+            if (layout.chat.y, layout.chat.height) != (0, body) {
+                return Err(format!("{ctx}: hidden windows left the chat short"));
+            }
+            return Ok(());
+        }
+
+        // Never combined: both squares or neither.
+        if layout.agents.is_some() != layout.jobs.is_some() {
+            return Err(format!("{ctx}: only one of agents and jobs placed"));
+        }
+        // Top to bottom without gaps: squares, LIVE, finished, chat.
+        let mut y = 0u32;
+        let blocks = [
+            ("agents", layout.agents),
+            ("live", layout.live),
+            ("finished", layout.finished),
+        ];
+        for (name, slot) in blocks {
+            if let Some(rect) = slot {
+                if u32::from(rect.y) != y {
+                    return Err(format!("{ctx}: {name} {rect:?} does not start at row {y}"));
+                }
+                y += u32::from(rect.height);
+            }
+        }
+        if u32::from(layout.chat.y) != y || y + u32::from(layout.chat.height) != u32::from(body) {
+            return Err(format!("{ctx}: chat {:?} is not the rest", layout.chat));
+        }
+        if let (Some(live), Some(finished)) = (layout.live, layout.finished)
+            && finished.y != live.y + live.height
+        {
+            return Err(format!("{ctx}: finished is not directly below LIVE"));
+        }
+
+        // Minimums 8 (chat), 5 (squares), 3 (LIVE), 1 (finished); when they
+        // do not fit, finished goes first, then LIVE, then the squares.
+        let present = (
+            layout.agents.is_some(),
+            layout.live.is_some(),
+            layout.finished.is_some(),
+        );
+        let (chat_min, square_min, live_min, finished_min) = (8u16, 5u16, 3u16, 1u16);
+        let expected = (
+            body >= chat_min + square_min,
+            body >= chat_min + square_min + live_min,
+            body >= chat_min + square_min + live_min + finished_min,
+        );
+        if present != expected {
+            return Err(format!(
+                "{ctx}: body {body} placed {present:?}, the plan says {expected:?}"
+            ));
+        }
+        let height = |slot: Option<Rect>| slot.map_or(0, |rect| rect.height);
+        let (square, live, finished) = (
+            height(layout.agents),
+            height(layout.live),
+            height(layout.finished),
+        );
+        let square_target = spec_square_target(input);
+        let finished_target = spec_finished_target(input);
+        if present.0 && !(5..=square_target).contains(&square) {
+            return Err(format!(
+                "{ctx}: squares {square} rows, target {square_target}"
+            ));
+        }
+        if present.1 && !(3..=10).contains(&live) {
+            return Err(format!("{ctx}: LIVE {live} rows"));
+        }
+        if present.2 && finished != 1 && !(3..=finished_target).contains(&finished) {
+            return Err(format!("{ctx}: finished {finished} rows"));
+        }
+        if layout.chat.height < body.min(8) {
+            return Err(format!("{ctx}: chat below eight rows"));
+        }
+
+        // Growth order: LIVE to 10, then the squares to their target, then
+        // the expanded finished window.
+        if present.1 && square > 5 && live < 10 {
+            return Err(format!("{ctx}: squares grew before LIVE reached 10 rows"));
+        }
+        if finished > 1 && (square < square_target || live < 10) {
+            return Err(format!("{ctx}: finished expanded before the others grew"));
+        }
+        // Rows to spare: every block has its full size; the finished window
+        // only stays collapsed when one spare row cannot expand it.
+        if layout.chat.height > 8 {
+            let finished_full =
+                finished == finished_target || (finished == 1 && layout.chat.height == 9);
+            if (present.1 && live != 10)
+                || (present.0 && square != square_target)
+                || (present.2 && !finished_full)
+            {
+                return Err(format!("{ctx}: rows to spare but a block is not full"));
+            }
+        }
+        // LIVE gets its 8 content rows whenever the body holds chat 8,
+        // squares 5, LIVE 10 and finished 1.
+        if body >= chat_min + square_min + 10 + finished_min && live != 10 {
+            return Err(format!("{ctx}: LIVE {live} rows although 10 fit"));
+        }
+        Ok(())
+    }
+
     /// One row of the size matrix: placement plus every window rect.
     struct Expected {
         cols: u16,
@@ -1068,10 +1427,18 @@ mod tests {
     /// Classifies every row of `table` with the reference input and checks
     /// the invariants and every expected rect.
     fn assert_matrix(table: &[Expected]) -> TestResult {
+        assert_matrix_at(0, table)
+    }
+
+    /// [`assert_matrix`] with the cell aspect `aspect` (permille, 0 = 500).
+    fn assert_matrix_at(aspect: u16, table: &[Expected]) -> TestResult {
         for row in table {
-            let inp = input(row.cols, row.rows);
+            let inp = MissionInput {
+                cell_aspect_permille: aspect,
+                ..input(row.cols, row.rows)
+            };
             let layout = classify_mission(inp);
-            let ctx = format!("{}x{}", row.cols, row.rows);
+            let ctx = format!("{}x{} aspect {aspect}", row.cols, row.rows);
             check_invariants(inp, &layout)?;
             assert_eq!(layout.orientation, row.orientation, "{ctx}");
             assert_eq!(layout.placement, row.placement, "{ctx}");
@@ -1097,80 +1464,100 @@ mod tests {
         Ok(())
     }
 
+    /// One portrait-stack row of a size matrix, from the top of the
+    /// terminal: agents (`cols / 2`) | jobs (rest) squares of `square` rows,
+    /// the bordered LIVE window of `live` rows, the finished strip of
+    /// `finished` rows and the chat of `chat` rows.
+    fn stack_row(
+        cols: u16,
+        rows: u16,
+        orientation: Orientation,
+        square: u16,
+        live: u16,
+        finished: u16,
+        chat: u16,
+    ) -> Expected {
+        let agents_width = cols / 2;
+        Expected {
+            cols,
+            rows,
+            orientation,
+            placement: MissionPlacement::PortraitStack,
+            chat: rect(0, square + live + finished, cols, chat),
+            agents: Some(rect(0, 0, agents_width, square)),
+            jobs: Some(rect(agents_width, 0, cols - agents_width, square)),
+            finished: Some(rect(0, square + live, cols, finished)),
+            live: Some(rect(0, square, cols, live)),
+            live_mode: LiveMode::Body {
+                lines: (live - 2).min(MINI_LIVE_MAX_BODY_LINES),
+            },
+            live_content_rows: live - 2,
+        }
+    }
+
     #[test]
     fn portrait_stack_at_46x78_48x65_70x90_60x60_80x40() -> TestResult {
-        use MissionPlacement::PortraitStack;
         use Orientation::{Balanced, Landscape, Portrait};
+        // (cols, rows, orientation, squares, LIVE, finished, chat); body =
+        // rows - 4, squares round(cols / 2 * 0.5) rows where they fit.
         assert_matrix(&[
-            // Combined cards below 68 columns.
-            Expected {
-                cols: 46,
-                rows: 78,
-                orientation: Portrait,
-                placement: PortraitStack,
-                chat: rect(0, 10, 46, 64),
-                agents: Some(rect(0, 0, 46, 4)),
-                jobs: None,
-                finished: Some(rect(0, 4, 46, 1)),
-                live: Some(rect(0, 5, 46, 5)),
-                live_mode: LiveMode::Body { lines: 4 },
-                live_content_rows: 4,
-            },
-            Expected {
-                cols: 48,
-                rows: 65,
-                orientation: Portrait,
-                placement: PortraitStack,
-                chat: rect(0, 10, 48, 51),
-                agents: Some(rect(0, 0, 48, 4)),
-                jobs: None,
-                finished: Some(rect(0, 4, 48, 1)),
-                live: Some(rect(0, 5, 48, 5)),
-                live_mode: LiveMode::Body { lines: 4 },
-                live_content_rows: 4,
-            },
-            // Agents | jobs from 68 columns.
-            Expected {
-                cols: 70,
-                rows: 90,
-                orientation: Portrait,
-                placement: PortraitStack,
-                chat: rect(0, 10, 70, 76),
-                agents: Some(rect(0, 0, 35, 4)),
-                jobs: Some(rect(35, 0, 35, 4)),
-                finished: Some(rect(0, 4, 70, 1)),
-                live: Some(rect(0, 5, 70, 5)),
-                live_mode: LiveMode::Body { lines: 4 },
-                live_content_rows: 4,
-            },
-            Expected {
-                cols: 60,
-                rows: 60,
-                orientation: Balanced,
-                placement: PortraitStack,
-                chat: rect(0, 10, 60, 46),
-                agents: Some(rect(0, 0, 60, 4)),
-                jobs: None,
-                finished: Some(rect(0, 4, 60, 1)),
-                live: Some(rect(0, 5, 60, 5)),
-                live_mode: LiveMode::Body { lines: 4 },
-                live_content_rows: 4,
-            },
-            // Landscape by aspect, but portrait stack by rule (< 100 columns).
-            Expected {
-                cols: 80,
-                rows: 40,
-                orientation: Landscape,
-                placement: PortraitStack,
-                chat: rect(0, 10, 80, 26),
-                agents: Some(rect(0, 0, 40, 4)),
-                jobs: Some(rect(40, 0, 40, 4)),
-                finished: Some(rect(0, 4, 80, 1)),
-                live: Some(rect(0, 5, 80, 5)),
-                live_mode: LiveMode::Body { lines: 4 },
-                live_content_rows: 4,
-            },
+            // Two squares also below 68 columns: never a combined list.
+            stack_row(46, 78, Portrait, 12, 10, 1, 51),
+            stack_row(48, 65, Portrait, 12, 10, 1, 38),
+            stack_row(70, 90, Portrait, 18, 10, 1, 57),
+            stack_row(60, 60, Balanced, 15, 10, 1, 30),
+            // Landscape in cells and on screen (40 * 1000 = 80 * 500), but
+            // portrait stack by rule (< 100 columns). Body 36: the squares
+            // stop at 17 of their 20 rows so the chat keeps eight.
+            stack_row(80, 40, Landscape, 17, 10, 1, 8),
         ])
+    }
+
+    #[test]
+    fn portrait_square_stack_at_84x77_66x59_66x35_46x78_40x28_30x40_120x200_with_aspect_500_and_480()
+    -> TestResult {
+        use Orientation::{Landscape, Portrait};
+        // (cols, rows, orientation, squares, LIVE, finished, chat) with one
+        // status row and three composer rows; the first three rows are the
+        // plan's examples (84x77 phone, 66x59 zoomed in, 66x35 keyboard).
+        // Those three and 40x28 are landscape in cells but physically
+        // portrait (`rows * 1000 > cols * aspect`).
+        assert_matrix_at(
+            500,
+            &[
+                stack_row(84, 77, Landscape, 21, 10, 1, 41),
+                stack_row(66, 59, Landscape, 17, 10, 1, 27),
+                // Keyboard: the squares give way before LIVE and the chat.
+                stack_row(66, 35, Landscape, 12, 10, 1, 8),
+                stack_row(46, 78, Portrait, 12, 10, 1, 51),
+                // Body 24: LIVE reaches 10 rows before the squares grow.
+                stack_row(40, 28, Landscape, 5, 10, 1, 8),
+                stack_row(30, 40, Portrait, 8, 10, 1, 17),
+                // Physically portrait from 100 columns: no side column.
+                stack_row(120, 200, Portrait, 30, 10, 1, 155),
+            ],
+        )?;
+        assert_matrix_at(
+            480,
+            &[
+                stack_row(84, 77, Landscape, 20, 10, 1, 42),
+                stack_row(66, 59, Landscape, 16, 10, 1, 28),
+                stack_row(66, 35, Landscape, 12, 10, 1, 8),
+                stack_row(46, 78, Portrait, 11, 10, 1, 52),
+                stack_row(40, 28, Landscape, 5, 10, 1, 8),
+                stack_row(30, 40, Portrait, 7, 10, 1, 18),
+                stack_row(120, 200, Portrait, 29, 10, 1, 156),
+            ],
+        )?;
+        // The LIVE window is bordered: eight content rows at full height.
+        for aspect in [500u16, 480] {
+            let layout = classify_mission(MissionInput {
+                cell_aspect_permille: aspect,
+                ..input(84, 77)
+            });
+            assert_eq!(layout.live_content_rows(), PORTRAIT_LIVE_CONTENT_ROWS);
+        }
+        Ok(())
     }
 
     #[test]
@@ -1242,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_summary_at_39x60_48x19_1x1_0x0() -> TestResult {
+    fn compact_summary_at_29x60_48x19_1x1_0x0() -> TestResult {
         use MissionPlacement::CompactSummary;
         use Orientation::{Balanced, Landscape, Portrait};
         let empty = |cols, rows, orientation, chat| Expected {
@@ -1258,9 +1645,10 @@ mod tests {
             live_mode: LiveMode::Hidden,
             live_content_rows: 0,
         };
-        // Too narrow, too low, degenerate.
+        // Too narrow (39x60 is a portrait stack since the minimum is 30
+        // columns), too low (below 20 rows), degenerate.
         assert_matrix(&[
-            empty(39, 60, Portrait, rect(0, 0, 39, 56)),
+            empty(29, 60, Portrait, rect(0, 0, 29, 56)),
             empty(48, 19, Landscape, rect(0, 0, 48, 15)),
             empty(1, 1, Balanced, rect(0, 0, 1, 0)),
             empty(0, 0, Balanced, rect(0, 0, 0, 0)),
@@ -1276,44 +1664,63 @@ mod tests {
     }
 
     #[test]
-    fn placement_flips_exactly_at_cols_99_100_107_108_131_132_39_40_rows_27_28_body_19_20()
+    fn placement_flips_exactly_at_cols_29_30_99_100_107_108_131_132_rows_19_20_body_19_20_and_the_physical_aspect()
     -> TestResult {
         use MissionPlacement::{
             CompactSummary, LandscapeThreeColumns, PortraitStack, ShallowLandscape,
         };
-        // (cols, rows, placement, three-column widths chat | centre | right).
+        // (cols, rows, cell aspect, placement, three-column widths chat |
+        // centre | right); aspect 0 is the default 500.
         let table = [
             // Wide side column from 100 columns.
-            (99, 30, PortraitStack, None),
-            (100, 30, ShallowLandscape, None),
+            (99, 30, 0, PortraitStack, None),
+            (100, 30, 0, ShallowLandscape, None),
             // Dense three columns from 108 columns.
-            (107, 45, ShallowLandscape, None),
-            (108, 45, LandscapeThreeColumns, Some((48, 34, 26))),
+            (107, 45, 0, ShallowLandscape, None),
+            (108, 45, 0, LandscapeThreeColumns, Some((48, 34, 26))),
             // Dense to full profile: the columns do not jump.
-            (131, 45, LandscapeThreeColumns, Some((71, 34, 26))),
-            (132, 45, LandscapeThreeColumns, Some((72, 34, 26))),
-            (151, 45, LandscapeThreeColumns, Some((84, 37, 30))),
-            (152, 45, LandscapeThreeColumns, Some((84, 38, 30))),
+            (131, 45, 0, LandscapeThreeColumns, Some((71, 34, 26))),
+            (132, 45, 0, LandscapeThreeColumns, Some((72, 34, 26))),
+            (151, 45, 0, LandscapeThreeColumns, Some((84, 37, 30))),
+            (152, 45, 0, LandscapeThreeColumns, Some((84, 38, 30))),
             // Body 19 / 20 (one status row, three composer rows).
-            (108, 23, ShallowLandscape, None),
-            (108, 24, LandscapeThreeColumns, Some((48, 34, 26))),
-            (160, 23, ShallowLandscape, None),
-            (160, 24, LandscapeThreeColumns, Some((88, 40, 32))),
-            // Portrait dock from 40 columns and 28 rows.
-            (60, 27, CompactSummary, None),
-            (60, 28, PortraitStack, None),
-            (39, 60, CompactSummary, None),
-            (40, 60, PortraitStack, None),
-            // Balanced gets three columns, portrait never.
-            (120, 120, LandscapeThreeColumns, Some((60, 34, 26))),
-            (120, 121, ShallowLandscape, None),
-            (132, 132, LandscapeThreeColumns, Some((72, 34, 26))),
-            (132, 133, ShallowLandscape, None),
+            (108, 23, 0, ShallowLandscape, None),
+            (108, 24, 0, LandscapeThreeColumns, Some((48, 34, 26))),
+            (160, 23, 0, ShallowLandscape, None),
+            (160, 24, 0, LandscapeThreeColumns, Some((88, 40, 32))),
+            // Portrait stack from 30 columns and 20 rows (zoomed-in phone).
+            (60, 19, 0, CompactSummary, None),
+            (60, 20, 0, PortraitStack, None),
+            (40, 27, 0, PortraitStack, None),
+            (29, 60, 0, CompactSummary, None),
+            (30, 60, 0, PortraitStack, None),
+            (39, 60, 0, PortraitStack, None),
+            // Physically portrait (rows * 1000 > cols * aspect) takes the
+            // stack from 100 columns as well, three columns and the side
+            // column stay for screens that are not.
+            (160, 80, 0, LandscapeThreeColumns, Some((88, 40, 32))),
+            (160, 81, 0, PortraitStack, None),
+            (100, 50, 0, ShallowLandscape, None),
+            (100, 51, 0, PortraitStack, None),
+            (120, 120, 0, PortraitStack, None),
+            (132, 132, 0, PortraitStack, None),
+            (160, 76, 480, LandscapeThreeColumns, Some((88, 40, 32))),
+            (160, 77, 480, PortraitStack, None),
+            // Square cells: balanced gets three columns, one more row not.
+            (120, 120, 1000, LandscapeThreeColumns, Some((60, 34, 26))),
+            (120, 121, 1000, PortraitStack, None),
+            // Wide cells: portrait in cells but not on screen, so the side
+            // column (portrait in cells never gets three columns).
+            (120, 150, 1500, ShallowLandscape, None),
+            (120, 181, 1500, PortraitStack, None),
         ];
-        for (cols, rows, placement, widths) in table {
-            let inp = input(cols, rows);
+        for (cols, rows, aspect, placement, widths) in table {
+            let inp = MissionInput {
+                cell_aspect_permille: aspect,
+                ..input(cols, rows)
+            };
             let layout = classify_mission(inp);
-            let ctx = format!("{cols}x{rows}");
+            let ctx = format!("{cols}x{rows} aspect {aspect}");
             check_invariants(inp, &layout)?;
             assert_eq!(layout.placement, placement, "{ctx}");
             if let Some((chat, center, right)) = widths {
@@ -1542,10 +1949,11 @@ mod tests {
                 "{cols}x{rows}"
             );
         }
-        // Portrait never gets three columns, however wide.
+        // Portrait never gets three columns or the side column, however
+        // wide: it is physically portrait as well and takes the stack.
         let portrait_wide = classify_mission(input(140, 150));
         assert_eq!(portrait_wide.orientation, Orientation::Portrait);
-        assert_eq!(portrait_wide.placement, MissionPlacement::ShallowLandscape);
+        assert_eq!(portrait_wide.placement, MissionPlacement::PortraitStack);
         Ok(())
     }
 
@@ -1649,13 +2057,21 @@ mod tests {
 
     #[test]
     fn portrait_finished_strip_expands_while_the_chat_keeps_its_floor() -> TestResult {
+        // 46x78: squares 12, LIVE 10, then the finished window below LIVE.
         let expanded = classify_mission(MissionInput {
             finished_rows_wanted: 5,
             ..input(46, 78)
         });
-        assert_eq!(expanded.finished, Some(rect(0, 4, 46, 5)));
-        assert_eq!(expanded.live, Some(rect(0, 9, 46, 5)));
-        assert_eq!(expanded.chat, rect(0, 14, 46, 60));
+        check_invariants(
+            MissionInput {
+                finished_rows_wanted: 5,
+                ..input(46, 78)
+            },
+            &expanded,
+        )?;
+        assert_eq!(expanded.live, Some(rect(0, 12, 46, 10)));
+        assert_eq!(expanded.finished, Some(rect(0, 22, 46, 5)));
+        assert_eq!(expanded.chat, rect(0, 27, 46, 47));
         // Two wanted rows round up to the expanded minimum.
         let two = classify_mission(MissionInput {
             finished_rows_wanted: 2,
@@ -1665,23 +2081,199 @@ mod tests {
             two.finished.map(|r| r.height),
             Some(FINISHED_EXPANDED_MIN_ROWS)
         );
-        // 46x28: body 24 = cards 4 + strip 1 + LIVE 5 + chat 14, so six spare
-        // rows let the strip grow to seven rows and the chat keeps eight.
+        // 46x37: body 33 = squares 12 + LIVE 10 + strip 1 + chat 10, so two
+        // spare rows let the strip grow to three rows and the chat keeps eight.
         let tight = classify_mission(MissionInput {
             finished_rows_wanted: 8,
-            ..input(46, 28)
+            ..input(46, 37)
         });
-        assert_eq!(tight.finished, Some(rect(0, 4, 46, 7)));
+        assert_eq!(tight.agents.map(|r| r.height), Some(12));
+        assert_eq!(tight.finished, Some(rect(0, 22, 46, 3)));
         assert_eq!(tight.chat.height, MINI_LIVE_MIN_CHAT_ROWS);
         // One spare row is not enough for an expanded window: stays collapsed.
-        // Body 19 = cards 4 + strip 1 + LIVE 5 + chat 9.
+        // 46x36: body 32 = squares 12 + LIVE 10 + strip 1 + chat 9.
         let collapsed = classify_mission(MissionInput {
             finished_rows_wanted: 8,
-            composer_rows: 8,
+            ..input(46, 36)
+        });
+        assert_eq!(collapsed.finished, Some(rect(0, 22, 46, 1)));
+        assert_eq!(collapsed.chat.height, MINI_LIVE_MIN_CHAT_ROWS + 1);
+        // The expansion comes last: at 46x28 (body 24) every row above the
+        // chat floor goes to the minimums and LIVE, the strip stays one row.
+        let low = classify_mission(MissionInput {
+            finished_rows_wanted: 8,
             ..input(46, 28)
         });
-        assert_eq!(collapsed.finished, Some(rect(0, 4, 46, 1)));
-        assert_eq!(collapsed.chat.height, MINI_LIVE_MIN_CHAT_ROWS + 1);
+        assert_eq!(low.agents.map(|r| r.height), Some(5));
+        assert_eq!(low.live, Some(rect(0, 5, 46, 10)));
+        assert_eq!(low.finished, Some(rect(0, 15, 46, 1)));
+        assert_eq!(low.chat, rect(0, 16, 46, MINI_LIVE_MIN_CHAT_ROWS));
+        Ok(())
+    }
+
+    /// Brute-force oracle of the portrait heights: among all candidate
+    /// (squares, LIVE, finished) heights that leave the chat its eight rows,
+    /// the lexicographically best by the plan's priority list wins --
+    /// squares placed, LIVE placed, finished placed (each only below the one
+    /// before it), then LIVE height up to 10, squares height up to the target,
+    /// finished height (1, or 3 up to the wanted rows).
+    fn brute_force_portrait(input: MissionInput, body: u16) -> (u16, u16, u16) {
+        let budget = body.saturating_sub(8);
+        let square_target = spec_square_target(input);
+        let finished_target = spec_finished_target(input);
+        let squares = std::iter::once(0).chain(5..=square_target.min(budget));
+        let mut best = (0u16, 0u16, 0u16);
+        let mut best_key = (false, false, false, 0u16, 0u16, 0u16);
+        for square in squares {
+            let lives = std::iter::once(0).chain(3..=10u16);
+            for live in lives.filter(|&live| live == 0 || square > 0) {
+                let finisheds = [0u16, 1].into_iter().chain(3..=finished_target);
+                for finished in finisheds.filter(|&finished| finished == 0 || live > 0) {
+                    if u32::from(square) + u32::from(live) + u32::from(finished) > u32::from(budget)
+                    {
+                        continue;
+                    }
+                    let key = (square > 0, live > 0, finished > 0, live, square, finished);
+                    if key > best_key {
+                        best_key = key;
+                        best = (square, live, finished);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn portrait_stack_heights_follow_the_priority_list_chat_squares_live_finished_then_growth()
+    -> TestResult {
+        // Against the brute-force oracle for every body from 0 to 120 rows.
+        for cols in [30u16, 46, 66, 84, 120] {
+            for aspect in [0u16, 200, 480, 1500] {
+                for finished_rows_wanted in [1u16, 2, 5, 8] {
+                    for body in 0..=120u16 {
+                        let inp = MissionInput {
+                            cell_aspect_permille: aspect,
+                            finished_rows_wanted,
+                            status_rows: 0,
+                            composer_rows: 0,
+                            ..input(cols, body.max(PORTRAIT_MIN_ROWS))
+                        };
+                        // Keep the body at `body` rows: the rest is composer.
+                        let inp = MissionInput {
+                            composer_rows: inp.rows - body,
+                            ..inp
+                        };
+                        let layout = classify_mission(inp);
+                        let ctx = format!("{cols} cols aspect {aspect} body {body} {inp:?}");
+                        if layout.placement != MissionPlacement::PortraitStack {
+                            continue;
+                        }
+                        check_invariants(inp, &layout)?;
+                        let height = |slot: Option<Rect>| slot.map_or(0, |r| r.height);
+                        let got = (
+                            height(layout.agents),
+                            height(layout.live),
+                            height(layout.finished),
+                        );
+                        assert_eq!(got, brute_force_portrait(inp, body), "{ctx}");
+                    }
+                }
+            }
+        }
+
+        // The shrink order at 66 columns (squares target 17), body by body:
+        // (body, squares, LIVE, finished, chat).
+        let table = [
+            (36u16, 17u16, 10u16, 1u16, 8u16),
+            // Squares give way first ...
+            (35, 16, 10, 1, 8),
+            (24, 5, 10, 1, 8),
+            // ... then LIVE down to its minimum ...
+            (23, 5, 9, 1, 8),
+            (17, 5, 3, 1, 8),
+            // ... then the minimums drop: finished, LIVE, squares.
+            (16, 5, 3, 0, 8),
+            (15, 7, 0, 0, 8),
+            (13, 5, 0, 0, 8),
+            (12, 0, 0, 0, 12),
+            (0, 0, 0, 0, 0),
+        ];
+        for (body, square, live, finished, chat) in table {
+            let inp = MissionInput {
+                composer_rows: 40 - body,
+                status_rows: 0,
+                ..input(66, 40)
+            };
+            let layout = classify_mission(inp);
+            check_invariants(inp, &layout)?;
+            let height = |slot: Option<Rect>| slot.map_or(0, |r| r.height);
+            assert_eq!(
+                (
+                    height(layout.agents),
+                    height(layout.live),
+                    height(layout.finished),
+                    layout.chat.height
+                ),
+                (square, live, finished, chat),
+                "66 cols, body {body}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn portrait_stack_sweep_never_combines_keeps_ten_live_rows_puts_finished_below_live_and_eight_chat_rows()
+    -> TestResult {
+        for aspect in [0u16, 480, 1000] {
+            for finished_rows_wanted in [1u16, 8] {
+                for explorer_visible in [false, true] {
+                    for cols in 0..=250u16 {
+                        for rows in 0..=200u16 {
+                            let inp = MissionInput {
+                                cell_aspect_permille: aspect,
+                                finished_rows_wanted,
+                                explorer_visible,
+                                ..input(cols, rows)
+                            };
+                            let layout = classify_mission(inp);
+                            if layout.placement != MissionPlacement::PortraitStack {
+                                continue;
+                            }
+                            let ctx = format!("{cols}x{rows} {inp:?}");
+                            let body = rows - 4;
+                            // Agents and jobs: two windows or none.
+                            assert_eq!(layout.agents.is_some(), layout.jobs.is_some(), "{ctx}");
+                            // Full LIVE window whenever chat 8 + squares 5 +
+                            // LIVE 10 + finished 1 fit.
+                            if body >= 24 {
+                                assert_eq!(layout.live.map(|r| r.height), Some(10), "{ctx}");
+                            }
+                            // Finished directly below LIVE.
+                            if let Some(finished) = layout.finished {
+                                let live = layout.live.ok_or("finished without LIVE")?;
+                                assert_eq!(finished.y, live.y + live.height, "{ctx}");
+                            }
+                            // Chat keeps eight rows (or the whole body).
+                            assert!(layout.chat.height >= body.min(8), "{ctx}");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cell_aspect_zero_means_500() -> TestResult {
+        for (cols, rows) in [(84u16, 77u16), (66, 35), (160, 80), (160, 81), (30, 40)] {
+            let zero = classify_mission(input(cols, rows));
+            let explicit = classify_mission(MissionInput {
+                cell_aspect_permille: DEFAULT_CELL_ASPECT_PERMILLE,
+                ..input(cols, rows)
+            });
+            assert_eq!(zero, explicit, "{cols}x{rows}");
+        }
         Ok(())
     }
 

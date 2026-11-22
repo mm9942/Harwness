@@ -11590,7 +11590,7 @@ mod tests {
                 let allow: Arc<dyn harw_extension_api::ApprovalHandler> =
                     Arc::new(CountingApproval::allow_everything());
                 let mut handlers: Vec<Arc<dyn harw_extension_api::ApprovalHandler>> =
-                    vec![allow, Arc::new(LabelledAllow(*label))];
+                    vec![allow, Arc::new(LabelledAllow(label))];
                 if let Some(mode) = mode {
                     handlers.push(taint_policy(mode));
                 }

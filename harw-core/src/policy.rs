@@ -653,7 +653,7 @@ mod tests {
         for label in NON_INTERACTIVE_ASK_LABELS {
             let non_interactive: Vec<Arc<dyn ApprovalHandler>> = vec![
                 Arc::new(Labelled("default-policy")),
-                Arc::new(Labelled(*label)),
+                Arc::new(Labelled(label)),
             ];
             assert!(
                 !DodTaintPolicy::ask_answerable(&non_interactive, true),

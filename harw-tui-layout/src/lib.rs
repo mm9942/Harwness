@@ -14,7 +14,10 @@
 //!
 //! Mission Control geometry (portrait stack, three-column landscape, shallow
 //! landscape, compact summary) is computed by [`classify_mission`]; see
-//! `docs/planning/97-harw-dod-mission-control-chain/README.md` §3.3.2.
+//! `docs/planning/97-harw-dod-mission-control-chain/README.md` §3.3.2. Its
+//! portrait stack (square agents | jobs windows, bordered LIVE window,
+//! finished strip, chat) no longer uses [`chat_first`] or [`split_dock`];
+//! both stay for the shallow landscape and the legacy dock.
 
 mod dock;
 mod mini_live;
@@ -27,11 +30,12 @@ pub use mini_live::{
     MINI_LIVE_MIN_CHAT_ROWS, chat_first,
 };
 pub use mission::{
-    FINISHED_COLLAPSED_ROWS, FINISHED_EXPANDED_MAX_ROWS, FINISHED_EXPANDED_MIN_ROWS,
-    LANDSCAPE_CENTER_MIN_COLS, LANDSCAPE_CHAT_MIN_COLS, LANDSCAPE_DENSE_CENTER_MIN_COLS,
-    LANDSCAPE_DENSE_CHAT_MIN_COLS, LANDSCAPE_DENSE_RIGHT_MIN_COLS, LANDSCAPE_MIN_ROWS_BODY,
-    LANDSCAPE_RIGHT_MIN_COLS, MissionInput, MissionLayout, MissionPlacement, Orientation,
-    classify_mission, orientation,
+    DEFAULT_CELL_ASPECT_PERMILLE, FINISHED_COLLAPSED_ROWS, FINISHED_EXPANDED_MAX_ROWS,
+    FINISHED_EXPANDED_MIN_ROWS, LANDSCAPE_CENTER_MIN_COLS, LANDSCAPE_CHAT_MIN_COLS,
+    LANDSCAPE_DENSE_CENTER_MIN_COLS, LANDSCAPE_DENSE_CHAT_MIN_COLS, LANDSCAPE_DENSE_RIGHT_MIN_COLS,
+    LANDSCAPE_MIN_ROWS_BODY, LANDSCAPE_RIGHT_MIN_COLS, MissionInput, MissionLayout,
+    MissionPlacement, Orientation, PORTRAIT_LIVE_CONTENT_ROWS, PORTRAIT_LIVE_MIN_ROWS,
+    PORTRAIT_MIN_COLS, PORTRAIT_MIN_ROWS, PORTRAIT_SQUARE_MIN_ROWS, classify_mission, orientation,
 };
 pub use placement::{
     LayoutInput, PHONE_DOCK_MAX_HEIGHT, PHONE_DOCK_MIN_COLS, PHONE_DOCK_MIN_HEIGHT,

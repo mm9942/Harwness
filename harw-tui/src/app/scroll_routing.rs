@@ -472,12 +472,13 @@ mod tests {
         Ok(())
     }
 
-    /// Unter 100 Spalten klappt das Agenten-Panel zu einer Zeile zusammen
-    /// (ab 16 Zeilen Höhe), darüber erscheint das volle Panel. PL-97 C3:
+    /// Im Hochformat (30 <= Spalten < 100, ab 20 Zeilen) steht das
+    /// Agenten-Fenster neben den Jobs und das Reasoning-Fenster darunter;
+    /// darunter bleibt nur die Kompakt-Zeile (ab 16 Zeilen Höhe). PL-97 C3:
     /// 120×40 und 200×50 sind dreispaltiges Querformat — die fertigen
     /// Agenten zählt dort das Finished/Failed-Fenster.
     #[test]
-    fn agent_panel_collapses_below_the_width_threshold() -> TestResult {
+    fn agent_panel_is_a_window_in_portrait_and_compact_below_it() -> TestResult {
         let mut app = test_chat_app()?;
         with_agents(&mut app);
         for (width, height) in SIZES {
@@ -485,7 +486,17 @@ mod tests {
             let shown = rows.join("\n");
             let panel = rows.iter().any(|row| row.contains("Agents · 1 active"));
             let summary = rows.iter().any(|row| row.contains("Agents: ● 1 active"));
-            if width >= crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH {
+            let portrait = (harw_tui_layout::PORTRAIT_MIN_COLS
+                ..crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH)
+                .contains(&width)
+                && height >= harw_tui_layout::PORTRAIT_MIN_ROWS;
+            if portrait {
+                assert!(panel && !summary, "{width}x{height}: {shown}");
+                assert!(
+                    rows.iter().any(|row| row.contains("Reasoning · 0 active")),
+                    "{width}x{height}: {shown}"
+                );
+            } else if width >= crate::panes::AGENTS_PANEL_MIN_TERMINAL_WIDTH {
                 assert!(panel && !summary, "{width}x{height}: {shown}");
                 assert!(
                     rows.iter()
@@ -774,8 +785,8 @@ mod tests {
         assert_eq!(offsets(&app), (WHEEL_LINES, WHEEL_LINES, 0, true));
         assert_eq!(
             route_scroll_input(&mut app, &over(live)),
-            Some(false),
-            "LIVE consumes the wheel without scrolling"
+            Some(true),
+            "the focusable Reasoning window scrolls on the wheel"
         );
         assert_eq!(offsets(&app), (WHEEL_LINES, WHEEL_LINES, 0, true));
         let over_chat = wheel(MouseEventKind::ScrollUp, 2, live.y + live.height + 2);
@@ -898,8 +909,11 @@ mod tests {
         let ctrl_down = TuiEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
         assert_eq!(route_scroll_input(&mut app, &ctrl_down), Some(true));
         assert_eq!(app.panels.focus, crate::panes::PaneFocus::Chat);
-        // Ohne sichtbares Panel (schmal) geht die Taste normal weiter.
+        // Im Hochformat (80×24) sind die Fenster sichtbar, Ctrl+↓ scrollt sie.
         let _ = screen(&app, 80, 24)?;
+        assert_eq!(route_scroll_input(&mut app, &ctrl_down), Some(true));
+        // Ohne sichtbares Panel (Kompakt-Zeile) geht die Taste normal weiter.
+        let _ = screen(&app, 40, 12)?;
         assert_eq!(route_scroll_input(&mut app, &ctrl_down), None);
         Ok(())
     }

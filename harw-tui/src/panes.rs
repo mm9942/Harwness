@@ -129,6 +129,8 @@ pub(crate) struct MissionRows {
     pub live_body_lines: u16,
     /// Finished/Failed rows: 1 collapsed, more when expanded.
     pub finished: u16,
+    /// Cell width/height x 1000 (0 = unknown -> layout default).
+    pub cell_aspect_permille: u16,
 }
 
 /// Ratatui form of [`harw_tui_layout::MissionLayout`]: the same placement,
@@ -167,6 +169,7 @@ pub(crate) fn classify_mission(area: Rect, state: &PanelState, rows: MissionRows
     let layout = harw_tui_layout::classify_mission(harw_tui_layout::MissionInput {
         cols: area.width,
         rows: area.height,
+        cell_aspect_permille: rows.cell_aspect_permille,
         status_rows: rows.status,
         composer_rows: rows.composer,
         live_body_lines_wanted: rows.live_body_lines,
@@ -617,62 +620,63 @@ mod tests {
             composer: 3,
             live_body_lines,
             finished: 1,
+            cell_aspect_permille: 0,
         }
     }
 
-    /// PL-97 C2: das Kartenfenster wird ab 68 Spalten in Agenten- und
-    /// Jobs-Fenster geteilt, darunter bleibt es eine kombinierte Liste.
+    /// Portrait stack: the card row is always two bordered windows (agents
+    /// | jobs) of equal height, also below 68 columns (never a combined list).
     #[test]
-    fn split_dock_areas_splits_at_68_and_combines_below_it() -> TestResult {
+    fn split_dock_areas_always_split_into_two_windows_in_portrait() -> TestResult {
         let state = PanelState::default();
-        let split = classify_mission(Rect::new(0, 0, 68, 40), &state, mission_rows(0));
-        let agents = split.agents.ok_or("agents window at 68 columns")?;
-        let jobs = split.jobs.ok_or("jobs window at 68 columns")?;
-        assert_eq!(agents.width + jobs.width, 68);
-        assert_eq!(jobs.x, agents.x + agents.width);
-        assert_eq!((agents.y, agents.height), (jobs.y, jobs.height));
-
-        let combined = classify_mission(Rect::new(0, 0, 67, 40), &state, mission_rows(0));
-        assert_eq!(combined.agents, Some(Rect::new(0, 0, 67, 4)));
-        assert_eq!(combined.jobs, None);
+        for (cols, agents_width) in [(68u16, 34u16), (67, 33), (46, 23)] {
+            let out = classify_mission(Rect::new(0, 0, cols, 40), &state, mission_rows(0));
+            let agents = out.agents.ok_or("agents window")?;
+            let jobs = out.jobs.ok_or("jobs window")?;
+            assert_eq!(agents.width, agents_width, "cols={cols}");
+            assert_eq!(agents.width + jobs.width, cols, "cols={cols}");
+            assert_eq!(jobs.x, agents.x + agents.width, "cols={cols}");
+            assert_eq!(
+                (agents.y, agents.height),
+                (jobs.y, jobs.height),
+                "cols={cols}"
+            );
+        }
+        let narrow = classify_mission(Rect::new(0, 0, 67, 40), &state, mission_rows(0));
+        assert_eq!(narrow.agents, Some(Rect::new(0, 0, 33, 17)));
+        assert_eq!(narrow.jobs, Some(Rect::new(33, 0, 34, 17)));
         Ok(())
     }
 
-    /// 46×78 (Referenz-Portrait aus W02): Karten (4 Zeilen), Finished-Streifen,
-    /// LIVE-Streifen aus `chat_first`, der Chat behält den Rest; alle Flächen
-    /// folgen dem Ursprung der Eingabefläche.
+    /// 46x78 (reference portrait): squares (agents | jobs, 12 rows), the
+    /// bordered Reasoning window (10 rows), the finished strip, then the chat
+    /// with the rest; all rects follow the origin of the input area. The wanted
+    /// body lines no longer influence the geometry.
     #[test]
-    fn portrait_live_strip_follows_chat_first_at_46x78() -> TestResult {
+    fn portrait_stack_at_46x78_places_squares_reasoning_finished_then_chat() -> TestResult {
         let state = PanelState::default();
-        let two = classify_mission(Rect::new(0, 0, 46, 78), &state, mission_rows(2));
-        assert_eq!(
-            two.placement,
-            harw_tui_layout::MissionPlacement::PortraitStack
-        );
-        assert_eq!(two.agents, Some(Rect::new(0, 0, 46, 4)));
-        assert_eq!(two.finished, Some(Rect::new(0, 4, 46, 1)));
-        assert_eq!(two.live, Some(Rect::new(0, 5, 46, 3)));
-        assert_eq!(two.live_body_lines, 2);
-        assert_eq!(two.chat, Rect::new(0, 8, 46, 66));
-        assert_eq!(two.status, Rect::new(0, 74, 46, 1));
-        assert_eq!(two.composer, Rect::new(0, 75, 46, 3));
-
-        // Mehr als `MINI_LIVE_MAX_BODY_LINES` Wunschzeilen werden gekappt.
         let max = harw_tui_layout::MINI_LIVE_MAX_BODY_LINES;
-        let many = classify_mission(Rect::new(0, 0, 46, 78), &state, mission_rows(99));
-        assert_eq!(many.live_body_lines, max);
-        assert_eq!(many.live, Some(Rect::new(0, 5, 46, 1 + max)));
-        assert_eq!(many.chat, Rect::new(0, 6 + max, 46, 68 - max));
-
-        // Ohne Inhalt bleibt nur die Kopfzeile.
-        let none = classify_mission(Rect::new(0, 0, 46, 78), &state, mission_rows(0));
-        assert_eq!(none.live, Some(Rect::new(0, 5, 46, 1)));
-        assert_eq!(none.live_body_lines, 0);
-        assert_eq!(none.chat, Rect::new(0, 6, 46, 68));
+        for wanted in [0u16, 2, 99] {
+            let out = classify_mission(Rect::new(0, 0, 46, 78), &state, mission_rows(wanted));
+            assert_eq!(
+                out.placement,
+                harw_tui_layout::MissionPlacement::PortraitStack
+            );
+            assert_eq!(out.agents, Some(Rect::new(0, 0, 23, 12)), "w={wanted}");
+            assert_eq!(out.jobs, Some(Rect::new(23, 0, 23, 12)), "w={wanted}");
+            assert_eq!(out.live, Some(Rect::new(0, 12, 46, 10)), "w={wanted}");
+            assert_eq!(out.live_body_lines, max, "w={wanted}");
+            assert_eq!(out.finished, Some(Rect::new(0, 22, 46, 1)), "w={wanted}");
+            assert_eq!(out.chat, Rect::new(0, 23, 46, 51), "w={wanted}");
+            assert_eq!(out.status, Rect::new(0, 74, 46, 1), "w={wanted}");
+            assert_eq!(out.composer, Rect::new(0, 75, 46, 3), "w={wanted}");
+        }
 
         let shifted = classify_mission(Rect::new(3, 2, 46, 78), &state, mission_rows(2));
-        assert_eq!(shifted.live, Some(Rect::new(3, 7, 46, 3)));
-        assert_eq!(shifted.chat, Rect::new(3, 10, 46, 66));
+        assert_eq!(shifted.agents, Some(Rect::new(3, 2, 23, 12)));
+        assert_eq!(shifted.live, Some(Rect::new(3, 14, 46, 10)));
+        assert_eq!(shifted.finished, Some(Rect::new(3, 24, 46, 1)));
+        assert_eq!(shifted.chat, Rect::new(3, 25, 46, 51));
         Ok(())
     }
 
@@ -717,59 +721,67 @@ mod tests {
         Ok(())
     }
 
-    /// Der Chat behält seine Mindesthöhe: bei knappem Platz entfällt zuerst
-    /// der LIVE-Körper, dann die Kopfzeile, nie ein Chat-Zeilenanteil darunter.
+    /// The chat keeps its floor: when rows are short the squares (min 5) win
+    /// first, then the Reasoning window (min 3), then the finished strip; none
+    /// of them ever takes a row below the chat floor.
     #[test]
-    fn portrait_live_strip_collapses_body_then_header_before_the_chat() -> TestResult {
+    fn portrait_stack_gives_the_chat_its_floor_before_squares_reasoning_and_finished() -> TestResult
+    {
         let floor = harw_tui_layout::MINI_LIVE_MIN_CHAT_ROWS;
         let max = harw_tui_layout::MINI_LIVE_MAX_BODY_LINES;
         let state = PanelState::default();
         for height in 28..=60u16 {
             for composer in 3..=24u16 {
-                for wanted in 0..=6u16 {
-                    let rows = MissionRows {
-                        status: 1,
-                        composer,
-                        live_body_lines: wanted,
-                        finished: 1,
-                    };
-                    let out = classify_mission(Rect::new(0, 0, 46, height), &state, rows);
-                    let ctx = format!("h={height} c={composer} w={wanted}");
-                    assert_eq!(out.composer.height, composer.min(height), "{ctx}");
-                    let Some(strip) = out.live else {
-                        continue;
-                    };
-                    assert_eq!(strip.height, 1 + out.live_body_lines, "{ctx}");
-                    assert!(out.live_body_lines <= wanted.min(max), "{ctx}");
-                    assert_eq!(out.chat.y, strip.y + strip.height, "{ctx}");
-                    assert!(out.chat.height >= floor, "{ctx}");
-                    if out.live_body_lines < wanted.min(max) {
-                        assert_eq!(out.chat.height, floor, "body shrinks first: {ctx}");
-                    }
+                let rows = MissionRows {
+                    status: 1,
+                    composer,
+                    live_body_lines: 0,
+                    finished: 1,
+                    cell_aspect_permille: 0,
+                };
+                let out = classify_mission(Rect::new(0, 0, 46, height), &state, rows);
+                let ctx = format!("h={height} c={composer}");
+                assert_eq!(out.composer.height, composer.min(height), "{ctx}");
+                let Some(strip) = out.live else {
+                    continue;
+                };
+                assert!((3..=10).contains(&strip.height), "{ctx}");
+                assert_eq!(out.live_body_lines, (strip.height - 2).min(max), "{ctx}");
+                let agents = out.agents.ok_or("squares come before the live window")?;
+                assert_eq!(strip.y, agents.y + agents.height, "{ctx}");
+                assert!(agents.height >= 5, "{ctx}");
+                let mut below = strip.y + strip.height;
+                if let Some(finished) = out.finished {
+                    assert_eq!(finished.y, below, "{ctx}");
+                    below += finished.height;
+                }
+                assert_eq!(out.chat.y, below, "{ctx}");
+                assert!(out.chat.height >= floor, "{ctx}");
+                if strip.height < 10 {
+                    assert_eq!(out.chat.height, floor, "live grows before the chat: {ctx}");
                 }
             }
         }
-        // Genau an den Kanten (Karten 4 + Finished 1 + Chat 8 = 13 Zeilen):
-        // 13 Zeilen tragen keinen Streifen, 14 nur die Kopfzeile, 15 die
-        // Kopfzeile mit einer Körperzeile.
+        // Exactly at the edges (chat 8 + squares 5 = 13 body rows): 13 rows
+        // carry only the squares, 16 add the Reasoning window (3 rows), 17 the
+        // finished strip.
         let at = |body: u16| {
             let rows = MissionRows {
                 status: 1,
                 composer: 28 - 1 - body,
                 live_body_lines: 2,
                 finished: 1,
+                cell_aspect_permille: 0,
             };
             classify_mission(Rect::new(0, 0, 46, 28), &state, rows)
         };
+        assert_eq!(at(12).agents, None);
+        assert_eq!(at(13).agents.map(|r| r.height), Some(5));
         assert_eq!(at(13).live, None);
-        assert_eq!(
-            (at(14).live.map(|r| r.height), at(14).live_body_lines),
-            (Some(1), 0)
-        );
-        assert_eq!(
-            (at(15).live.map(|r| r.height), at(15).live_body_lines),
-            (Some(2), 1)
-        );
+        assert_eq!(at(15).live, None);
+        assert_eq!(at(16).live.map(|r| r.height), Some(3));
+        assert_eq!(at(16).finished, None);
+        assert_eq!(at(17).finished.map(|r| r.height), Some(1));
         Ok(())
     }
 

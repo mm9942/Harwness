@@ -24,13 +24,13 @@
 # which tmpfiles.d/harw.conf creates as 2750 harw-sentinel:harw-dod-readers
 # (setgid, so the files are group-readable by harw-dod-readers members).
 # The sentinel keeps its finding dedup state in
-# @STATEDIR@/finding-throttle.json (0600, PL-100 WP0.4), the listener
-# history of the listener-new rule in @STATEDIR@/listener-history.json
+# STATEDIR/finding-throttle.json (0600, PL-100 WP0.4), the listener
+# history of the listener-new rule in STATEDIR/listener-history.json
 # (0600, PL-100 WP1.6; both replaced atomically through a hidden
 # .<name>.tmp sibling, and no export may alias either) and, with
 # --findings-export, freezes a FindingRecord per reported finding into
-# @STATEDIR@/spool (0700, owner-only); all of them lie below
-# ReadWritePaths=@STATEDIR@. No capability is involved.
+# STATEDIR/spool (0700, owner-only); all of them lie below
+# ReadWritePaths=STATEDIR. No capability is involved.
 #
 # Before its Landlock self-restriction the sentinel reads /etc/passwd
 # (probe accounts and, for the path rules, every home directory) and

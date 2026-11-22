@@ -34,6 +34,7 @@ pub(crate) mod finished_window;
 pub(crate) mod jobs_window;
 pub(crate) mod live_window;
 pub(crate) mod projection;
+pub(crate) mod reasoning_feed;
 pub(crate) mod stop_job;
 
 /// Focus cycle order of `F4` (PL-97 §3.3.3): Chat → Agents → Jobs →
