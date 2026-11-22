@@ -17,18 +17,30 @@ use std::pin::Pin;
 
 use harw_types::SessionId;
 
+use crate::methods::{
+    METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE,
+    METHOD_SESSION_PROJECTS, METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT,
+};
 use crate::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, FrameEnvelope,
-    GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams,
-    GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult, GatewayStatus,
-    GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams,
-    HistoryParams, InterruptParams, RespondResult, SessionSummary, SetEffortParams, SetModeParams,
-    SetModelParams, SubmitParams, SubmitResult, ToolCallParams, ToolCallResultFrame,
-    ToolCancelParams, ToolListParams, ToolListResult,
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CreateInParams, CreateParams,
+    FrameEnvelope, GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo,
+    GatewayListenerSetParams, GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult,
+    GatewayStatus, GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck,
+    HelloParams, HistoryParams, InterruptParams, PageParams, PageResult, ProjectsParams,
+    ProjectsResult, RenameParams, RespondResult, SessionRow, SessionSummary, SetEffortParams,
+    SetModeParams, SetModelParams, SetProjectParams, SubmitParams, SubmitResult, ToolCallParams,
+    ToolCallResultFrame, ToolCancelParams, ToolListParams, ToolListResult,
 };
 
 /// Boxed future returned by every port method.
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
+
+/// Answer of a port implementation that does not serve a minor-3 method.
+fn unsupported<'a, T: Send + 'a>(method: &'static str) -> PortFuture<'a, T> {
+    Box::pin(std::future::ready(Err(PortError::Protocol(format!(
+        "{method} is not served by this port"
+    )))))
+}
 
 /// A stream of frames for one attachment. `Ok(None)` ends the stream.
 pub trait FrameSource: Send {
@@ -52,6 +64,35 @@ pub trait SessionPort: Send + Sync {
     fn set_model(&self, params: SetModelParams) -> PortFuture<'_, ()>;
     fn set_mode(&self, params: SetModeParams) -> PortFuture<'_, ()>;
     fn set_effort(&self, params: SetEffortParams) -> PortFuture<'_, ()>;
+
+    /// `session.projects` (observe, feature `projects`).
+    fn projects(&self, _params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
+        unsupported(METHOD_SESSION_PROJECTS)
+    }
+    /// `session.page` (observe).
+    fn page(&self, _params: PageParams) -> PortFuture<'_, PageResult> {
+        unsupported(METHOD_SESSION_PAGE)
+    }
+    /// `session.adopt` (steer + mode continue). Same code path as adoption on `submit`.
+    fn adopt(&self, _session: SessionId) -> PortFuture<'_, SessionSummary> {
+        unsupported(METHOD_SESSION_ADOPT)
+    }
+    /// `session.create_in` (steer + continue).
+    fn create_in(&self, _params: CreateInParams) -> PortFuture<'_, SessionSummary> {
+        unsupported(METHOD_SESSION_CREATE_IN)
+    }
+    /// `session.set_project` (steer + continue); returns the updated row.
+    fn set_project(&self, _params: SetProjectParams) -> PortFuture<'_, SessionRow> {
+        unsupported(METHOD_SESSION_SET_PROJECT)
+    }
+    /// `session.rename` (steer + continue); returns the updated row.
+    fn rename(&self, _params: RenameParams) -> PortFuture<'_, SessionRow> {
+        unsupported(METHOD_SESSION_RENAME)
+    }
+    /// `session.archive` (steer + continue); returns the updated row.
+    fn archive(&self, _params: ArchiveParams) -> PortFuture<'_, SessionRow> {
+        unsupported(METHOD_SESSION_ARCHIVE)
+    }
 }
 
 /// The tool surface of the gateway as seen by an agent principal (R18 D-A).
@@ -182,6 +223,10 @@ pub enum PortError {
         refusal: ToolRefusal,
         detail: String,
     },
+    /// The session is busy (lease held by TUI/job/another gateway) or the
+    /// connection is overloaded. Not a transport failure. `reason` is a short
+    /// display text.
+    Busy(String),
 }
 
 impl fmt::Display for PortError {
@@ -195,6 +240,7 @@ impl fmt::Display for PortError {
             Self::ToolRefused { refusal, detail } => {
                 write!(f, "tool call refused ({}): {detail}", refusal.label())
             }
+            Self::Busy(reason) => write!(f, "session busy: {reason}"),
         }
     }
 }
@@ -214,6 +260,7 @@ impl PortError {
             Self::Protocol(_) => error_codes::INVALID_PARAMS,
             Self::Revoked => error_codes::REVOKED,
             Self::ToolRefused { refusal, .. } => refusal.code(),
+            Self::Busy(_) => error_codes::BUSY,
         }
     }
 
@@ -231,6 +278,7 @@ impl PortError {
             error_codes::DENIED | error_codes::HELLO_REQUIRED => Self::Denied(message),
             error_codes::NOT_FOUND => Self::NotFound,
             error_codes::REVOKED => Self::Revoked,
+            error_codes::BUSY => Self::Busy(message),
             error_codes::INVALID_PARAMS
             | error_codes::METHOD_NOT_FOUND
             | error_codes::PARSE_ERROR => Self::Protocol(message),
@@ -250,11 +298,12 @@ mod tests {
             PortError::NotFound,
             PortError::Revoked,
             PortError::Protocol("bad".into()),
+            PortError::Busy("Läuft gerade in der TUI".into()),
         ] {
             let back = PortError::from_code(
                 error.code(),
                 match &error {
-                    PortError::Denied(m) | PortError::Protocol(m) => m.clone(),
+                    PortError::Denied(m) | PortError::Protocol(m) | PortError::Busy(m) => m.clone(),
                     _ => String::new(),
                 },
             );
@@ -285,5 +334,103 @@ mod tests {
         fn assert_error<E: std::error::Error + Send + Sync + 'static>() {}
         assert_error::<PortError>();
         assert_eq!(PortError::Revoked.to_string(), "session access revoked");
+    }
+
+    #[test]
+    fn busy_has_its_own_code_and_display() {
+        let busy = PortError::Busy("running elsewhere".into());
+        assert_eq!(busy.code(), crate::session_wire::error_codes::BUSY);
+        assert_eq!(busy.to_string(), "session busy: running elsewhere");
+        assert!(!matches!(
+            PortError::from_code(busy.code(), "x".into()),
+            PortError::Transport(_)
+        ));
+    }
+
+    struct Bare;
+    impl super::SessionPort for Bare {
+        fn hello(
+            &self,
+            _: crate::session_wire::HelloParams,
+        ) -> super::PortFuture<'_, crate::session_wire::HelloAck> {
+            unreachable!()
+        }
+        fn list(&self) -> super::PortFuture<'_, Vec<crate::session_wire::SessionSummary>> {
+            unreachable!()
+        }
+        fn create(
+            &self,
+            _: crate::session_wire::CreateParams,
+        ) -> super::PortFuture<'_, crate::session_wire::SessionSummary> {
+            unreachable!()
+        }
+        fn attach(
+            &self,
+            _: crate::session_wire::AttachParams,
+        ) -> super::PortFuture<'_, (crate::session_wire::AttachAck, Box<dyn super::FrameSource>)>
+        {
+            unreachable!()
+        }
+        fn detach(&self, _: harw_types::SessionId) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn history(
+            &self,
+            _: crate::session_wire::HistoryParams,
+        ) -> super::PortFuture<'_, Vec<crate::session_wire::FrameEnvelope>> {
+            unreachable!()
+        }
+        fn submit(
+            &self,
+            _: crate::session_wire::SubmitParams,
+        ) -> super::PortFuture<'_, crate::session_wire::SubmitResult> {
+            unreachable!()
+        }
+        fn interrupt(&self, _: crate::session_wire::InterruptParams) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn resume(&self, _: harw_types::SessionId) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn close(&self, _: harw_types::SessionId) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn respond(
+            &self,
+            _: crate::session_wire::ApprovalRespondParams,
+        ) -> super::PortFuture<'_, crate::session_wire::RespondResult> {
+            unreachable!()
+        }
+        fn set_model(&self, _: crate::session_wire::SetModelParams) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn set_mode(&self, _: crate::session_wire::SetModeParams) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn set_effort(&self, _: crate::session_wire::SetEffortParams) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+    }
+
+    fn ready<T>(future: super::PortFuture<'_, T>) -> Result<T, PortError> {
+        use std::task::{Context, Poll, Waker};
+        let mut future = future;
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("default body must be ready immediately"),
+        }
+    }
+
+    #[test]
+    fn minor3_default_bodies_answer_protocol_error() {
+        use super::SessionPort;
+        let session = harw_types::SessionId::try_from_str("s-synthetic").ok();
+        if let Some(session) = session {
+            let err = ready(Bare.adopt(session)).err();
+            assert!(matches!(err, Some(PortError::Protocol(m)) if m.contains("session.adopt")));
+        }
     }
 }

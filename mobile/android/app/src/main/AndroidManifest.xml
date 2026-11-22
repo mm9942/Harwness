@@ -23,6 +23,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!--
+                Deep-Link für Benachrichtigungen (A9): harw://open?project=<id>&session=<id>.
+                Bewusst OHNE BROWSABLE: Browser lösen den Filter nicht auf, nur explizite
+                Intents der App selbst und Benachrichtigungs-PendingIntents.
+                Die Activity muss die Parameter als unvertrauene Eingabe prüfen.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="harw" android:host="open" />
+            </intent-filter>
         </activity>
         <activity
             android:name=".SessionWindowActivity"

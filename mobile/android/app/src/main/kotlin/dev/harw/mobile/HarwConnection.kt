@@ -31,7 +31,11 @@ import uniffi.harw_mobile_ffi.ConnectionRoute
 import uniffi.harw_mobile_ffi.ConnectionStatus
 import uniffi.harw_mobile_ffi.MobileCore
 import uniffi.harw_mobile_ffi.MobileException
+import uniffi.harw_mobile_ffi.MobileHolder
+import uniffi.harw_mobile_ffi.MobileProject
 import uniffi.harw_mobile_ffi.MobileSession
+import uniffi.harw_mobile_ffi.MobileSessionRow
+import uniffi.harw_mobile_ffi.MobileShareInfo
 import uniffi.harw_mobile_ffi.RoutePreference
 import uniffi.harw_mobile_ffi.ServerProfile
 import uniffi.harw_mobile_ffi.SessionCursor
@@ -84,6 +88,14 @@ internal data class WorkspaceState(
     val tor: TorBootstrap? = null,
     val attempt: UInt = 0u,
     val nextRetryAtMs: ULong? = null,
+    val projectsSupported: Boolean = false,
+    val projects: List<MobileProject> = emptyList(),
+    val projectsLoaded: Boolean = false,
+    val projectsError: String? = null,
+    val projectsLegacy: Boolean = false,
+    val projectsShare: MobileShareInfo? = null,
+    /** Open project view; `null` while the project list is shown. */
+    val projectView: ProjectSessionsState? = null,
 ) {
     val online: Boolean get() = phase == ConnectionPhase.CONNECTED && !stopping
     val canSetUp: Boolean get() = !setupPending && !forgetRequired && cleanupError == null
@@ -99,6 +111,13 @@ internal data class WorkspaceState(
         sessions = emptyList(),
         sessionsLoaded = false,
         listError = null,
+        projectsSupported = false,
+        projects = emptyList(),
+        projectsLoaded = false,
+        projectsError = null,
+        projectsLegacy = false,
+        projectsShare = null,
+        projectView = null,
         creating = false,
         generation = null,
         activeRoute = null,
@@ -150,7 +169,44 @@ internal data class WindowState(
     val snapshot: SessionSnapshot? = null,
     val generation: Long? = null,
     val error: String? = null,
+    /** Last known lease holder (`holder` frames); `null` = free or unknown. */
+    val holder: MobileHolder? = null,
 )
+
+internal const val ProjectPageSize = 50u
+
+/** Appends `incoming` to `existing` (or replaces it) and drops duplicates by session id, keeping the newest copy. */
+internal fun mergeSessionRows(
+    existing: List<MobileSessionRow>,
+    incoming: List<MobileSessionRow>,
+    replace: Boolean,
+): List<MobileSessionRow> {
+    val base = if (replace) emptyList() else existing
+    val seen = incoming.mapTo(HashSet()) { it.sessionId }
+    return base.filterNot { it.sessionId in seen } + incoming
+}
+
+internal fun replaceSessionRow(rows: List<MobileSessionRow>, updated: MobileSessionRow): List<MobileSessionRow> =
+    rows.map { if (it.sessionId == updated.sessionId) updated else it }
+
+internal fun withoutSessionRow(rows: List<MobileSessionRow>, sessionId: String): List<MobileSessionRow> =
+    rows.filterNot { it.sessionId == sessionId }
+
+/** Result of a project mutation, applied to the open project view on the main thread. */
+internal sealed interface ProjectChange {
+    data object None : ProjectChange
+    data class Replace(val row: MobileSessionRow) : ProjectChange
+    data class Remove(val sessionId: String) : ProjectChange
+}
+
+internal fun ProjectSessionsState.applyChange(change: ProjectChange): ProjectSessionsState = when (change) {
+    ProjectChange.None -> this
+    is ProjectChange.Replace -> copy(rows = replaceSessionRow(rows, change.row), error = null)
+    is ProjectChange.Remove -> copy(rows = withoutSessionRow(rows, change.sessionId), error = null)
+}
+
+/** Maps a submit receipt to the draft outcome; BUSY keeps the draft so the user can retry later. */
+internal fun busyDraftMessage(detail: String?): String = detail?.takeUnless { it.isBlank() } ?: "Die Session ist gerade belegt."
 
 internal data class DraftAttempt(val text: String, val head: SessionCursor, val id: String)
 
@@ -198,6 +254,9 @@ internal class HarwConnection(private val context: Context) {
     private var presenceJob: Job? = null
     private var listLoop: Job? = null
     private var refreshJob: Job? = null
+    private var projectsJob: Job? = null
+    private var projectSessionsJob: Job? = null
+    private var projectCursor: String? = null
     private var setupJob: Job? = null
     private var accountJob: Job? = null
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
@@ -645,6 +704,247 @@ internal class HarwConnection(private val context: Context) {
         }
     }
 
+    // ---- Projekte und Seiten (Paket A5) ----
+
+    fun refreshProjects() {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        if (projectsJob?.isActive == true) return
+        projectsJob = scope.launch {
+            try {
+                val (supported, page) = withContext(Dispatchers.IO) {
+                    native.projectsSupported() to native.listProjects(null, null, null)
+                }
+                if (generation == gate.generation) {
+                    change {
+                        it.copy(
+                            projectsSupported = supported,
+                            projects = page.projects,
+                            projectsLoaded = true,
+                            projectsError = null,
+                            projectsLegacy = page.legacy,
+                            projectsShare = page.share,
+                            projectView = it.projectView?.let { v ->
+                                v.copy(
+                                    project = page.projects.firstOrNull { p -> p.projectKey == v.projectKey } ?: v.project,
+                                    projects = page.projects,
+                                    share = page.share,
+                                )
+                            },
+                        )
+                    }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    change { it.copy(projectsError = "Projekte laden: ${error.displayMessage()}") }
+                }
+            }
+        }
+    }
+
+    /** Opens the session list of one project (`""` = "Ohne Projekt"). */
+    fun openProject(projectKey: String) {
+        if (state.value.projectView?.projectKey == projectKey) {
+            refreshProjectSessions()
+            return
+        }
+        projectSessionsJob?.cancel()
+        projectCursor = null
+        val project = state.value.projects.firstOrNull { it.projectKey == projectKey }
+        change {
+            it.copy(
+                projectView = ProjectSessionsState(
+                    project = project,
+                    legacy = it.projectsLegacy,
+                    share = it.projectsShare,
+                    projects = it.projects,
+                    loading = true,
+                    projectKey = projectKey,
+                ),
+            )
+        }
+        loadProjectSessions(replace = true)
+    }
+
+    fun closeProject() {
+        projectSessionsJob?.cancel()
+        projectCursor = null
+        change { it.copy(projectView = null) }
+        refreshProjects()
+    }
+
+    fun setProjectQuery(query: String) {
+        if (state.value.projectView == null) return
+        projectCursor = null
+        change { it.copy(projectView = it.projectView?.copy(query = query, loading = true)) }
+        loadProjectSessions(replace = true)
+    }
+
+    fun refreshProjectSessions() {
+        if (state.value.projectView == null) return
+        projectCursor = null
+        loadProjectSessions(replace = true)
+    }
+
+    fun loadMoreProjectSessions() {
+        val view = state.value.projectView ?: return
+        if (view.loading || !view.hasMore || projectCursor == null) return
+        change { it.copy(projectView = it.projectView?.copy(loading = true)) }
+        loadProjectSessions(replace = false)
+    }
+
+    private fun loadProjectSessions(replace: Boolean) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        val view = state.value.projectView ?: return
+        val key = view.projectKey
+        val query = view.query.takeUnless { it.isBlank() }
+        val cursor = if (replace) null else projectCursor
+        projectSessionsJob?.cancel()
+        projectSessionsJob = scope.launch {
+            try {
+                val page = withContext(Dispatchers.IO) {
+                    native.listSessionsPage(key, query, false, cursor, ProjectPageSize)
+                }
+                if (generation == gate.generation && state.value.projectView != null) {
+                    projectCursor = page.nextCursor
+                    change {
+                        it.copy(
+                            projectView = it.projectView?.copy(
+                                rows = mergeSessionRows(it.projectView.rows, page.sessions, replace),
+                                hasMore = page.nextCursor != null,
+                                loading = false,
+                                error = null,
+                                legacy = page.legacy,
+                            ),
+                        )
+                    }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    change {
+                        it.copy(projectView = it.projectView?.copy(loading = false, error = error.displayMessage()))
+                    }
+                }
+            }
+        }
+    }
+
+    /** Creates a session in the open project and selects it. */
+    fun createInProject(select: (String) -> Unit) {
+        val key = state.value.projectView?.projectKey ?: return
+        createInProject(key, select)
+    }
+
+    /**
+     * Creates a session in [projectKey] (`""` = "Ohne Projekt") and selects it.
+     * Falls back to a plain session when the gateway has no project support.
+     */
+    fun createInProject(projectKey: String, select: (String) -> Unit) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        if (!state.value.canCreate || state.value.creating) return
+        if (!state.value.projectsSupported) {
+            createSession(null, select)
+            return
+        }
+        change { it.copy(creating = true) }
+        commands.launch {
+            try {
+                val session = withContext(Dispatchers.IO) { native.createInProject(projectKey, null) }
+                if (generation == gate.generation) {
+                    select(session.sessionId)
+                    if (state.value.projectView?.projectKey == projectKey) refreshProjectSessions()
+                    refreshProjectsQuietly()
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    val message = "Neue Session: ${error.displayMessage()}"
+                    if (state.value.projectView?.projectKey == projectKey) {
+                        projectViewError(message)
+                    } else {
+                        change { it.copy(projectsError = message) }
+                    }
+                }
+            } finally {
+                change { it.copy(creating = false) }
+            }
+        }
+    }
+
+    /** Takes over a profile session so it can be continued from the phone. */
+    fun adoptSession(sessionId: String, done: (Boolean) -> Unit = {}) {
+        projectMutation("Session übernehmen", done) { native ->
+            native.adoptSession(sessionId)
+            ProjectChange.None
+        }
+    }
+
+    fun renameSession(sessionId: String, title: String) {
+        projectMutation("Umbenennen") { native ->
+            ProjectChange.Replace(native.renameSession(sessionId, title))
+        }
+    }
+
+    fun archiveSession(sessionId: String) {
+        projectMutation("Archivieren") { native ->
+            native.archiveSession(sessionId, true)
+            ProjectChange.Remove(sessionId)
+        }
+    }
+
+    fun assignProject(sessionId: String, projectKey: String) {
+        projectMutation("Projekt zuweisen") { native ->
+            native.setProject(sessionId, projectKey)
+            ProjectChange.Remove(sessionId)
+        }
+    }
+
+    private fun refreshProjectsQuietly() {
+        projectsJob?.cancel()
+        refreshProjects()
+    }
+
+    private fun projectViewError(message: String) {
+        change { it.copy(projectView = it.projectView?.copy(error = message)) }
+    }
+
+    private fun projectMutation(
+        label: String,
+        done: (Boolean) -> Unit = {},
+        block: suspend (MobileCore) -> ProjectChange,
+    ) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        commands.launch {
+            try {
+                val outcome = withContext(Dispatchers.IO) { block(native) }
+                if (generation == gate.generation) {
+                    change { it.copy(projectView = it.projectView?.applyChange(outcome)) }
+                    if (outcome is ProjectChange.Remove) refreshProjectsQuietly()
+                }
+                done(true)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                done(false)
+                if (generation == gate.generation) projectViewError("$label: ${error.displayMessage()}")
+            }
+        }
+    }
+
+    /** Actions for `WorkspaceScreen` (A4); `onNew` selects the created session through `select`. */
+    fun projectActions(select: (String) -> Unit) = ProjectSessionsActions(
+        onNew = { createInProject(select) },
+        onRefresh = ::refreshProjectSessions,
+        onLoadMore = ::loadMoreProjectSessions,
+        onRename = ::renameSession,
+        onArchive = ::archiveSession,
+        onAssign = ::assignProject,
+    )
+
     fun createSession(title: String?, select: (String) -> Unit) {
         val generation = gate.generation ?: return
         val native = core ?: return
@@ -680,6 +980,7 @@ internal class HarwConnection(private val context: Context) {
                 SubmitOutcome.STALE -> DraftResult.Rejected("The session changed. Review the latest messages before sending again.")
                 SubmitOutcome.QUEUE_FULL -> DraftResult.Rejected(receipt.detail ?: "The server's queue is full.")
                 SubmitOutcome.DENIED -> DraftResult.Rejected(receipt.detail ?: "The server refused this prompt.")
+                SubmitOutcome.BUSY -> DraftResult.Rejected(busyDraftMessage(receipt.detail))
                 SubmitOutcome.IN_FLIGHT -> DraftResult.Rejected(receipt.detail ?: "Check the transcript before retrying this prompt.", ambiguous = true)
             }
             result(outcome)
@@ -831,6 +1132,7 @@ internal class HarwConnection(private val context: Context) {
         listLoop = scope.launch {
             while (isActive && request == lifecycle && state.value.hasConnection) {
                 refreshSessions()
+                refreshProjects()
                 delay(3_000)
             }
         }
@@ -843,7 +1145,11 @@ internal class HarwConnection(private val context: Context) {
         val results = withContext(Dispatchers.IO) {
             windows.map { (id, attached) ->
                 id to try {
-                    Result.success(if (attached) native.snapshot(id) else native.openSession(id))
+                    Result.success(
+                        (if (attached) native.snapshot(id) else native.openSession(id)).let { snap ->
+                            snap to runCatching { native.sessionHolder(id) }.getOrNull()
+                        },
+                    )
                 } catch (error: Exception) {
                     Result.failure(error)
                 }
@@ -852,7 +1158,8 @@ internal class HarwConnection(private val context: Context) {
         if (request != lifecycle || gate.generation != generation) return
         val updates = state.value.windows.toMutableMap()
         for ((id, result) in results) {
-            val snapshot = result.getOrNull()
+            val snapshot = result.getOrNull()?.first
+            val holder = result.getOrNull()?.second
             if (snapshot != null && id !in detaching) opened.add(id)
             if (id !in observers) {
                 if (id !in detachJobs) detachSession(id)
@@ -860,7 +1167,7 @@ internal class HarwConnection(private val context: Context) {
             }
             val previous = updates[id] ?: WindowState()
             updates[id] = if (snapshot != null) {
-                previous.copy(snapshot = snapshot, generation = generation.takeIf { snapshot.online })
+                previous.copy(snapshot = snapshot, generation = generation.takeIf { snapshot.online }, holder = holder)
             } else {
                 previous.copy(generation = null, error = result.exceptionOrNull()?.displayMessage())
             }
@@ -1031,6 +1338,7 @@ private fun Throwable.displayMessage(): String = when (this) {
     is MobileException.Connect -> detail
     is MobileException.Session -> detail
     is MobileException.Denied -> detail
+    is MobileException.Busy -> detail
     is MobileException.Transport -> detail
     is MobileException.Ambiguous -> detail
     is MobileException.Internal -> detail

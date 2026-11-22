@@ -1,7 +1,9 @@
 package dev.harw.mobile
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -26,6 +28,8 @@ import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -38,6 +42,7 @@ import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -48,7 +53,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ConnectionPhase
+import uniffi.harw_mobile_ffi.MobileHolderKind
+import uniffi.harw_mobile_ffi.MobileLastOrigin
+import uniffi.harw_mobile_ffi.MobileProject
+import uniffi.harw_mobile_ffi.MobileReadOnlyReason
 import uniffi.harw_mobile_ffi.MobileSession
+import uniffi.harw_mobile_ffi.MobileSessionRow
+import uniffi.harw_mobile_ffi.MobileShareInfo
+import uniffi.harw_mobile_ffi.MobileShareMode
+import uniffi.harw_mobile_ffi.MobileTier
 import uniffi.harw_mobile_ffi.MobileSessionState
 
 @Composable
@@ -60,6 +73,8 @@ internal fun WorkspaceScreen(
     onDecide: (String, Long, String, ApprovalDecision) -> Unit,
     onOpenSettings: () -> Unit,
     onNewWindow: (String) -> Unit,
+    projectView: ProjectSessionsState? = null,
+    projectActions: ProjectSessionsActions? = null,
 ) {
     val sessionId = window.sessionId
     val session = state.sessions.firstOrNull { it.sessionId == sessionId }
@@ -94,7 +109,19 @@ internal fun WorkspaceScreen(
                 IconButton(onClick = onOpenSettings) { Icon(Icons.Outlined.Settings, "Connection settings") }
             }
             Row(Modifier.fillMaxSize()) {
-                if (split || sessionId == null) {
+                if ((split || sessionId == null) && projectView != null && projectActions != null) {
+                    ProjectSessionList(
+                        view = projectView,
+                        actions = projectActions,
+                        selected = sessionId,
+                        online = state.online,
+                        onSelect = window::select,
+                        modifier = when {
+                            split -> Modifier.width(if (roomy) 245.dp else 205.dp)
+                            else -> Modifier.weight(1f)
+                        },
+                    )
+                } else if (split || sessionId == null) {
                     SessionDirectory(
                         state = state,
                         selected = sessionId,
@@ -338,4 +365,261 @@ internal fun MobileSessionState.displayName(): String = when (this) {
     MobileSessionState.INTERRUPTED -> "Interrupted"
     MobileSessionState.FAILED -> "Failed"
     MobileSessionState.CLOSED -> "Closed"
+}
+
+// ---- Projektansicht (Paket A4) ----
+
+/** Zustand der Sessions eines Projekts; wird von HarwConnection (A5) befuellt. */
+internal data class ProjectSessionsState(
+    val project: MobileProject?,
+    val rows: List<MobileSessionRow> = emptyList(),
+    val hasMore: Boolean = false,
+    val loading: Boolean = false,
+    val error: String? = null,
+    val legacy: Boolean = false,
+    val share: MobileShareInfo? = null,
+    /** Ziele fuer "Projekt zuweisen". */
+    val projects: List<MobileProject> = emptyList(),
+    val query: String = "",
+    /** Schluessel der offenen Ansicht; "" = "Ohne Projekt". */
+    val projectKey: String = NoProjectKey,
+)
+
+internal data class ProjectSessionSection(val heading: String?, val rows: List<MobileSessionRow>)
+
+internal fun projectSessionSections(view: ProjectSessionsState): List<ProjectSessionSection> = when {
+    view.rows.isEmpty() -> emptyList()
+    view.projectKey == NoProjectKey ->
+        groupByMonth(view.rows, { it.updatedAt }).map { (key, rows) -> ProjectSessionSection(monthHeading(key), rows) }
+    else -> listOf(ProjectSessionSection(null, view.rows))
+}
+
+internal class ProjectSessionsActions(
+    val onNew: () -> Unit,
+    val onRefresh: () -> Unit,
+    val onLoadMore: () -> Unit,
+    val onRename: (sessionId: String, title: String) -> Unit,
+    val onArchive: (sessionId: String) -> Unit,
+    val onAssign: (sessionId: String, projectKey: String) -> Unit,
+)
+
+internal enum class OwnerMark { RUNNING_ON_GATEWAY, HELD_BY_TERMINAL, HELD_BY_JOB, HELD, LAST_PHONE, LAST_TERMINAL }
+
+/** Besitz-Marke: aktueller Halter hat Vorrang vor der zuletzt schreibenden Seite. */
+internal fun MobileSessionRow.ownerMark(): OwnerMark? {
+    holder?.let {
+        return when (it.kind) {
+            MobileHolderKind.GATEWAY -> OwnerMark.RUNNING_ON_GATEWAY
+            MobileHolderKind.TUI -> OwnerMark.HELD_BY_TERMINAL
+            MobileHolderKind.JOB -> OwnerMark.HELD_BY_JOB
+            MobileHolderKind.UNKNOWN -> OwnerMark.HELD
+        }
+    }
+    return when (lastOrigin) {
+        MobileLastOrigin.GATEWAY -> OwnerMark.LAST_PHONE
+        MobileLastOrigin.TUI -> OwnerMark.LAST_TERMINAL
+        else -> null
+    }
+}
+
+internal fun OwnerMark.label(): String = when (this) {
+    OwnerMark.RUNNING_ON_GATEWAY -> "Läuft auf Gateway"
+    OwnerMark.HELD_BY_TERMINAL -> "Belegt im Terminal"
+    OwnerMark.HELD_BY_JOB -> "Belegt durch Job"
+    OwnerMark.HELD -> "Belegt"
+    OwnerMark.LAST_PHONE -> "Zuletzt: Handy"
+    OwnerMark.LAST_TERMINAL -> "Zuletzt: Terminal"
+}
+
+internal fun MobileTier.label(): String = when (this) {
+    MobileTier.OBSERVER -> "Nur beobachten"
+    MobileTier.OPERATOR -> "Bedienen"
+    MobileTier.MAINTAINER -> "Verwalten"
+    MobileTier.OWNER -> "Besitzer"
+}
+
+internal fun MobileReadOnlyReason.label(): String = when (this) {
+    MobileReadOnlyReason.SHARE_READ_ONLY -> "Dieses Gateway teilt nur lesend"
+    MobileReadOnlyReason.FOREIGN_ORIGIN -> "Stammt aus einem anderen Kanal"
+    MobileReadOnlyReason.NO_WORKDIR -> "Arbeitsordner fehlt"
+    MobileReadOnlyReason.NO_STEER -> "Keine Berechtigung zum Schreiben"
+    MobileReadOnlyReason.CLOSED -> "Beendet"
+    MobileReadOnlyReason.UNKNOWN -> "Nur lesen"
+}
+
+internal fun MobileSessionRow.displayTitle(): String =
+    title?.takeUnless { it.isBlank() } ?: firstMessage?.takeUnless { it.isBlank() }?.take(60) ?: "Session ${sessionId.take(8)}"
+
+/** Leer-Text der Projektansicht; null, wenn Zeilen vorhanden sind. */
+internal fun projectEmptyText(view: ProjectSessionsState, canCreate: Boolean): String? {
+    if (view.rows.isNotEmpty()) return null
+    return when {
+        view.query.isNotBlank() -> "Keine Treffer für \u201E${view.query.trim()}\u201C."
+        view.share?.mode == MobileShareMode.OFF && !view.legacy -> "Dieses Gateway teilt keine TUI-Sessions."
+        view.legacy -> "Dieser Server kennt keine Projekte. Es werden nur Handy-Sessions angezeigt."
+        canCreate -> "In diesem Projekt gibt es noch keine Sessions. Mit + startest du eine."
+        else -> "In diesem Projekt sind für dieses Gerät keine Sessions sichtbar."
+    }
+}
+
+@Composable
+private fun ProjectSessionList(
+    view: ProjectSessionsState,
+    actions: ProjectSessionsActions,
+    selected: String?,
+    online: Boolean,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val canWrite = online && view.share?.tier?.let { it != MobileTier.OBSERVER } != false
+    var menuFor by remember { mutableStateOf<String?>(null) }
+    var renaming by remember { mutableStateOf<MobileSessionRow?>(null) }
+    var assigning by remember { mutableStateOf<MobileSessionRow?>(null) }
+    renaming?.let { row ->
+        RenameDialog(
+            initial = row.title.orEmpty(),
+            onDismiss = { renaming = null },
+            onConfirm = { actions.onRename(row.sessionId, it); renaming = null },
+        )
+    }
+    assigning?.let { row ->
+        AssignDialog(
+            projects = view.projects.filter { it.projectKey != row.projectKey.orEmpty() },
+            onDismiss = { assigning = null },
+            onPick = { actions.onAssign(row.sessionId, it); assigning = null },
+        )
+    }
+    Column(modifier.fillMaxHeight().padding(top = 9.dp)) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    view.project?.label ?: "Sessions",
+                    style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                view.share?.let { share ->
+                    Text(share.tier.label(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            IconButton(onClick = actions.onRefresh, enabled = online) { Icon(Icons.Outlined.Refresh, "Aktualisieren") }
+            FilledIconButton(onClick = actions.onNew, enabled = canWrite) { Icon(Icons.Outlined.Add, "Neue Session", Modifier.size(18.dp)) }
+        }
+        val empty = projectEmptyText(view, canWrite)
+        when {
+            view.loading && view.rows.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+            }
+            view.error != null && view.rows.isEmpty() -> Box(Modifier.fillMaxSize().padding(14.dp), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    StatusMessage("Sessions konnten nicht geladen werden: ${view.error}", error = true)
+                    TextButton(onClick = actions.onRefresh, enabled = online) { Text("Erneut versuchen") }
+                }
+            }
+            empty != null -> Box(Modifier.fillMaxSize().padding(14.dp), contentAlignment = Alignment.Center) { DirectoryEmpty(empty) }
+            else -> LazyColumn(
+                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 9.dp, bottom = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                view.error?.let { item { StatusMessage("Aktualisieren fehlgeschlagen: $it", error = true) } }
+                for (section in projectSessionSections(view)) {
+                    section.heading?.let { heading ->
+                        item(key = "month-$heading") {
+                            Text(heading, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    items(section.rows, key = { it.sessionId }) { row ->
+                        Box {
+                            ProjectSessionRow(
+                                row = row,
+                                selected = row.sessionId == selected,
+                                onClick = { onSelect(row.sessionId) },
+                                onLongClick = { if (!view.legacy) menuFor = row.sessionId },
+                            )
+                            DropdownMenu(expanded = menuFor == row.sessionId, onDismissRequest = { menuFor = null }) {
+                                DropdownMenuItem(text = { Text("Umbenennen") }, enabled = canWrite, onClick = { menuFor = null; renaming = row })
+                                DropdownMenuItem(text = { Text("Projekt zuweisen") }, enabled = canWrite, onClick = { menuFor = null; assigning = row })
+                                DropdownMenuItem(text = { Text("Archivieren") }, enabled = canWrite, onClick = { menuFor = null; actions.onArchive(row.sessionId) })
+                            }
+                        }
+                    }
+                }
+                if (view.hasMore) {
+                    item {
+                        TextButton(onClick = actions.onLoadMore, enabled = online && !view.loading, modifier = Modifier.fillMaxWidth()) {
+                            Text(if (view.loading) "Lädt …" else "Weitere laden")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ProjectSessionRow(row: MobileSessionRow, selected: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        shape = RoundedCornerShape(15.dp),
+        border = BorderStroke(1.dp, if (selected) colors.primary else colors.outlineVariant),
+        color = if (selected) colors.primaryContainer else colors.surfaceContainerLowest,
+    ) {
+        Column(
+            Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(13.dp, 10.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Text(row.displayTitle(), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            val detail = listOfNotNull(
+                row.state.displayName(),
+                row.model?.takeUnless { it.isBlank() },
+                row.turns?.let { "$it Turns" },
+            ).joinToString(" · ")
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            val marks = listOfNotNull(
+                row.ownerMark()?.label(),
+                if (!row.continuable) (row.reason ?: MobileReadOnlyReason.UNKNOWN).label() else null,
+            )
+            if (marks.isNotEmpty()) {
+                Text(marks.joinToString(" · "), style = MaterialTheme.typography.labelSmall, color = colors.primary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RenameDialog(initial: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    var title by rememberSaveable { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Umbenennen") },
+        text = { OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Titel") }, modifier = Modifier.fillMaxWidth(), singleLine = true) },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } },
+        confirmButton = { Button(onClick = { onConfirm(title.trim()) }, enabled = title.isNotBlank()) { Text("Speichern") } },
+    )
+}
+
+@Composable
+private fun AssignDialog(projects: List<MobileProject>, onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Projekt zuweisen") },
+        text = {
+            LazyColumn {
+                items(projects, key = { it.projectKey }) { project ->
+                    val name = project.label.ifBlank { "Ohne Projekt" }
+                    Text(
+                        listOfNotNull(name, project.pathHint).joinToString("  "),
+                        Modifier.fillMaxWidth().clickable { onPick(project.projectKey) }.padding(vertical = 12.dp),
+                        style = MaterialTheme.typography.bodyLarge, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } },
+    )
 }

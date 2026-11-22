@@ -17,10 +17,15 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -70,10 +75,13 @@ internal open class MainActivity : ComponentActivity() {
                         approvalAuthorization.cancel()
                         intent.removeExtra(InitialSessionKey)
                         intent.removeExtra(WindowProfileKey)
+                        intent.removeExtra(HarwConnectionService.ExtraOpenSession)
+                        intent.data = null
                     }
                     if (!setupPending) window.useProfile(profile?.windowKey())
                 }
         }
+        if (savedInstanceState == null) handleLink(intent)
         enableEdgeToEdge()
         setContent {
             HarwTheme {
@@ -82,6 +90,20 @@ internal open class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLink(intent)
+    }
+
+    // Deep-Link und Benachrichtigungs-Extra sind unvertrauene Eingabe: nur geprueft navigieren.
+    private fun handleLink(intent: Intent?) {
+        val link = linkFromIntent(intent) ?: return
+        window.openLink(link)
+        intent?.removeExtra(HarwConnectionService.ExtraOpenSession)
+        intent?.data = null
     }
 
     override fun onDestroy() {
@@ -98,6 +120,7 @@ internal open class MainActivity : ComponentActivity() {
     private fun Workspace() {
         val state by connection.state.collectAsState()
         val sessionId = window.sessionId
+        val projectKey = window.projectKey
         var showSettings by rememberSaveable { mutableStateOf(false) }
         var connectingFromSetup by rememberSaveable { mutableStateOf(false) }
         var notificationDenied by rememberSaveable { mutableStateOf(false) }
@@ -148,9 +171,16 @@ internal open class MainActivity : ComponentActivity() {
             if (sessionId != null) connection.retainSession(sessionId)
             onDispose { if (sessionId != null) connection.releaseSession(sessionId) }
         }
-        BackHandler(showSettings || sessionId != null) {
-            if (showSettings) showSettings = false
-            else window.select(null)
+        BackHandler(backStep(showSettings, sessionId, projectKey) != BackStep.Exit) {
+            when (backStep(showSettings, sessionId, projectKey)) {
+                BackStep.CloseSettings -> showSettings = false
+                BackStep.CloseSession -> window.select(null)
+                BackStep.CloseProject -> {
+                    window.selectProject(null)
+                    connection.closeProject()
+                }
+                BackStep.Exit -> Unit
+            }
         }
         if (showSetup) {
             ConnectionScreen(
@@ -214,7 +244,36 @@ internal open class MainActivity : ComponentActivity() {
                 onDismissPlanNotice = connection::dismissChatgptPlanNotice,
                 onManageChatgpt = ::openChatgptUsage,
             )
+        } else if (projectKey == null && sessionId == null) {
+            LaunchedEffect(state.online, state.generation) { if (state.online) connection.refreshProjects() }
+            Column(Modifier.fillMaxSize()) {
+                HarwHeader(title = "Projekte") {
+                    ConnectionBadge(state)
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Outlined.Settings, "Connection settings")
+                    }
+                }
+                ProjectsScreen(
+                    projects = state.projects,
+                    loaded = state.projectsLoaded,
+                    online = state.online,
+                    canCreate = state.online && state.canCreate && !state.creating,
+                    error = state.projectsError,
+                    onSelect = window::selectProject,
+                    onNewSession = { key -> connection.createInProject(key) { id -> window.openLink(DeepLink(key, id)) } },
+                    onRefresh = connection::refreshProjects,
+                )
+            }
         } else {
+            val key = projectKey
+            if (key != null) {
+                LaunchedEffect(key, state.online, state.generation) { if (state.online) connection.openProject(key) }
+            }
+            // E-10: eine globale Projektansicht; gehoert sie zu einem anderen Fenster, Rueckfall auf SessionDirectory.
+            val view = if (key == null) null else state.projectView?.takeIf { it.projectKey == key }
+            val actions = if (key == null) null else remember(key) {
+                connection.projectActions { id -> window.openLink(DeepLink(key, id)) }
+            }
             WorkspaceScreen(
                 state = state,
                 window = window,
@@ -223,6 +282,8 @@ internal open class MainActivity : ComponentActivity() {
                 onDecide = ::authenticateDecision,
                 onOpenSettings = { showSettings = true },
                 onNewWindow = ::openWindow,
+                projectView = view,
+                projectActions = if (view != null) actions else null,
             )
         }
     }
@@ -288,6 +349,8 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
         else savedState.get<String>(InitialSessionKey),
     )
         private set
+    var projectKey by mutableStateOf(savedState.get<String>(SelectedProjectKey))
+        private set
     private var drafts by mutableStateOf<Map<String, SessionDraft>>(emptyMap())
     private var sessionResetEpoch = 0L
 
@@ -296,6 +359,7 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
         if (prior != null && prior != key) {
             drafts = emptyMap()
             select(null)
+            selectProject(null)
         }
         savedState[WindowProfileKey] = key
     }
@@ -306,12 +370,24 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
         drafts = emptyMap()
         savedState[WindowProfileKey] = null
         select(null)
+        selectProject(null)
         return true
     }
 
     fun select(id: String?) {
         sessionId = id
         savedState[SelectedSessionKey] = id
+    }
+
+    fun selectProject(key: String?) {
+        projectKey = key
+        savedState[SelectedProjectKey] = key
+    }
+
+    /** Oeffnet ein geprueftes Ziel: Projekt zuerst, dann die Session darin. */
+    fun openLink(link: DeepLink) {
+        if (link.projectKey != null) selectProject(link.projectKey)
+        select(link.sessionId)
     }
 
     fun draft(id: String): SessionDraft = drafts[id] ?: SessionDraft()
@@ -354,5 +430,62 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
 
 private const val InitialSessionKey = "initial_session"
 private const val SelectedSessionKey = "selected_session"
+private const val SelectedProjectKey = "selected_project"
 private const val WindowProfileKey = "window_profile"
 private const val AwaitingCredentialKey = "awaiting_approval_credential"
+
+// ---- Routen Projekte -> Sessions -> Unterhaltung (Paket A6) ----
+
+/** Was die Zurueck-Taste als Naechstes schliesst; Reihenfolge: Einstellungen, Unterhaltung, Projekt. */
+internal enum class BackStep { CloseSettings, CloseSession, CloseProject, Exit }
+
+internal fun backStep(showSettings: Boolean, sessionId: String?, projectKey: String?): BackStep = when {
+    showSettings -> BackStep.CloseSettings
+    sessionId != null -> BackStep.CloseSession
+    projectKey != null -> BackStep.CloseProject
+    else -> BackStep.Exit
+}
+
+/** Geprueftes Navigationsziel; mindestens eines der Felder ist gesetzt. */
+internal data class DeepLink(val projectKey: String?, val sessionId: String?)
+
+private val SessionIdPattern = Regex("^[A-Za-z0-9_-]{1,64}$")
+private val ProjectKeyPattern = Regex("^[A-Za-z0-9._:-]{1,128}$")
+
+/**
+ * Prueft ein Ziel `harw://open?project=<key>&session=<id>` aus rohen Teilen.
+ * Leeres `project` bedeutet "Ohne Projekt". Jede ungueltige Angabe verwirft das ganze Ziel.
+ */
+internal fun parseDeepLink(scheme: String?, host: String?, project: String?, session: String?): DeepLink? {
+    if (scheme != "harw" || host != "open") return null
+    val projectKey = when {
+        project == null -> null
+        project.isEmpty() -> NoProjectKey
+        ProjectKeyPattern.matches(project) -> project
+        else -> return null
+    }
+    val sessionId = when {
+        session == null -> null
+        SessionIdPattern.matches(session) -> session
+        else -> return null
+    }
+    if (projectKey == null && sessionId == null) return null
+    return DeepLink(projectKey, sessionId)
+}
+
+/** Nur die Session-Id aus dem Benachrichtigungs-Extra (A9), geprueft. */
+internal fun parseOpenSessionExtra(sessionId: String?): DeepLink? =
+    sessionId?.takeIf { SessionIdPattern.matches(it) }?.let { DeepLink(null, it) }
+
+internal fun linkFromIntent(intent: Intent?): DeepLink? {
+    if (intent == null) return null
+    val uri = intent.data
+    if (uri != null) {
+        return try {
+            parseDeepLink(uri.scheme, uri.host, uri.getQueryParameter("project"), uri.getQueryParameter("session"))
+        } catch (_: Exception) {
+            null
+        }
+    }
+    return parseOpenSessionExtra(intent.getStringExtra(HarwConnectionService.ExtraOpenSession))
+}

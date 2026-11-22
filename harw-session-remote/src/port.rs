@@ -6,16 +6,19 @@
 //! is [`PortError::Transport`].
 
 use harw_protocol::methods::{
-    METHOD_APPROVAL_RESP, METHOD_SESSION_ATTACH, METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE,
-    METHOD_SESSION_DETACH, METHOD_SESSION_HISTORY, METHOD_SESSION_LIST, METHOD_SESSION_RESUME,
-    METHOD_SESSION_SET_EFFORT, METHOD_SESSION_SET_MODE, METHOD_SESSION_SET_MODEL,
+    METHOD_APPROVAL_RESP, METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_ATTACH,
+    METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_DETACH,
+    METHOD_SESSION_HISTORY, METHOD_SESSION_LIST, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS,
+    METHOD_SESSION_RENAME, METHOD_SESSION_RESUME, METHOD_SESSION_SET_EFFORT,
+    METHOD_SESSION_SET_MODE, METHOD_SESSION_SET_MODEL, METHOD_SESSION_SET_PROJECT,
     METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT,
 };
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, FrameEnvelope, HelloAck,
-    HelloParams, HistoryParams, HistoryResult, InterruptParams, ListResult, RespondResult,
-    SessionRef, SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SubmitParams,
-    SubmitResult,
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CreateInParams, CreateParams,
+    FrameEnvelope, HelloAck, HelloParams, HistoryParams, HistoryResult, InterruptParams,
+    ListResult, PageParams, PageResult, ProjectsParams, ProjectsResult, RenameParams,
+    RespondResult, SessionRef, SessionRow, SessionSummary, SetEffortParams, SetModeParams,
+    SetModelParams, SetProjectParams, SubmitParams, SubmitResult,
 };
 use harw_protocol::{FrameSource, PortFuture, SessionPort};
 use harw_types::SessionId;
@@ -197,11 +200,67 @@ impl SessionPort for RemotePort {
                 .await
         })
     }
+    fn projects(&self, params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_SESSION_PROJECTS, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn page(&self, params: PageParams) -> PortFuture<'_, PageResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_SESSION_PAGE, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn adopt(&self, session: SessionId) -> PortFuture<'_, SessionSummary> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_SESSION_ADOPT, &session_ref(session), Effect::None)
+                .await
+        })
+    }
+
+    fn create_in(&self, params: CreateInParams) -> PortFuture<'_, SessionSummary> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_SESSION_CREATE_IN, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn set_project(&self, params: SetProjectParams) -> PortFuture<'_, SessionRow> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_SESSION_SET_PROJECT, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn rename(&self, params: RenameParams) -> PortFuture<'_, SessionRow> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_SESSION_RENAME, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn archive(&self, params: ArchiveParams) -> PortFuture<'_, SessionRow> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_SESSION_ARCHIVE, &params, Effect::None)
+                .await
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use harw_protocol::PortError;
+    use harw_protocol::session_wire::error_codes;
 
     use crate::RemoteError;
 
@@ -211,5 +270,12 @@ mod tests {
         assert!(matches!(error, PortError::Transport(_)));
         let error = PortError::from(RemoteError::Protocol("p".into()));
         assert!(matches!(error, PortError::Protocol(_)));
+    }
+
+    #[test]
+    fn busy_code_maps_to_port_busy_not_transport() {
+        let error = PortError::from_code(error_codes::BUSY, "synthetic reason".into());
+        assert_eq!(error, PortError::Busy("synthetic reason".into()));
+        assert!(!matches!(error, PortError::Transport(_)));
     }
 }

@@ -11,4 +11,53 @@
     <string name="notification_disconnecting">Disconnecting</string>
     <string name="notification_forgetting">Removing saved phone setup</string>
     <string name="notification_stop">Disconnect</string>
+
+    <!-- Projects screen (ProjectsScreen.kt) -->
+    <string name="projects_title">Projects</string>
+    <string name="projects_search_hint">Search projects</string>
+    <string name="projects_without_project">Without project</string>
+    <string name="projects_new_session">+ Session</string>
+    <string name="projects_empty">No projects yet</string>
+    <string name="projects_empty_search">No projects match your search</string>
+    <string name="projects_last_activity">Last activity %1$s</string>
+    <plurals name="projects_session_count">
+        <item quantity="one">%1$d session</item>
+        <item quantity="other">%1$d sessions</item>
+    </plurals>
+
+    <!-- Workspace screen: sessions of one project (WorkspaceScreen.kt) -->
+    <string name="workspace_title">Sessions</string>
+    <string name="workspace_empty_sessions">No sessions in this project yet</string>
+    <string name="workspace_pages">Pages</string>
+    <string name="workspace_owner_this_device">This phone</string>
+    <string name="workspace_owner_other">Other device</string>
+    <string name="workspace_rename">Rename</string>
+    <string name="workspace_archive">Archive</string>
+    <string name="workspace_assign_project">Assign to project</string>
+    <string name="workspace_rename_title">Rename session</string>
+    <string name="workspace_archived">Session archived</string>
+
+    <!-- Conversation screen (SessionConversation.kt) -->
+    <string name="conv_busy_banner">Session is busy</string>
+    <string name="conv_holder_banner">In use elsewhere since %1$s</string>
+    <string name="conv_read_only">Read only</string>
+    <string name="conv_read_only_hint">This session can only be viewed here.</string>
+    <string name="conv_input_hint">Message</string>
+    <string name="conv_send">Send</string>
+
+    <!-- Markdown rendering (MarkdownText.kt) -->
+    <string name="markdown_copy_code">Copy code</string>
+    <string name="markdown_copied">Copied</string>
+
+    <!-- Common actions -->
+    <string name="common_cancel">Cancel</string>
+    <string name="common_save">Save</string>
+    <string name="common_back">Back</string>
+
+    <!-- Notifications (HarwConnectionService.kt). No session or project names: the text shows on the lock screen. -->
+    <string name="notification_channel_sessions">Session activity</string>
+    <string name="notification_approval_title">Approval needed</string>
+    <string name="notification_approval_text">A session is waiting for your approval</string>
+    <string name="notification_turn_done_title">Reply finished</string>
+    <string name="notification_turn_done_text">A session has finished its reply</string>
 </resources>

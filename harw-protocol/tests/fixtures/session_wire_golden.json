@@ -2,8 +2,9 @@
   "constants": {
     "subprotocol": "harw.session.v1",
     "path": "/v1/session-ws",
-    "wire_minor": 2,
+    "wire_minor": 3,
     "tool_gateway_wire_minor": 2,
+    "projects_wire_minor": 3,
     "default_tail_items": 200
   },
   "hello_params": {

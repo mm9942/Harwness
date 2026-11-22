@@ -68,6 +68,8 @@ import java.time.format.FormatStyle
 import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ApprovalRisk
 import uniffi.harw_mobile_ffi.MobileApproval
+import uniffi.harw_mobile_ffi.MobileHolder
+import uniffi.harw_mobile_ffi.MobileHolderKind
 import uniffi.harw_mobile_ffi.MobileSession
 import uniffi.harw_mobile_ffi.MobileToolState
 import uniffi.harw_mobile_ffi.TranscriptEntry
@@ -98,6 +100,13 @@ internal fun SessionConversation(
     val approvalPending = SessionAction(sessionId, SessionActionKind.Decide) in state.pendingActions
     val interruptPending = SessionAction(sessionId, SessionActionKind.Interrupt) in state.pendingActions
     val sendPending = SessionAction(sessionId, SessionActionKind.Send) in state.pendingActions
+    val holder = view?.holder
+    val access = conversationAccess(
+        active = active,
+        canSubmit = snapshot?.canSubmit == true,
+        holder = holder,
+        turnRunning = turnId != null,
+    )
 
     if (approval != null) {
         ApprovalScreen(
@@ -185,6 +194,7 @@ internal fun SessionConversation(
                     }
                 }
             }
+            HolderBanner(access, holder, Modifier.padding(horizontal = 15.dp, vertical = 4.dp))
             if (approvals.isNotEmpty()) {
                 ApprovalStrip(
                     approvals.size,
@@ -219,7 +229,7 @@ internal fun SessionConversation(
                 modifier = Modifier.weight(1f).fillMaxWidth(),
             )
             val head = snapshot?.head
-            val composerEnabled = active && head != null && snapshot?.canSubmit == true && !sendPending
+            val composerEnabled = access == ConversationAccess.Writable && head != null && !sendPending
             PromptComposer(
                 draft = window.draft(sessionId),
                 enabled = composerEnabled,
@@ -230,11 +240,7 @@ internal fun SessionConversation(
                 onSend = {
                     if (generation != null && head != null) window.submit(connection, sessionId, generation, head)
                 },
-                hint = when {
-                    !active -> "Read-only until the session reconnects"
-                    snapshot?.canSubmit != true -> "The server is not accepting prompts in this session"
-                    else -> "Message Harw"
-                },
+                hint = composerHint(access),
             )
         }
     }
@@ -311,14 +317,97 @@ private fun MessageBlock(label: String, text: String, kind: TranscriptKind) {
             Column(Modifier.padding(horizontal = 13.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
                 SelectionContainer {
-                    Text(
-                        text,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontFamily = if (kind == TranscriptKind.TOOL) FontFamily.Monospace else null,
-                    )
+                    if (rendersMarkdown(kind)) {
+                        // MarkdownText (A8) behandelt Code-Blöcke, Listen, Links und Kopieren selbst.
+                        MarkdownText(text = text, modifier = Modifier.fillMaxWidth())
+                    } else {
+                        Text(
+                            text,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontFamily = if (kind == TranscriptKind.TOOL) FontFamily.Monospace else null,
+                        )
+                    }
                 }
             }
         }
+    }
+}
+
+/** Was der Nutzer in dieser Unterhaltung gerade darf. */
+internal enum class ConversationAccess {
+    /** Senden möglich. */
+    Writable,
+    /** Verbindung fehlt oder ist veraltet. */
+    Offline,
+    /** Ein anderer Prozess (Terminal, Job, unbekannt) hält die Session. */
+    HeldElsewhere,
+    /** Ein anderes Gerät lässt gerade einen Turn über das Gateway laufen. */
+    RunningOnGateway,
+    /** Der Server nimmt keine Eingaben an (Freigabe nur lesend, fehlende Rechte). */
+    ReadOnly,
+}
+
+internal fun conversationAccess(
+    active: Boolean,
+    canSubmit: Boolean,
+    holder: MobileHolder?,
+    turnRunning: Boolean,
+): ConversationAccess = when {
+    !active -> ConversationAccess.Offline
+    holder != null && holder.kind != MobileHolderKind.GATEWAY -> ConversationAccess.HeldElsewhere
+    !canSubmit -> ConversationAccess.ReadOnly
+    // Eigener Turn läuft: Halter ist das Gateway, Senden bleibt dem Host überlassen (BUSY).
+    holder != null && !turnRunning -> ConversationAccess.RunningOnGateway
+    else -> ConversationAccess.Writable
+}
+
+internal fun composerHint(access: ConversationAccess): String = when (access) {
+    ConversationAccess.Writable -> "Nachricht an Harw"
+    ConversationAccess.Offline -> "Nur lesen, bis die Verbindung wieder steht"
+    ConversationAccess.HeldElsewhere -> "Nur lesen, die Session ist belegt"
+    ConversationAccess.RunningOnGateway -> "Nur lesen, ein Turn läuft auf dem Gateway"
+    ConversationAccess.ReadOnly -> "Nur lesen, der Server nimmt hier keine Eingaben an"
+}
+
+/** Abzeichen-Text für den aktuellen Halter; `null` = frei. */
+internal fun holderBadge(holder: MobileHolder?): String? = holder?.let {
+    when (it.kind) {
+        MobileHolderKind.GATEWAY -> "Läuft auf Gateway"
+        MobileHolderKind.TUI -> "Belegt im Terminal"
+        MobileHolderKind.JOB -> "Belegt durch Job"
+        MobileHolderKind.UNKNOWN -> "Belegt"
+    }
+}
+
+internal fun holderBannerText(access: ConversationAccess, holder: MobileHolder?): String? = when (access) {
+    ConversationAccess.HeldElsewhere -> when (holder?.kind) {
+        MobileHolderKind.TUI -> "Die Session ist im Terminal geöffnet. Senden ist pausiert, bis sie dort frei wird."
+        MobileHolderKind.JOB -> "Ein Job schreibt gerade in diese Session. Senden ist pausiert."
+        else -> "Die Session ist gerade belegt. Senden ist pausiert."
+    }
+    ConversationAccess.RunningOnGateway -> "Auf dem Gateway läuft gerade ein Turn. Du kannst mitlesen."
+    ConversationAccess.ReadOnly -> "Nur lesen: Der Server nimmt in dieser Session keine Eingaben an."
+    else -> null
+}
+
+/** Nur Antworten des Modells werden als Markdown gesetzt; Nutzer-, Tool- und Fehlertexte bleiben wörtlich. */
+internal fun rendersMarkdown(kind: TranscriptKind): Boolean = kind == TranscriptKind.ASSISTANT
+
+@Composable
+private fun HolderBanner(access: ConversationAccess, holder: MobileHolder?, modifier: Modifier) {
+    val text = holderBannerText(access, holder) ?: return
+    val badge = holderBadge(holder)
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (badge != null) {
+            Surface(
+                shape = RoundedCornerShape(50),
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            ) {
+                Text(badge, Modifier.padding(horizontal = 10.dp, vertical = 3.dp), style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        StatusMessage(text)
     }
 }
 

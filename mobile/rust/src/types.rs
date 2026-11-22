@@ -1,4 +1,9 @@
+use harw_protocol::session_wire::{
+    HolderInfo, HolderKind, HostedState, LastOrigin, ProjectSummary, ReadOnlyReason, RowOrigin,
+    SessionRow, ShareInfo, ShareMode,
+};
 use harw_protocol::{Cursor, PortError};
+use harw_types::PermissionTier;
 use serde::{Deserialize, Serialize};
 
 #[derive(uniffi::Record)]
@@ -274,6 +279,8 @@ pub struct MobileApproval {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum SubmitOutcome {
     Accepted,
+    /// The session is held by another writer (TUI, gateway, job); see `detail`.
+    Busy,
     Stale,
     QueueFull,
     Denied,
@@ -333,6 +340,8 @@ pub enum MobileError {
     Transport { detail: String },
     #[error("submission may have reached the server: {detail}")]
     Ambiguous { detail: String },
+    #[error("busy: {detail}")]
+    Busy { detail: String },
     #[error("mobile core: {detail}")]
     Internal { detail: String },
 }
@@ -343,9 +352,353 @@ impl From<PortError> for MobileError {
             PortError::Transport(detail) => Self::Transport { detail },
             PortError::Denied(detail) => Self::Denied { detail },
             PortError::Revoked => Self::Revoked,
+            PortError::Busy(detail) => Self::Busy { detail },
             other => Self::Session {
                 detail: other.to_string(),
             },
         }
+    }
+}
+
+/// Share mode of the gateway for TUI sessions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileShareMode {
+    Off,
+    Read,
+    Continue,
+}
+
+/// Effective permission tier of this connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileTier {
+    Observer,
+    Operator,
+    Maintainer,
+    Owner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MobileShareInfo {
+    pub mode: MobileShareMode,
+    pub tier: MobileTier,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MobileProject {
+    /// Empty string means "no project".
+    pub project_key: String,
+    pub label: String,
+    pub path_hint: Option<String>,
+    pub session_count: u32,
+    pub active_count: u32,
+    /// RFC 3339, like `MobileSession.updated_at`.
+    pub last_activity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MobileProjectPage {
+    pub projects: Vec<MobileProject>,
+    pub next_cursor: Option<String>,
+    pub share: MobileShareInfo,
+    /// True when the host lacks the `projects` feature and the list was built from `session.list`.
+    pub legacy: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileHolderKind {
+    Tui,
+    Gateway,
+    Job,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MobileHolder {
+    pub kind: MobileHolderKind,
+    pub since: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileRowOrigin {
+    Hosted,
+    Profile,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileLastOrigin {
+    Tui,
+    Gateway,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileReadOnlyReason {
+    ShareReadOnly,
+    ForeignOrigin,
+    NoWorkdir,
+    NoSteer,
+    Closed,
+    Unknown,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MobileSessionRow {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub project_key: Option<String>,
+    pub updated_at: String,
+    pub turns: Option<u64>,
+    pub state: MobileSessionState,
+    pub attached: u32,
+    pub model: Option<String>,
+    pub origin: MobileRowOrigin,
+    pub continuable: bool,
+    pub reason: Option<MobileReadOnlyReason>,
+    pub holder: Option<MobileHolder>,
+    pub last_origin: Option<MobileLastOrigin>,
+    pub first_message: Option<String>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MobileSessionPage {
+    pub sessions: Vec<MobileSessionRow>,
+    pub next_cursor: Option<String>,
+    pub legacy: bool,
+}
+
+/// Maps a wire session state to the mobile state (same mapping as `From<SessionSummary>`).
+pub(crate) fn mobile_state(state: &HostedState) -> MobileSessionState {
+    match state {
+        HostedState::Idle => MobileSessionState::Idle,
+        HostedState::Running => MobileSessionState::Running,
+        HostedState::WaitingForApproval => MobileSessionState::WaitingForApproval,
+        HostedState::WaitingForChild => MobileSessionState::WaitingForChild,
+        HostedState::Queued { .. } => MobileSessionState::Queued,
+        HostedState::Interrupted => MobileSessionState::Interrupted,
+        HostedState::Failed => MobileSessionState::Failed,
+        HostedState::Closed => MobileSessionState::Closed,
+    }
+}
+
+impl From<ShareMode> for MobileShareMode {
+    fn from(mode: ShareMode) -> Self {
+        match mode {
+            ShareMode::Off => Self::Off,
+            ShareMode::Read => Self::Read,
+            ShareMode::Continue => Self::Continue,
+        }
+    }
+}
+
+impl From<PermissionTier> for MobileTier {
+    fn from(tier: PermissionTier) -> Self {
+        match tier {
+            PermissionTier::Observer => Self::Observer,
+            PermissionTier::Operator => Self::Operator,
+            PermissionTier::Maintainer => Self::Maintainer,
+            PermissionTier::Owner => Self::Owner,
+        }
+    }
+}
+
+impl From<ShareInfo> for MobileShareInfo {
+    fn from(info: ShareInfo) -> Self {
+        Self {
+            mode: info.mode.into(),
+            tier: info.tier.into(),
+        }
+    }
+}
+
+impl From<ProjectSummary> for MobileProject {
+    fn from(project: ProjectSummary) -> Self {
+        Self {
+            project_key: project.project_key,
+            label: project.label,
+            path_hint: project.path_hint,
+            session_count: project.session_count,
+            active_count: project.active_count,
+            last_activity: project.last_activity.to_string(),
+        }
+    }
+}
+
+impl From<HolderKind> for MobileHolderKind {
+    fn from(kind: HolderKind) -> Self {
+        match kind {
+            HolderKind::Tui => Self::Tui,
+            HolderKind::Gateway => Self::Gateway,
+            HolderKind::Job => Self::Job,
+            HolderKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<HolderInfo> for MobileHolder {
+    fn from(holder: HolderInfo) -> Self {
+        Self {
+            kind: holder.kind.into(),
+            since: holder.since.to_string(),
+        }
+    }
+}
+
+impl From<RowOrigin> for MobileRowOrigin {
+    fn from(origin: RowOrigin) -> Self {
+        match origin {
+            RowOrigin::Hosted => Self::Hosted,
+            RowOrigin::Profile => Self::Profile,
+            RowOrigin::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<LastOrigin> for MobileLastOrigin {
+    fn from(origin: LastOrigin) -> Self {
+        match origin {
+            LastOrigin::Tui => Self::Tui,
+            LastOrigin::Gateway => Self::Gateway,
+            LastOrigin::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<ReadOnlyReason> for MobileReadOnlyReason {
+    fn from(reason: ReadOnlyReason) -> Self {
+        match reason {
+            ReadOnlyReason::ShareReadOnly => Self::ShareReadOnly,
+            ReadOnlyReason::ForeignOrigin => Self::ForeignOrigin,
+            ReadOnlyReason::NoWorkdir => Self::NoWorkdir,
+            ReadOnlyReason::NoSteer => Self::NoSteer,
+            ReadOnlyReason::Closed => Self::Closed,
+            ReadOnlyReason::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<SessionRow> for MobileSessionRow {
+    fn from(row: SessionRow) -> Self {
+        Self {
+            session_id: row.session_id.to_string(),
+            title: row.title,
+            project_key: row.project_key,
+            updated_at: row.updated_at.to_string(),
+            turns: row.turns,
+            state: mobile_state(&row.state),
+            attached: row.attached,
+            model: row.model,
+            origin: row.origin.into(),
+            continuable: row.continuable,
+            reason: row.reason.map(Into::into),
+            holder: row.holder.map(Into::into),
+            last_origin: row.last_origin.map(Into::into),
+            first_message: row.first_message,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harw_types::SessionId;
+
+    fn timestamp(raw: &str) -> jiff::Timestamp {
+        raw.parse().expect("valid timestamp")
+    }
+
+    fn full_row() -> SessionRow {
+        SessionRow {
+            session_id: SessionId::try_from_str("session-a").expect("id"),
+            title: Some("Titel".to_owned()),
+            project_key: Some("demo-0123".to_owned()),
+            updated_at: timestamp("2026-01-02T03:04:05Z"),
+            turns: Some(7),
+            state: HostedState::Queued { depth: 2 },
+            attached: 3,
+            model: Some("model-x".to_owned()),
+            origin: RowOrigin::Profile,
+            continuable: false,
+            reason: Some(ReadOnlyReason::ShareReadOnly),
+            holder: Some(HolderInfo {
+                kind: HolderKind::Gateway,
+                since: timestamp("2026-01-02T03:00:00Z"),
+            }),
+            last_origin: Some(LastOrigin::Tui),
+            first_message: Some("Hallo".to_owned()),
+        }
+    }
+
+    #[test]
+    fn session_row_maps_all_fields() {
+        let row: MobileSessionRow = full_row().into();
+        assert_eq!(row.session_id, "session-a");
+        assert_eq!(row.title.as_deref(), Some("Titel"));
+        assert_eq!(row.project_key.as_deref(), Some("demo-0123"));
+        assert_eq!(row.updated_at, "2026-01-02T03:04:05Z");
+        assert_eq!(row.turns, Some(7));
+        assert_eq!(row.state, MobileSessionState::Queued);
+        assert_eq!(row.attached, 3);
+        assert_eq!(row.model.as_deref(), Some("model-x"));
+        assert_eq!(row.origin, MobileRowOrigin::Profile);
+        assert!(!row.continuable);
+        assert_eq!(row.reason, Some(MobileReadOnlyReason::ShareReadOnly));
+        let holder = row.holder.expect("holder");
+        assert_eq!(holder.kind, MobileHolderKind::Gateway);
+        assert_eq!(holder.since, "2026-01-02T03:00:00Z");
+        assert_eq!(row.last_origin, Some(MobileLastOrigin::Tui));
+        assert_eq!(row.first_message.as_deref(), Some("Hallo"));
+    }
+
+    #[test]
+    fn unknown_enums_map_to_unknown() {
+        assert_eq!(
+            MobileRowOrigin::from(RowOrigin::Unknown),
+            MobileRowOrigin::Unknown
+        );
+        assert_eq!(
+            MobileLastOrigin::from(LastOrigin::Unknown),
+            MobileLastOrigin::Unknown
+        );
+        assert_eq!(
+            MobileReadOnlyReason::from(ReadOnlyReason::Unknown),
+            MobileReadOnlyReason::Unknown
+        );
+        assert_eq!(
+            MobileHolderKind::from(HolderKind::Unknown),
+            MobileHolderKind::Unknown
+        );
+    }
+
+    #[test]
+    fn busy_port_error_maps_to_mobile_busy() {
+        let error = MobileError::from(PortError::Busy("laeuft".to_owned()));
+        assert!(matches!(error, MobileError::Busy { ref detail } if detail == "laeuft"));
+        assert_eq!(error.to_string(), "busy: laeuft");
+    }
+
+    #[test]
+    fn project_and_share_map() {
+        let project: MobileProject = ProjectSummary {
+            project_key: String::new(),
+            label: "Ohne Projekt".to_owned(),
+            path_hint: Some("~/a/b".to_owned()),
+            session_count: 4,
+            last_activity: timestamp("2026-01-02T03:04:05Z"),
+            active_count: 1,
+        }
+        .into();
+        assert_eq!(project.project_key, "");
+        assert_eq!(project.path_hint.as_deref(), Some("~/a/b"));
+        assert_eq!(project.session_count, 4);
+        assert_eq!(project.active_count, 1);
+        assert_eq!(project.last_activity, "2026-01-02T03:04:05Z");
+        let share: MobileShareInfo = ShareInfo {
+            mode: ShareMode::Continue,
+            tier: PermissionTier::Maintainer,
+        }
+        .into();
+        assert_eq!(share.mode, MobileShareMode::Continue);
+        assert_eq!(share.tier, MobileTier::Maintainer);
     }
 }

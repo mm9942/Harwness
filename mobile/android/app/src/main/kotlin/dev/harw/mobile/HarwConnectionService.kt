@@ -24,10 +24,65 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import uniffi.harw_mobile_ffi.ConnectionPhase
+import uniffi.harw_mobile_ffi.MobileSession
+import uniffi.harw_mobile_ffi.MobileSessionState
 
 // attempt == 0u -> null (Basistext verwenden); sonst die Versuchszahl als Int für %1$d.
 internal fun reconnectAttemptArg(attempt: UInt): Int? =
     if (attempt == 0u) null else attempt.toInt()
+
+internal enum class SessionAlertKind { Approval, TurnEnd }
+
+internal data class SessionAlert(val sessionId: String, val kind: SessionAlertKind)
+
+// Erkennt Zustandswechsel zwischen zwei Session-Listen. Die erste Liste nach einem Reset
+// ist nur Basis und löst nichts aus; sonst würde jede Wiederverbindung alte Sessions melden.
+internal class SessionAlertTracker {
+    private var known: Map<String, MobileSessionState>? = null
+
+    fun reset() {
+        known = null
+    }
+
+    /** Liefert neue Hinweise und die Sessions, deren Freigabe-Hinweis zurückgenommen werden soll. */
+    fun update(sessions: List<MobileSession>): Pair<List<SessionAlert>, List<String>> {
+        val next = sessions.associate { it.sessionId to it.state }
+        val before = known
+        known = next
+        if (before == null) return emptyList<SessionAlert>() to emptyList()
+        val alerts = mutableListOf<SessionAlert>()
+        val cleared = mutableListOf<String>()
+        for ((id, state) in next) {
+            val old = before[id] ?: continue
+            if (old == state) continue
+            if (state == MobileSessionState.WAITING_FOR_APPROVAL) {
+                alerts += SessionAlert(id, SessionAlertKind.Approval)
+            } else {
+                if (old == MobileSessionState.WAITING_FOR_APPROVAL) cleared += id
+                if (state == MobileSessionState.IDLE && old in busyStates) {
+                    alerts += SessionAlert(id, SessionAlertKind.TurnEnd)
+                }
+            }
+        }
+        for (id in before.keys) if (id !in next) cleared += id
+        return alerts to cleared
+    }
+
+    private companion object {
+        val busyStates = setOf(
+            MobileSessionState.RUNNING,
+            MobileSessionState.WAITING_FOR_APPROVAL,
+            MobileSessionState.WAITING_FOR_CHILD,
+            MobileSessionState.QUEUED,
+        )
+    }
+}
+
+// Stabile Benachrichtigungs-Id je Session und Art, ohne die Id selbst preiszugeben.
+internal fun alertNotificationId(sessionId: String, kind: SessionAlertKind): Int =
+    AlertIdBase + (sessionId.hashCode() and 0x3fffffff) % 1_000_000 * 2 + kind.ordinal
+
+private const val AlertIdBase = 1000
 
 internal class HarwConnectionService : Service() {
     private val connection get() = (application as HarwApplication).connection
@@ -36,12 +91,17 @@ internal class HarwConnectionService : Service() {
     private var foreground = false
     private var latestStart = 0
     private var observation: Job? = null
+    private var alertObservation: Job? = null
+    private val alertTracker = SessionAlertTracker()
 
     override fun onCreate() {
         super.onCreate()
         notifications = checkNotNull(getSystemService(NotificationManager::class.java))
         notifications.createNotificationChannel(
             NotificationChannel(ChannelId, getString(R.string.connection_channel), NotificationManager.IMPORTANCE_LOW),
+        )
+        notifications.createNotificationChannel(
+            NotificationChannel(AlertChannelId, getString(R.string.notification_channel_sessions), NotificationManager.IMPORTANCE_HIGH),
         )
     }
 
@@ -61,6 +121,7 @@ internal class HarwConnectionService : Service() {
                     foreground = true
                     if (connection.connect()) {
                         if (observation?.isActive != true) observeConnection()
+                        if (alertObservation?.isActive != true) observeAlerts()
                     } else {
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         foreground = false
@@ -127,6 +188,48 @@ internal class HarwConnectionService : Service() {
         }
     }
 
+    private fun observeAlerts() {
+        alertObservation = scope.launch {
+            connection.state
+                .map { if (it.online && it.sessionsLoaded) it.sessions else null }
+                .distinctUntilChanged()
+                .collect { sessions ->
+                    if (sessions == null) {
+                        alertTracker.reset()
+                        return@collect
+                    }
+                    val (alerts, cleared) = alertTracker.update(sessions)
+                    for (id in cleared) notifications.cancel(alertNotificationId(id, SessionAlertKind.Approval))
+                    if (notifications.areNotificationsEnabled()) alerts.forEach { postAlert(it) }
+                }
+        }
+    }
+
+    // Kein Titel und kein Projektname: die Meldung erscheint auch auf dem gesperrten Bildschirm.
+    private fun postAlert(alert: SessionAlert) {
+        val open = PendingIntent.getActivity(
+            this,
+            alertNotificationId(alert.sessionId, alert.kind),
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                .putExtra(ExtraOpenSession, alert.sessionId),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val approval = alert.kind == SessionAlertKind.Approval
+        val notification = NotificationCompat.Builder(this, AlertChannelId)
+            .setSmallIcon(R.drawable.ic_harw_notification)
+            .setContentTitle(getString(if (approval) R.string.notification_approval_title else R.string.notification_turn_done_title))
+            .setContentText(getString(if (approval) R.string.notification_approval_text else R.string.notification_turn_done_text))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .setCategory(if (approval) NotificationCompat.CATEGORY_MESSAGE else NotificationCompat.CATEGORY_STATUS)
+            .setPriority(if (approval) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .build()
+        notifications.notify(alertNotificationId(alert.sessionId, alert.kind), notification)
+    }
+
     private fun notification(text: Int): Notification =
         notification(getString(text), stopAction = true, batteryAction = false)
 
@@ -163,6 +266,10 @@ internal class HarwConnectionService : Service() {
     companion object {
         private const val ChannelId = "connection"
         private const val NotificationId = 1
+        private const val AlertChannelId = "alerts"
+
+        /** Intent-Extra mit der Session-Id; MainActivity (A6) löst Projekt -> Session daraus auf. */
+        const val ExtraOpenSession = "dev.harw.mobile.OPEN_SESSION"
         private const val ConnectAction = "dev.harw.mobile.CONNECT"
         private const val DisconnectAction = "dev.harw.mobile.DISCONNECT"
 

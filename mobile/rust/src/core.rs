@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use harw_node_transport::{LocalNode, NodeBody, empty_body};
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachParams, ClientCaps, CreateParams, Cursor, DEFAULT_TAIL_ITEMS,
-    InterruptParams, RespondResult, StreamProfile, SubmitParams, SubmitResult, features,
+    ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams,
+    Cursor, DEFAULT_TAIL_ITEMS, HolderInfo, InterruptParams, PageParams, ProjectsParams,
+    RenameParams, RespondResult, SessionFrame, SetProjectParams, StreamProfile, SubmitParams,
+    SubmitResult, features,
 };
 use harw_protocol::{PortError, SessionPort};
 use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError, RemotePort};
@@ -24,8 +26,9 @@ use crate::provider::request_provider;
 use crate::{
     ApprovalDecision, ApprovalOutcome, ApprovalReceipt, ChatgptProviderCredential,
     ChatgptProviderStatus, ConnectionPhase, ConnectionRoute, ConnectionStatus, DeviceEnrollment,
-    MobileError, MobileSession, RoutePreference, ServerProfile, SessionCursor, SessionSnapshot,
-    SubmitOutcome, SubmitReceipt,
+    MobileError, MobileHolder, MobileProject, MobileProjectPage, MobileRowOrigin, MobileSession,
+    MobileSessionPage, MobileSessionRow, MobileShareInfo, MobileShareMode, MobileTier,
+    RoutePreference, ServerProfile, SessionCursor, SessionSnapshot, SubmitOutcome, SubmitReceipt,
 };
 
 pub(crate) mod route;
@@ -33,6 +36,12 @@ pub(crate) mod route;
 use route::{Dialer, available_routes, route_label, route_plan};
 
 const MAX_ATTACHMENTS: usize = 32;
+/// Upper bound for remembered lease holders (session ids only, no paths or titles).
+const MAX_HOLDERS: usize = 4096;
+/// Shown when the host predates the `projects` feature (wire minor 2).
+const NO_PROJECTS_DETAIL: &str = "Server kennt keine Projekte";
+/// Label of the pseudo project that collects sessions without a project.
+const NO_PROJECT_LABEL: &str = "Ohne Projekt";
 const MAX_SUBMISSION_BYTES: usize = 256 * 1024;
 const MAX_PROCESS_SUBMISSIONS: usize = 8192;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -62,7 +71,11 @@ enum NetworkAction {
     Restart,
 }
 
-fn network_action(phase: ConnectionPhase, run_active: bool, retryable_failure: bool) -> NetworkAction {
+fn network_action(
+    phase: ConnectionPhase,
+    run_active: bool,
+    retryable_failure: bool,
+) -> NetworkAction {
     match phase {
         ConnectionPhase::Connecting | ConnectionPhase::Reconnecting if run_active => {
             NetworkAction::WakeBackoff
@@ -75,7 +88,9 @@ fn network_action(phase: ConnectionPhase, run_active: bool, retryable_failure: b
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+        })
 }
 
 impl Shared {
@@ -92,6 +107,8 @@ struct CoreState {
     run: Option<CancellationToken>,
     link: Option<Arc<Link>>,
     sessions: HashMap<SessionId, SessionState>,
+    /// Last known lease holder per session, from `holder` frames and pages.
+    holders: HashMap<SessionId, Option<HolderInfo>>,
     detaching: HashSet<SessionId>,
     submissions: HashMap<(SessionId, String), Submission>,
     route_preference: RoutePreference,
@@ -111,6 +128,7 @@ impl Default for CoreState {
             run: None,
             link: None,
             sessions: HashMap::new(),
+            holders: HashMap::new(),
             detaching: HashSet::new(),
             submissions: HashMap::new(),
             route_preference: RoutePreference::Auto,
@@ -157,6 +175,7 @@ impl CoreState {
         for session in self.sessions.values_mut() {
             session.offline(detail);
         }
+        self.holders.clear();
     }
 
     fn stop(&mut self, detail: &str) {
@@ -461,6 +480,181 @@ impl MobileCore {
         })
     }
 
+    /// True when the connected host serves the `projects` feature (wire minor 3).
+    pub fn projects_supported(&self) -> bool {
+        self.shared
+            .state()
+            .active()
+            .is_ok_and(|link| link_supports_projects(&link))
+    }
+
+    pub fn list_projects(
+        &self,
+        query: Option<String>,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<MobileProjectPage, MobileError> {
+        let link = self.shared.state().active()?;
+        self.run(async move {
+            if !link_supports_projects(&link) {
+                let sessions: Vec<MobileSession> = link
+                    .request(link.port.list())
+                    .await?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                return Ok(legacy_project_page(&sessions));
+            }
+            let result = link
+                .request(link.port.projects(ProjectsParams {
+                    query,
+                    limit,
+                    cursor,
+                }))
+                .await?;
+            Ok(MobileProjectPage {
+                projects: result
+                    .projects
+                    .into_iter()
+                    .map(MobileProject::from)
+                    .collect(),
+                next_cursor: result.next_cursor,
+                share: result.share.into(),
+                legacy: false,
+            })
+        })
+    }
+
+    pub fn list_sessions_page(
+        &self,
+        project_key: Option<String>,
+        query: Option<String>,
+        include_archived: bool,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<MobileSessionPage, MobileError> {
+        let link = self.shared.state().active()?;
+        let shared = Arc::clone(&self.shared);
+        self.run(async move {
+            if !link_supports_projects(&link) {
+                let steer = link.port.connection().hello_ack().granted.steer;
+                let sessions: Vec<MobileSession> = link
+                    .request(link.port.list())
+                    .await?
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                return Ok(legacy_session_page(sessions, project_key.as_deref(), steer));
+            }
+            let result = link
+                .request(link.port.page(PageParams {
+                    project_key,
+                    query,
+                    include_archived,
+                    limit,
+                    cursor,
+                }))
+                .await?;
+            {
+                let mut state = shared.state();
+                if state.same_link(&link) {
+                    for row in &result.sessions {
+                        remember_holder(&mut state, row.session_id.clone(), row.holder.clone());
+                    }
+                }
+            }
+            Ok(MobileSessionPage {
+                sessions: result
+                    .sessions
+                    .into_iter()
+                    .map(MobileSessionRow::from)
+                    .collect(),
+                next_cursor: result.next_cursor,
+                legacy: false,
+            })
+        })
+    }
+
+    pub fn adopt_session(&self, session_id: String) -> Result<MobileSession, MobileError> {
+        let id = parse_session_id(session_id)?;
+        let link = self.projects_link()?;
+        self.run(async move { link.request(link.port.adopt(id)).await.map(Into::into) })
+    }
+
+    pub fn create_in_project(
+        &self,
+        project_key: String,
+        title: Option<String>,
+    ) -> Result<MobileSession, MobileError> {
+        let link = self.projects_link()?;
+        self.run(async move {
+            link.request(link.port.create_in(CreateInParams { project_key, title }))
+                .await
+                .map(Into::into)
+        })
+    }
+
+    pub fn set_project(
+        &self,
+        session_id: String,
+        project_key: String,
+    ) -> Result<MobileSessionRow, MobileError> {
+        let session_id = parse_session_id(session_id)?;
+        let link = self.projects_link()?;
+        self.run(async move {
+            link.request(link.port.set_project(SetProjectParams {
+                session_id,
+                project_key,
+            }))
+            .await
+            .map(Into::into)
+        })
+    }
+
+    pub fn rename_session(
+        &self,
+        session_id: String,
+        title: String,
+    ) -> Result<MobileSessionRow, MobileError> {
+        let session_id = parse_session_id(session_id)?;
+        let link = self.projects_link()?;
+        self.run(async move {
+            link.request(link.port.rename(RenameParams { session_id, title }))
+                .await
+                .map(Into::into)
+        })
+    }
+
+    pub fn archive_session(
+        &self,
+        session_id: String,
+        archived: bool,
+    ) -> Result<MobileSessionRow, MobileError> {
+        let session_id = parse_session_id(session_id)?;
+        let link = self.projects_link()?;
+        self.run(async move {
+            link.request(link.port.archive(ArchiveParams {
+                session_id,
+                archived,
+            }))
+            .await
+            .map(Into::into)
+        })
+    }
+
+    /// Last known lease holder from `holder` frames or the last page. No network call.
+    pub fn session_holder(&self, session_id: String) -> Result<Option<MobileHolder>, MobileError> {
+        let id = parse_session_id(session_id)?;
+        Ok(self
+            .shared
+            .state()
+            .holders
+            .get(&id)
+            .cloned()
+            .flatten()
+            .map(MobileHolder::from))
+    }
+
     pub fn create_session(&self, title: Option<String>) -> Result<MobileSession, MobileError> {
         let link = self.shared.state().active()?;
         if !link.port.connection().hello_ack().granted.steer {
@@ -751,6 +945,18 @@ impl MobileCore {
         })
     }
 
+    /// Active link for a project mutation; a minor-2 host is refused without a request.
+    fn projects_link(&self) -> Result<Arc<Link>, MobileError> {
+        let link = self.shared.state().active()?;
+        if link_supports_projects(&link) {
+            Ok(link)
+        } else {
+            Err(MobileError::Denied {
+                detail: NO_PROJECTS_DETAIL.into(),
+            })
+        }
+    }
+
     fn run<T, F>(&self, operation: F) -> Result<T, MobileError>
     where
         T: Send + 'static,
@@ -797,8 +1003,9 @@ async fn drive_connection(
                     break;
                 }
                 state.attempt = retry;
-                state.next_retry_at_ms =
-                    Some(now_ms().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64));
+                state.next_retry_at_ms = Some(
+                    now_ms().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                );
             }
             let woken = tokio::select! {
                 () = run.cancelled() => break,
@@ -819,7 +1026,7 @@ async fn drive_connection(
             break;
         }
         let mut options = ConnectOptions::new(&label);
-        options.requested_caps = Some(ClientCaps::OPERATE);
+        options.requested_caps = Some(ClientCaps::ALL);
         options.features = requested_features();
         let plan = {
             let preference = shared.state().route_preference;
@@ -1120,10 +1327,100 @@ fn requested_features() -> Vec<String> {
         features::CHILD_FRAMES,
         features::COMPACT_REASONING,
         features::JOB_FRAMES,
+        features::PROJECTS,
     ]
     .iter()
     .map(|feature| (*feature).to_owned())
     .collect()
+}
+
+fn link_supports_projects(link: &Link) -> bool {
+    link.port
+        .connection()
+        .hello_ack()
+        .features
+        .iter()
+        .any(|feature| feature == features::PROJECTS)
+}
+
+fn remember_holder(state: &mut CoreState, id: SessionId, holder: Option<HolderInfo>) {
+    if state.holders.len() >= MAX_HOLDERS && !state.holders.contains_key(&id) {
+        state.holders.clear();
+    }
+    state.holders.insert(id, holder);
+}
+
+/// Minor-2 fallback: one pseudo project built from `session.list`.
+fn legacy_project_page(sessions: &[MobileSession]) -> MobileProjectPage {
+    let latest = sessions
+        .iter()
+        .filter_map(|session| session.updated_at.parse::<jiff::Timestamp>().ok())
+        .max()
+        .map(|timestamp| timestamp.to_string())
+        .or_else(|| sessions.first().map(|session| session.updated_at.clone()));
+    let projects = latest
+        .map(|last_activity| {
+            vec![MobileProject {
+                project_key: String::new(),
+                label: NO_PROJECT_LABEL.into(),
+                path_hint: None,
+                session_count: u32::try_from(sessions.len()).unwrap_or(u32::MAX),
+                active_count: u32::try_from(
+                    sessions
+                        .iter()
+                        .filter(|session| session.attached > 0)
+                        .count(),
+                )
+                .unwrap_or(u32::MAX),
+                last_activity,
+            }]
+        })
+        .unwrap_or_default();
+    MobileProjectPage {
+        projects,
+        next_cursor: None,
+        share: MobileShareInfo {
+            mode: MobileShareMode::Off,
+            tier: MobileTier::Observer,
+        },
+        legacy: true,
+    }
+}
+
+/// Minor-2 fallback: rows from `session.list`, only for "all" and "no project".
+fn legacy_session_page(
+    sessions: Vec<MobileSession>,
+    project_key: Option<&str>,
+    steer: bool,
+) -> MobileSessionPage {
+    let rows = if matches!(project_key, None | Some("")) {
+        sessions
+            .into_iter()
+            .map(|session| MobileSessionRow {
+                session_id: session.session_id,
+                title: session.title,
+                project_key: None,
+                updated_at: session.updated_at,
+                turns: None,
+                state: session.state,
+                attached: session.attached,
+                model: session.model,
+                origin: MobileRowOrigin::Hosted,
+                continuable: steer,
+                reason: None,
+                holder: None,
+                last_origin: None,
+                first_message: None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    MobileSessionPage {
+        sessions: rows,
+        next_cursor: None,
+        legacy: true,
+    }
 }
 
 /// Profile for `session.attach`: reasoning-aware only when the host granted it.
@@ -1226,6 +1523,12 @@ async fn drive_attachment(
                 }
                 None => return,
             };
+            if let SessionFrame::Holder { session_id, holder } = &envelope.frame {
+                let mut state = shared.state();
+                if state.same_link(&link) {
+                    remember_holder(&mut state, session_id.clone(), holder.clone());
+                }
+            }
             let Some(action) =
                 with_session(&shared, &id, &link, |session| session.observe(&envelope))
             else {
@@ -1356,6 +1659,11 @@ async fn submit(
             ..SubmitReceipt::new(SubmitOutcome::Denied)
         }),
         Err(error @ (MobileError::Denied { .. } | MobileError::Revoked)) => Err(error),
+        // The lease is held elsewhere: nothing was written, so this is a plain refusal.
+        Err(MobileError::Busy { detail }) => Ok(SubmitReceipt {
+            detail: Some(detail),
+            ..SubmitReceipt::new(SubmitOutcome::Busy)
+        }),
         Err(_) => Err(ambiguous()),
     };
     {
@@ -1464,6 +1772,88 @@ mod profile_tests {
 }
 
 #[cfg(test)]
+mod projects_tests {
+    use super::*;
+    use crate::MobileSessionState;
+
+    fn session(id: &str, updated_at: &str, attached: u32) -> MobileSession {
+        MobileSession {
+            session_id: id.into(),
+            title: None,
+            state: MobileSessionState::Idle,
+            attached,
+            updated_at: updated_at.into(),
+            model: None,
+        }
+    }
+
+    #[test]
+    fn requested_features_include_projects() {
+        assert!(requested_features().iter().any(|f| f == features::PROJECTS));
+    }
+
+    #[test]
+    fn clear_link_forgets_holders() {
+        let mut state = CoreState::default();
+        remember_holder(
+            &mut state,
+            SessionId::try_from_str("sess-a1").expect("id"),
+            None,
+        );
+        state.clear_link("offline");
+        assert!(state.holders.is_empty());
+    }
+
+    #[test]
+    fn legacy_project_page_from_list() {
+        let page = legacy_project_page(&[
+            session("sess-a1", "2026-01-02T00:00:00Z", 1),
+            session("sess-a2", "2026-03-04T00:00:00Z", 0),
+        ]);
+        assert!(page.legacy);
+        assert_eq!(page.projects.len(), 1);
+        let project = &page.projects[0];
+        assert_eq!(project.project_key, "");
+        assert_eq!(project.label, "Ohne Projekt");
+        assert_eq!(project.session_count, 2);
+        assert_eq!(project.active_count, 1);
+        assert_eq!(project.last_activity, "2026-03-04T00:00:00Z");
+        assert_eq!(page.share.mode, MobileShareMode::Off);
+        assert_eq!(page.share.tier, MobileTier::Observer);
+        assert!(legacy_project_page(&[]).projects.is_empty());
+    }
+
+    #[test]
+    fn legacy_session_page_filters_by_project() {
+        let list = || vec![session("sess-a1", "2026-01-02T00:00:00Z", 0)];
+        let all = legacy_session_page(list(), None, true);
+        assert!(all.legacy && all.next_cursor.is_none());
+        assert_eq!(all.sessions.len(), 1);
+        assert!(all.sessions[0].continuable);
+        assert!(matches!(all.sessions[0].origin, MobileRowOrigin::Hosted));
+        assert_eq!(
+            legacy_session_page(list(), Some(""), false).sessions.len(),
+            1
+        );
+        assert!(
+            legacy_session_page(list(), Some("proj-x"), true)
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn holder_map_is_bounded() {
+        let mut state = CoreState::default();
+        for index in 0..=MAX_HOLDERS {
+            let id = SessionId::try_from_str(format!("sess-{index}")).expect("id");
+            remember_holder(&mut state, id, None);
+        }
+        assert!(state.holders.len() <= MAX_HOLDERS);
+    }
+}
+
+#[cfg(test)]
 mod route_failure_tests {
     use super::*;
 
@@ -1546,7 +1936,10 @@ mod route_failure_tests {
     fn network_action_wakes_backoff_while_dialing() {
         for phase in [ConnectionPhase::Connecting, ConnectionPhase::Reconnecting] {
             for retryable in [false, true] {
-                assert_eq!(network_action(phase, true, retryable), NetworkAction::WakeBackoff);
+                assert_eq!(
+                    network_action(phase, true, retryable),
+                    NetworkAction::WakeBackoff
+                );
             }
         }
     }
@@ -1555,7 +1948,10 @@ mod route_failure_tests {
     fn network_action_ignores_dialing_without_run() {
         for phase in [ConnectionPhase::Connecting, ConnectionPhase::Reconnecting] {
             for retryable in [false, true] {
-                assert_eq!(network_action(phase, false, retryable), NetworkAction::Ignore);
+                assert_eq!(
+                    network_action(phase, false, retryable),
+                    NetworkAction::Ignore
+                );
             }
         }
     }
