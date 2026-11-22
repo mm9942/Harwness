@@ -12,7 +12,7 @@ use harw_config::{ProviderToml, SecretRef};
 use secrecy::{ExposeSecret, SecretString};
 use zeroize::Zeroizing;
 
-use crate::home::{AppHome, write_private_atomic};
+use crate::home::{AppHome, LOCAL_ROUTE_ID, write_private_atomic};
 use crate::secrets::{KeystoreSecretResolver, PlatformKeystore, SecretError, route_slot};
 use crate::types::{
     AppHomeInfo, MobileError, ProviderDefaults, ProviderKind, ProviderRoute, ProviderValidation,
@@ -36,6 +36,7 @@ const MAX_ROUTE_FILE_BYTES: u64 = 64 * 1024;
 const API_ANTHROPIC: &str = "anthropic-messages";
 const API_OPENAI_RESPONSES: &str = "openai-responses";
 const API_OPENAI_CHAT: &str = "openai-chat";
+const API_LOCAL_GGUF: &str = "local-gguf";
 
 /// Suggested defaults for a provider family.
 #[uniffi::export]
@@ -51,6 +52,7 @@ pub fn provider_defaults(kind: ProviderKind) -> ProviderDefaults {
         ),
         ProviderKind::OpenRouter => ("https://openrouter.ai/api/v1", API_OPENAI_CHAT, true, ""),
         ProviderKind::OpenAiCompatible => ("", API_OPENAI_CHAT, false, ""),
+        ProviderKind::LocalGguf => ("", API_LOCAL_GGUF, false, ""),
     };
     ProviderDefaults {
         base_url: base_url.to_owned(),
@@ -58,6 +60,29 @@ pub fn provider_defaults(kind: ProviderKind) -> ProviderDefaults {
         secret_required,
         suggested_model: suggested_model.to_owned(),
     }
+}
+
+/// Makes a downloaded or imported model the active provider ("On this device").
+///
+/// Fails unless the model file is complete and readable. The next
+/// standalone-mode open (`open_local`) loads it.
+#[uniffi::export]
+pub fn activate_local_model(
+    files_dir: String,
+    models_dir: String,
+    model_id: String,
+) -> Result<(), MobileError> {
+    let home = AppHome::open(std::path::Path::new(&files_dir))?;
+    crate::models::model_path(models_dir.clone(), model_id.clone())?;
+    check_model(&model_id, false).map_err(|message| MobileError::Session { detail: message })?;
+    home.set_local_models_dir(&models_dir)?;
+    home.set_active_route(LOCAL_ROUTE_ID, &model_id)
+}
+
+/// Model id when the on-device model is the active provider, else `None`.
+#[uniffi::export]
+pub fn active_local_model(files_dir: String) -> Result<Option<String>, MobileError> {
+    AppHome::open(std::path::Path::new(&files_dir))?.active_local_model()
 }
 
 /// Provider routes, their secrets and the active selection.
@@ -99,6 +124,17 @@ impl ProviderStore {
                 base_url,
                 id: stem,
             });
+        }
+        if let Some(model) = self.home.active_local_model()? {
+            routes.push(ProviderRoute {
+                id: LOCAL_ROUTE_ID.to_owned(),
+                kind: ProviderKind::LocalGguf,
+                base_url: String::new(),
+                default_model: model,
+                has_secret: false,
+                active: true,
+            });
+            routes.sort_by(|a, b| a.id.cmp(&b.id));
         }
         Ok(routes)
     }
@@ -471,6 +507,12 @@ fn check_base_url(raw: &str, kind: ProviderKind) -> Result<String, String> {
 }
 
 fn clean_route(route: &ProviderRoute) -> Result<CleanRoute, String> {
+    if route.kind == ProviderKind::LocalGguf {
+        return Err("the on-device model is chosen on the Models screen".to_owned());
+    }
+    if route.id == LOCAL_ROUTE_ID {
+        return Err("this route id is reserved for the on-device model".to_owned());
+    }
     check_id(&route.id)?;
     let base_url = check_base_url(&route.base_url, route.kind)?;
     check_model(&route.default_model, true)?;

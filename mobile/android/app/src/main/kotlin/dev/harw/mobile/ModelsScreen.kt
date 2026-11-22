@@ -64,7 +64,8 @@ private const val TextVerifiedModel = "Pinned version, checksum verified"
 private const val TextNotChecked = "Downloaded, not checked"
 private const val TextInvalid = "Invalid file, delete and download again"
 private const val TextUnreadable = "Belongs to an earlier install, re-import"
-private const val TextLaterUpdate = "Local execution follows in a later update"
+private const val TextInUse = "Active provider on this device"
+private const val TextUseHint = "Runs offline in standalone mode"
 private const val TextImportCancelled = "Import cancelled"
 private const val TextOldFileKept =
     "The old file could not be removed and still uses space. Delete it in a file manager."
@@ -160,6 +161,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
     var showDocumentsFallback by remember { mutableStateOf(false) }
     var expandedSha by remember { mutableStateOf<String?>(null) }
     var wifiOnly by remember { mutableStateOf(true) }
+    var activeLocalId by remember { mutableStateOf<String?>(null) }
 
     fun show(text: String?, error: Boolean = false) {
         message = text
@@ -170,6 +172,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
         if (!ready) return
         try {
             locals = manager.local()
+            activeLocalId = manager.activeLocal(context.filesDir.path)
         } catch (e: MobileException) {
             show(e.message ?: "Could not read models", error = true)
         }
@@ -184,6 +187,18 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
             storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         } else {
             ready = true
+        }
+    }
+
+    fun useModel(modelId: String) {
+        scope.launch {
+            try {
+                manager.useLocal(context.filesDir.path, modelId)
+                activeLocalId = modelId
+                show("Active provider is now the model on this device")
+            } catch (e: MobileException) {
+                show(e.message ?: "Could not select the model", error = true)
+            }
         }
     }
 
@@ -409,7 +424,7 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                         Text(stateText(model, local), style = MaterialTheme.typography.bodyMedium)
                         if (state == ModelFileState.COMPLETE) {
                             Text(
-                                TextLaterUpdate,
+                                if (activeLocalId == model.id) TextInUse else TextUseHint,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -460,6 +475,8 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                                     Button(enabled = !busy, onClick = { requestDownload(model.id) }) {
                                         Text(if (state == ModelFileState.PARTIAL) "Resume" else "Download")
                                     }
+                                } else if (activeLocalId != model.id) {
+                                    Button(enabled = !busy, onClick = { useModel(model.id) }) { Text("Use") }
                                 }
                                 if (state != ModelFileState.MISSING && local != null) {
                                     OutlinedButton(enabled = !busy, onClick = { pendingDelete = local }) { Text("Delete") }
@@ -485,7 +502,16 @@ internal fun ModelsScreen(manager: ModelManager, onBack: () -> Unit) {
                                 modifier = Modifier.clickable { expandedSha = if (expanded) null else local.id },
                             )
                         }
-                        OutlinedButton(enabled = !busy, onClick = { pendingDelete = local }) { Text("Delete") }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (local.state == ModelFileState.COMPLETE) {
+                                if (activeLocalId == local.id) {
+                                    Text(TextInUse, style = MaterialTheme.typography.bodySmall)
+                                } else {
+                                    Button(enabled = !busy, onClick = { useModel(local.id) }) { Text("Use") }
+                                }
+                            }
+                            OutlinedButton(enabled = !busy, onClick = { pendingDelete = local }) { Text("Delete") }
+                        }
                     }
                 }
             }

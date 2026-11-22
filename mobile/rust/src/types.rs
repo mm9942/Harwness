@@ -617,6 +617,8 @@ pub enum ProviderKind {
     OpenAiCompatible,
     DashScope,
     OpenRouter,
+    /// The GGUF model running on this device (not a stored route file).
+    LocalGguf,
 }
 
 /// A model provider route stored in the app home.

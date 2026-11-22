@@ -60,7 +60,7 @@ private val KIND_CHOICES = listOf(
 )
 
 private fun kindLabel(kind: ProviderKind): String =
-    KIND_CHOICES.firstOrNull { it.first == kind }?.second ?: kind.name
+    if (kind == ProviderKind.LOCAL_GGUF) "On this device" else KIND_CHOICES.firstOrNull { it.first == kind }?.second ?: kind.name
 
 private fun failureText(error: Exception): String =
     if (error is MobileException) error.message ?: "Der Vorgang ist fehlgeschlagen." else "Der Vorgang ist fehlgeschlagen."
