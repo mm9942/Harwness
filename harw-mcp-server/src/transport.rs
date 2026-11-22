@@ -2385,9 +2385,15 @@ mod tests {
         let error_code = |envelope: &Value| envelope.pointer("/error/code").and_then(Value::as_i64);
 
         let list = json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"});
-        let peer_tools = rpc(address, "codex-token", &codex_session, &codex_protocol, list.clone())
-            .await?
-            .to_string();
+        let peer_tools = rpc(
+            address,
+            "codex-token",
+            &codex_session,
+            &codex_protocol,
+            list.clone(),
+        )
+        .await?
+        .to_string();
         for tool in ["harw_peer_sessions", "harw_peer_send", "harw_peer_poll"] {
             assert!(peer_tools.contains(tool), "{peer_tools}");
         }

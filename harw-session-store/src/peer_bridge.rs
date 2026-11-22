@@ -915,7 +915,7 @@ mod tests {
         if len != 0 {
             return Err(unexpected(len));
         }
-        if handle.session() != &session() {
+        if *handle.session() != session() {
             return Err(unexpected(handle.session()));
         }
         Ok(())

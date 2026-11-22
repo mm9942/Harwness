@@ -123,7 +123,8 @@ mod tests {
     #[test]
     fn test_build_peer_bridge_disabled_returns_none() -> TestResult {
         let root = std::env::temp_dir().join("harw-peer-bridge-test");
-        let bridge = build_peer_bridge(&config(false, &["alice"], "alice"), &root).map_err(ctx("build_peer_bridge"))?;
+        let bridge = build_peer_bridge(&config(false, &["alice"], "alice"), &root)
+            .map_err(ctx("build_peer_bridge"))?;
         assert!(bridge.is_none());
         Ok(())
     }
@@ -141,7 +142,8 @@ mod tests {
     #[test]
     fn test_build_peer_bridge_valid_principal_is_peer() -> TestResult {
         let root = std::env::temp_dir().join("harw-peer-bridge-test");
-        let bridge = build_peer_bridge(&config(true, &["alice"], "alice"), &root).map_err(ctx("build_peer_bridge"))?;
+        let bridge = build_peer_bridge(&config(true, &["alice"], "alice"), &root)
+            .map_err(ctx("build_peer_bridge"))?;
         let bridge = some_or(bridge, "bridge")?;
         assert!(bridge.is_peer("alice"));
         Ok(())

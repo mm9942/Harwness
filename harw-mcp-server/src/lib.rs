@@ -26,7 +26,10 @@ pub use events::{
     McpEventBus, McpEventBusError, McpEventReceiveError, McpEventSubscription, McpLifecycleEvent,
     McpLifecycleEventKind,
 };
-pub use peer::{FilePeerBridge, McpPeerBridge, McpPeerError, PeerBridgeServerConfig, PeerSendRequest, PeerServerConfig};
+pub use peer::{
+    FilePeerBridge, McpPeerBridge, McpPeerError, PeerBridgeServerConfig, PeerSendRequest,
+    PeerServerConfig,
+};
 pub use session::{McpServerError, McpServerResult, McpSession, McpSessionRegistry};
 pub use supervisor::{
     DurableMcpSupervisor, McpCancellationReceipt, McpJobCapability, McpJobStatus, McpPrincipal,
