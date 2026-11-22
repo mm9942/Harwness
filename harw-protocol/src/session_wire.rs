@@ -923,6 +923,10 @@ pub struct SubmitParams {
     /// Images attached to the prompt (feature `images`). Empty = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<SubmitImage>,
+    /// Item id of an earlier user message of this session: the history is cut before it and replaced,
+    /// then `text` runs as a new turn ("resend" replaces instead of duplicating).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewind_before: Option<String>,
 }
 
 /// Largest image (stored bytes) `media.get` returns; bigger ones are refused so the answer fits the 1 MiB transport message.

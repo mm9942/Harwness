@@ -405,9 +405,9 @@ internal fun SessionConversation(
                 entries = snapshot?.transcript.orEmpty(),
                 sentImages = { text, count -> window.sentImages(sessionId, text, count) },
                 fetchMedia = { ref -> connection.mediaThumbnail(sessionId, ref) },
-                onRegenerate = { text, images ->
+                onRegenerate = { entryId, text, images ->
                     val currentHead = snapshot?.head
-                    if (generation != null && currentHead != null) window.regenerate(connection, sessionId, generation, currentHead, text, images)
+                    if (generation != null && currentHead != null) window.regenerate(connection, sessionId, generation, currentHead, entryId, text, images)
                 },
                 onFork = { text, images ->
                     val open = { id: String -> window.prefillDraft(id, text, images); window.select(id) }
@@ -465,7 +465,7 @@ private fun ConversationFeed(
     entries: List<TranscriptEntry>,
     sentImages: (String, Int) -> List<uniffi.harw_mobile_ffi.PromptImage>?,
     fetchMedia: suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?,
-    onRegenerate: ((String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
+    onRegenerate: ((String, String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
     onFork: ((String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
     liveText: String?,
     jumpToLatest: Int,
@@ -516,14 +516,14 @@ private fun ConversationFeed(
                     MessageBlock(
                         label, clean, entry.kind, imageCount = count, thumbs = thumbs,
                         imageRefs = entry.images, fetchMedia = fetchMedia,
-                        onRegenerate = onRegenerate?.let { cb -> { cb(clean, thumbs.orEmpty()) } },
+                        onRegenerate = onRegenerate?.let { cb -> { cb(entry.id, clean, thumbs.orEmpty()) } },
                         onFork = onFork?.let { cb -> { cb(forkText(entries, entry, clean), thumbs.orEmpty()) } },
                     )
                     return@items
                 }
                 MessageBlock(
                     label, entry.text, entry.kind,
-                    onRegenerate = onRegenerate?.let { cb -> { cb(entry.text, emptyList()) } },
+                    onRegenerate = onRegenerate?.let { cb -> { cb(entry.id, entry.text, emptyList()) } },
                     onFork = onFork?.let { cb -> { cb(forkText(entries, entry, entry.text), emptyList()) } },
                 )
                 return@items

@@ -464,6 +464,7 @@ impl RemoteSession {
                     client_msg_id: key.clone(),
                     force: false,
                     images: Vec::new(),
+                    rewind_before: None,
                 })
                 .await
                 .map_err(|error| SdkError::Turn {

@@ -849,6 +849,25 @@ impl MobileCore {
         client_message_id: String,
         images: Vec<PromptImage>,
     ) -> Result<SubmitReceipt, MobileError> {
+        self.submit_edit(session_id, text, expected_head, client_message_id, images, None)
+    }
+
+    /// Sendet `text` neu und ersetzt dabei die frühere User-Nachricht `rewind_before` samt allem danach
+    /// (Verlauf wird vor ihr abgeschnitten), statt eine zweite Nachricht anzuhängen. Ohne `rewind_before` wie `submit_with_images`.
+    pub fn submit_edit(
+        &self,
+        session_id: String,
+        text: String,
+        expected_head: SessionCursor,
+        client_message_id: String,
+        images: Vec<PromptImage>,
+        rewind_before: Option<String>,
+    ) -> Result<SubmitReceipt, MobileError> {
+        if let Some(target) = &rewind_before {
+            if target.is_empty() || target.len() > 128 || !target.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(session_error("Ungültige Nachrichten-Id"));
+            }
+        }
         let id = parse_session_id(session_id)?;
         validate_submission(&text, &client_message_id)?;
         let images = validate_images(images)?;
@@ -866,6 +885,7 @@ impl MobileCore {
                 images,
                 expected_head.into(),
                 client_message_id,
+                rewind_before,
             )
             .await
         })
@@ -2061,6 +2081,7 @@ async fn submit(
     images: Vec<SubmitImage>,
     displayed: Cursor,
     client_message_id: String,
+    rewind_before: Option<String>,
 ) -> Result<SubmitReceipt, MobileError> {
     let submission_id = (id.clone(), client_message_id.clone());
     let fingerprint = {
@@ -2114,6 +2135,7 @@ async fn submit(
         client_msg_id: client_message_id.clone(),
         force: false,
         images,
+        rewind_before: rewind_before.clone(),
     };
     let mut result = link
         .request(link.backend.port().submit(params.clone()))
@@ -2153,6 +2175,7 @@ async fn submit(
                 .as_ref()
                 .is_ok_and(|receipt| receipt.outcome == SubmitOutcome::Accepted)
                 && state.same_link(&link)
+                && rewind_before.is_none()
                 && let Ok(session) = state.session_mut(&id)
             {
                 session.echo_prompt(&id, displayed, &client_message_id, text);

@@ -302,6 +302,7 @@ impl Rig {
             submitted_by: "tester".to_owned(),
             actor: operator(),
             origin: ConnectionId::next(),
+            rewind_before: None,
         }
     }
 

@@ -212,6 +212,7 @@ fn input(session: &SessionId, text: &str) -> TurnInput {
             id: "op".to_owned(),
         },
         origin: ConnectionId::next(),
+        rewind_before: None,
     }
 }
 

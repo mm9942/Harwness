@@ -74,6 +74,8 @@ pub struct TurnInput {
     pub actor: ApprovalActor,
     /// Connection that submitted it (revocation drops its queued inputs).
     pub origin: ConnectionId,
+    /// Item id of an earlier user message: history is cut before it and replaced before the turn runs.
+    pub rewind_before: Option<String>,
 }
 
 /// How a turn ended.

@@ -264,7 +264,7 @@ impl SessionState {
             SessionFrame::HostDraining { retry_after_ms } => {
                 return FrameAction::Draining(*retry_after_ms);
             }
-            SessionFrame::Resync { .. } => {
+            SessionFrame::Resync { .. } | SessionFrame::HistoryReplaced { .. } => {
                 self.reset_view();
                 self.begin_attach("Refreshing transcript after a server history change");
                 return FrameAction::Reattach(None);

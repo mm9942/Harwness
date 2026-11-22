@@ -279,6 +279,8 @@ internal data class DraftAttempt(
     val head: SessionCursor,
     val id: String,
     val images: List<uniffi.harw_mobile_ffi.PromptImage> = emptyList(),
+    /** Id der zu ersetzenden früheren Nachricht ("Neu generieren"): Verlauf wird davor abgeschnitten. */
+    val rewindBefore: String? = null,
 )
 
 internal data class ChatgptTarget(
@@ -1582,10 +1584,10 @@ internal class HarwConnection(private val context: Context, private val localBac
             result(DraftResult.Rejected(error.displayMessage(), error is MobileException.Ambiguous))
         }) {
             val receipt = withContext(Dispatchers.IO) {
-                if (attempt.images.isEmpty()) {
+                if (attempt.images.isEmpty() && attempt.rewindBefore == null) {
                     it.submit(sessionId, attempt.text, attempt.head, attempt.id)
                 } else {
-                    it.submitWithImages(sessionId, attempt.text, attempt.head, attempt.id, attempt.images)
+                    it.submitEdit(sessionId, attempt.text, attempt.head, attempt.id, attempt.images, attempt.rewindBefore)
                 }
             }
             val outcome = when (receipt.outcome) {

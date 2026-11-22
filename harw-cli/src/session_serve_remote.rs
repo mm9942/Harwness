@@ -1781,6 +1781,7 @@ mod tests {
                 client_msg_id: "m1".to_owned(),
                 force: false,
                 images: Vec::new(),
+                rewind_before: None,
             })
             .await?;
         assert!(

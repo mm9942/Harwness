@@ -745,6 +745,7 @@ impl TurnDriver for CoreTurnDriver {
             let media = self.ingest_images(&input.images).map_err(HostError::from)?;
             let core_input = CoreTurnInput::user(input.text)
                 .with_images(media)
+                .with_rewind_before(input.rewind_before.clone())
                 .with_control(control);
             self.runtime
                 .bind_live_sink(&input.session_id, Arc::clone(&sink));
@@ -1851,6 +1852,7 @@ mod live_events {
                 id: "op".to_owned(),
             },
             origin: ConnectionId::next(),
+            rewind_before: None,
         };
         let cancel = tokio::sync::watch::channel(false).1;
         let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());

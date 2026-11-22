@@ -209,6 +209,7 @@ mod tests {
             submitted_by: "test".into(),
             actor: ApprovalActor::Operator { id: "uid:1".into() },
             origin,
+            rewind_before: None,
         })
     }
 

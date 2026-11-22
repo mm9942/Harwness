@@ -2191,6 +2191,7 @@ impl HostConnection {
             submitted_by: self.identity.label.clone(),
             actor: self.identity.actor.clone(),
             origin: self.identity.connection,
+            rewind_before: params.rewind_before,
         };
         let result = state
             .arbiter
@@ -4175,6 +4176,7 @@ mod share_tests {
             client_msg_id: "msg-1".into(),
             force: true,
             images: Vec::new(),
+            rewind_before: None,
         }
     }
 

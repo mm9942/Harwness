@@ -332,6 +332,7 @@ async fn attach_submit_receives_turn_events_then_detach_ends_the_stream() -> Tes
             client_msg_id: "m1".into(),
             force: false,
             images: Vec::new(),
+            rewind_before: None,
         })
         .await?;
     assert!(
@@ -370,6 +371,7 @@ async fn many_sessions_share_one_connection() -> TestResult {
                 client_msg_id: format!("m-{name}"),
                 force: false,
                 images: Vec::new(),
+                rewind_before: None,
             })
             .await?;
         assert!(
@@ -405,6 +407,7 @@ async fn responses_correlate_under_interleaving() -> TestResult {
         client_msg_id: "flood".into(),
         force: false,
         images: Vec::new(),
+        rewind_before: None,
     })
     .await?;
 

@@ -1165,6 +1165,9 @@ pub struct TurnInput {
     pub metadata: serde_json::Value,
     /// Steuerblock (Abbruch, Grenzwerte, Uhr, Zähler) dieses Turns.
     pub control: TurnControl,
+    /// Id einer früheren User-Nachricht: der Verlauf wird vor dieser Nachricht abgeschnitten (und
+    /// dauerhaft ersetzt), bevor der Turn läuft. So ersetzt "Neu senden" die Nachricht, statt sie zu doppeln.
+    pub rewind_before: Option<String>,
 }
 
 impl TurnInput {
@@ -1175,7 +1178,15 @@ impl TurnInput {
             user_images: Vec::new(),
             metadata: serde_json::Value::Null,
             control: TurnControl::new(),
+            rewind_before: None,
         }
+    }
+
+    /// Schneidet den Verlauf vor der User-Nachricht `item_id` ab, bevor der Turn läuft.
+    #[must_use]
+    pub fn with_rewind_before(mut self, item_id: Option<String>) -> Self {
+        self.rewind_before = item_id;
+        self
     }
 
     /// Hängt gespeicherte Bilder an die User-Nachricht dieses Turns. Die
@@ -3878,6 +3889,34 @@ pub async fn run_turn_durable(
     run_turn_with_approvals(session, model, store, Some(approvals), input).await
 }
 
+/// Schneidet den Verlauf vor der User-Nachricht `target` ab und ersetzt ihn dauerhaft (Rewind).
+/// Nur im Zustand Idle/Failed; ein unbekanntes Ziel ist ein Fehler und ändert nichts.
+async fn rewind_history_before(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+    target: &str,
+) -> CoreResult<()> {
+    if !matches!(
+        session.state(),
+        crate::session::SessionState::Idle | crate::session::SessionState::Failed(_)
+    ) {
+        return Err(CoreError::TurnRejected("rewind needs an idle session".to_owned()));
+    }
+    let Some(index) = session.history().items().iter().position(|item| {
+        matches!(item, harw_protocol::items::TurnItem::UserMessage(m) if m.id.as_str() == target)
+    }) else {
+        return Err(CoreError::TurnRejected(
+            "rewind target is not a user message of this session".to_owned(),
+        ));
+    };
+    session.history_mut().truncate(index);
+    store
+        .save_history(session.id(), session.history())
+        .await
+        .map_err(|error| CoreError::TurnRejected(format!("rewind could not be saved: {error}")))?;
+    Ok(())
+}
+
 async fn run_turn_with_approvals(
     session: &mut AgentSession,
     model: &dyn ModelProvider,
@@ -3885,6 +3924,9 @@ async fn run_turn_with_approvals(
     approvals: Option<&ApprovalStore>,
     input: TurnInput,
 ) -> CoreResult<TurnOutcome> {
+    if let Some(target) = input.rewind_before.as_deref() {
+        rewind_history_before(session, store, target).await?;
+    }
     let handle = session
         .try_start_turn()
         .map_err(|r| CoreError::TurnRejected(r.to_string()))?;

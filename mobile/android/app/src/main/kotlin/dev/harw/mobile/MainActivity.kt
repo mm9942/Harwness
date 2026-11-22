@@ -605,6 +605,7 @@ internal data class SessionDraft(
     val uncertain: Boolean = false,
     val sending: Boolean = false,
     val images: List<DraftImage> = emptyList(),
+    val rewindBefore: String? = null,
 )
 
 internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewModel() {
@@ -744,6 +745,7 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
         id: String,
         generation: Long,
         head: SessionCursor,
+        entryId: String,
         text: String,
         images: List<uniffi.harw_mobile_ffi.PromptImage>,
     ) {
@@ -756,6 +758,7 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
         drafts = drafts + (id to SessionDraft(
             text,
             images = images.mapIndexed { i, image -> DraftImage("Bild ${i + 1}", image, image.dataB64.length) },
+            rewindBefore = entryId,
         ))
         submit(connection, id, generation, head)
     }
@@ -784,6 +787,7 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
             head,
             UUID.randomUUID().toString(),
             current.images.map { it.image },
+            current.rewindBefore,
         )
         drafts = drafts + (id to current.copy(attempt = attempt, sending = true, error = null))
         val admitted = connection.submit(id, generation, attempt) { result ->
