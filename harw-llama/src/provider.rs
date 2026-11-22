@@ -118,6 +118,12 @@ impl LocalGgufProvider {
     pub fn supports_vision(&self) -> bool {
         self.engine.supports_vision()
     }
+
+    /// Why the configured projector could not be loaded, if it could not.
+    #[must_use]
+    pub fn vision_error(&self) -> Option<&str> {
+        self.engine.vision_error()
+    }
 }
 
 /// Everything a generation needs, owned so it can move to a blocking thread.
@@ -222,6 +228,47 @@ fn tool_result_text(result: &ToolCallResult) -> String {
 const LEAN_SYSTEM_PROMPT: &str = "You are a helpful assistant running on the user's phone. \
 Answer concisely and in the language of the user. You have no tools: answer from your own knowledge.";
 
+/// System prompt of lean runs whose model reads images: one tool, `view_image`.
+const LEAN_VISION_SYSTEM_PROMPT: &str = "You are a helpful assistant running on the user's phone. \
+Answer concisely and in the language of the user. Images in the chat are numbered [Bild N]; \
+only the newest ones are visible. To look at an earlier image again, call the tool view_image \
+with its number. You have no other tools: answer from your own knowledge.";
+
+const VIEW_IMAGE: &str = "view_image";
+
+/// The only tool of lean vision runs; the provider answers it itself.
+fn view_image_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": VIEW_IMAGE,
+            "description": "Look at an earlier image of this chat again.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image": {"type": "integer", "description": "Number N of [Bild N]"}
+                },
+                "required": ["image"],
+            },
+        },
+    })
+}
+
+/// Image numbers asked for by `view_image` calls.
+fn view_image_numbers(calls: &[ToolCall]) -> Vec<usize> {
+    calls
+        .iter()
+        .filter(|call| call.name.as_str() == VIEW_IMAGE)
+        .filter_map(|call| {
+            let value = call.arguments.get("image")?;
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|t| t.trim().parse().ok()))
+                .and_then(|n| usize::try_from(n).ok())
+        })
+        .collect()
+}
+
 fn tools_json(tools: &[ToolSpec]) -> Vec<Value> {
     tools
         .iter()
@@ -239,6 +286,46 @@ fn tools_json(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
+/// Most images shown to the model at once (each costs up to `image_max_tokens`).
+const MAX_SHOWN_IMAGES: usize = 3;
+
+/// Most images a message may name for a re-view.
+const MAX_REFERENCED_IMAGES: usize = 4;
+
+/// Image numbers a user text refers to: "Bild 2", "image 3", "das erste Bild".
+fn referenced_images(text: &str) -> Vec<usize> {
+    const ORDINALS: [(&str, usize); 5] = [
+        ("erste", 1),
+        ("zweite", 2),
+        ("dritte", 3),
+        ("vierte", 4),
+        ("fuenfte", 5),
+    ];
+    let lower = text.to_lowercase().replace('\u{e4}', "ae").replace('\u{fc}', "ue");
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut found = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        let is_image = word.starts_with("bild") || word.starts_with("image");
+        if !is_image {
+            continue;
+        }
+        if let Some(number) = words.get(i + 1).and_then(|w| w.parse::<usize>().ok()) {
+            found.push(number);
+        }
+        if let Some(prev) = i.checked_sub(1).and_then(|p| words.get(p)) {
+            if let Some((_, number)) = ORDINALS.iter().find(|(name, _)| prev.starts_with(name)) {
+                found.push(*number);
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
 /// What `chat_messages` prepared.
 struct Chat {
     messages: Vec<ChatMessage>,
@@ -248,11 +335,19 @@ struct Chat {
     images: Vec<Arc<[u8]>>,
 }
 
-/// Chat messages for the template. With `vision`, the images of the last user
-/// message are shown to the model (one media marker each); every other image is
+/// Chat messages for the template. With `vision`, the newest images of the
+/// history are shown to the model (one media marker each); every other image is
 /// replaced by a short note.
-fn chat_messages(request: &ModelRequest, lean: bool, vision: bool) -> Chat {
-    let mut system = if lean {
+fn chat_messages(
+    request: &ModelRequest,
+    lean: bool,
+    vision: bool,
+    projector_failure: Option<&str>,
+    extra_refs: &[usize],
+) -> Chat {
+    let mut system = if lean && vision {
+        LEAN_VISION_SYSTEM_PROMPT.to_owned()
+    } else if lean {
         LEAN_SYSTEM_PROMPT.to_owned()
     } else {
         request.system_prompt.clone()
@@ -271,23 +366,68 @@ fn chat_messages(request: &ModelRequest, lean: bool, vision: bool) -> Chat {
     }
     let history: &ConversationHistory = &request.history;
     let items = history.to_model_messages();
-    let last_user = items
+    // Every attached image gets a running number ("[Bild N]") in the prompt. The
+    // lean local chat has no tools, so earlier images are re-shown by a plain
+    // rule: when the newest user text names images ("Bild 2", "das erste
+    // Bild"), exactly those are sent again; otherwise the newest few are.
+    let mut numbered: Vec<(usize, usize, bool)> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if let ModelMessage::User { images, .. } = item {
+            for (n, image) in images.iter().enumerate() {
+                numbered.push((index, n, image.data.is_some()));
+            }
+        }
+    }
+    let newest_text = items.iter().rev().find_map(|item| match item {
+        ModelMessage::User { text, .. } => Some(text.as_str()),
+        _ => None,
+    });
+    let mut referenced = newest_text.map(referenced_images).unwrap_or_default();
+    referenced.extend_from_slice(extra_refs);
+    referenced.sort_unstable();
+    referenced.dedup();
+    let mut visible: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let by_reference: Vec<_> = referenced
         .iter()
-        .rposition(|item| matches!(item, ModelMessage::User { .. }));
+        .filter_map(|number| numbered.get(number.wrapping_sub(1)))
+        .filter(|(_, _, has_data)| *has_data)
+        .take(MAX_REFERENCED_IMAGES)
+        .collect();
+    if by_reference.is_empty() {
+        for (index, n, has_data) in numbered.iter().rev().take(MAX_SHOWN_IMAGES) {
+            if *has_data {
+                visible.insert((*index, *n));
+            }
+        }
+    } else {
+        for (index, n, _) in by_reference {
+            visible.insert((*index, *n));
+        }
+    }
+    let number_of = |index: usize, n: usize| {
+        numbered
+            .iter()
+            .position(|(i, k, _)| *i == index && *k == n)
+            .map_or(0, |p| p + 1)
+    };
     let mut shown: Vec<Arc<[u8]>> = Vec::new();
     for (index, item) in items.into_iter().enumerate() {
         match item {
             ModelMessage::User { mut text, images } => {
                 let mut omitted = 0_usize;
                 let mut markers = String::new();
-                for image in &images {
+                for (n, image) in images.iter().enumerate() {
                     match image.data.as_ref() {
-                        Some(data) if vision && Some(index) == last_user => {
+                        Some(data) if vision && visible.contains(&(index, n)) => {
+                            markers.push_str(&format!("[Bild {}]\n", number_of(index, n)));
                             markers.push_str(MEDIA_MARKER);
                             markers.push('\n');
                             shown.push(Arc::clone(data));
                         }
-                        Some(_) => omitted += 1,
+                        Some(_) => {
+                            omitted += 1;
+                            text.push_str(&format!("\n[Bild {}]", number_of(index, n)));
+                        }
                         None => {
                             text.push('\n');
                             text.push_str(&image.placeholder("the image data is not available"));
@@ -296,9 +436,11 @@ fn chat_messages(request: &ModelRequest, lean: bool, vision: bool) -> Chat {
                 }
                 if omitted > 0 {
                     let why = if vision {
-                        "only the newest message's images are shown"
+                        "only the newest images are shown".to_owned()
+                    } else if let Some(reason) = projector_failure {
+                        format!("the vision projector failed to load ({reason})")
                     } else {
-                        "this on-device model reads text only"
+                        "this on-device model reads text only".to_owned()
                     };
                     text.push_str(&format!("\n[{omitted} image(s) omitted: {why}]"));
                 }
@@ -362,11 +504,21 @@ impl LocalGgufProvider {
         ToolCallId::from_str(format!("call_local_{millis:x}_{n}"))
     }
 
-    fn prepare(&self, request: &ModelRequest) -> Result<Job, ModelError> {
+    fn prepare(&self, request: &ModelRequest, forced: &[usize]) -> Result<Job, ModelError> {
         let Chat { messages, switch, images } =
-            chat_messages(request, self.config.lean, self.engine.supports_vision());
+            chat_messages(
+                request,
+                self.config.lean,
+                self.engine.supports_vision(),
+                self.engine.vision_error(),
+                forced,
+            );
         let thinking = thinking_for(request, switch, self.config.thinking_default);
-        let tools = if self.config.lean { Vec::new() } else { tools_json(&request.tools) };
+        let tools = if self.config.lean {
+            if self.engine.supports_vision() { vec![view_image_tool()] } else { Vec::new() }
+        } else {
+            tools_json(&request.tools)
+        };
         let prompt = render_prompt(
             self.engine.chat_template(),
             &RenderInput {
@@ -403,6 +555,7 @@ impl LocalGgufProvider {
         let calls = parse_tool_calls(&generated.output.tool_raw, tools);
         let tool_calls: Vec<ToolCall> = calls
             .into_iter()
+            .filter(|call| !(self.config.lean && call.name == VIEW_IMAGE))
             .map(|call| ToolCall {
                 id: self.next_call_id(),
                 name: ToolName::new(call.name),
@@ -438,20 +591,43 @@ impl LocalGgufProvider {
 impl ModelProvider for LocalGgufProvider {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
-            let job = self.prepare(&request)?;
-            let tools = job.tools.clone();
-            let stream = job.stream.clone();
-            let abort = Arc::new(AtomicBool::new(false));
-            let _abort_on_drop = AbortOnDrop(Arc::clone(&abort));
-            let engine = Arc::clone(&self.engine);
-            let gate = Arc::clone(&self.gate);
-            let worker_abort = Arc::clone(&abort);
-            let generated = tokio::task::spawn_blocking(move || {
-                run_job(&engine, &gate, &job, &worker_abort)
-            })
-            .await
-            .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
-            .map_err(map_error)?;
+            let mut forced: Vec<usize> = Vec::new();
+            let mut round = 0;
+            let (generated, tools, stream) = loop {
+                let job = self.prepare(&request, &forced)?;
+                let tools = job.tools.clone();
+                let stream = job.stream.clone();
+                let abort = Arc::new(AtomicBool::new(false));
+                let _abort_on_drop = AbortOnDrop(Arc::clone(&abort));
+                let engine = Arc::clone(&self.engine);
+                let gate = Arc::clone(&self.gate);
+                let worker_abort = Arc::clone(&abort);
+                let generated = tokio::task::spawn_blocking(move || {
+                    run_job(&engine, &gate, &job, &worker_abort)
+                })
+                .await
+                .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
+                .map_err(map_error)?;
+                // `view_image` is answered here: the asked-for images are put into
+                // the prompt and the model answers again (at most twice).
+                if self.config.lean && round < 2 && generated.finish != FinishReason::Cancelled {
+                    let calls: Vec<ToolCall> = parse_tool_calls(&generated.output.tool_raw, &tools)
+                        .into_iter()
+                        .map(|call| ToolCall {
+                            id: self.next_call_id(),
+                            name: ToolName::new(call.name),
+                            arguments: call.arguments,
+                        })
+                        .collect();
+                    let wanted = view_image_numbers(&calls);
+                    if !wanted.is_empty() && wanted.iter().any(|n| !forced.contains(n)) {
+                        forced.extend(wanted);
+                        round += 1;
+                        continue;
+                    }
+                }
+                break (generated, tools, stream);
+            };
             let response = self.into_response(generated, &tools)?;
             if let Some(sink) = stream {
                 sink.emit(ModelStreamEvent::Usage(response.usage.clone()));

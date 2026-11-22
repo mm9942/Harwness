@@ -119,9 +119,32 @@ internal fun localModelLabel(provider: String?, model: String?): String = when {
 /** Whether the vision projector of the on-device model is on the phone, so it reads images. */
 internal fun localModelSeesImages(context: android.content.Context, modelId: String?): Boolean {
     if (modelId.isNullOrBlank()) return false
+    if (localVisionFailure(modelId) != null) return false
     val addon = uniffi.harw_mobile_ffi.visionCatalog().firstOrNull { modelId in it.modelIds } ?: return false
     return uniffi.harw_mobile_ffi.visionModels(ModelStore(context.applicationContext).modelsDir().path)
         .any { it.id == addon.file.id && it.state == uniffi.harw_mobile_ffi.ModelFileState.COMPLETE }
+}
+
+/** Ob der Provider beim letzten Laden wirklich Bilder lesen kann (Status der Engine, nicht Dateiexistenz). */
+internal fun localVisionLoaded(modelId: String?): Boolean {
+    if (modelId.isNullOrBlank()) return false
+    val status = try {
+        uniffi.harw_mobile_ffi.localVisionStatus()
+    } catch (_: Exception) {
+        null
+    } ?: return false
+    return status.modelId == modelId && status.loaded
+}
+
+/** Fehlertext, wenn die Projektor-Datei des Modells vorhanden ist, aber beim letzten Laden nicht benutzbar war. */
+internal fun localVisionFailure(modelId: String?): String? {
+    val status = try {
+        uniffi.harw_mobile_ffi.localVisionStatus()
+    } catch (_: Exception) {
+        null
+    } ?: return null
+    if (status.modelId != modelId || !status.projectorPresent || status.loaded) return null
+    return status.error ?: "unbekannter Fehler"
 }
 
 internal fun modelChipBlock(support: ManageSupport?, active: Boolean): String? = when {
@@ -964,7 +987,7 @@ internal fun LocalModelChip(hasImages: Boolean = false) {
             try {
                 val info = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
                 val base = localModelLabel(info.activeProvider, info.activeModel)
-                if (info.activeProvider == "local-gguf" && localModelSeesImages(context, info.activeModel)) {
+                if (info.activeProvider == "local-gguf" && localVisionLoaded(info.activeModel)) {
                     "$base · Bilder"
                 } else {
                     base
@@ -1068,6 +1091,14 @@ private fun LocalVisionHint(hasImages: Boolean, refresh: Int, onActivated: () ->
                 OutlinedButton(onClick = { start() }) { Text("Fortsetzen") }
             }
             else -> {
+                val failure = current.modelIds.firstNotNullOfOrNull { localVisionFailure(it) }
+                if (failure != null) {
+                    Text(
+                        "Die Datei für das Bildverständnis ist da, ließ sich aber nicht laden ($failure). Bilder werden ignoriert.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 if (hasImages) {
                     Text(
                         "Dieses Modell ignoriert Bilder, bis das Bildverständnis geladen ist.",

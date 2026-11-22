@@ -48,6 +48,7 @@ pub(crate) async fn open_local(
     let resolver = store.resolver().clone();
     let model_home = home.clone();
     let selection = home.active_route()?;
+    let fingerprint = projector_fingerprint(&home);
     let resolver_for_build = resolver.clone();
     let built = tokio::task::spawn_blocking(move || {
         build_active_model(&model_home, &resolver_for_build)
@@ -59,7 +60,7 @@ pub(crate) async fn open_local(
     let model: Arc<dyn harw_core::ModelProvider> = Arc::new(SwitchingModel {
         home: home.clone(),
         resolver,
-        current: tokio::sync::Mutex::new((selection, built)),
+        current: tokio::sync::Mutex::new((selection, fingerprint, built)),
     });
     // The device tools follow the profile switch (off by default for the on-device model).
     let (shell, files) = device;
@@ -95,8 +96,24 @@ struct SwitchingModel {
     resolver: crate::secrets::KeystoreSecretResolver,
     current: tokio::sync::Mutex<(
         Option<(String, String)>,
+        Option<ProjectorFingerprint>,
         Arc<dyn harw_core::ModelProvider>,
     )>,
+}
+
+/// Path, size and modification time of the projector of the active on-device
+/// model; a changed value means the model must be reloaded (the add-on was
+/// downloaded or replaced after the model was loaded without it).
+#[cfg(feature = "local-host")]
+type ProjectorFingerprint = (String, u64, Option<std::time::SystemTime>);
+
+#[cfg(feature = "local-host")]
+fn projector_fingerprint(home: &crate::home::AppHome) -> Option<ProjectorFingerprint> {
+    let model_id = home.active_local_model().ok()??;
+    let dir = home.local_models_dir()?;
+    let path = crate::models::vision_path_in(std::path::Path::new(&dir), &model_id)?;
+    let meta = std::fs::metadata(&path).ok()?;
+    Some((path, meta.len(), meta.modified().ok()))
 }
 
 #[cfg(feature = "local-host")]
@@ -104,20 +121,21 @@ impl SwitchingModel {
     async fn provider(&self) -> Result<Arc<dyn harw_core::ModelProvider>, harw_core::ModelError> {
         let failed = |detail: String| harw_core::ModelError::RequestFailed(detail);
         let wanted = self.home.active_route().map_err(|e| failed(e.to_string()))?;
+        let fingerprint = projector_fingerprint(&self.home);
         let mut current = self.current.lock().await;
-        if current.0 != wanted {
+        if current.0 != wanted || current.1 != fingerprint {
             // Release the old model first: two loaded GGUFs do not fit in memory.
             let placeholder: Arc<dyn harw_core::ModelProvider> = Arc::new(NoModel);
-            current.1 = placeholder;
+            current.2 = placeholder;
             let home = self.home.clone();
             let resolver = self.resolver.clone();
             let built = tokio::task::spawn_blocking(move || build_active_model(&home, &resolver))
                 .await
                 .map_err(|_| failed("on-device model switch failed".to_owned()))?
                 .map_err(|e| failed(e.to_string()))?;
-            *current = (wanted, built);
+            *current = (wanted, fingerprint, built);
         }
-        Ok(Arc::clone(&current.1))
+        Ok(Arc::clone(&current.2))
     }
 }
 
@@ -230,6 +248,7 @@ fn build_local_gguf(
     let vision = crate::models::vision_path_in(std::path::Path::new(&models_dir), model_id);
     let path = crate::models::model_path(models_dir, model_id.to_owned())?;
     let mut config = local_gguf_config();
+    let has_projector = vision.is_some();
     config.mmproj = vision.map(Into::into);
     let provider = harw_llama::LocalGgufProvider::open(
         std::path::Path::new(&path),
@@ -237,6 +256,12 @@ fn build_local_gguf(
         config,
     )
     .map_err(|e| session(e.to_string()))?;
+    crate::models::set_local_vision_status(crate::models::LocalVisionStatus {
+        model_id: model_id.to_owned(),
+        projector_present: has_projector,
+        loaded: provider.supports_vision(),
+        error: provider.vision_error().map(str::to_owned),
+    });
     Ok(Arc::new(provider))
 }
 

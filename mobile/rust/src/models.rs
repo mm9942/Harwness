@@ -360,9 +360,14 @@ pub(crate) fn vision_path_in(dir: &Path, model_id: &str) -> Option<String> {
         .into_iter()
         .find(|a| a.model_ids.iter().any(|id| id == model_id))?;
     let local = find_local(dir, std::slice::from_ref(&addon.file), &addon.file.id)?;
+    // A complete file of the pinned size is used even when the checksum was
+    // not recorded (`Unchecked`); only a known-bad file is refused.
     (local.state == ModelFileState::Complete
-        && local.verification == ModelVerification::Verified)
-        .then_some(local.path)
+        && matches!(
+            local.verification,
+            ModelVerification::Verified | ModelVerification::Unchecked
+        ))
+    .then_some(local.path)
 }
 
 fn catalog_entries() -> Vec<CatalogModel> {
@@ -1136,6 +1141,35 @@ pub fn model_path(models_dir: String, model_id: String) -> Result<String, Mobile
 #[uniffi::export]
 pub fn vision_catalog() -> Vec<VisionAddon> {
     vision_entries()
+}
+
+/// What the last load of the on-device model found about image understanding.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct LocalVisionStatus {
+    /// Model that was loaded.
+    pub model_id: String,
+    /// A projector file was on the phone and handed to the engine.
+    pub projector_present: bool,
+    /// The projector loaded, so the model reads images.
+    pub loaded: bool,
+    /// Why the projector file could not be used (English engine detail).
+    pub error: Option<String>,
+}
+
+static LOCAL_VISION: std::sync::Mutex<Option<LocalVisionStatus>> = std::sync::Mutex::new(None);
+
+#[cfg_attr(not(feature = "local-host"), allow(dead_code))]
+pub(crate) fn set_local_vision_status(status: LocalVisionStatus) {
+    *LOCAL_VISION.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(status);
+}
+
+/// Vision state of the on-device model as last loaded; `None` before any load.
+#[uniffi::export]
+pub fn local_vision_status() -> Option<LocalVisionStatus> {
+    LOCAL_VISION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// State of each projector in `models_dir`, in the order of [`vision_catalog`].

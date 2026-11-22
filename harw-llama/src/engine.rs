@@ -160,6 +160,12 @@ mod stub {
             false
         }
 
+        /// Why the projector did not load (never in this build).
+        #[must_use]
+        pub fn vision_error(&self) -> Option<&str> {
+            None
+        }
+
         /// Always [`LlamaError::Unavailable`] in this build.
         pub fn generate(
             &self,
@@ -221,6 +227,8 @@ mod real {
         /// The vision projector; encoding needs `&mut`, and generations are
         /// serialised by the provider anyway.
         vision: Option<Mutex<MtmdContext>>,
+        /// Why a configured projector could not be used.
+        vision_error: Option<String>,
         template: Option<String>,
         bos: String,
         eos: String,
@@ -277,14 +285,21 @@ mod real {
             } else {
                 default_threads()
             };
-            let vision = config
-                .mmproj
-                .as_deref()
-                .and_then(|mmproj| load_vision(mmproj, &model, config, n_threads));
+            let (vision, vision_error) = match config.mmproj.as_deref() {
+                None => (None, None),
+                Some(mmproj) => match load_vision(mmproj, &model, config, n_threads) {
+                    Ok(context) => (Some(context), None),
+                    Err(reason) => {
+                        tracing::warn!("{reason}");
+                        (None, Some(reason))
+                    }
+                },
+            };
             Ok(Self {
                 backend,
                 model,
                 vision,
+                vision_error,
                 template,
                 bos,
                 eos,
@@ -322,6 +337,12 @@ mod real {
         #[must_use]
         pub fn supports_vision(&self) -> bool {
             self.vision.is_some()
+        }
+
+        /// Why the configured projector could not be loaded, if it could not.
+        #[must_use]
+        pub fn vision_error(&self) -> Option<&str> {
+            self.vision_error.as_deref()
         }
 
         /// Generates a reply to `prompt`, calling `on_text` with each decoded chunk.
@@ -487,31 +508,32 @@ mod real {
         }
     }
 
-    /// Loads the projector; `None` (and a warning) when it cannot be used.
+    /// Loads the projector; the reason when it cannot be used.
     fn load_vision(
         mmproj: &Path,
         model: &LlamaModel,
         config: &EngineConfig,
         n_threads: i32,
-    ) -> Option<Mutex<MtmdContext>> {
+    ) -> Result<Mutex<MtmdContext>, String> {
         let params = MtmdContextParams {
             use_gpu: false,
             print_timings: false,
             n_threads,
-            media_marker: std::ffi::CString::new(super::MEDIA_MARKER).ok()?,
+            media_marker: std::ffi::CString::new(super::MEDIA_MARKER)
+                .map_err(|e| e.to_string())?,
             image_min_tokens: config.image_min_tokens,
             image_max_tokens: config.image_max_tokens,
         };
-        match MtmdContext::init_from_file(mmproj.to_str()?, model, &params) {
-            Ok(context) if context.support_vision() => Some(Mutex::new(context)),
-            Ok(_) => {
-                tracing::warn!("the projector {} has no vision encoder", mmproj.display());
-                None
-            }
-            Err(error) => {
-                tracing::warn!("could not load the projector {}: {error}", mmproj.display());
-                None
-            }
+        let path = mmproj
+            .to_str()
+            .ok_or_else(|| "the projector path is not valid text".to_owned())?;
+        match MtmdContext::init_from_file(path, model, &params) {
+            Ok(context) if context.support_vision() => Ok(Mutex::new(context)),
+            Ok(_) => Err(format!("the projector {} has no vision encoder", mmproj.display())),
+            Err(error) => Err(format!(
+                "could not load the projector {}: {error}",
+                mmproj.display()
+            )),
         }
     }
 }
