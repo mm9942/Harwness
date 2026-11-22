@@ -54,8 +54,8 @@ use harw_session_driver::{
     CoreDriverConfig, CoreSession, CoreSessionFactory, CoreTurnDriver, DriverBridgeError,
     SessionWiring,
 };
-use harw_session_host::driver::TurnDriver;
 use harw_session_host::HostConfig;
+use harw_session_host::driver::TurnDriver;
 use harw_types::{ApprovalActor, IngressSurface, PermissionTier, SessionId};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;

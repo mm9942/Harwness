@@ -3156,6 +3156,7 @@ dependencies = [
  "harw-knowledge",
  "harw-lens",
  "harw-lens-types",
+ "harw-local-host",
  "harw-macros",
  "harw-mcp-client",
  "harw-mcp-server",
@@ -4442,6 +4443,25 @@ dependencies = [
  "harw-test-support",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "harw-local-host"
+version = "0.10.0"
+dependencies = [
+ "harw-authority",
+ "harw-core",
+ "harw-extension-api",
+ "harw-protocol",
+ "harw-registry-defaults",
+ "harw-runtime",
+ "harw-session-driver",
+ "harw-session-host",
+ "harw-session-store",
+ "harw-types",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

@@ -34,3 +34,4 @@
 "harw-tui/src/app/plan_mode.rs" = "tooling: interactive helper (editor/clipboard) that needs the user's terminal, not a workload"
 "harw-tui/src/clipboard.rs" = "tooling: interactive helper (editor/clipboard) that needs the user's terminal, not a workload"
 "harw-tui/src/process_tree.rs" = "tooling: read-only `ps -A -o pid=,ppid=,stat=` process-table snapshot for the 2x Ctrl+C emergency stop when /proc is unavailable; not a workload"
+"mobile/rust/src/bin/mobile-bootstrap.rs" = "tooling: opt-in developer launcher for an isolated phone test gateway (starts the gateway binary and re-executes itself), not a user workload"

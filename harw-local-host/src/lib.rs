@@ -307,10 +307,11 @@ impl LocalCoreFactory {
                 write_scope: self.rights.write_scope.clone(),
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
-                permissions: permissions_for_tier(admission.map_or(
-                    self.rights.tier,
-                    |admission| self.rights.tier.min(admission.maximum_tier()),
-                )),
+                permissions: permissions_for_tier(
+                    admission.map_or(self.rights.tier, |admission| {
+                        self.rights.tier.min(admission.maximum_tier())
+                    }),
+                ),
                 workspace_root: self.rights.workspace_root.clone(),
             })
             .build()
@@ -520,11 +521,9 @@ impl LocalHost {
         let stores =
             open_durable_stores(&sessions_root, &host_state_dir).map_err(LocalHostError::Setup)?;
         let factory = config.core_factory(model);
-        let driver = CoreTurnDriver::with_factory(
-            CoreDriverConfig::new(sessions_root),
-            Arc::new(factory),
-        )
-        .map_err(|error| LocalHostError::Setup(format!("session driver: {error}")))?;
+        let driver =
+            CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), Arc::new(factory))
+                .map_err(|error| LocalHostError::Setup(format!("session driver: {error}")))?;
         let host = SessionHost::open(
             HostConfig::new(host_state_dir),
             Arc::new(driver),
@@ -700,10 +699,7 @@ mod tests {
         assert_eq!(identity.actor, owner.actor());
         assert_eq!(identity.label, "local-phone:owner");
         assert!(identity.tenant.is_none());
-        assert_eq!(
-            LocalOwner::for_uid(7, PermissionTier::Operator).id,
-            "uid:7"
-        );
+        assert_eq!(LocalOwner::for_uid(7, PermissionTier::Operator).id, "uid:7");
         Ok(())
     }
 

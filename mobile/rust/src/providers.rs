@@ -113,7 +113,10 @@ impl ProviderStore {
     ) -> Result<ProviderValidation, MobileError> {
         let secret = Zeroizing::new(secret);
         ensure_outside_runtime()?;
-        let _guard = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let existing = self.read_all()?;
         let prepared = match self.prepare(&route, &secret, &existing) {
             Ok(prepared) => prepared,
@@ -161,7 +164,10 @@ impl ProviderStore {
     /// Removes the route file and its secret, and deselects it when active.
     pub fn delete_route(&self, route_id: String) -> Result<(), MobileError> {
         check_id(&route_id).map_err(|_| unknown_route())?;
-        let _guard = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.load_route(&route_id)?.is_some() {
             match std::fs::remove_file(self.route_path(&route_id)) {
                 Ok(()) => {}
@@ -179,7 +185,10 @@ impl ProviderStore {
     pub fn activate_route(&self, route_id: String, model: String) -> Result<(), MobileError> {
         check_id(&route_id).map_err(|_| unknown_route())?;
         check_model(&model, false).map_err(|message| MobileError::Session { detail: message })?;
-        let _guard = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.load_route(&route_id)?.is_none() {
             return Err(unknown_route());
         }
@@ -340,7 +349,9 @@ fn secret_failure(error: SecretError) -> MobileError {
 
 fn ensure_outside_runtime() -> Result<(), MobileError> {
     if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(internal("provider validation must not run on the async runtime"));
+        return Err(internal(
+            "provider validation must not run on the async runtime",
+        ));
     }
     Ok(())
 }
@@ -356,7 +367,11 @@ fn invalid_route(detail: String) -> ProviderValidation {
     }
 }
 
-fn outcome_only(outcome: ValidationOutcome, status: Option<u16>, detail: &str) -> ProviderValidation {
+fn outcome_only(
+    outcome: ValidationOutcome,
+    status: Option<u16>,
+    detail: &str,
+) -> ProviderValidation {
     ProviderValidation {
         outcome,
         http_status: status,
@@ -449,7 +464,9 @@ fn check_base_url(raw: &str, kind: ProviderKind) -> Result<String, String> {
     }
     match uri.scheme_str() {
         Some("https") => Ok(url),
-        Some("http") if kind == ProviderKind::OpenAiCompatible && is_loopback_host(authority.host()) => {
+        Some("http")
+            if kind == ProviderKind::OpenAiCompatible && is_loopback_host(authority.host()) =>
+        {
             Ok(url)
         }
         Some("http") => Err("the base URL must use https".to_owned()),
@@ -474,7 +491,8 @@ fn clean_secret(secret: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
     if secret.len() > MAX_SECRET_INPUT_BYTES {
         return Err("the API key is too long".to_owned());
     }
-    let text = std::str::from_utf8(secret).map_err(|_| "the API key must be UTF-8 text".to_owned())?;
+    let text =
+        std::str::from_utf8(secret).map_err(|_| "the API key must be UTF-8 text".to_owned())?;
     let trimmed = text.trim();
     if trimmed.chars().any(char::is_control) {
         return Err("the API key must not contain control characters".to_owned());
@@ -663,16 +681,21 @@ pub(crate) fn build_model_provider(
         }
     }
     let layers = harw_home::config_layers_report_at(home.home(), home.workspace())
-        .map_err(|e| MobileError::Internal { detail: e.to_string() })?
+        .map_err(|e| MobileError::Internal {
+            detail: e.to_string(),
+        })?
         .layers;
-    let config = harw_config::discover_config(&layers)
-        .map_err(|e| MobileError::Internal { detail: e.to_string() })?;
+    let config = harw_config::discover_config(&layers).map_err(|e| MobileError::Internal {
+        detail: e.to_string(),
+    })?;
     let (provider, _load) = harw_provider_http::build_provider_with_load_registry_and_home(
         &config,
         home.home(),
         Some(resolver),
     )
-    .map_err(|e| MobileError::Internal { detail: e.to_string() })?;
+    .map_err(|e| MobileError::Internal {
+        detail: e.to_string(),
+    })?;
     Ok(Arc::from(provider))
 }
 
@@ -737,7 +760,9 @@ mod tests {
         let long = format!("https://example.com/{}", "a".repeat(MAX_URL_LEN));
         assert!(check_base_url(&long, compat).is_err());
         assert_eq!(
-            check_base_url("https://api.openai.com/v1/", ProviderKind::OpenAi).ok().as_deref(),
+            check_base_url("https://api.openai.com/v1/", ProviderKind::OpenAi)
+                .ok()
+                .as_deref(),
             Some("https://api.openai.com/v1")
         );
     }
@@ -784,8 +809,14 @@ mod tests {
 
     #[test]
     fn kind_derivation() {
-        assert_eq!(derive_kind(API_ANTHROPIC, "https://x.test"), ProviderKind::Anthropic);
-        assert_eq!(derive_kind(API_OPENAI_RESPONSES, "https://x.test"), ProviderKind::OpenAi);
+        assert_eq!(
+            derive_kind(API_ANTHROPIC, "https://x.test"),
+            ProviderKind::Anthropic
+        );
+        assert_eq!(
+            derive_kind(API_OPENAI_RESPONSES, "https://x.test"),
+            ProviderKind::OpenAi
+        );
         assert_eq!(
             derive_kind(API_OPENAI_CHAT, "https://openrouter.ai/api/v1"),
             ProviderKind::OpenRouter
@@ -802,8 +833,15 @@ mod tests {
 
     #[test]
     fn defaults_table() {
-        assert!(provider_defaults(ProviderKind::OpenAiCompatible).base_url.is_empty());
-        assert_eq!(provider_defaults(ProviderKind::DashScope).suggested_model, "qwen3-max");
+        assert!(
+            provider_defaults(ProviderKind::OpenAiCompatible)
+                .base_url
+                .is_empty()
+        );
+        assert_eq!(
+            provider_defaults(ProviderKind::DashScope).suggested_model,
+            "qwen3-max"
+        );
         assert!(provider_defaults(ProviderKind::Anthropic).secret_required);
     }
 
@@ -832,7 +870,10 @@ mod tests {
         let dir = store.home().providers_dir();
         std::fs::create_dir_all(&dir)?;
         let body = "api = \"openai-chat\"\nbase_url = \"https://x.test/v1\"\n";
-        std::fs::write(dir.join("other.toml"), format!("name = \"different\"\n{body}"))?;
+        std::fs::write(
+            dir.join("other.toml"),
+            format!("name = \"different\"\n{body}"),
+        )?;
         std::fs::write(
             dir.join("envkey.toml"),
             format!("name = \"envkey\"\nauth = \"env:SOME_KEY\"\n{body}"),
@@ -877,7 +918,10 @@ mod tests {
         )?;
         assert_eq!(outcome.outcome, ValidationOutcome::NotChecked);
         assert!(outcome.saved);
-        assert_eq!(keystore.stored("route-main").as_deref(), Some(&b"sk-test"[..]));
+        assert_eq!(
+            keystore.stored("route-main").as_deref(),
+            Some(&b"sk-test"[..])
+        );
         let routes = store.routes()?;
         assert_eq!(routes.len(), 1);
         assert!(routes[0].has_secret);
@@ -894,7 +938,12 @@ mod tests {
             b"sk-test".to_vec(),
         )?;
         store.activate_route("main".to_owned(), "gpt-y".to_owned())?;
-        assert!(store.routes()?.iter().any(|r| r.active && r.default_model == "gpt-y"));
+        assert!(
+            store
+                .routes()?
+                .iter()
+                .any(|r| r.active && r.default_model == "gpt-y")
+        );
         store.delete_route("main".to_owned())?;
         assert!(store.routes()?.is_empty());
         assert!(keystore.stored("route-main").is_none());
@@ -911,7 +960,10 @@ mod tests {
         use std::time::Duration;
 
         /// Serves canned answers; each request text goes to the channel.
-        fn serve(status: u16, body: &'static str) -> Result<(u16, mpsc::Receiver<String>), std::io::Error> {
+        fn serve(
+            status: u16,
+            body: &'static str,
+        ) -> Result<(u16, mpsc::Receiver<String>), std::io::Error> {
             let listener = TcpListener::bind("127.0.0.1:0")?;
             let port = listener.local_addr()?.port();
             let (tx, rx) = mpsc::channel();
@@ -932,7 +984,10 @@ mod tests {
                         body.len()
                     );
                     let _ = stream.write_all(reply.as_bytes());
-                    if tx.send(String::from_utf8_lossy(&request).into_owned()).is_err() {
+                    if tx
+                        .send(String::from_utf8_lossy(&request).into_owned())
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -961,9 +1016,14 @@ mod tests {
             assert_eq!(outcome.model_count, 2);
             assert_eq!(outcome.models, vec!["m1".to_owned(), "m2".to_owned()]);
             assert!(outcome.saved);
-            let request = rx.recv_timeout(Duration::from_secs(5))?.to_ascii_lowercase();
+            let request = rx
+                .recv_timeout(Duration::from_secs(5))?
+                .to_ascii_lowercase();
             assert!(request.contains("authorization: bearer sk-test"));
-            assert_eq!(keystore.stored("route-local").as_deref(), Some(&b"sk-test"[..]));
+            assert_eq!(
+                keystore.stored("route-local").as_deref(),
+                Some(&b"sk-test"[..])
+            );
             assert_eq!(store.routes()?.len(), 1);
             store.activate_route("local".to_owned(), "m1".to_owned())?;
             let _model = build_model_provider(store.home(), store.resolver())?;

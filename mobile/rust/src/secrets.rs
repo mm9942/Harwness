@@ -112,7 +112,8 @@ pub struct KeystoreSecretResolver {
 
 impl fmt::Debug for KeystoreSecretResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KeystoreSecretResolver").finish_non_exhaustive()
+        f.debug_struct("KeystoreSecretResolver")
+            .finish_non_exhaustive()
     }
 }
 
@@ -297,7 +298,9 @@ mod tests {
             .map_err(|e| e.diagnostic())?;
         assert!(resolver.has("route-a"));
         assert!(keystore.stored("route-a").is_some());
-        let secret = resolver.resolve_slot("route-a").map_err(|e| e.diagnostic())?;
+        let secret = resolver
+            .resolve_slot("route-a")
+            .map_err(|e| e.diagnostic())?;
         assert_eq!(secret.expose_secret(), "sk-test-123");
         resolver.remove("route-a").map_err(|e| e.diagnostic())?;
         assert!(!resolver.has("route-a"));
@@ -328,7 +331,10 @@ mod tests {
                 resolver.store(slot, Zeroizing::new(b"x".to_vec())),
                 Err(SecretError::InvalidSlot)
             ));
-            assert!(matches!(resolver.remove(slot), Err(SecretError::InvalidSlot)));
+            assert!(matches!(
+                resolver.remove(slot),
+                Err(SecretError::InvalidSlot)
+            ));
             assert!(!resolver.has(slot));
         }
         assert!(is_valid_slot(&"a".repeat(64)));
