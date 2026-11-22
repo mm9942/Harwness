@@ -44,7 +44,9 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use harw_core::{AgentSession, ModelProvider, StateStore, TranscriptStateStore};
+use harw_core::{
+    AgentSession, ModelProvider, SessionThreadMapper, StateStore, TranscriptStateStore,
+};
 use harw_runtime::{
     EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeStores, permissions_for_tier,
 };
@@ -56,7 +58,7 @@ use harw_session_driver::{
 use harw_session_host::driver::TurnDriver;
 use harw_session_host::record::RecordStore;
 use harw_session_host::{DurableApprovals, DurableTranscripts, HostConfig};
-use harw_session_store::TranscriptStore;
+use harw_session_store::{HolderKind, TranscriptStore};
 use harw_types::{ApprovalActor, IngressSurface, PermissionTier, SessionId, ThreadRef};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -124,7 +126,14 @@ pub struct GatewayCoreFactory {
     /// Approval actor override (remote ingress: the one device allowed to
     /// resolve approvals). `None` = the local owner's `uid:<euid>`.
     actor: Option<ApprovalActor>,
+    /// Per-session working directory (shared-profile mode); `None` or a
+    /// `None` answer falls back to `cwd`.
+    session_cwd: Option<SessionCwdResolver>,
 }
+
+/// Resolves the working directory of a session; `None` = the factory's
+/// default `cwd`.
+pub type SessionCwdResolver = Arc<dyn Fn(&SessionId) -> Option<PathBuf> + Send + Sync>;
 
 impl std::fmt::Debug for GatewayCoreFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -147,6 +156,13 @@ fn with_operator_actor(
     })?;
     context.approval_actor = Some(actor);
     Ok(session.with_spawn_context(context))
+}
+
+/// Thread of the local CLI sessions, identical to the format `chat.rs` uses
+/// (`cli-session:<id>`), so a TUI session continued over a host sees its
+/// earlier entries.
+pub(crate) fn cli_session_thread(session_id: &SessionId) -> ThreadRef {
+    ThreadRef::from_str(format!("cli-session:{}", session_id.as_str()))
 }
 
 fn hosted_thread(session_id: &SessionId) -> ThreadRef {
@@ -178,7 +194,27 @@ impl GatewayCoreFactory {
             // `local_principal`: an operator.
             tier: PermissionTier::Operator,
             actor: None,
+            session_cwd: None,
         }
+    }
+
+    /// Replaces the thread mapper (shared-profile mode: `cli_session_thread`)
+    /// and rebuilds the store over `sessions_root`, writing as the gateway.
+    #[must_use]
+    pub fn with_thread_mapper(mut self, mapper: SessionThreadMapper, sessions_root: &Path) -> Self {
+        self.store = Arc::new(TranscriptStateStore::new(
+            TranscriptStore::new(sessions_root).with_writer_kind(HolderKind::Gateway),
+            mapper,
+        ));
+        self
+    }
+
+    /// Working directory per session (shared-profile mode: from the profile
+    /// index), so a session runs in its project folder.
+    #[must_use]
+    pub fn with_session_cwd(mut self, resolver: SessionCwdResolver) -> Self {
+        self.session_cwd = Some(resolver);
+        self
     }
 
     /// Binds the sessions' approval actor to `actor` instead of the local
@@ -237,10 +273,15 @@ impl GatewayCoreFactory {
         admission: Option<&harw_session_host::driver::ExecutionAdmission>,
     ) -> Result<CoreSession, DriverBridgeError> {
         let runtime = |error: String| DriverBridgeError::Runtime(error);
+        let cwd = self
+            .session_cwd
+            .as_ref()
+            .and_then(|resolve| resolve(session_id))
+            .unwrap_or_else(|| self.cwd.clone());
         let spec = crate::runtime_entry::runtime_spec(
             EntryKind::SessionHost,
             &self.home,
-            &self.cwd,
+            &cwd,
             admission
                 .map(|admission| admission.principal_with_ceiling(self.tier))
                 .unwrap_or_else(|| crate::runtime_entry::local_principal(IngressSurface::Tui)),
@@ -569,6 +610,39 @@ mod tests {
             dir.to_path_buf(),
             uid,
         )
+    }
+
+    #[test]
+    fn cli_session_thread_matches_chat_format() {
+        assert_eq!(
+            cli_session_thread(&SessionId::from_str("sess-a1")).as_str(),
+            "cli-session:sess-a1"
+        );
+    }
+
+    #[test]
+    fn with_thread_mapper_and_cwd_resolver_are_applied() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&seen);
+        let project = dir.path().join("proj");
+        let expected = project.clone();
+        let factory = factory_in(dir.path(), 1000)
+            .with_thread_mapper(cli_session_thread, &dir.path().join("shared"))
+            .with_session_cwd(Arc::new(move |id: &SessionId| {
+                log.lock().ok()?.push(id.as_str().to_owned());
+                Some(expected.clone())
+            }));
+        assert!(factory.session_cwd.is_some());
+        assert_eq!(
+            factory
+                .session_cwd
+                .as_ref()
+                .and_then(|resolve| resolve(&SessionId::from_str("sess-a1"))),
+            Some(project)
+        );
+        assert_eq!(seen.lock().map(|v| v.len()).unwrap_or(0), 1);
+        Ok(())
     }
 
     fn wiring() -> SessionWiring {

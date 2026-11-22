@@ -55,6 +55,7 @@ use harw_node_transport::{
     AuthHubNodeSigner, AuthHubSign, LocalNode, NodeIdentity, PinnedPeers, SignFuture, SignerError,
     TranscriptWrappedVerifier,
 };
+use harw_session_host::index::ShareMode;
 use harw_types::{DeviceId, NodeId, PermissionTier};
 use tokio::net::TcpListener;
 
@@ -211,6 +212,94 @@ pub(crate) fn parse_tier(raw: &str) -> Result<PermissionTier, String> {
     }
 }
 
+/// Upper bound of `share_legacy_rows`.
+const MAX_SHARE_LEGACY_ROWS: u32 = 1000;
+
+/// Validated sharing settings of TUI sessions (pure; no I/O).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharePlan {
+    /// `off` (default), `read` or `continue`.
+    pub mode: ShareMode,
+    /// `Some` exactly when `mode != Off`.
+    pub tenant: Option<harw_types::TenantId>,
+    /// Legacy rows for clients without the `projects` feature.
+    pub legacy_rows: usize,
+    /// `share_since` at 00:00 UTC.
+    pub since: Option<jiff::Timestamp>,
+    /// Syntactically checked (absolute, no `.`/`..`); canonicalised later.
+    pub roots: Vec<PathBuf>,
+}
+
+impl SharePlan {
+    /// Sharing disabled.
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            mode: ShareMode::Off,
+            tenant: None,
+            legacy_rows: 100,
+            since: None,
+            roots: Vec::new(),
+        }
+    }
+}
+
+/// Validates the five `share_*` keys.
+fn plan_share(section: &SessionListenerSection) -> Result<SharePlan, String> {
+    let raw_mode = section.share_profile_sessions.as_str();
+    let mode = ShareMode::parse(raw_mode).ok_or_else(|| {
+        format!("[session_listener] share_profile_sessions `{raw_mode}` must be off|read|continue")
+    })?;
+    let tenant = match (mode, section.share_tenant.as_deref()) {
+        (ShareMode::Off, _) => None,
+        (_, None) => {
+            return Err(
+                "[session_listener] share_tenant is required when share_profile_sessions is not off"
+                    .to_owned(),
+            );
+        }
+        (_, Some(raw)) => Some(
+            harw_types::TenantId::try_from_str(raw)
+                .map_err(|error| format!("[session_listener] share_tenant: {error}"))?,
+        ),
+    };
+    if section.share_legacy_rows > MAX_SHARE_LEGACY_ROWS {
+        return Err("[session_listener] share_legacy_rows must be at most 1000".to_owned());
+    }
+    let since = section
+        .share_since
+        .as_deref()
+        .map(|raw| {
+            let bad = || "[session_listener] share_since must be a date YYYY-MM-DD".to_owned();
+            if raw.len() != 10 {
+                return Err(bad());
+            }
+            let date: jiff::civil::Date = raw.parse().map_err(|_| bad())?;
+            date.to_zoned(jiff::tz::TimeZone::UTC)
+                .map(|zoned| zoned.timestamp())
+                .map_err(|_| bad())
+        })
+        .transpose()?;
+    let mut roots = Vec::with_capacity(section.share_roots.len());
+    for raw in &section.share_roots {
+        let path = PathBuf::from(raw);
+        if !path.is_absolute() || raw.split('/').any(|part| part == "." || part == "..") {
+            return Err(
+                "[session_listener] share_roots entries must be absolute paths without `.` or `..`"
+                    .to_owned(),
+            );
+        }
+        roots.push(path);
+    }
+    Ok(SharePlan {
+        mode,
+        tenant,
+        legacy_rows: section.share_legacy_rows as usize,
+        since,
+        roots,
+    })
+}
+
 /// Validated settings derived from the section (pure; no I/O).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerPlan {
@@ -228,6 +317,8 @@ pub struct ListenerPlan {
     pub onion: bool,
     /// Absolute onion directory override (`None`: `<state>/onion`).
     pub onion_dir: Option<PathBuf>,
+    /// Sharing of TUI sessions (default off).
+    pub share: SharePlan,
 }
 
 /// Validates `[session_listener]`.
@@ -292,6 +383,7 @@ pub fn plan(section: &SessionListenerSection) -> Result<ListenerPlan, String> {
             .map_err(|error| format!("[session_listener] provider_link_device: {error}"))?,
         onion: section.onion,
         onion_dir,
+        share: plan_share(section)?,
     })
 }
 
@@ -336,6 +428,7 @@ pub async fn start_from_config(
     config.tier = plan.tier;
     config.approval_device = plan.approval_device;
     config.provider_link_device = plan.provider_link_device;
+    config.share = plan.share.clone();
     let remote_dir = state_dir.join("remote");
     let peers_text = crate::session_serve_remote::read_peer_pins(&remote_dir.join(PEERS_FILE))?;
     config.peer_pins_digest = Some(*blake3::hash(peers_text.as_bytes()).as_bytes());
@@ -475,6 +568,84 @@ mod tests {
         assert_eq!(plan.tier, PermissionTier::Observer);
         assert_eq!(plan.approval_device, None);
         Ok(())
+    }
+
+    #[test]
+    fn share_defaults_to_off() -> Result<(), String> {
+        let plan = plan(&section())?;
+        assert_eq!(plan.share, SharePlan::off());
+        assert_eq!(plan.share.mode, ShareMode::Off);
+        assert_eq!(plan.share.legacy_rows, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn read_without_tenant_is_rejected() {
+        let mut shared = section();
+        shared.share_profile_sessions = "read".to_owned();
+        assert!(plan(&shared).is_err_and(|e| e.contains("share_tenant is required")));
+        shared.share_tenant = Some("tenant-a".to_owned());
+        assert!(
+            plan(&shared)
+                .is_ok_and(|p| p.share.mode == ShareMode::Read && p.share.tenant.is_some())
+        );
+    }
+
+    #[test]
+    fn continue_without_tenant_is_rejected() {
+        let mut shared = section();
+        shared.share_profile_sessions = "continue".to_owned();
+        assert!(plan(&shared).is_err_and(|e| e.contains("share_tenant is required")));
+    }
+
+    #[test]
+    fn unknown_share_mode_is_rejected() {
+        let mut shared = section();
+        shared.share_profile_sessions = "write".to_owned();
+        assert!(plan(&shared).is_err_and(|e| e.contains("must be off|read|continue")));
+    }
+
+    #[test]
+    fn share_limits_are_validated() {
+        let mut many = section();
+        many.share_legacy_rows = 1001;
+        assert!(plan(&many).is_err_and(|e| e.contains("at most 1000")));
+        many.share_legacy_rows = 1000;
+        assert!(plan(&many).is_ok());
+    }
+
+    #[test]
+    fn share_since_parses_date() -> Result<(), String> {
+        let mut dated = section();
+        dated.share_since = Some("2026-01-02".to_owned());
+        let since = plan(&dated)?.share.since;
+        assert_eq!(since.map(|t| t.as_second()), Some(1_767_312_000));
+        for bad in ["2026-1-2", "yesterday", "2026-13-01", ""] {
+            dated.share_since = Some(bad.to_owned());
+            assert!(
+                plan(&dated).is_err_and(|e| e.contains("YYYY-MM-DD")),
+                "{bad}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn relative_share_root_is_rejected() {
+        for raw in ["work/dir", "/a/../b", "/a/./b"] {
+            let mut rooted = section();
+            rooted.share_roots = vec![raw.to_owned()];
+            assert!(
+                plan(&rooted).is_err_and(|e| e.contains("share_roots")),
+                "{raw}"
+            );
+        }
+        let mut ok = section();
+        ok.share_roots = vec!["/srv/work".to_owned()];
+        assert_eq!(
+            plan(&ok).map(|p| p.share.roots).ok(),
+            Some(vec![PathBuf::from("/srv/work")])
+        );
     }
 
     #[test]

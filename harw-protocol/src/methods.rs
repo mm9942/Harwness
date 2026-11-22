@@ -33,6 +33,14 @@ pub const METHOD_GATEWAY_LISTENERS_SET: &str = "gateway.listeners.set";
 pub const METHOD_GATEWAY_TOOLS_GRANT: &str = "gateway.tools.grant";
 pub const METHOD_GATEWAY_TOOLS_NARROW: &str = "gateway.tools.narrow";
 
+pub const METHOD_SESSION_PROJECTS: &str = "session.projects";
+pub const METHOD_SESSION_PAGE: &str = "session.page";
+pub const METHOD_SESSION_ADOPT: &str = "session.adopt";
+pub const METHOD_SESSION_CREATE_IN: &str = "session.create_in";
+pub const METHOD_SESSION_SET_PROJECT: &str = "session.set_project";
+pub const METHOD_SESSION_RENAME: &str = "session.rename";
+pub const METHOD_SESSION_ARCHIVE: &str = "session.archive";
+
 pub const NOTIF_SESSION_EVENT: &str = "event.session";
 pub const NOTIF_TURN_EVENT: &str = "event.turn";
 pub const NOTIF_APPROVAL_REQ: &str = "approval.request";
@@ -55,6 +63,18 @@ pub const SESSION_METHODS: &[&str] = &[
     METHOD_TURN_SUBMIT,
     METHOD_TURN_INTERRUPT,
     METHOD_APPROVAL_RESP,
+];
+
+/// Minor 3, feature `projects`: projects and pages. Own table, NOT part of
+/// `SESSION_METHODS`.
+pub const PROJECT_METHODS: &[&str] = &[
+    METHOD_SESSION_PROJECTS,
+    METHOD_SESSION_PAGE,
+    METHOD_SESSION_ADOPT,
+    METHOD_SESSION_CREATE_IN,
+    METHOD_SESSION_SET_PROJECT,
+    METHOD_SESSION_RENAME,
+    METHOD_SESSION_ARCHIVE,
 ];
 
 /// R18 D-A: the closed `tool.*` method table.
@@ -88,6 +108,7 @@ mod tests {
     fn method_tables_are_disjoint_and_unique() {
         let mut all: Vec<&str> = SESSION_METHODS
             .iter()
+            .chain(PROJECT_METHODS)
             .chain(TOOL_METHODS)
             .chain(GATEWAY_READ_METHODS)
             .chain(GATEWAY_ADMIN_METHODS)
@@ -98,6 +119,11 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), total);
         assert!(TOOL_METHODS.iter().all(|name| name.starts_with("tool.")));
+        assert!(
+            PROJECT_METHODS
+                .iter()
+                .all(|name| name.starts_with("session."))
+        );
         assert!(
             GATEWAY_READ_METHODS
                 .iter()

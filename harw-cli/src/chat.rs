@@ -76,7 +76,10 @@ use harw_runtime::{
     RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, RuntimeError, RuntimeResult, RuntimeSpec,
     RuntimeStores,
 };
-use harw_session_store::JobStore;
+use harw_session_store::{
+    HolderKind, JobStore, LastOrigin, SessionLease, SessionStoreError, TranscriptHead,
+    TranscriptStore,
+};
 use harw_tui::{TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring};
 use harw_types::{IngressSurface, SessionId, ThreadRef};
 use tokio::{runtime::Builder, sync::mpsc::UnboundedSender};
@@ -378,6 +381,9 @@ struct ChatRuntimeInputs {
     startup: ChatStartup,
     // Durabler Transkript-Speicher des aktiven Profils.
     state_store: Arc<dyn StateStore>,
+    // Derselbe Speicher als Turn-Wächter (Lease je Turn, Kopfprüfung); die
+    // Montage meldet ihm ihre Wurzelsitzung an (`adopt_root`).
+    turn_guard: Arc<TurnGuardStateStore>,
     // Job-Speicher des aktiven Profils.
     job_store: Arc<JobStore>,
     // Gedächtnis des aktiven Profils, falls es geöffnet werden konnte.
@@ -431,8 +437,12 @@ impl ChatRuntimeInputs {
             .or_else(|| config.harness.active_agent_definition.clone());
 
         let home = spec.home.clone();
-        let state_store =
-            transcript_state_store(&profile_sessions_root(&home)?, cli_thread_for_session);
+        let sessions_root = profile_sessions_root(&home)?;
+        let turn_guard = Arc::new(TurnGuardStateStore::new(
+            transcript_state_store(&sessions_root, cli_thread_for_session),
+            sessions_root,
+        ));
+        let state_store: Arc<dyn StateStore> = turn_guard.clone();
         let job_store = Arc::new(JobStore::new(&active_profile_job_store_root(&home)?));
         let memory = build_memory(&home, config, agents);
         let secret_resolver = configured_secret_resolver(&home, config)?;
@@ -442,6 +452,7 @@ impl ChatRuntimeInputs {
             spec,
             startup,
             state_store,
+            turn_guard,
             job_store,
             memory,
             secret_resolver,
@@ -610,6 +621,9 @@ impl TuiAssemblyFactory for ChatTuiFactory {
             .build()
             .map_err(|error| assembly_error(&self.inputs, error))?;
         apply_extra_dirs(&assembly, &self.add_dirs);
+        self.inputs
+            .turn_guard
+            .adopt_root(assembly.root_session_id());
         tag_session_project(
             &self.inputs.spec.home,
             &self.inputs.spec.cwd,
@@ -958,6 +972,363 @@ fn one_shot_assembly(
         .map_err(|error| assembly_error(inputs, error))
 }
 
+/// Hinweis, wenn der Transcript-Kopf seit dem eigenen Stand gewachsen ist.
+fn head_moved_message(new_entries: u64) -> String {
+    format!(
+        "Session wurde auf dem Handy weitergeführt ({new_entries} neue Einträge). /resume lädt neu."
+    )
+}
+
+/// Hinweis, wenn ein anderer Schreiber die Besitz-Sperre der Session hält.
+fn lease_held_message(holder: Option<HolderKind>) -> &'static str {
+    match holder {
+        Some(HolderKind::Gateway) => "Läuft gerade auf dem Gateway (Handy)",
+        Some(HolderKind::Tui) => "Läuft gerade in einer anderen TUI",
+        Some(HolderKind::Job) => "Ein Job schreibt gerade in diese Session",
+        _ => "Die Session wird gerade von einem anderen Schreiber verwendet",
+    }
+}
+
+fn rejection(text: &str) -> harw_core::state_store::StateStoreError {
+    harw_core::state_store::StateStoreError::SessionStore(SessionStoreError::Io(
+        std::io::Error::other(text.to_owned()),
+    ))
+}
+
+// Zustand je angemeldeter Wurzelsitzung.
+#[derive(Default)]
+struct GuardSlot {
+    // Eigener Stand des Transcript-Kopfs (nach dem letzten eigenen Schreiben
+    // bzw. beim Laden); `None`, solange noch keiner bekannt ist.
+    known: Option<TranscriptHead>,
+    // Turn-Lease, solange ein Turn dieses Prozesses läuft.
+    lease: Option<SessionLease>,
+}
+
+/// Turn-Wächter der TUI: Besitz-Sperre je Turn und Kopfprüfung davor.
+///
+/// # Beschreibung
+/// Dünner Dekorator um den Profil-[`StateStore`] (Plan §3.5). Für Sitzungen,
+/// die die Montage per [`Self::adopt_root`] angemeldet hat (nur Wurzeln, nie
+/// Kind-Sitzungen):
+///
+/// - Turn-Beginn (erstes `UserMessage`-Item): [`SessionLease`] mit
+///   [`HolderKind::Tui`] nehmen und den Transcript-Kopf gegen den eigenen
+///   Stand prüfen. Fremd belegt oder Kopf weitergewandert -> der Turn wird
+///   abgelehnt (nichts geschrieben), mit Hinweis auf `/resume`.
+/// - Turn-Ende ([`StateStore::save_session_state`], von der TUI an jeder
+///   Turn-Grenze gerufen): Stand nachziehen, `last_origin = tui` setzen,
+///   Lease freigeben.
+///
+/// Alle übrigen Methoden gehen unverändert an den inneren Speicher.
+///
+/// # Nebenläufigkeit
+/// Ein `std::sync::Mutex` über der Slot-Tabelle, nie über einen `.await`
+/// gehalten. Datei-I/O (stat, kurzer Lock) ist klein und läuft inline.
+struct TurnGuardStateStore {
+    inner: Arc<dyn StateStore>,
+    sessions_root: PathBuf,
+    slots: std::sync::Mutex<std::collections::HashMap<String, GuardSlot>>,
+}
+
+impl TurnGuardStateStore {
+    fn new(inner: Arc<dyn StateStore>, sessions_root: PathBuf) -> Self {
+        Self {
+            inner,
+            sessions_root,
+            slots: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn lock_slots(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, GuardSlot>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn current_head(&self, session: &SessionId) -> Option<TranscriptHead> {
+        harw_session_store::head(&TranscriptStore::new(&self.sessions_root), session).ok()
+    }
+
+    /// Meldet eine Wurzelsitzung an und merkt sich den aktuellen Kopf als
+    /// eigenen Stand. Mehrfaches Anmelden setzt den Stand neu (`/resume`).
+    fn adopt_root(&self, session: &SessionId) {
+        let head = self.current_head(session);
+        let mut slots = self.lock_slots();
+        let slot = slots.entry(session.as_str().to_owned()).or_default();
+        if slot.lease.is_none() {
+            slot.known = head;
+        }
+    }
+
+    fn is_root(&self, session: &SessionId) -> bool {
+        self.lock_slots().contains_key(session.as_str())
+    }
+
+    /// Turn-Beginn: Lease nehmen, Kopf prüfen. `Ok` auch, wenn die Lease schon
+    /// zu diesem Turn gehört.
+    fn begin_turn(&self, session: &SessionId) -> harw_core::state_store::StateStoreResult<()> {
+        let mut slots = self.lock_slots();
+        let Some(slot) = slots.get_mut(session.as_str()) else {
+            return Ok(());
+        };
+        if slot.lease.is_some() {
+            return Ok(());
+        }
+        let lease = match SessionLease::acquire(&self.sessions_root, session, HolderKind::Tui) {
+            Ok(lease) => lease,
+            Err(SessionStoreError::LeaseHeld { holder, .. }) => {
+                return Err(rejection(lease_held_message(holder.map(|h| h.kind))));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let now = self.current_head(session);
+        if let (Some(known), Some(now)) = (slot.known, now)
+            && known.next_sequence != now.next_sequence
+        {
+            // `lease` fällt hier und gibt die Sperre wieder frei.
+            let new_entries = now.next_sequence.saturating_sub(known.next_sequence);
+            return Err(rejection(&head_moved_message(new_entries)));
+        }
+        if slot.known.is_none() {
+            slot.known = now;
+        }
+        slot.lease = Some(lease);
+        Ok(())
+    }
+
+    /// Stand der Sitzung vor einem Schreiben; `Some(next_sequence)` nur, wenn
+    /// keine Turn-Lease gehalten wird (dann zieht `after_write` den Stand nur
+    /// nach, wenn niemand dazwischen geschrieben hat).
+    fn before_write(&self, session: &SessionId) -> Option<u64> {
+        if !self.is_root(session) {
+            return None;
+        }
+        let leased = self
+            .lock_slots()
+            .get(session.as_str())
+            .is_some_and(|slot| slot.lease.is_some());
+        if leased {
+            return None;
+        }
+        self.current_head(session).map(|head| head.next_sequence)
+    }
+
+    /// Zieht den eigenen Stand nach einem erfolgreichen Schreiben nach.
+    fn after_write(&self, session: &SessionId, before: Option<u64>) {
+        if !self.is_root(session) {
+            return;
+        }
+        let head = self.current_head(session);
+        let mut slots = self.lock_slots();
+        let Some(slot) = slots.get_mut(session.as_str()) else {
+            return;
+        };
+        let unchanged_by_others = slot.lease.is_some()
+            || matches!((before, slot.known), (Some(b), Some(k)) if b == k.next_sequence);
+        if unchanged_by_others && head.is_some() {
+            slot.known = head;
+        }
+    }
+
+    /// Turn-Ende: Stand nachziehen, `last_origin = tui`, Lease freigeben.
+    /// Ohne gehaltene Lease (kein Turn lief) passiert nichts.
+    fn end_turn(&self, session: &SessionId) {
+        let head = self.current_head(session);
+        let lease = {
+            let mut slots = self.lock_slots();
+            let Some(slot) = slots.get_mut(session.as_str()) else {
+                return;
+            };
+            let Some(lease) = slot.lease.take() else {
+                return;
+            };
+            if head.is_some() {
+                slot.known = head;
+            }
+            lease
+        };
+        if let Err(error) = harw_session_store::meta::set_last_origin(
+            &self.sessions_root,
+            session,
+            LastOrigin::Tui,
+            jiff::Timestamp::now(),
+        ) {
+            tracing::warn!(session = %session, %error, "chat: last_origin nicht gespeichert");
+        }
+        drop(lease);
+    }
+}
+
+impl StateStore for TurnGuardStateStore {
+    fn record_agent_orchestration<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        event: &'a harw_protocol::AgentOrchestrationEvent,
+    ) -> harw_extension_api::ExtFuture<'a, harw_core::state_store::StateStoreResult<()>> {
+        Box::pin(async move {
+            let before = self.before_write(sid);
+            self.inner.record_agent_orchestration(sid, event).await?;
+            self.after_write(sid, before);
+            Ok(())
+        })
+    }
+
+    fn load_agent_orchestration<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> harw_extension_api::ExtFuture<
+        'a,
+        harw_core::state_store::StateStoreResult<Vec<harw_protocol::AgentOrchestrationEvent>>,
+    > {
+        self.inner.load_agent_orchestration(sid)
+    }
+
+    fn save_turn<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        item: &'a harw_protocol::TurnItem,
+    ) -> harw_extension_api::ExtFuture<'a, harw_core::state_store::StateStoreResult<()>> {
+        Box::pin(async move {
+            if matches!(item, harw_protocol::TurnItem::UserMessage(_)) {
+                self.begin_turn(sid)?;
+            }
+            let before = self.before_write(sid);
+            self.inner.save_turn(sid, item).await?;
+            self.after_write(sid, before);
+            Ok(())
+        })
+    }
+
+    fn load_history<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> harw_extension_api::ExtFuture<
+        'a,
+        harw_core::state_store::StateStoreResult<harw_core::ConversationHistory>,
+    > {
+        Box::pin(async move {
+            // Wer lädt, hat danach den Stand dieses Kopfs (Start, `/resume`).
+            // Den Kopf VOR dem Laden merken: ein Schreiben währenddessen fällt
+            // dann bei der nächsten Prüfung auf.
+            let head = self.current_head(sid);
+            let history = self.inner.load_history(sid).await?;
+            let mut slots = self.lock_slots();
+            if let Some(slot) = slots.get_mut(sid.as_str())
+                && slot.lease.is_none()
+                && head.is_some()
+            {
+                slot.known = head;
+            }
+            Ok(history)
+        })
+    }
+
+    fn save_history<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        history: &'a harw_core::ConversationHistory,
+    ) -> harw_extension_api::ExtFuture<'a, harw_core::state_store::StateStoreResult<()>> {
+        Box::pin(async move {
+            let before = self.before_write(sid);
+            self.inner.save_history(sid, history).await?;
+            self.after_write(sid, before);
+            Ok(())
+        })
+    }
+
+    fn save_session_state<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        state: &'a harw_core::state_store::SessionStateSnapshot,
+    ) -> harw_extension_api::ExtFuture<'a, harw_core::state_store::StateStoreResult<()>> {
+        Box::pin(async move {
+            let before = self.before_write(sid);
+            let written = self.inner.save_session_state(sid, state).await;
+            if written.is_ok() {
+                self.after_write(sid, before);
+            }
+            // Die TUI ruft das an jeder Turn-Grenze: der Turn ist zu Ende,
+            // auch wenn das Schreiben des Zustands scheiterte.
+            self.end_turn(sid);
+            written
+        })
+    }
+
+    fn load_session_state<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> harw_extension_api::ExtFuture<
+        'a,
+        harw_core::state_store::StateStoreResult<
+            Option<harw_core::state_store::SessionStateSnapshot>,
+        >,
+    > {
+        self.inner.load_session_state(sid)
+    }
+
+    fn record_usage<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        round: &'a harw_core::UsageRound,
+    ) -> harw_extension_api::ExtFuture<'a, harw_core::state_store::StateStoreResult<()>> {
+        Box::pin(async move {
+            let before = self.before_write(sid);
+            self.inner.record_usage(sid, round).await?;
+            self.after_write(sid, before);
+            Ok(())
+        })
+    }
+
+    fn record_drift<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        event: &'a harw_core::DriftEvent,
+    ) -> harw_extension_api::ExtFuture<'a, harw_core::state_store::StateStoreResult<()>> {
+        Box::pin(async move {
+            let before = self.before_write(sid);
+            self.inner.record_drift(sid, event).await?;
+            self.after_write(sid, before);
+            Ok(())
+        })
+    }
+
+    fn record_skill_injection<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        record: &'a harw_session_store::InjectionRecord,
+    ) -> harw_extension_api::ExtFuture<'a, harw_core::state_store::StateStoreResult<()>> {
+        Box::pin(async move {
+            let before = self.before_write(sid);
+            self.inner.record_skill_injection(sid, record).await?;
+            self.after_write(sid, before);
+            Ok(())
+        })
+    }
+
+    fn load_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> harw_extension_api::ExtFuture<
+        'a,
+        harw_core::state_store::StateStoreResult<Vec<harw_session_store::InjectionRecord>>,
+    > {
+        self.inner.load_skill_injections(sid)
+    }
+
+    fn load_active_skill_injections<'a>(
+        &'a self,
+        sid: &'a SessionId,
+    ) -> harw_extension_api::ExtFuture<
+        'a,
+        harw_core::state_store::StateStoreResult<Vec<harw_session_store::InjectionRecord>>,
+    > {
+        self.inner.load_active_skill_injections(sid)
+    }
+}
+
 // Führt genau einen Turn über die One-shot-Montage aus und druckt die Antwort.
 fn run_one_shot(
     inputs: &ChatRuntimeInputs,
@@ -977,6 +1348,7 @@ fn run_one_shot(
     let assembly = one_shot_assembly(inputs, ModelSource::Configured, event_tx.clone())?;
     apply_extra_dirs(&assembly, add_dirs);
     let root_id = assembly.root_session_id().clone();
+    inputs.turn_guard.adopt_root(&root_id);
     tag_session_project(&inputs.spec.home, &inputs.spec.cwd, &root_id);
     let RootSession { mut session, .. } = assembly
         .new_root_session(root_id.clone(), event_tx, turn_tx, None)
@@ -1046,6 +1418,9 @@ fn run_one_shot(
     });
     assembly.close_session(&root_id);
 
+    // Ein One-shot-Lauf hat keine TUI-Turn-Grenze: Lease und Herkunft hier
+    // abschließen.
+    inputs.turn_guard.end_turn(&root_id);
     let reply = result?;
     println!("{reply}");
     Ok(())
@@ -2342,6 +2717,150 @@ mod tests {
                 "the first round of a Full root must fit the 32k fallback window",
             ))?;
         assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        Ok(())
+    }
+
+    // ---- Turn-Wächter (Plan §3.5, Abnahme S6) ----
+
+    fn guard_fixture(root: &Path) -> Arc<TurnGuardStateStore> {
+        Arc::new(TurnGuardStateStore::new(
+            transcript_state_store(root, cli_thread_for_session),
+            root.to_path_buf(),
+        ))
+    }
+
+    fn user_item(text: &str) -> TestResult<TurnItem> {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text(text);
+        history
+            .items()
+            .first()
+            .cloned()
+            .ok_or(TestError::Missing("history has a turn item"))
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> TestResult<F::Output> {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(ctx("build test runtime"))?;
+        Ok(runtime.block_on(future))
+    }
+
+    /// Simuliert einen fremden Halter (anderer Dateikopf, wie ein zweiter
+    /// Prozess): sperrt `<id>.lease` über ein eigenes Handle.
+    fn hold_foreign_lease(root: &Path, session: &SessionId) -> TestResult<std::fs::File> {
+        let path = harw_session_store::lease_path(root, session).map_err(ctx("lease path"))?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(ctx("open foreign lease"))?;
+        file.try_lock()
+            .map_err(|error| TestError::Unexpected(format!("foreign lock: {error:?}")))?;
+        file.write_all(br#"{"holder":"gateway","pid":1,"since":"2026-11-22T10:00:00Z"}"#)
+            .map_err(ctx("write foreign holder"))?;
+        file.sync_data().map_err(ctx("sync foreign holder"))?;
+        Ok(file)
+    }
+
+    #[test]
+    fn parallel_turns_tui_and_host_exactly_one_runs() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create sessions dir"))?;
+        let session = SessionId::from_str("sess-parallel");
+        let guard = guard_fixture(dir.path());
+        guard.adopt_root(&session);
+        let item = user_item("hello")?;
+
+        // Das Gateway hält die Lease: der TUI-Turn wird abgelehnt, nichts geschrieben.
+        let foreign = hold_foreign_lease(dir.path(), &session)?;
+        let rejected = block_on(guard.save_turn(&session, &item))?;
+        let message = rejected
+            .err()
+            .ok_or(TestError::Missing(
+                "turn must be rejected while the gateway holds the lease",
+            ))?
+            .to_string();
+        assert!(
+            message.contains("Läuft gerade auf dem Gateway (Handy)"),
+            "{message}"
+        );
+        let head = harw_session_store::head(&TranscriptStore::new(dir.path()), &session)
+            .map_err(ctx("read head"))?;
+        assert_eq!(head.next_sequence, 0);
+        assert!(SessionLease::held_here(dir.path(), &session).is_none());
+
+        // Frei: der TUI-Turn läuft und hält die Lease bis zur Turn-Grenze.
+        drop(foreign);
+        block_on(guard.save_turn(&session, &item))?.map_err(ctx("TUI turn after release"))?;
+        assert!(SessionLease::held_here(dir.path(), &session).is_some());
+        guard.end_turn(&session);
+        assert!(SessionLease::held_here(dir.path(), &session).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn open_tui_rejects_after_phone_turn() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create sessions dir"))?;
+        let session = SessionId::from_str("sess-handover");
+        let guard = guard_fixture(dir.path());
+        let item = user_item("from the terminal")?;
+        block_on(guard.save_turn(&session, &item))?.map_err(ctx("unadopted pass-through"))?;
+        guard.adopt_root(&session);
+
+        // Das Handy schreibt über einen unabhängigen Speicher (anderer Prozess).
+        let phone = transcript_state_store(dir.path(), cli_thread_for_session);
+        block_on(phone.save_turn(&session, &user_item("from the phone")?))?
+            .map_err(ctx("phone turn"))?;
+
+        let rejected = block_on(guard.save_turn(&session, &item))?;
+        let message = rejected
+            .err()
+            .ok_or(TestError::Missing(
+                "open TUI must reject after a phone turn",
+            ))?
+            .to_string();
+        assert!(message.contains(&head_moved_message(1)), "{message}");
+        // Die abgelehnte Prüfung hält keine Lease zurück.
+        assert!(SessionLease::held_here(dir.path(), &session).is_none());
+
+        // `/resume` lädt neu: danach läuft der Turn wieder.
+        block_on(guard.load_history(&session))?.map_err(ctx("reload history"))?;
+        block_on(guard.save_turn(&session, &item))?.map_err(ctx("turn after reload"))?;
+        guard.end_turn(&session);
+        Ok(())
+    }
+
+    #[test]
+    fn turn_end_records_tui_origin_and_keeps_own_writes_from_tripping() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create sessions dir"))?;
+        let session = SessionId::from_str("sess-origin");
+        let guard = guard_fixture(dir.path());
+        guard.adopt_root(&session);
+        let item = user_item("first")?;
+
+        block_on(guard.save_turn(&session, &item))?.map_err(ctx("first turn"))?;
+        guard.end_turn(&session);
+        let meta = harw_session_store::meta::load_or_derive(dir.path(), &session)
+            .map_err(ctx("load meta"))?;
+        assert_eq!(meta.last_origin, Some(LastOrigin::Tui));
+        assert!(meta.last_activity_at.is_some());
+
+        // Eigene Schreiber ziehen den Stand nach: der nächste Turn wird nicht abgelehnt.
+        block_on(guard.save_turn(&session, &item))?.map_err(ctx("second own turn"))?;
+        guard.end_turn(&session);
+        Ok(())
+    }
+
+    #[test]
+    fn child_sessions_pass_through_without_lease() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("create sessions dir"))?;
+        let child = SessionId::from_str("sess-child");
+        let guard = guard_fixture(dir.path());
+        block_on(guard.save_turn(&child, &user_item("task")?))?.map_err(ctx("child turn"))?;
+        assert!(SessionLease::held_here(dir.path(), &child).is_none());
         Ok(())
     }
 }

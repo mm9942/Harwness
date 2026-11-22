@@ -2,11 +2,14 @@
 //! is a wire change: bump `SESSION_WIRE_MINOR` or keep the old shape.
 
 use harw_protocol::items::ToolPlacement;
+use harw_protocol::session_port::PortError;
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, GatewayStatus, HelloAck, HelloParams,
-    PlacementGeneration, RespondResult, SESSION_WIRE_MINOR, SESSION_WS_PATH,
-    SESSION_WS_SUBPROTOCOL, SubmitResult, TOOL_GATEWAY_WIRE_MINOR, ToolCallParams,
-    ToolCallResultFrame, ToolListResult, error_codes,
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CreateInParams, GatewayStatus,
+    HelloAck, HelloParams, HolderInfo, HolderKind, LastOrigin, PROJECTS_WIRE_MINOR, PageParams,
+    PageResult, PlacementGeneration, ProjectsParams, ProjectsResult, ReadOnlyReason, RenameParams,
+    RespondResult, RowOrigin, SESSION_WIRE_MINOR, SESSION_WS_PATH, SESSION_WS_SUBPROTOCOL,
+    SessionRow, SessionSummary, SetProjectParams, SubmitResult, TOOL_GATEWAY_WIRE_MINOR,
+    ToolCallParams, ToolCallResultFrame, ToolListResult, error_codes,
 };
 use harw_protocol::{AgentRole, ClientCaps, Cursor, FrameEnvelope, SessionFrame, ToolApproval};
 use serde::Serialize;
@@ -292,6 +295,10 @@ fn version_and_subprotocol_constants_match_fixture() -> TestResult {
     assert_eq!(text("path").as_deref(), Some(SESSION_WS_PATH));
     assert_eq!(number("wire_minor"), Some(u64::from(SESSION_WIRE_MINOR)));
     assert_eq!(
+        number("projects_wire_minor"),
+        Some(u64::from(PROJECTS_WIRE_MINOR))
+    );
+    assert_eq!(
         number("tool_gateway_wire_minor"),
         Some(u64::from(TOOL_GATEWAY_WIRE_MINOR))
     );
@@ -339,4 +346,157 @@ fn placement_generation_is_a_transparent_integer() -> TestResult {
     assert_eq!(decoded, PlacementGeneration(9));
     assert!(serde_json::from_str::<PlacementGeneration>("-1").is_err());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Wire minor 3 (feature `projects`). All ids are synthetic.
+// ---------------------------------------------------------------------------
+
+fn sorted_keys(value: &Value) -> TestResult<Vec<String>> {
+    let object = value.as_object().ok_or("value is not an object")?;
+    let mut keys: Vec<String> = object.keys().cloned().collect();
+    keys.sort();
+    Ok(keys)
+}
+
+/// The minor-2 hello, its ack and `SessionSummary` keep their exact bytes:
+/// the minor-3 additions never leak into them.
+#[test]
+fn frozen_v2_messages_are_byte_identical_at_minor_3() -> TestResult {
+    let hello: HelloParams = round_trip("hello_params")?;
+    assert_eq!(hello.wire_minor, 2);
+    let ack: HelloAck = round_trip("hello_ack")?;
+    assert_eq!(ack.wire_minor, 2);
+    let hello_text = serde_json::to_string(&hello)?;
+    assert!(!hello_text.contains("projects"), "{hello_text}");
+
+    let summary_json = r#"{"session_id":"sess-a1","title":"t","tenant":null,"state":{"state":"idle"},"attached":0,"updated_at":"2026-01-01T00:00:00Z","model":null}"#;
+    let summary: SessionSummary = serde_json::from_str(summary_json)?;
+    let value = serde_json::to_value(&summary)?;
+    assert_eq!(value, serde_json::from_str::<Value>(summary_json)?);
+    assert_eq!(
+        sorted_keys(&value)?,
+        [
+            "attached",
+            "model",
+            "session_id",
+            "state",
+            "tenant",
+            "title",
+            "updated_at"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn holder_frame_round_trips_and_is_unknown_to_v2_kinds() -> TestResult {
+    let json = r#"{"session_id":"sess-a1","cursor":{"generation":1,"durable":2,"live":0},"frame":{"kind":"holder","data":{"session_id":"sess-a1","holder":{"kind":"tui","since":"2026-01-01T00:00:00Z"}}}}"#;
+    let envelope: FrameEnvelope = serde_json::from_str(json)?;
+    assert!(matches!(
+        envelope.frame,
+        SessionFrame::Holder { holder: Some(ref h), .. } if h.kind == HolderKind::Tui
+    ));
+    assert_eq!(
+        serde_json::to_value(&envelope)?,
+        serde_json::from_str::<Value>(json)?
+    );
+
+    let free = r#"{"kind":"holder","data":{"session_id":"sess-a1","holder":null}}"#;
+    let frame: SessionFrame = serde_json::from_str(free)?;
+    assert!(matches!(frame, SessionFrame::Holder { holder: None, .. }));
+
+    let future = r#"{"session_id":"s","cursor":{"generation":1,"durable":1,"live":0},"frame":{"kind":"holder_v9","data":{"a":1}}}"#;
+    let envelope: FrameEnvelope = serde_json::from_str(future)?;
+    assert!(matches!(envelope.frame, SessionFrame::Unknown));
+    Ok(())
+}
+
+#[test]
+fn holder_info_has_no_pid_field() -> TestResult {
+    let info: HolderInfo =
+        serde_json::from_str(r#"{"kind":"gateway","since":"2026-01-01T00:00:00Z","pid":4242}"#)?;
+    assert_eq!(info.kind, HolderKind::Gateway);
+    let value = serde_json::to_value(&info)?;
+    assert_eq!(sorted_keys(&value)?, ["kind", "since"]);
+    Ok(())
+}
+
+#[test]
+fn minor3_params_reject_unknown_fields() {
+    fn rejects<T: DeserializeOwned>(base: &str) -> bool {
+        let text = format!("{},\"tenant\":\"x\"}}", base.trim_end_matches('}'));
+        serde_json::from_str::<T>(&text).is_err()
+    }
+    assert!(rejects::<ProjectsParams>("{}"));
+    assert!(rejects::<PageParams>("{}"));
+    assert!(rejects::<CreateInParams>(r#"{"project_key":"p"}"#));
+    assert!(rejects::<SetProjectParams>(
+        r#"{"session_id":"sess-a1","project_key":"p"}"#
+    ));
+    assert!(rejects::<RenameParams>(
+        r#"{"session_id":"sess-a1","title":"t"}"#
+    ));
+    assert!(rejects::<ArchiveParams>(
+        r#"{"session_id":"sess-a1","archived":true}"#
+    ));
+}
+
+#[test]
+fn minor3_params_accept_their_plain_shape() -> TestResult {
+    let page: PageParams = serde_json::from_str("{}")?;
+    assert_eq!(page.project_key, None);
+    assert!(!page.include_archived);
+    let none_project: PageParams = serde_json::from_str(r#"{"project_key":""}"#)?;
+    assert_eq!(none_project.project_key.as_deref(), Some(""));
+    let projects: ProjectsParams = serde_json::from_str(r#"{"limit":50}"#)?;
+    assert_eq!(projects.limit, Some(50));
+    Ok(())
+}
+
+#[test]
+fn minor3_results_accept_additional_fields() -> TestResult {
+    let row = r#"{"session_id":"sess-a1","updated_at":"2026-01-01T00:00:00Z","state":{"state":"idle"},"attached":0,"origin":"hosted","continuable":true,"future_field":1}"#;
+    let parsed: SessionRow = serde_json::from_str(row)?;
+    assert!(parsed.continuable);
+    assert_eq!(parsed.origin, RowOrigin::Hosted);
+
+    let page = format!(r#"{{"sessions":[{row}],"extra":true}}"#);
+    let parsed: PageResult = serde_json::from_str(&page)?;
+    assert_eq!(parsed.sessions.len(), 1);
+    assert_eq!(parsed.next_cursor, None);
+
+    let projects = r#"{"projects":[{"project_key":"","label":"x","session_count":1,"last_activity":"2026-01-01T00:00:00Z","active_count":0,"more":1}],"share":{"mode":"off","tier":"observer"},"extra":[]}"#;
+    let parsed: ProjectsResult = serde_json::from_str(projects)?;
+    assert_eq!(parsed.projects.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn row_enums_decode_unknown() -> TestResult {
+    assert_eq!(
+        serde_json::from_str::<RowOrigin>(r#""future""#)?,
+        RowOrigin::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<ReadOnlyReason>(r#""future""#)?,
+        ReadOnlyReason::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<HolderKind>(r#""future""#)?,
+        HolderKind::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<LastOrigin>(r#""future""#)?,
+        LastOrigin::Unknown
+    );
+    Ok(())
+}
+
+#[test]
+fn busy_code_maps_to_port_busy() {
+    assert_eq!(
+        PortError::from_code(error_codes::BUSY, "x".into()),
+        PortError::Busy("x".into())
+    );
 }

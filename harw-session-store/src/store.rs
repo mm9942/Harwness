@@ -27,8 +27,19 @@
 //!   und `freeze` mitbenutzt.
 //!
 //! # Nebenläufigkeit
-//! `TranscriptStore` hat keinen inneren Zustand (`Send + Sync`). Konkurrierende
-//! Schreiber bekommen [`SessionStoreError::LockContended`] statt zu warten.
+//! `TranscriptStore` hat keinen veränderlichen Zustand (`Send + Sync`).
+//! Konkurrierende Schreiber bekommen [`SessionStoreError::LockContended`]
+//! statt zu warten.
+//!
+//! # Besitz-Sperre (Plan §3.5)
+//! Jeder Schreibpfad ([`TranscriptStore::append`], [`TranscriptStore::rewrite`],
+//! [`TranscriptStore::repair_tail`]) nimmt vor dem Transcript-Lock die
+//! [`SessionLease`] der Session: hält dieser Prozess sie schon, wird das
+//! vorhandene Handle mitbenutzt; sonst wird sie nur für die Dauer des Aufrufs
+//! genommen (Short-Take, Halter-Art [`TranscriptStore::writer_kind`]). Hält
+//! ein anderer Prozess sie, schlägt der Aufruf mit
+//! [`SessionStoreError::LeaseHeld`] fehl, bevor irgendetwas geschrieben wird.
+//! Lock-Reihenfolge: Lease, dann Transcript-Lock. Lesen nimmt keine Lease.
 //!
 //! # Beispiel
 //! ```rust,no_run
@@ -59,6 +70,7 @@ use harw_types::SessionId;
 use tempfile::NamedTempFile;
 
 use crate::error::{SessionStoreError, SessionStoreResult};
+use crate::lease::{HolderKind, SessionLease};
 pub use crate::reader::MAX_RECORD_BYTES;
 use crate::reader::TranscriptReader;
 use crate::record::TranscriptRecord;
@@ -115,6 +127,8 @@ pub enum TailRepair {
 pub struct TranscriptStore {
     /// Directory under which per-session `<session_id>.jsonl` files live.
     root: PathBuf,
+    /// Halter-Art für Short-Take-Leases dieses Stores (Standard: `Job`).
+    writer_kind: HolderKind,
 }
 
 impl TranscriptStore {
@@ -123,6 +137,35 @@ impl TranscriptStore {
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
+            writer_kind: HolderKind::Job,
+        }
+    }
+
+    /// Setzt die Halter-Art für kurze Leases dieses Stores (Short-Take in
+    /// `append`/`rewrite`/`repair_tail`). Hält der Prozess die Lease schon,
+    /// bleibt deren Halter unverändert.
+    #[must_use]
+    pub fn with_writer_kind(mut self, kind: HolderKind) -> Self {
+        self.writer_kind = kind;
+        self
+    }
+
+    /// Halter-Art für kurze Leases dieses Stores (Standard [`HolderKind::Job`]).
+    #[must_use]
+    pub fn writer_kind(&self) -> HolderKind {
+        self.writer_kind
+    }
+
+    /// Besitz-Sperre für einen Schreibaufruf: das Handle dieses Prozesses,
+    /// sonst ein Short-Take mit [`Self::writer_kind`].
+    ///
+    /// # Errors
+    /// [`SessionStoreError::LeaseHeld`], wenn ein anderer Prozess die Lease
+    /// hält; sonst Fehler von [`SessionLease::acquire`].
+    fn writer_lease(&self, session_id: &SessionId) -> SessionStoreResult<SessionLease> {
+        match SessionLease::held_here(&self.root, session_id) {
+            Some(lease) => Ok(lease),
+            None => SessionLease::acquire(&self.root, session_id, self.writer_kind),
         }
     }
 
@@ -154,19 +197,26 @@ impl TranscriptStore {
     ///
     /// # Errors
     /// - [`SessionStoreError::TranscriptRecordTooLarge`]: record over the limit
-    ///   (nothing is written, no lock is taken).
+    ///   (nothing is written, no lock or lease is taken).
+    /// - [`SessionStoreError::LeaseHeld`]: another process holds the session
+    ///   lease (Plan §3.5); nothing is written.
     /// - [`SessionStoreError::LockContended`]: another writer holds the lock.
     /// - [`SessionStoreError::UnsafeTranscriptPath`], [`SessionStoreError::Io`],
     ///   [`SessionStoreError::Serde`].
     ///
     /// # Concurrency
-    /// Exclusive `fs4` try-lock on `<id>.jsonl.lock`; never blocks.
+    /// Session lease first (this process's handle, or a short take released
+    /// when the call returns; the retry window of [`SessionLease::acquire`]
+    /// is the only wait), then the exclusive `fs4` try-lock on
+    /// `<id>.jsonl.lock`, which never blocks.
     pub fn append(&self, record: &TranscriptRecord) -> SessionStoreResult<()> {
         let path = self.transcript_path(&record.session_id)?;
         let line = record.to_jsonl_line()?;
         ensure_record_within_limit(&record.session_id, &line)?;
         let parent = transcript_parent(&path)?;
         std::fs::create_dir_all(parent).map_err(SessionStoreError::Io)?;
+        // Lock-Reihenfolge: Lease vor Transcript-Lock; fällt nach dem Unlock.
+        let _lease = self.writer_lease(&record.session_id)?;
         let lock = lock_transcript(&path, &record.session_id)?;
 
         let write_result = (|| -> SessionStoreResult<()> {
@@ -204,6 +254,8 @@ impl TranscriptStore {
     ///
     /// # Errors
     /// - [`SessionStoreError::NotFound`]: no transcript exists.
+    /// - [`SessionStoreError::LeaseHeld`]: another process holds the session
+    ///   lease; nothing is changed.
     /// - [`SessionStoreError::LockContended`]: another writer or repairer holds
     ///   the lock — the repair is **not** attempted without the lock.
     /// - [`SessionStoreError::UnsafeTranscriptPath`], [`SessionStoreError::Io`]
@@ -238,6 +290,7 @@ impl TranscriptStore {
             }
             Err(error) => return Err(SessionStoreError::Io(error)),
         }
+        let _lease = self.writer_lease(session_id)?;
         let lock = lock_transcript(&path, session_id)?;
         let repair_result = (|| -> SessionStoreResult<TailRepair> {
             reject_symlink(&path, "transcript")?;
@@ -264,6 +317,14 @@ impl TranscriptStore {
     ///
     /// Each record must belong to `session_id`; the replacement only becomes
     /// visible after the synced sibling temp file is atomically persisted.
+    ///
+    /// # Errors
+    /// - [`SessionStoreError::SessionMismatch`], [`SessionStoreError::TranscriptRecordTooLarge`]
+    ///   (checked before any lock or lease).
+    /// - [`SessionStoreError::LeaseHeld`]: another process holds the session
+    ///   lease, so retention/compaction never lands inside a foreign turn.
+    /// - [`SessionStoreError::LockContended`], [`SessionStoreError::UnsafeTranscriptPath`],
+    ///   [`SessionStoreError::Io`], [`SessionStoreError::Serde`].
     pub fn rewrite(
         &self,
         session_id: &SessionId,
@@ -284,6 +345,7 @@ impl TranscriptStore {
         }
         let parent = transcript_parent(&path)?;
         std::fs::create_dir_all(parent).map_err(SessionStoreError::Io)?;
+        let _lease = self.writer_lease(session_id)?;
         let lock = lock_transcript(&path, session_id)?;
 
         let rewrite_result = (|| -> SessionStoreResult<()> {
@@ -892,6 +954,189 @@ mod tests {
         assert_symlink_rejected(store.rewrite(&session, &[record("session-a", 1)]))?;
         assert_eq!(std::fs::read_to_string(target)?, "outside lock");
         assert!(!transcript_path.exists());
+        Ok(())
+    }
+
+    /// Holder-JSON eines "fremden" Prozesses (synthetisch, ohne Hostname).
+    const FOREIGN_HOLDER_JSON: &str =
+        r#"{"holder":"tui","pid":4242,"since":"2026-11-22T10:00:00Z"}"#;
+
+    /// Simuliert einen fremden Prozess: eigener fd auf `<id>.lease`, Holder-JSON
+    /// hinein, exklusiver fs4-Lock (flock gilt je offener Datei, nicht je Prozess).
+    fn hold_foreign_lease(root: &Path, session: &SessionId) -> TestResult<File> {
+        let path = crate::lease::lease_path(root, session)?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        file.write_all(FOREIGN_HOLDER_JSON.as_bytes())?;
+        file.sync_data()?;
+        FileExt::try_lock(&file).map_err(|error| {
+            TestError::Unexpected(format!("foreign lease lock failed: {error:?}"))
+        })?;
+        Ok(file)
+    }
+
+    fn assert_lease_held<T: std::fmt::Debug>(
+        result: SessionStoreResult<T>,
+        expected: &SessionId,
+    ) -> TestResult {
+        match result {
+            Err(SessionStoreError::LeaseHeld { session, holder }) => {
+                assert_eq!(&session, expected);
+                let holder = holder.ok_or(TestError::Missing("lease holder"))?;
+                assert_eq!(holder.kind, HolderKind::Tui);
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "expected LeaseHeld, got {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn writer_kind_defaults_to_job_and_is_configurable() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        assert_eq!(store.writer_kind(), HolderKind::Job);
+        let store = store.with_writer_kind(HolderKind::Gateway);
+        assert_eq!(store.writer_kind(), HolderKind::Gateway);
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_append_fails_while_lease_is_held() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        let session = SessionId::from_str("sess-a1");
+        store.append(&record("sess-a1", 0))?;
+        let path = store.transcript_path(&session)?;
+        let before = std::fs::read(&path)?;
+
+        let foreign = hold_foreign_lease(temp.path(), &session)?;
+        assert_lease_held(store.append(&record("sess-a1", 1)), &session)?;
+        assert_eq!(std::fs::read(&path)?, before);
+
+        FileExt::unlock(&foreign)?;
+        drop(foreign);
+        store.append(&record("sess-a1", 1))?;
+        let replayed = store
+            .reader(&session)?
+            .collect::<SessionStoreResult<Vec<_>>>()?;
+        assert_eq!(replayed.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn append_under_own_lease_succeeds() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        let session = SessionId::from_str("sess-a2");
+        let lease = SessionLease::acquire(temp.path(), &session, HolderKind::Tui)?;
+
+        store.append(&record("sess-a2", 0))?;
+        store.append(&record("sess-a2", 1))?;
+
+        assert!(SessionLease::held_here(temp.path(), &session).is_some());
+        let holder = crate::lease::peek_holder(temp.path(), &session)?
+            .ok_or(TestError::Missing("own lease holder after append"))?;
+        assert_eq!(holder.kind, HolderKind::Tui);
+        let replayed = store
+            .reader(&session)?
+            .collect::<SessionStoreResult<Vec<_>>>()?;
+        assert_eq!(replayed.len(), 2);
+
+        drop(lease);
+        assert!(SessionLease::held_here(temp.path(), &session).is_none());
+        assert_eq!(crate::lease::peek_holder(temp.path(), &session)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn short_take_append_releases_lease_after_write() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path()).with_writer_kind(HolderKind::Gateway);
+        let session = SessionId::from_str("sess-a3");
+
+        store.append(&record("sess-a3", 0))?;
+
+        assert!(SessionLease::held_here(temp.path(), &session).is_none());
+        assert_eq!(crate::lease::peek_holder(temp.path(), &session)?, None);
+        // Ein fremder Halter bekommt die Lease sofort.
+        let foreign = hold_foreign_lease(temp.path(), &session)?;
+        FileExt::unlock(&foreign)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_respects_lease() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        let session = SessionId::from_str("sess-a4");
+        store.append(&record("sess-a4", 0))?;
+        let path = store.transcript_path(&session)?;
+        let before = std::fs::read(&path)?;
+
+        let foreign = hold_foreign_lease(temp.path(), &session)?;
+        assert_lease_held(store.rewrite(&session, &[record("sess-a4", 9)]), &session)?;
+        assert_eq!(std::fs::read(&path)?, before);
+        FileExt::unlock(&foreign)?;
+        drop(foreign);
+
+        store.rewrite(&session, &[record("sess-a4", 9)])?;
+        let replayed = store
+            .reader(&session)?
+            .collect::<SessionStoreResult<Vec<_>>>()?;
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repair_tail_respects_lease() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        let session = SessionId::from_str("sess-a5");
+        store.append(&record("sess-a5", 0))?;
+        let path = store.transcript_path(&session)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+        file.write_all(b"{\"torn\":")?;
+        drop(file);
+        let before = std::fs::read(&path)?;
+
+        let foreign = hold_foreign_lease(temp.path(), &session)?;
+        assert_lease_held(store.repair_tail(&session), &session)?;
+        assert_eq!(std::fs::read(&path)?, before);
+        FileExt::unlock(&foreign)?;
+        drop(foreign);
+
+        assert!(matches!(
+            store.repair_tail(&session)?,
+            TailRepair::Repaired { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_does_not_need_the_lease() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        let session = SessionId::from_str("sess-a6");
+        store.append(&record("sess-a6", 0))?;
+
+        let foreign = hold_foreign_lease(temp.path(), &session)?;
+        let replayed = store
+            .reader(&session)?
+            .collect::<SessionStoreResult<Vec<_>>>()?;
+        assert_eq!(replayed.len(), 1);
+        FileExt::unlock(&foreign)?;
         Ok(())
     }
 

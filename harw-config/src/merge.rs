@@ -1318,7 +1318,7 @@ fn merge_tools_doc(
     }
 }
 
-// `[session_listener]` — alle zehn Felder `GlobalOnly` und
+// `[session_listener]` — alle fünfzehn Felder `GlobalOnly` und
 // sicherheitskritisch: nur die Baseline (Home) setzt sie.
 fn merge_session_listener(
     trusted: &mut HarnessConfig,
@@ -1416,6 +1416,51 @@ fn merge_session_listener(
         present("onion_dir"),
         role,
         "session_listener.onion_dir",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_profile_sessions,
+        incoming.share_profile_sessions,
+        present("share_profile_sessions"),
+        role,
+        "session_listener.share_profile_sessions",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_tenant,
+        incoming.share_tenant,
+        present("share_tenant"),
+        role,
+        "session_listener.share_tenant",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_legacy_rows,
+        incoming.share_legacy_rows,
+        present("share_legacy_rows"),
+        role,
+        "session_listener.share_legacy_rows",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_since,
+        incoming.share_since,
+        present("share_since"),
+        role,
+        "session_listener.share_since",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_roots,
+        incoming.share_roots,
+        present("share_roots"),
+        role,
+        "session_listener.share_roots",
         layer_path,
         out,
     );
@@ -2993,6 +3038,63 @@ mod tests {
                 "{role:?}"
             );
             for field in ["session_listener.onion", "session_listener.onion_dir"] {
+                assert!(
+                    diagnostics.iter().any(|d| d.field == field),
+                    "{role:?} {field}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // [session_listener] share_*: Profil und nicht vertrautes Projekt können
+    // die Sitzungsfreigabe nicht ändern; jede Abweichung erzeugt eine Diagnose.
+    #[test]
+    fn test_session_listener_share_fields_reject_non_baseline_override() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        let home =
+            "[session_listener]\nshare_profile_sessions = \"read\"\nshare_tenant = \"tenant-test\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.session_listener.share_profile_sessions, "read");
+        let default_rows = trusted.session_listener.share_legacy_rows;
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack = "[session_listener]\nshare_profile_sessions = \"continue\"\nshare_tenant = \"tenant-other\"\nshare_roots = [\"/attack\"]\nshare_legacy_rows = 1\nshare_since = \"2020-01-01\"";
+            let diagnostics = merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(
+                trusted.session_listener.share_profile_sessions, "read",
+                "{role:?}"
+            );
+            assert_eq!(
+                trusted.session_listener.share_tenant.as_deref(),
+                Some("tenant-test"),
+                "{role:?}"
+            );
+            assert_eq!(
+                trusted.session_listener.share_legacy_rows, default_rows,
+                "{role:?}"
+            );
+            assert_eq!(trusted.session_listener.share_since, None, "{role:?}");
+            assert!(trusted.session_listener.share_roots.is_empty(), "{role:?}");
+            for field in [
+                "share_profile_sessions",
+                "share_tenant",
+                "share_legacy_rows",
+                "share_since",
+                "share_roots",
+            ] {
+                let field = format!("session_listener.{field}");
                 assert!(
                     diagnostics.iter().any(|d| d.field == field),
                     "{role:?} {field}"

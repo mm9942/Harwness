@@ -34,6 +34,7 @@ pub mod error;
 pub mod freeze;
 pub mod injection;
 pub mod job_store;
+pub mod lease;
 pub mod meta;
 pub mod reader;
 pub mod record;
@@ -55,7 +56,11 @@ pub use job_store::{
     JobEventSink, JobLifecycleEvent, JobListQuery, JobPage, JobStore, NoopJobEventSink,
     RenewalRequest, RetryRequest,
 };
-pub use meta::{SESSION_META_VERSION, SessionMeta, TitleSource};
+pub use lease::{
+    HolderKind, LEASE_EXT, LEASE_RETRY_WINDOW, LeaseHolder, SessionLease, TranscriptHead, head,
+    lease_path, peek_holder,
+};
+pub use meta::{LastOrigin, SESSION_META_VERSION, SessionMeta, TitleSource};
 pub use reader::TranscriptReader;
 pub use record::{RecordKind, TranscriptRecord};
 pub use store::TranscriptStore;

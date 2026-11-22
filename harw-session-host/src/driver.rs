@@ -260,6 +260,13 @@ pub trait TurnDriver: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Drop cached core state of an established session so the next turn
+    /// hydrates from the transcript again (head check, plan §3.5). Never
+    /// deletes the transcript and leaves no admission tombstone.
+    fn forget_session(&self, _session_id: &SessionId) -> Result<(), HostError> {
+        Ok(())
+    }
+
     /// Prepare durable state for a new session (transcript, meta).
     fn create_session(&self, session_id: &SessionId, title: Option<&str>) -> DriverFuture<'_, ()>;
 

@@ -18,8 +18,17 @@
 //! `tool.*` methods for agent principals, `gateway.*` methods for gateway
 //! inspection/administration and the caps `tool_call`, `gateway_read`,
 //! `gateway_admin`. There is still no generic operation execution (W00 D5).
+//!
+//! Wire minor 3 adds the `projects` feature: `session.projects`,
+//! `session.page`, `session.adopt`, `session.create_in`,
+//! `session.set_project`, `session.rename`, `session.archive`, the
+//! [`SessionFrame::Holder`] frame and the vocabulary types for them
+//! ([`ProjectSummary`], [`SessionRow`], [`ShareInfo`], ...). Minor 2 bytes
+//! are unchanged; `SessionSummary` is not touched.
 
-use harw_types::{ApprovalId, DeviceId, ReviewDecision, SessionId, TenantId, ToolCallId, TurnId};
+use harw_types::{
+    ApprovalId, DeviceId, PermissionTier, ReviewDecision, SessionId, TenantId, ToolCallId, TurnId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::approvals::ApprovalRequest;
@@ -32,7 +41,21 @@ use crate::items::{ResultTrust, ToolCallResult, ToolPlacement};
 /// - 1: W00 session control plane.
 /// - 2: R18 tool gateway (`tool.*`, `gateway.*`, caps `tool_call`,
 ///   `gateway_read`, `gateway_admin`).
-pub const SESSION_WIRE_MINOR: u32 = 2;
+/// - 3: projects (`session.projects`, `session.page`, ..., frame `holder`,
+///   feature `projects`).
+pub const SESSION_WIRE_MINOR: u32 = 3;
+
+/// First wire minor with feature `projects` and the project/page methods.
+pub const PROJECTS_WIRE_MINOR: u32 = 3;
+
+/// Default `limit` of `session.projects` and `session.page`.
+pub const DEFAULT_PAGE_LIMIT: u32 = 50;
+
+/// Upper bound for `limit` of `session.projects` and `session.page`.
+pub const MAX_PAGE_LIMIT: u32 = 200;
+
+/// Pseudo project key for sessions without a project ("Ohne Projekt").
+pub const NO_PROJECT_KEY: &str = "";
 
 /// First wire minor that knows the R18 caps and methods. A host masks the
 /// R18 caps out of every grant negotiated below this minor
@@ -62,6 +85,8 @@ pub mod features {
     pub const TOOLS: &str = "tools";
     /// The host serves the `gateway.*` methods (R18 D-B).
     pub const GATEWAY: &str = "gateway";
+    /// Projects and pages (`session.projects`, `session.page`, ...) and the `holder` frame. Minor >= 3.
+    pub const PROJECTS: &str = "projects";
 }
 
 /// Position in a session stream.
@@ -328,6 +353,224 @@ impl HostedState {
     }
 }
 
+/// Share mode of the gateway for TUI (profile) sessions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareMode {
+    #[default]
+    Off,
+    Read,
+    Continue,
+}
+
+impl ShareMode {
+    /// `"off" | "read" | "continue"`, otherwise `None`.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "off" => Some(Self::Off),
+            "read" => Some(Self::Read),
+            "continue" => Some(Self::Continue),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Read => "read",
+            Self::Continue => "continue",
+        }
+    }
+}
+
+/// Holder of a session lease as a client sees it. Never a pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HolderKind {
+    Tui,
+    Gateway,
+    Job,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Current lease holder of a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HolderInfo {
+    pub kind: HolderKind,
+    pub since: jiff::Timestamp,
+}
+
+/// Where the last turn of a session ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LastOrigin {
+    Tui,
+    Gateway,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Where a row of `session.page` comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowOrigin {
+    /// Has a host record.
+    Hosted,
+    /// Only in the profile store (TUI session without a record).
+    Profile,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a row cannot be continued. Clients translate it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOnlyReason {
+    /// The gateway shares read-only.
+    ShareReadOnly,
+    /// Origin is not a CLI session (web, run, gateway channel).
+    ForeignOrigin,
+    /// No valid working directory.
+    NoWorkdir,
+    /// The connection has no `steer` cap.
+    NoSteer,
+    /// The session is closed.
+    Closed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a client needs to know about sharing (tier badge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareInfo {
+    pub mode: ShareMode,
+    /// Effective tier: min(device tier, listener tier).
+    pub tier: PermissionTier,
+}
+
+/// One project in `session.projects`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    /// `""` = sessions without a project.
+    pub project_key: String,
+    pub label: String,
+    /// Only on basename collisions: shortened parent path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_hint: Option<String>,
+    pub session_count: u32,
+    pub last_activity: jiff::Timestamp,
+    pub active_count: u32,
+}
+
+/// One row in `session.page`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRow {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub updated_at: jiff::Timestamp,
+    /// Only when greater than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u64>,
+    pub state: HostedState,
+    pub attached: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub origin: RowOrigin,
+    pub continuable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ReadOnlyReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<HolderInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_origin: Option<LastOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<String>,
+}
+
+/// `session.projects`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectsParams {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Result of `session.projects`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectsResult {
+    pub projects: Vec<ProjectSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub share: ShareInfo,
+}
+
+/// `session.page`. `project_key`: `None` = all projects, `Some("")` = no project.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageParams {
+    #[serde(default)]
+    pub project_key: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub include_archived: bool,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Result of `session.page`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageResult {
+    pub sessions: Vec<SessionRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// `session.create_in`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateInParams {
+    pub project_key: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// `session.set_project`. `project_key = ""` removes the assignment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetProjectParams {
+    pub session_id: SessionId,
+    pub project_key: String,
+}
+
+/// `session.rename`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameParams {
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+/// `session.archive`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveParams {
+    pub session_id: SessionId,
+    pub archived: bool,
+}
+
 /// One attached client as other clients see it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -398,7 +641,12 @@ pub enum SessionFrame {
     Revoked,
     /// Keep-alive.
     Heartbeat,
-    /// A frame kind this client does not know (additive evolution).
+    /// Lease change of a session (feature `projects`). `holder: None` = free.
+    Holder {
+        session_id: SessionId,
+        holder: Option<HolderInfo>,
+    },
+    /// A frame kind this client does not know (additive evolution). Must stay last.
     Unknown,
 }
 
@@ -419,6 +667,7 @@ const KNOWN_FRAME_KINDS: &[&str] = &[
     "host_draining",
     "revoked",
     "heartbeat",
+    "holder",
     "unknown",
 ];
 
@@ -441,6 +690,7 @@ impl SessionFrame {
             Self::HostDraining { .. } => "host_draining",
             Self::Revoked => "revoked",
             Self::Heartbeat => "heartbeat",
+            Self::Holder { .. } => "holder",
             Self::Unknown => "unknown",
         }
     }
@@ -1055,6 +1305,130 @@ mod tests {
         let bare = r#"{"kind":"another_new_kind"}"#;
         let frame: SessionFrame = ctx(serde_json::from_str(bare), "decode bare unknown kind")?;
         assert!(matches!(frame, SessionFrame::Unknown));
+        Ok(())
+    }
+
+    #[test]
+    fn holder_frame_round_trips_and_old_clients_see_unknown() -> TestResult {
+        let since: jiff::Timestamp = ctx("2026-01-02T03:04:05Z".parse(), "timestamp")?;
+        let frame = SessionFrame::Holder {
+            session_id: sid("sess-a1")?,
+            holder: Some(HolderInfo {
+                kind: HolderKind::Tui,
+                since,
+            }),
+        };
+        let value = ctx(serde_json::to_value(&frame), "encode")?;
+        assert_eq!(value["kind"], "holder");
+        assert_eq!(value["data"]["session_id"], "sess-a1");
+        assert_eq!(value["data"]["holder"]["kind"], "tui");
+        let back: SessionFrame = ctx(serde_json::from_value(value), "decode")?;
+        assert_eq!(back.kind(), "holder");
+        assert!(!back.is_disposable());
+        let free = SessionFrame::Holder {
+            session_id: sid("sess-a1")?,
+            holder: None,
+        };
+        let back: SessionFrame = ctx(
+            serde_json::from_str(&ctx(serde_json::to_string(&free), "encode free")?),
+            "decode free",
+        )?;
+        assert!(matches!(back, SessionFrame::Holder { holder: None, .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn minor_three_constants() {
+        assert_eq!(SESSION_WIRE_MINOR, 3);
+        assert_eq!(PROJECTS_WIRE_MINOR, 3);
+        assert_eq!(features::PROJECTS, "projects");
+        const { assert!(DEFAULT_PAGE_LIMIT <= MAX_PAGE_LIMIT) };
+        assert_eq!(NO_PROJECT_KEY, "");
+    }
+
+    #[test]
+    fn share_mode_parse_and_default() {
+        assert_eq!(ShareMode::default(), ShareMode::Off);
+        for mode in [ShareMode::Off, ShareMode::Read, ShareMode::Continue] {
+            assert_eq!(ShareMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(ShareMode::parse("Read"), None);
+        assert_eq!(ShareMode::parse(""), None);
+    }
+
+    #[test]
+    fn unknown_enum_values_decode_to_unknown() -> TestResult {
+        let kind: HolderKind = ctx(serde_json::from_str("\"future\""), "holder kind")?;
+        assert_eq!(kind, HolderKind::Unknown);
+        let reason: ReadOnlyReason = ctx(serde_json::from_str("\"future\""), "reason")?;
+        assert_eq!(reason, ReadOnlyReason::Unknown);
+        let origin: RowOrigin = ctx(serde_json::from_str("\"future\""), "origin")?;
+        assert_eq!(origin, RowOrigin::Unknown);
+        let last: LastOrigin = ctx(serde_json::from_str("\"future\""), "last origin")?;
+        assert_eq!(last, LastOrigin::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn project_params_reject_unknown_fields_results_tolerate_them() -> TestResult {
+        assert!(serde_json::from_str::<PageParams>(r#"{"tenant":"x"}"#).is_err());
+        assert!(serde_json::from_str::<ProjectsParams>(r#"{"actor":"x"}"#).is_err());
+        assert!(serde_json::from_str::<CreateInParams>(r#"{"project_key":"p","uid":1}"#).is_err());
+        let page: PageParams = ctx(serde_json::from_str("{}"), "empty page params")?;
+        assert_eq!(page, PageParams::default());
+        let result: PageResult = ctx(
+            serde_json::from_str(r#"{"sessions":[],"added_later":true}"#),
+            "result with extra field",
+        )?;
+        assert!(result.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn session_row_omits_empty_options_and_round_trips() -> TestResult {
+        let at: jiff::Timestamp = ctx("2026-01-02T03:04:05Z".parse(), "timestamp")?;
+        let row = SessionRow {
+            session_id: sid("sess-a1")?,
+            title: None,
+            project_key: Some(NO_PROJECT_KEY.to_owned()),
+            updated_at: at,
+            turns: None,
+            state: HostedState::Idle,
+            attached: 0,
+            model: None,
+            origin: RowOrigin::Profile,
+            continuable: false,
+            reason: Some(ReadOnlyReason::ShareReadOnly),
+            holder: None,
+            last_origin: None,
+            first_message: None,
+        };
+        let value = ctx(serde_json::to_value(&row), "encode row")?;
+        for absent in [
+            "title",
+            "turns",
+            "model",
+            "holder",
+            "last_origin",
+            "first_message",
+        ] {
+            assert!(value.get(absent).is_none(), "{absent} must be omitted");
+        }
+        assert_eq!(value["reason"], "share_read_only");
+        let back: SessionRow = ctx(serde_json::from_value(value), "decode row")?;
+        assert_eq!(back, row);
+        Ok(())
+    }
+
+    #[test]
+    fn share_info_round_trips() -> TestResult {
+        let info = ShareInfo {
+            mode: ShareMode::Continue,
+            tier: PermissionTier::Operator,
+        };
+        let json = ctx(serde_json::to_string(&info), "encode share")?;
+        let back: ShareInfo = ctx(serde_json::from_str(&json), "decode share")?;
+        assert_eq!(back, info);
         Ok(())
     }
 

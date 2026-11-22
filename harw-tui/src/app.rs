@@ -13063,6 +13063,9 @@ mod tests {
             usage_rounds: 0,
             total_usage: harw_types::TokenUsage::default(),
             drift_events: std::collections::BTreeMap::new(),
+            archived: false,
+            last_origin: None,
+            last_activity_at: None,
         };
         harw_session_store::meta::save(root, &meta).map_err(ctx("save session meta sidecar"))?;
         Ok(())
