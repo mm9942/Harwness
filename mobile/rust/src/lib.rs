@@ -28,7 +28,7 @@ pub use models::{
     ModelProgress, ModelVerification, commit_import, delete_model, discard_import, finalize_model,
     import_model, local_models, model_catalog, model_path,
 };
-pub use provider::{ChatgptProviderCredential, ChatgptProviderStatus};
+pub use provider::{ChatgptLinkAvailability, ChatgptProviderCredential, ChatgptProviderStatus};
 pub use providers::ProviderStore;
 pub use secrets::{KeystoreError, KeystoreSecretResolver, PlatformKeystore};
 pub use types::*;

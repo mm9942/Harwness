@@ -342,6 +342,7 @@ private fun ChatgptAccountCard(
     }
 
     SetupCard(Icons.Outlined.AccountCircle, "ChatGPT account") {
+        val unavailable = account.unavailable
         val status = when (account.operation) {
             ChatgptOperation.Checking -> "Checking account on ${profile.label}…"
             ChatgptOperation.Browser -> "Complete sign-in and review access in your browser."
@@ -350,6 +351,7 @@ private fun ChatgptAccountCard(
             ChatgptOperation.Unlinking -> "Unlinking your account from ${profile.label}…"
             null -> when {
                 target == null -> "Connect to ${profile.label} to manage ChatGPT access."
+                unavailable != null -> unavailable
                 account.linked == true -> "Linked to ${profile.label}"
                 account.linked == false -> "Use your ChatGPT plan for eligible Harw requests on ${profile.label}."
                 else -> "Check whether ${profile.label} can link a ChatGPT account."
@@ -361,13 +363,13 @@ private fun ChatgptAccountCard(
             OutlinedButton(onClick = onCancel) { Text("Cancel sign-in") }
         } else if (target != null && account.operation == null) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (account.linked == false) {
+                if (account.canStartSignIn()) {
                     ContinueWithChatgpt { consent = target }
                 } else if (account.linked == true) {
                     OutlinedButton(onClick = { unlink = target }) { Text("Unlink account") }
                     TextButton(onClick = onManage) { Text("Manage usage") }
                 }
-                if (account.linked != false || account.error != null) {
+                if (account.linked != false || account.error != null || unavailable != null) {
                     TextButton(onClick = onCheck) { Text("Check account") }
                 }
             }
