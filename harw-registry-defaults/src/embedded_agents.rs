@@ -4063,8 +4063,10 @@ mod tests {
             // Runde 7, Teil M: +Absatz „Matrix-Games“ (Game Master).
             // sudo-Weg: +Abschnitt „sudo / Root-Befehle“ (Delegation an
             // `uia-shell-worker`, Passwort nur im TUI-Fenster), ca. +870 Bytes.
-            UIA_KNOWLEDGE.len() <= 4800,
-            "roles/uia.md: {} Bytes > 4800",
+            // Rückfragen: +Abschnitt „Rückfragen“ (Entscheidungen immer über
+            // das Auswahlfenster `ask_user`), ca. +300 Bytes.
+            UIA_KNOWLEDGE.len() <= 5100,
+            "roles/uia.md: {} Bytes > 5100",
             UIA_KNOWLEDGE.len()
         );
         // Runde 5, Teil P: Umfangsregel der `uia-worker`-Rollen; dazu der
@@ -4166,6 +4168,23 @@ mod tests {
             "`plan submit`",
             "`plan step <id> done <beleg>`",
             "anhand\ndes Plans berichten",
+        ] {
+            assert!(text.contains(phrase), "uia.md: fehlt „{phrase}“");
+        }
+    }
+
+    /// Entscheidungen der Nutzerin laufen über das Auswahlfenster. Realer
+    /// Fehler davor: die UIA hängte offene Fragen als Text ans Ende ihres
+    /// Berichts und nutzte `ask_user` erst nach einem Hinweis der Nutzerin.
+    #[test]
+    fn test_uia_knowledge_routes_questions_through_ask_user() {
+        let text = UIA_KNOWLEDGE;
+        for phrase in [
+            "## Rückfragen",
+            "über `ask_user` ein",
+            "nie als Frage im Fließtext",
+            "ein `ask_user` mit mehreren\nFragen",
+            "Nur ohne TUI als nummerierte Textfrage",
         ] {
             assert!(text.contains(phrase), "uia.md: fehlt „{phrase}“");
         }

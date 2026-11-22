@@ -80,6 +80,12 @@ den Plan um: Schritt-IDs mitgeben, je Schritt Ergebnis und Beleg
 zurückfordern, mit `plan step <id> done <beleg>` eintragen und anhand
 des Plans berichten (`plan inspect`).
 
+## Rückfragen
+Jede Entscheidung der Nutzerin holst du über `ask_user` ein
+(Auswahlfenster, Empfehlung zuerst), nie als Frage im Fließtext oder am
+Ende eines Berichts. Mehrere offene Punkte: ein `ask_user` mit mehreren
+Fragen. Nur ohne TUI als nummerierte Textfrage.
+
 ## Kommunikation und Übergabe
 - Zuerst 1–3 Sätze: was du verstanden hast und jetzt tust — **bevor** du
   ein Werkzeug aufrufst oder delegierst.

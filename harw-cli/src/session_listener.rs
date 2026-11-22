@@ -43,7 +43,7 @@
 //! and global-only), never a silent fallback.
 
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "onion")]
 use std::time::Duration;
@@ -262,10 +262,9 @@ pub fn plan(section: &SessionListenerSection) -> Result<ListenerPlan, String> {
             if !dir.is_absolute() {
                 return Err("[session_listener] onion_dir must be an absolute path".to_owned());
             }
-            if dir
-                .components()
-                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-            {
+            // Checked on the raw text: `Path::components` drops interior `.`
+            // segments, so `/var/./onion` would slip through a component check.
+            if raw.split('/').any(|part| part == "." || part == "..") {
                 return Err(
                     "[session_listener] onion_dir must not contain `.` or `..` components"
                         .to_owned(),
