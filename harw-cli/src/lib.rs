@@ -29,6 +29,7 @@
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod admin;
+mod onion_identity;
 mod agent_cmd;
 mod attach_cmd;
 mod auth;

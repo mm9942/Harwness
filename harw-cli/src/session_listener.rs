@@ -537,10 +537,21 @@ async fn start_onion(
             }
         }
     };
+    // Identität zurückspielen, falls der Zustandsordner fehlt; nach dem Start automatisch sichern.
+    match crate::onion_identity::restore_if_missing(dir) {
+        Ok(true) => eprintln!("  session onion  : Identität aus der Sicherung wiederhergestellt"),
+        Ok(false) => {}
+        Err(error) => eprintln!("  session onion  : Wiederherstellung fehlgeschlagen: {error}"),
+    }
     let server = OnionServer::launch(OnionServerConfig::new(state, cache), on_progress, handler)
         .await
         .map_err(|error| format!("[session_listener] onion: {error}"))?;
     write_locator(&dir.join(ONION_LOCATOR_FILE), server.locator())?;
+    match crate::onion_identity::backup_now(dir) {
+        Ok(true) => eprintln!("  session onion  : Identität gesichert ({})", crate::onion_identity::backup_dir(dir).display()),
+        Ok(false) => {}
+        Err(error) => eprintln!("  session onion  : Sicherung fehlgeschlagen: {error}"),
+    }
     let _ = ONION_LOCATOR.set(server.locator().to_string());
     if server.wait_reachable(ONION_REACHABLE_TIMEOUT).await {
         eprintln!("  session onion  : reachable");

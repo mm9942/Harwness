@@ -81,4 +81,11 @@ pub enum AdminAction {
     Status,
     /// Startet den Webdienst (nur Loopback, Adresse aus `[admin] listen`).
     Serve,
+    /// Rotiert die Onion-Identität bewusst: neue .onion-Adresse beim nächsten Gateway-Start.
+    /// Alle Geräte müssen danach einmal direkt neu verbunden werden. Ohne `--yes` passiert nichts.
+    OnionRotate {
+        /// Rotation tatsächlich ausführen.
+        #[arg(long)]
+        yes: bool,
+    },
 }

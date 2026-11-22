@@ -46,7 +46,28 @@ pub(crate) fn run(g: &GlobalArgs, action: AdminAction) -> Result<(), String> {
         AdminAction::Totp { disable } => totp_cmd(&home, &config, disable),
         AdminAction::Status => status(&home, &config),
         AdminAction::Serve => web::serve(&home, &config),
+        AdminAction::OnionRotate { yes } => onion_rotate(&home, &config, yes),
     }
+}
+
+fn onion_rotate(home: &Path, config: &ResolvedConfig, yes: bool) -> Result<(), String> {
+    let remote_dir = crate::session_serve_remote::remote_state_dir(home)?;
+    let state_dir = remote_dir.parent().map(Path::to_path_buf).unwrap_or(remote_dir);
+    let onion_dir = config
+        .harness
+        .session_listener
+        .onion_dir
+        .as_ref()
+        .map_or_else(|| state_dir.join(crate::session_listener::ONION_DIR), std::path::PathBuf::from);
+    if !yes {
+        println!("Das ändert die .onion-Adresse dauerhaft. Alle Geräte müssen danach einmal direkt neu verbunden werden.");
+        println!("Zum Ausführen: harw admin onion-rotate --yes   (Onion-Ordner: {})", onion_dir.display());
+        return Ok(());
+    }
+    let retired = crate::onion_identity::rotate(&onion_dir)?;
+    println!("Onion-Identität zurückgesetzt. Alter Schlüssel: {}", retired.display());
+    println!("Starte das Gateway neu (systemctl --user restart harw-gateway.service); die neue Adresse steht danach in {}/locator.", onion_dir.display());
+    Ok(())
 }
 
 fn load_config(home: &Path) -> Result<ResolvedConfig, String> {
