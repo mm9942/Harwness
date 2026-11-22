@@ -246,6 +246,7 @@ internal fun CloudModelsScreen(
     connection: HarwConnection,
     sessionId: String?,
     onBack: () -> Unit,
+    tabs: @Composable () -> Unit = {},
 ) {
     val manage = state.manage
     LaunchedEffect(state.online, state.generation) {
@@ -263,6 +264,7 @@ internal fun CloudModelsScreen(
             title = "Modelle & Provider",
             onBack = { if (view == CloudView.Overview) onBack() else view = CloudView.Overview },
         ) {}
+        tabs()
         val support = manage.support
         if (support != null && !support.manage) {
             StatusMessage(NO_MANAGE_TEXT, Modifier.padding(12.dp))

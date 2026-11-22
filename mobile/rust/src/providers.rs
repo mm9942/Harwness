@@ -29,6 +29,7 @@ pub const MAX_DISCOVERED_MODELS: usize = 2000;
 pub const MAX_SECRET_INPUT_BYTES: usize = 8 * 1024;
 
 const MAX_ID_LEN: usize = 32;
+const MAX_IMPORT_MODELS: usize = 200;
 const MAX_URL_LEN: usize = 512;
 const MAX_MODEL_LEN: usize = 256;
 const MAX_ROUTE_FILE_BYTES: u64 = 64 * 1024;
@@ -171,6 +172,59 @@ impl ProviderStore {
             validation.saved = true;
         }
         Ok(validation)
+    }
+
+    /// Stores a route copied from a catalog without a secret and without a
+    /// network check. Refuses to replace an existing route. `models` are kept
+    /// in order (the first is the default); the key is entered later.
+    pub fn import_route(
+        &self,
+        route: ProviderRoute,
+        models: Vec<String>,
+    ) -> Result<(), MobileError> {
+        let session = |detail: &str| MobileError::Session {
+            detail: detail.to_owned(),
+        };
+        let clean = clean_route(&route).map_err(|message| MobileError::Session { detail: message })?;
+        if models.len() > MAX_IMPORT_MODELS {
+            return Err(session("too many models to import"));
+        }
+        for model in &models {
+            check_model(model, false).map_err(|message| MobileError::Session { detail: message })?;
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let existing = self.read_all()?;
+        if existing.iter().any(|(stem, _)| *stem == clean.id) {
+            return Err(session("a provider route with this id already exists"));
+        }
+        if existing.len() >= MAX_ROUTES {
+            return Err(session("too many provider routes"));
+        }
+        let (text, _) = render_route(&clean, false).map_err(|message| MobileError::Session { detail: message })?;
+        let mut table: toml::Table =
+            toml::from_str(&text).map_err(|_| internal("the rendered provider route is invalid"))?;
+        let mut list: Vec<String> = Vec::new();
+        if !clean.model.is_empty() {
+            list.push(clean.model.clone());
+        }
+        for model in models {
+            if !list.contains(&model) {
+                list.push(model);
+            }
+        }
+        table.insert(
+            "models".to_owned(),
+            toml::Value::Array(list.into_iter().map(toml::Value::String).collect()),
+        );
+        let rendered = toml::to_string(&table)
+            .map_err(|_| internal("could not render the provider route file"))?;
+        toml::from_str::<ProviderToml>(&rendered)
+            .map_err(|_| internal("the rendered provider route is invalid"))?;
+        write_private_atomic(&self.route_path(&clean.id), rendered.as_bytes())?;
+        Ok(())
     }
 
     /// Re-checks a stored route against its endpoint. Persists nothing.

@@ -34,6 +34,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.foundation.text.KeyboardOptions
@@ -83,7 +84,12 @@ internal fun ProvidersScreen(
     onBack: () -> Unit,
     onOpenConnection: () -> Unit = {},
     onOpenLocalModels: () -> Unit = {},
+    tabs: @Composable () -> Unit = {},
+    importCard: (@Composable (List<ProviderRoute>, () -> Unit) -> Unit)? = null,
 ) {
+    val context = LocalContext.current
+    val scroll = rememberScrollState()
+    var imported by remember { mutableStateOf(readImportedRoutes(context)) }
     var mode by rememberSaveable { mutableStateOf(ProviderMode.Api) }
     var presetQuery by remember { mutableStateOf("") }
     var presetGroup by remember { mutableStateOf("Alle") }
@@ -120,6 +126,7 @@ internal fun ProvidersScreen(
             } catch (e: Exception) {
                 message = failureText(e)
             }
+            imported = readImportedRoutes(context)
             busy = false
         }
     }
@@ -138,7 +145,7 @@ internal fun ProvidersScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scroll)
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -148,13 +155,14 @@ internal fun ProvidersScreen(
                 }
                 Text("Provider", style = MaterialTheme.typography.titleLarge)
             }
+            tabs()
             message?.let { Text(friendlyProviderError(it), color = MaterialTheme.colorScheme.error) }
             Text(
                 "Wähle eine Verbindung. Cloud-Anfragen gehen an den gewählten Anbieter; lokale Modelle verarbeiten Text auf diesem Gerät.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ProviderMode.entries.forEach { m ->
+                ProviderMode.entries.filter { it != ProviderMode.Import || importCard != null }.forEach { m ->
                     FilterChip(selected = mode == m, onClick = { mode = m }, label = { Text(m.label) })
                 }
             }
@@ -164,6 +172,8 @@ internal fun ProvidersScreen(
                 CodexDirectCard(store, onOpenConnection)
             } else if (mode == ProviderMode.Claude) {
                 ClaudeDirectCard(store, onOpenConnection)
+            } else if (mode == ProviderMode.Import) {
+                importCard?.invoke(routes) { run {} }
             } else if (mode != ProviderMode.Api) {
                 ModeInfo(mode, onOpenConnection, onOpenLocalModels)
             }
@@ -184,6 +194,14 @@ internal fun ProvidersScreen(
                         if (route.defaultModel.isNotEmpty()) {
                             Text(route.defaultModel, style = MaterialTheme.typography.bodySmall)
                         }
+                        val fromCloud = route.id in imported
+                        if (fromCloud) {
+                            Text("aus Cloud importiert", style = MaterialTheme.typography.labelMedium)
+                        }
+                        val keyMissing = fromCloud && !route.hasSecret
+                        if (keyMissing) {
+                            Text("Schlüssel fehlt", color = MaterialTheme.colorScheme.error)
+                        }
                         if (route.active) {
                             Text("Aktiv", color = MaterialTheme.colorScheme.primary)
                         } else if (route.hasSecret) {
@@ -200,7 +218,28 @@ internal fun ProvidersScreen(
                                     }
                                 },
                             ) { Text("Prüfen") }
-                            if (route.defaultModel.isNotEmpty()) {
+                            if (keyMissing) {
+                                OutlinedButton(
+                                    enabled = !busy,
+                                    onClick = {
+                                        kind = route.kind
+                                        id = route.id
+                                        baseUrl = route.baseUrl
+                                        model = route.defaultModel
+                                        key = ""
+                                        presetId = null
+                                        scope.launch { scroll.animateScrollTo(scroll.maxValue) }
+                                    },
+                                ) { Text("Schlüssel eintragen") }
+                                if (route.kind == ProviderKind.OPEN_AI) {
+                                    OutlinedButton(onClick = { mode = ProviderMode.ChatGpt }) { Text("ChatGPT direkt") }
+                                    OutlinedButton(onClick = { mode = ProviderMode.Codex }) { Text("Codex") }
+                                }
+                                if (route.kind == ProviderKind.ANTHROPIC) {
+                                    OutlinedButton(onClick = { mode = ProviderMode.Claude }) { Text("Claude-Login") }
+                                }
+                            }
+                            if (route.defaultModel.isNotEmpty() && !keyMissing) {
                                 OutlinedButton(
                                     enabled = !busy,
                                     onClick = {
@@ -380,7 +419,10 @@ internal fun ProvidersScreen(
             confirmButton = {
                 TextButton(onClick = {
                     pendingDelete = null
-                    run { withContext(Dispatchers.IO) { store.deleteRoute(target.id) } }
+                    run {
+                        withContext(Dispatchers.IO) { store.deleteRoute(target.id) }
+                        removeImportedRoute(context, target.id)
+                    }
                 }) { Text("Löschen") }
             },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Abbrechen") } },
@@ -394,6 +436,7 @@ private enum class ProviderMode(val label: String) {
     Device("Auf diesem Gerät"),
     Codex("Codex"),
     Claude("Claude"),
+    Import("Aus Cloud importieren"),
 }
 
 @Composable
@@ -418,7 +461,7 @@ private fun ModeInfo(mode: ProviderMode, onOpenConnection: () -> Unit, onOpenLoc
                     )
                     Button(onClick = onOpenLocalModels) { Text("Lokale Modelle öffnen") }
                 }
-                ProviderMode.Codex, ProviderMode.Claude -> Unit
+                ProviderMode.Codex, ProviderMode.Claude, ProviderMode.Import -> Unit
                 ProviderMode.Api -> Unit
             }
         }

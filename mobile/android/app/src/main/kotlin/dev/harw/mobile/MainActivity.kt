@@ -225,7 +225,7 @@ internal open class MainActivity : ComponentActivity() {
         // Verwalten ist eine Server-Funktion: Hub, Modelle und Befehle sprechen immer mit der Cloud,
         // auch wenn gerade die Lokal-Ansicht offen ist (der On-Device-Host kennt weder Verwaltung noch Projekte).
         val manageRoute = settingsRoute == SettingsRoute.Hub || settingsRoute == SettingsRoute.Models ||
-            settingsRoute == SettingsRoute.Commands
+            settingsRoute == SettingsRoute.Providers || settingsRoute == SettingsRoute.Commands
         val manageConnection = if (manageRoute) cloud else connection
         val manageState = if (manageRoute) cloudState else state
         // Step-up-Host: immer ueber allen Zweigen, auch im Hub. Nichts davon ueberlebt Prozesstod.
@@ -267,13 +267,29 @@ internal open class MainActivity : ComponentActivity() {
                 onOpen = ::openSettings,
             )
         } else if (settingsRoute == SettingsRoute.Models) {
-            CloudModelsScreen(manageState, manageConnection, if (manageConnection === connection) sessionId else null, onBack = { openSettings(SettingsRoute.Hub) })
+            val providerStore = remember {
+                uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
+            }
+            ModelsAndProviders(
+                initialTab = ModelsTab.Cloud,
+                cloudState = manageState,
+                cloudConnection = manageConnection,
+                cloudSessionId = if (manageConnection === connection) sessionId else null,
+                providerStore = providerStore,
+                onBack = { openSettings(SettingsRoute.Hub) },
+                onOpenConnection = { openSettings(SettingsRoute.Connection) },
+                onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
+            )
         } else if (settingsRoute == SettingsRoute.Providers) {
             val providerStore = remember {
                 uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
             }
-            ProvidersScreen(
-                providerStore,
+            ModelsAndProviders(
+                initialTab = ModelsTab.Local,
+                cloudState = manageState,
+                cloudConnection = manageConnection,
+                cloudSessionId = if (manageConnection === connection) sessionId else null,
+                providerStore = providerStore,
                 onBack = { openSettings(SettingsRoute.Hub) },
                 onOpenConnection = { openSettings(SettingsRoute.Connection) },
                 onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
