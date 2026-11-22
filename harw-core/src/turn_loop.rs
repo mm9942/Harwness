@@ -16704,7 +16704,7 @@ mod tests {
                 TurnItem::ToolResult(result) => Some(format!("{:?}", result.result)),
                 _ => None,
             })
-            .ok_or_else(|| TestError::from(CoreError::ToolFailed("no tool result".to_owned())))
+            .ok_or_else(|| TestError::Unexpected("no tool result".to_owned()))
     }
 
     fn last_user_text(session: &AgentSession) -> Option<String> {
