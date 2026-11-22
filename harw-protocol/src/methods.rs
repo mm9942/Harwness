@@ -33,6 +33,9 @@ pub const METHOD_GATEWAY_LISTENERS_SET: &str = "gateway.listeners.set";
 pub const METHOD_GATEWAY_TOOLS_GRANT: &str = "gateway.tools.grant";
 pub const METHOD_GATEWAY_TOOLS_NARROW: &str = "gateway.tools.narrow";
 
+// Feature `media`.
+pub const METHOD_MEDIA_GET: &str = "media.get";
+
 pub const METHOD_SESSION_PROJECTS: &str = "session.projects";
 pub const METHOD_SESSION_PAGE: &str = "session.page";
 pub const METHOD_SESSION_ADOPT: &str = "session.adopt";
@@ -89,6 +92,9 @@ pub const PROJECT_METHODS: &[&str] = &[
     METHOD_SESSION_ARCHIVE,
 ];
 
+/// Feature `media`: stored prompt images. Own table.
+pub const MEDIA_METHODS: &[&str] = &[METHOD_MEDIA_GET];
+
 /// Minor 4, feature `manage`: typed, allow-listed operation execution (W00 D5
 /// amendment). Own table.
 pub const MANAGE_METHODS: &[&str] = &[
@@ -139,6 +145,7 @@ mod tests {
         let mut all: Vec<&str> = SESSION_METHODS
             .iter()
             .chain(PROJECT_METHODS)
+            .chain(MEDIA_METHODS)
             .chain(MANAGE_METHODS)
             .chain(STEPUP_METHODS)
             .chain(TOOL_METHODS)

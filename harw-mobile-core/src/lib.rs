@@ -88,6 +88,8 @@ pub struct Entry {
     key: String,
     /// What it shows.
     pub kind: EntryKind,
+    /// Stored images of a user message (from `ContentPart::Media`), in order.
+    pub media: Vec<harw_protocol::MediaRef>,
 }
 
 impl Entry {
@@ -222,8 +224,19 @@ impl SessionView {
 
     /// Add the chat entry of `item` unless one with its key exists.
     fn item(&mut self, item: &TurnItem) {
+        let mut media = Vec::new();
         let (key, kind) = match item {
-            TurnItem::UserMessage(m) => (m.id.as_str(), EntryKind::User(text_of(&m.content))),
+            TurnItem::UserMessage(m) => {
+                media = m
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Media { media, .. } => Some(media.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (m.id.as_str(), EntryKind::User(text_of(&m.content)))
+            }
             TurnItem::AssistantMessage(m) => {
                 // The full message replaces the partial text shown so far.
                 self.live = None;
@@ -245,6 +258,7 @@ impl SessionView {
         self.transcript.push(Entry {
             key: key.to_owned(),
             kind,
+            media,
         });
         if self.transcript.len() > KEEP_TRANSCRIPT {
             self.transcript.remove(0);

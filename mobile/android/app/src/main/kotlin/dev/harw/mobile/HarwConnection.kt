@@ -1483,6 +1483,31 @@ internal class HarwConnection(private val context: Context, private val localBac
             result(outcome)
         }
 
+    /** Holt ein gespeichertes Prompt-Bild vom Host (Feature `media`); `null` bei jedem Fehler. */
+    suspend fun mediaThumbnail(sessionId: String, imageRef: String): uniffi.harw_mobile_ffi.PromptImage? {
+        val native = core ?: return null
+        return withContext(Dispatchers.IO) {
+            try {
+                native.mediaThumbnail(sessionId, imageRef)
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    /** Setzt eine durch Neustart unterbrochene Session fort; `true` bei Erfolg. */
+    suspend fun resumeSession(sessionId: String): Boolean {
+        val native = core ?: return false
+        return withContext(Dispatchers.IO) {
+            try {
+                native.resumeSession(sessionId)
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
     /** Nimmt der aktive Host Bilder am Prompt an (Feature `images`)? */
     suspend fun supportsImages(): Boolean {
         val native = core ?: return false

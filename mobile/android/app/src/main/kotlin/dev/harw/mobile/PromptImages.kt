@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -22,6 +23,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -116,29 +120,110 @@ internal fun splitImagePlaceholders(text: String): Pair<String, Int> {
 /** Vergleichsschluessel fuer gesendeten Text; ein reiner Bild-Prompt wird als "(Bild)" gesendet. */
 internal fun sentTextKey(text: String): String = text.trim().let { if (it == "(Bild)") "" else it }
 
-/** Kleine Vorschauen gesendeter Bilder; ohne lokale Kopie (Verlauf vom Server) je ein "Bild"-Chip. */
+/** Zwischenspeicher fuer vom Host geholte Vorschaubilder (Schluessel: Bildreferenz). */
+private object ThumbCache {
+    val cache = object : android.util.LruCache<String, Bitmap>(24 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap) = value.byteCount
+    }
+}
+
+private fun decodeThumb(image: PromptImage, targetPx: Int): Bitmap? = try {
+    val bytes = Base64.decode(image.dataB64, Base64.DEFAULT)
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    var sample = 1
+    while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= targetPx) sample *= 2
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
+} catch (_: Exception) {
+    null
+}
+
+/**
+ * Kleine Vorschauen gesendeter Bilder. Vorrang hat die lokale Kopie; sonst werden die Bilder ueber [fetch]
+ * vom Host geholt und zwischengespeichert. Nur wenn das nicht klappt (oder ohne Referenz), erscheint ein "Bild"-Chip.
+ */
 @Composable
-internal fun ImageStrip(count: Int, thumbs: List<PromptImage>?) {
+internal fun ImageStrip(
+    count: Int,
+    thumbs: List<PromptImage>?,
+    refs: List<String> = emptyList(),
+    fetch: (suspend (String) -> PromptImage?)? = null,
+) {
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (thumbs != null && thumbs.size == count) {
             thumbs.forEach { Thumbnail(it) }
+        } else if (fetch != null && refs.isNotEmpty()) {
+            refs.forEach { RemoteThumbnail(it, fetch) }
         } else {
-            repeat(count) {
-                Surface(
-                    shape = RoundedCornerShape(50),
-                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
-                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                ) {
-                    Row(
-                        Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    ) {
-                        Icon(Icons.Outlined.Image, contentDescription = null, Modifier.size(16.dp))
-                        Text("Bild", style = MaterialTheme.typography.labelMedium)
-                    }
-                }
+            repeat(count) { ImageChip() }
+        }
+    }
+}
+
+@Composable
+private fun RemoteThumbnail(ref: String, fetch: suspend (String) -> PromptImage?) {
+    var failed by remember(ref) { mutableStateOf(false) }
+    val bitmap by produceState<ImageBitmap?>(ThumbCache.cache.get(ref)?.asImageBitmap(), ref) {
+        if (value != null) return@produceState
+        val decoded = withContext(Dispatchers.IO) { fetch(ref)?.let { decodeThumb(it, 288) } }
+        if (decoded != null) {
+            ThumbCache.cache.put(ref, decoded)
+            value = decoded.asImageBitmap()
+        } else {
+            failed = true
+        }
+    }
+    val shown = bitmap
+    val shape = RoundedCornerShape(10.dp)
+    when {
+        shown != null -> Image(shown, contentDescription = "Gesendetes Bild", contentScale = ContentScale.Crop, modifier = Modifier.size(72.dp).clip(shape))
+        failed -> ImageChip()
+        else -> Box(Modifier.size(72.dp).clip(shape).background(MaterialTheme.colorScheme.surfaceContainerHighest))
+    }
+}
+
+/** Entwurfsbild als kleine Vorschau mit Entfernen-Knopf (x). */
+@Composable
+internal fun DraftThumbnail(image: DraftImage, enabled: Boolean, onRemove: () -> Unit) {
+    val bitmap by produceState<ImageBitmap?>(null, image.image.dataB64) {
+        value = withContext(Dispatchers.Default) { decodeThumb(image.image, 192)?.asImageBitmap() }
+    }
+    val shape = RoundedCornerShape(10.dp)
+    Box(Modifier.size(72.dp)) {
+        val shown = bitmap
+        if (shown != null) {
+            Image(shown, contentDescription = image.label, contentScale = ContentScale.Crop, modifier = Modifier.matchParentSize().clip(shape))
+        } else {
+            Box(Modifier.matchParentSize().clip(shape).background(MaterialTheme.colorScheme.surfaceContainerHighest))
+        }
+        Surface(
+            onClick = onRemove,
+            enabled = enabled,
+            shape = RoundedCornerShape(50),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+            modifier = Modifier.align(Alignment.TopEnd).padding(3.dp).size(22.dp),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(Icons.Outlined.Close, contentDescription = "${image.label} entfernen", Modifier.size(14.dp))
             }
+        }
+    }
+}
+
+@Composable
+private fun ImageChip() {
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    ) {
+        Row(
+            Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Icon(Icons.Outlined.Image, contentDescription = null, Modifier.size(16.dp))
+            Text("Bild", style = MaterialTheme.typography.labelMedium)
         }
     }
 }

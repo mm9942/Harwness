@@ -5397,10 +5397,12 @@ dependencies = [
 name = "harw-session-host"
 version = "0.10.0"
 dependencies = [
+ "base64 0.23.1",
  "fs4",
  "getrandom 0.4.3",
  "harw-authority",
  "harw-fsutil",
+ "harw-media",
  "harw-protocol",
  "harw-sandbox",
  "harw-session-store",

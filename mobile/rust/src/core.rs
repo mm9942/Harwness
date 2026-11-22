@@ -8,8 +8,8 @@ use harw_node_transport::{LocalNode, NodeBody, empty_body};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams,
     Cursor, DEFAULT_TAIL_ITEMS, HolderInfo, InterruptParams, PageParams, ProjectsParams,
-    RenameParams, RespondResult, SessionFrame, SetModelParams, SetProjectParams, StreamProfile, SubmitImage,
-    SubmitParams, SubmitResult, features,
+    MediaGetParams, RenameParams, RespondResult, SessionFrame, SetModelParams, SetProjectParams, StreamProfile, SubmitImage,
+    SubmitParams, SubmitResult, HostedState, features,
 };
 use harw_protocol::{PortError, PortFuture, SessionPort};
 use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError};
@@ -881,6 +881,67 @@ impl MobileCore {
         })
     }
 
+    /// Setzt eine durch einen Host-Neustart unterbrochene Session fort (`session.resume`) und laedt den Verlauf neu.
+    pub fn resume_session(&self, session_id: String) -> Result<(), MobileError> {
+        let id = parse_session_id(session_id)?;
+        let shared = Arc::clone(&self.shared);
+        self.run(async move {
+            let link = shared.state().active()?;
+            link.request(link.backend.port().resume(id.clone())).await?;
+            let mut state = shared.state();
+            if state.same_link(&link)
+                && let Ok(session) = state.session_mut(&id)
+            {
+                session.mark_resumed();
+                shared.notifier.session(id.as_str());
+            }
+            Ok(())
+        })
+    }
+
+    /// Ob der aktive Host gespeicherte Prompt-Bilder ausliefert (Feature `media`). Ohne Verbindung `false`.
+    pub fn supports_media(&self) -> bool {
+        self.shared.state().active().is_ok_and(|link| {
+            link.backend
+                .features()
+                .iter()
+                .any(|f| f == features::MEDIA)
+        })
+    }
+
+    /// Holt ein gespeichertes Prompt-Bild (`image_ref` aus `TranscriptEntry.images`) vom Host.
+    /// Die Bytes sind das gespeicherte Bild; die App verkleinert beim Dekodieren.
+    pub fn media_thumbnail(
+        &self,
+        session_id: String,
+        image_ref: String,
+    ) -> Result<PromptImage, MobileError> {
+        let id = parse_session_id(session_id)?;
+        let media: harw_protocol::MediaRef =
+            serde_json::from_str(&image_ref).map_err(|_| MobileError::Denied {
+                detail: "Ungueltige Bildreferenz".into(),
+            })?;
+        if !self.supports_media() {
+            return Err(MobileError::Denied {
+                detail: "Dieser Host liefert keine Bilder aus".into(),
+            });
+        }
+        let shared = Arc::clone(&self.shared);
+        self.run(async move {
+            let link = shared.state().active()?;
+            let result = link
+                .request(link.backend.port().media_get(MediaGetParams {
+                    session_id: id,
+                    media,
+                }))
+                .await?;
+            Ok(PromptImage {
+                mime: result.mime,
+                data_b64: result.data_b64,
+            })
+        })
+    }
+
     pub fn interrupt(&self, session_id: String, turn_id: String) -> Result<(), MobileError> {
         let id = parse_session_id(session_id)?;
         let turn_id =
@@ -1702,6 +1763,7 @@ fn requested_features() -> Vec<String> {
         features::MANAGE,
         features::STEPUP,
         features::IMAGES,
+        features::MEDIA,
     ]
     .iter()
     .map(|feature| (*feature).to_owned())
@@ -1859,6 +1921,17 @@ async fn drive_attachment(
         };
         drop(permit);
         ack.granted = ack.granted.intersect(link.backend.granted());
+        // A host restart leaves sessions `Interrupted`; the app is not read-only
+        // for that, so resume them right away (needs steer) and show them idle.
+        if ack.session.state == HostedState::Interrupted
+            && ack.granted.steer
+            && link
+                .request(link.backend.port().resume(id.clone()))
+                .await
+                .is_ok()
+        {
+            ack.session.state = HostedState::Idle;
+        }
         if with_session(&shared, &id, &link, |session| {
             session.attached(&ack, from.is_none())
         })
@@ -2025,16 +2098,26 @@ async fn submit(
         );
         (link, head, state.profile_epoch)
     };
-    let result = link
-        .request(link.backend.port().submit(SubmitParams {
-            session_id: id.clone(),
-            text: text.clone(),
-            expect_head: head,
-            client_msg_id: client_message_id.clone(),
-            force: false,
-            images,
-        }))
+    let params = SubmitParams {
+        session_id: id.clone(),
+        text: text.clone(),
+        expect_head: head,
+        client_msg_id: client_message_id.clone(),
+        force: false,
+        images,
+    };
+    let mut result = link
+        .request(link.backend.port().submit(params.clone()))
         .await;
+    // A host restart left the session interrupted: resume it and send once more.
+    if matches!(&result, Ok(SubmitResult::Denied { reason }) if reason.contains("session.resume"))
+        && link
+            .request(link.backend.port().resume(id.clone()))
+            .await
+            .is_ok()
+    {
+        result = link.request(link.backend.port().submit(params)).await;
+    }
     let result = match result {
         Ok(SubmitResult::Accepted { position }) => Ok(SubmitReceipt {
             position: Some(position),

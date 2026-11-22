@@ -327,7 +327,11 @@ internal fun SessionConversation(
                     }
                 }
             }
-            HolderBanner(access, holder, Modifier.padding(horizontal = 15.dp, vertical = 4.dp))
+            val scope = rememberCoroutineScope()
+            HolderBanner(
+                access, holder, Modifier.padding(horizontal = 15.dp, vertical = 4.dp),
+                onResume = { scope.launch { connection.resumeSession(sessionId) } },
+            )
             if (approvals.isNotEmpty()) {
                 ApprovalStrip(
                     approvals.size,
@@ -353,6 +357,7 @@ internal fun SessionConversation(
             ConversationFeed(
                 entries = snapshot?.transcript.orEmpty(),
                 sentImages = { text, count -> window.sentImages(sessionId, text, count) },
+                fetchMedia = { ref -> connection.mediaThumbnail(sessionId, ref) },
                 liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
                 jumpToLatest = transcriptJump,
                 emptyMessage = when {
@@ -402,6 +407,7 @@ internal fun SessionConversation(
 private fun ConversationFeed(
     entries: List<TranscriptEntry>,
     sentImages: (String, Int) -> List<uniffi.harw_mobile_ffi.PromptImage>?,
+    fetchMedia: suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?,
     liveText: String?,
     jumpToLatest: Int,
     emptyMessage: String,
@@ -447,7 +453,10 @@ private fun ConversationFeed(
             if (entry.kind == TranscriptKind.USER) {
                 val (clean, count) = splitImagePlaceholders(entry.text)
                 if (count > 0) {
-                    MessageBlock(label, clean, entry.kind, imageCount = count, thumbs = sentImages(clean, count))
+                    MessageBlock(
+                        label, clean, entry.kind, imageCount = count, thumbs = sentImages(clean, count),
+                        imageRefs = entry.images, fetchMedia = fetchMedia,
+                    )
                     return@items
                 }
             }
@@ -463,6 +472,8 @@ private fun MessageBlock(
     kind: TranscriptKind,
     imageCount: Int = 0,
     thumbs: List<uniffi.harw_mobile_ffi.PromptImage>? = null,
+    imageRefs: List<String> = emptyList(),
+    fetchMedia: (suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?)? = null,
 ) {
     val colors = MaterialTheme.colorScheme
     val user = kind == TranscriptKind.USER
@@ -482,7 +493,7 @@ private fun MessageBlock(
         ) {
             Column(Modifier.padding(horizontal = 13.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                if (imageCount > 0) ImageStrip(imageCount, thumbs)
+                if (imageCount > 0) ImageStrip(imageCount, thumbs, imageRefs, fetchMedia)
                 if (imageCount == 0 || text.isNotBlank()) SelectionContainer {
                     if (rendersMarkdown(kind)) {
                         // MarkdownText (A8) behandelt Code-Blöcke, Listen, Links und Kopieren selbst.
@@ -561,7 +572,7 @@ internal fun holderBannerText(access: ConversationAccess, holder: MobileHolder?)
 internal fun rendersMarkdown(kind: TranscriptKind): Boolean = kind == TranscriptKind.ASSISTANT
 
 @Composable
-private fun HolderBanner(access: ConversationAccess, holder: MobileHolder?, modifier: Modifier) {
+private fun HolderBanner(access: ConversationAccess, holder: MobileHolder?, modifier: Modifier, onResume: () -> Unit) {
     val text = holderBannerText(access, holder) ?: return
     val badge = holderBadge(holder)
     Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -575,6 +586,9 @@ private fun HolderBanner(access: ConversationAccess, holder: MobileHolder?, modi
             }
         }
         StatusMessage(text)
+        if (access == ConversationAccess.ReadOnly) {
+            OutlinedButton(onClick = onResume) { Text("Fortsetzen") }
+        }
     }
 }
 
@@ -622,14 +636,9 @@ internal fun PromptComposer(
             }
         }
         if (draft.images.isNotEmpty()) {
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 draft.images.forEachIndexed { index, image ->
-                    InputChip(
-                        selected = false,
-                        enabled = enabled && !draft.uncertain,
-                        onClick = { onDetachImage(index) },
-                        label = { Text("${image.label} (${image.bytes / 1024} KB) entfernen") },
-                    )
+                    DraftThumbnail(image, enabled = enabled && !draft.uncertain) { onDetachImage(index) }
                 }
             }
         }

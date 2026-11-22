@@ -7,7 +7,7 @@
 
 use harw_protocol::methods::{
     METHOD_APPROVAL_RESP, METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST,
-    METHOD_CONFIG_GET, METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT,
+    METHOD_CONFIG_GET, METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_MEDIA_GET, METHOD_SECRET_PUT,
     METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_ATTACH, METHOD_SESSION_CLOSE,
     METHOD_SESSION_CREATE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_DETACH, METHOD_SESSION_HISTORY,
     METHOD_SESSION_LIST, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS, METHOD_SESSION_RENAME,
@@ -20,7 +20,7 @@ use harw_protocol::session_wire::{
     CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams,
     ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams, CreateParams,
     FrameEnvelope, HelloAck, HelloParams, HistoryParams, HistoryResult, InterruptParams,
-    ListResult, PageParams, PageResult, ProjectsParams, ProjectsResult, RenameParams,
+    ListResult, MediaGetParams, MediaGetResult, PageParams, PageResult, ProjectsParams, ProjectsResult, RenameParams,
     RespondResult, SecretPutParams, SecretPutResult, SessionRef, SessionRow, SessionSummary,
     SetEffortParams, SetModeParams, SetModelParams, SetProjectParams, StepUpCancelParams,
     StepUpConfirmParams, SubmitParams, SubmitResult,
@@ -209,6 +209,14 @@ impl SessionPort for RemotePort {
         Box::pin(async move {
             self.connection
                 .call(METHOD_SESSION_PROJECTS, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn media_get(&self, params: MediaGetParams) -> PortFuture<'_, MediaGetResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_MEDIA_GET, &params, Effect::None)
                 .await
         })
     }

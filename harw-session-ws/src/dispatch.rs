@@ -36,8 +36,8 @@ use harw_protocol::methods::{
 };
 use harw_protocol::methods::{
     METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
-    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
-    METHOD_STEPUP_CONFIRM,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_MEDIA_GET, METHOD_SECRET_PUT,
+    METHOD_STEPUP_CANCEL, METHOD_STEPUP_CONFIRM,
 };
 use harw_protocol::methods::{
     METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE,
@@ -51,7 +51,7 @@ use harw_protocol::session_wire::{
     error_codes,
 };
 use harw_protocol::session_wire::{
-    ArchiveParams, CreateInParams, PageParams, ProjectsParams, RenameParams, SetProjectParams,
+    ArchiveParams, CreateInParams, MediaGetParams, PageParams, ProjectsParams, RenameParams, SetProjectParams,
 };
 use harw_protocol::session_wire::{
     CatalogGetParams, CommandRunParams, CommandsListParams, ConfigGetParams, ConfigResetParams,
@@ -385,6 +385,10 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
         },
         METHOD_SESSION_PROJECTS => match decode::<ProjectsParams>(&id, null_to_object(params)) {
             Ok(params) => encode(id, port.projects(params).await),
+            Err(response) => *response,
+        },
+        METHOD_MEDIA_GET => match decode::<MediaGetParams>(&id, params) {
+            Ok(params) => encode(id, port.media_get(params).await),
             Err(response) => *response,
         },
         METHOD_SESSION_PAGE => match decode::<PageParams>(&id, null_to_object(params)) {

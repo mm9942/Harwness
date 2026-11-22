@@ -38,6 +38,8 @@ pub(crate) struct SessionState {
     last_sync_millis: Option<i64>,
     detail: Option<String>,
     server_error: Option<String>,
+    /// The host restart interrupted the last turn (shown as a short hint, not as an error).
+    restart_hint: bool,
     pub worker: Option<SessionWorker>,
 }
 
@@ -332,6 +334,7 @@ impl SessionState {
             SessionFrame::Turn(TurnEvent::TurnStarted { turn_id, .. }) => {
                 self.running_turn = Some(turn_id.clone());
                 self.server_error = None;
+                self.restart_hint = false;
                 if self
                     .partial
                     .as_ref()
@@ -359,6 +362,11 @@ impl SessionState {
                 self.closed = true;
                 self.running_turn = None;
                 return FrameAction::Closed;
+            }
+            SessionFrame::Session(SessionEvent::SessionError { message, .. })
+                if message.starts_with("session was interrupted by a host restart") =>
+            {
+                self.restart_hint = true;
             }
             SessionFrame::Session(SessionEvent::SessionError { message, .. })
             | SessionFrame::Session(SessionEvent::SessionFailed {
@@ -593,6 +601,12 @@ impl SessionState {
         }
     }
 
+    /// The session was resumed after a host restart: writable again.
+    pub fn mark_resumed(&mut self) {
+        self.readonly = false;
+        self.restart_hint = true;
+    }
+
     pub fn running_turn_id(&self) -> Option<&TurnId> {
         self.running_turn.as_ref()
     }
@@ -688,7 +702,12 @@ impl SessionState {
                 .clone()
                 .or_else(|| self.view.last_failure().map(str::to_owned)),
             last_sync_millis: self.last_sync_millis,
-            detail: self.detail.clone(),
+            detail: self.detail.clone().or_else(|| {
+                self.restart_hint.then(|| {
+                    "Unterbrochen durch Neustart – die letzte Antwort fehlt, du kannst weiterschreiben"
+                        .to_owned()
+                })
+            }),
             agents: self.mission.agents(),
             jobs: self.mission.jobs(),
             reasoning: self.mission.reasoning(),
@@ -766,6 +785,11 @@ fn project_entry(entry: &harw_mobile_core::Entry) -> TranscriptEntry {
         kind,
         text: text.clone(),
         tool_state,
+        images: entry
+            .media
+            .iter()
+            .filter_map(|media| serde_json::to_string(media).ok())
+            .collect(),
     }
 }
 

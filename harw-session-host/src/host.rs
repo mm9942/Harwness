@@ -44,7 +44,7 @@ use harw_protocol::session_wire::{
     GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams, GatewayListenersResult,
     GatewayRevokeParams, GatewayRevokeResult, GatewayStatus, GatewayToolRights,
     GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams, HistoryParams, HolderInfo,
-    InterruptParams, MANAGE_WIRE_MINOR, MAX_PAGE_LIMIT, NO_PROJECT_KEY, PROJECTS_WIRE_MINOR,
+    InterruptParams, MANAGE_WIRE_MINOR, MAX_MEDIA_GET_BYTES, MediaGetParams, MediaGetResult, MAX_PAGE_LIMIT, NO_PROJECT_KEY, PROJECTS_WIRE_MINOR,
     PageParams, PageResult, PrincipalSummary, ProjectsParams, ProjectsResult, ReadOnlyReason,
     RenameParams, RespondResult, RowOrigin, SESSION_WIRE_MINOR, SecretPutParams, SecretPutResult,
     SessionRow, SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SetProjectParams,
@@ -133,6 +133,7 @@ const HOST_FEATURES: &[&str] = &[
     features::MANAGE,
     features::STEPUP,
     features::IMAGES,
+    features::MEDIA,
 ];
 
 /// Features that exist only from [`TOOL_GATEWAY_WIRE_MINOR`] on.
@@ -2455,6 +2456,23 @@ impl HostConnection {
         self.host.publish_record(record)
     }
 
+    /// `media.get`: observe + tenant admission like `history`, then the
+    /// stored bytes from the process media source (the store the driver
+    /// installed). Content-addressed: the digest is the capability.
+    fn media_get_sync(&self, params: &MediaGetParams) -> Result<MediaGetResult, HostError> {
+        use base64::Engine as _;
+        self.observed_slot(&params.session_id)?;
+        if params.media.bytes() > MAX_MEDIA_GET_BYTES {
+            return Err(HostError::Protocol("image too large for media.get".into()));
+        }
+        let bytes = harw_media::load_installed_media(&params.media)
+            .map_err(|error| HostError::Protocol(format!("media not available: {error}")))?;
+        Ok(MediaGetResult {
+            mime: params.media.format().mime().to_owned(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+
     fn projects_sync(&self, params: &ProjectsParams) -> Result<ProjectsResult, HostError> {
         let granted = self.granted()?;
         Need::Observe.require(granted)?;
@@ -3541,6 +3559,10 @@ impl SessionPort for HostConnection {
 
     fn projects(&self, params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
         port(self.projects_sync(&params))
+    }
+
+    fn media_get(&self, params: MediaGetParams) -> PortFuture<'_, MediaGetResult> {
+        port(self.media_get_sync(&params))
     }
 
     fn page(&self, params: PageParams) -> PortFuture<'_, PageResult> {

@@ -117,6 +117,8 @@ pub mod features {
     pub const STEPUP: &str = "stepup";
     /// `turn.submit` honours [`super::SubmitParams::images`]. A client sends images only when the host granted this feature (an older host rejects the unknown field).
     pub const IMAGES: &str = "images";
+    /// The host serves `media.get`: the stored bytes of a prompt image of a session the caller may observe. A client calls it only when the host granted this feature.
+    pub const MEDIA: &str = "media";
 }
 
 /// Position in a session stream.
@@ -918,6 +920,28 @@ pub struct SubmitParams {
     /// Images attached to the prompt (feature `images`). Empty = none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<SubmitImage>,
+}
+
+/// Largest image (stored bytes) `media.get` returns; bigger ones are refused so the answer fits the 1 MiB transport message.
+pub const MAX_MEDIA_GET_BYTES: u64 = 512 * 1024;
+
+/// `media.get`: the stored bytes of one image a transcript item of the session references.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaGetParams {
+    pub session_id: SessionId,
+    /// The reference as carried by the transcript item.
+    pub media: crate::media::MediaRef,
+}
+
+/// Result of `media.get`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaGetResult {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    /// Standard base64 (with padding) of the stored image.
+    pub data_b64: String,
 }
 
 /// Most images one `turn.submit` may carry.

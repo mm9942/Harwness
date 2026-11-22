@@ -195,6 +195,8 @@ pub struct TranscriptEntry {
     pub kind: TranscriptKind,
     pub text: String,
     pub tool_state: Option<MobileToolState>,
+    /// Opaque references (JSON) to the stored images of a user message; pass one to `media_thumbnail`.
+    pub images: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

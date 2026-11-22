@@ -19,7 +19,7 @@ use harw_types::SessionId;
 
 use crate::methods::{
     METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
-    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_SESSION_ADOPT,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_MEDIA_GET, METHOD_SECRET_PUT, METHOD_SESSION_ADOPT,
     METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS,
     METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT, METHOD_STEPUP_CANCEL, METHOD_STEPUP_CONFIRM,
 };
@@ -30,7 +30,7 @@ use crate::session_wire::{
     FrameEnvelope, GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo,
     GatewayListenerSetParams, GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult,
     GatewayStatus, GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck,
-    HelloParams, HistoryParams, InterruptParams, PageParams, PageResult, ProjectsParams,
+    HelloParams, HistoryParams, InterruptParams, MediaGetParams, MediaGetResult, PageParams, PageResult, ProjectsParams,
     ProjectsResult, RenameParams, RespondResult, SecretPutParams, SecretPutResult, SessionRow,
     SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SetProjectParams,
     StepUpCancelParams, StepUpConfirmParams, SubmitParams, SubmitResult, ToolCallParams,
@@ -73,6 +73,10 @@ pub trait SessionPort: Send + Sync {
     /// `session.projects` (observe, feature `projects`).
     fn projects(&self, _params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
         unsupported(METHOD_SESSION_PROJECTS)
+    }
+    /// `media.get` (observe, feature `media`): the stored bytes of a prompt image of the session.
+    fn media_get(&self, _params: MediaGetParams) -> PortFuture<'_, MediaGetResult> {
+        unsupported(METHOD_MEDIA_GET)
     }
     /// `session.page` (observe).
     fn page(&self, _params: PageParams) -> PortFuture<'_, PageResult> {

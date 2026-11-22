@@ -13,6 +13,8 @@ harw-protocol = { path = "../harw-protocol" }
 harw-types = { path = "../harw-types" }
 harw-session-store = { path = "../harw-session-store" }
 harw-fsutil = { path = "../harw-fsutil" }
+harw-media = { path = "../harw-media" }
+base64 = "0.23.1"
 # R18 D-A: gateway tool host. Executors and their vocabulary (`harw-tools`),
 # the gateway-side sandbox authority (`harw-authority`: `SandboxSpec`,
 # `ensure_child_of`) and the process sandbox probe (`harw-sandbox`:
