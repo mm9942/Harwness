@@ -352,6 +352,7 @@ internal fun SessionConversation(
         }
             ConversationFeed(
                 entries = snapshot?.transcript.orEmpty(),
+                sentImages = { text, count -> window.sentImages(sessionId, text, count) },
                 liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
                 jumpToLatest = transcriptJump,
                 emptyMessage = when {
@@ -400,6 +401,7 @@ internal fun SessionConversation(
 @Composable
 private fun ConversationFeed(
     entries: List<TranscriptEntry>,
+    sentImages: (String, Int) -> List<uniffi.harw_mobile_ffi.PromptImage>?,
     liveText: String?,
     jumpToLatest: Int,
     emptyMessage: String,
@@ -442,13 +444,26 @@ private fun ConversationFeed(
                 TranscriptKind.TOOL -> entry.toolState?.let { "Werkzeug · ${it.displayName()}" } ?: "Werkzeug"
                 TranscriptKind.ERROR -> "Fehler"
             }
+            if (entry.kind == TranscriptKind.USER) {
+                val (clean, count) = splitImagePlaceholders(entry.text)
+                if (count > 0) {
+                    MessageBlock(label, clean, entry.kind, imageCount = count, thumbs = sentImages(clean, count))
+                    return@items
+                }
+            }
             MessageBlock(label, entry.text, entry.kind)
         }
     }
 }
 
 @Composable
-private fun MessageBlock(label: String, text: String, kind: TranscriptKind) {
+private fun MessageBlock(
+    label: String,
+    text: String,
+    kind: TranscriptKind,
+    imageCount: Int = 0,
+    thumbs: List<uniffi.harw_mobile_ffi.PromptImage>? = null,
+) {
     val colors = MaterialTheme.colorScheme
     val user = kind == TranscriptKind.USER
     val (background, foreground) = when (kind) {
@@ -467,7 +482,8 @@ private fun MessageBlock(label: String, text: String, kind: TranscriptKind) {
         ) {
             Column(Modifier.padding(horizontal = 13.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                SelectionContainer {
+                if (imageCount > 0) ImageStrip(imageCount, thumbs)
+                if (imageCount == 0 || text.isNotBlank()) SelectionContainer {
                     if (rendersMarkdown(kind)) {
                         // MarkdownText (A8) behandelt Code-Blöcke, Listen, Links und Kopieren selbst.
                         MarkdownText(text = text, modifier = Modifier.fillMaxWidth())
@@ -563,7 +579,7 @@ private fun HolderBanner(access: ConversationAccess, holder: MobileHolder?, modi
 }
 
 @Composable
-private fun PromptComposer(
+internal fun PromptComposer(
     draft: SessionDraft,
     enabled: Boolean,
     canSend: Boolean = enabled,
@@ -817,7 +833,14 @@ private val ShortTime = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT)
 
 /** Zweistufiger Modellwechsel fuer Cloud-Sessions: erst Provider, dann Modell aus dem Katalog; gilt ab der naechsten Nachricht. */
 @Composable
-private fun ModelSwitchSheet(state: WorkspaceState, connection: HarwConnection, sessionId: String, active: Boolean) {
+internal fun ModelSwitchSheet(
+    state: WorkspaceState,
+    connection: HarwConnection,
+    sessionId: String,
+    active: Boolean,
+    pending: String? = null,
+    onPick: ((String) -> Unit)? = null,
+) {
     val manage = state.manage
     val catalog = manage.catalog
     val models = switchableModels(catalog?.models.orEmpty()) { it.lifecycle }
@@ -836,7 +859,7 @@ private fun ModelSwitchSheet(state: WorkspaceState, connection: HarwConnection, 
             if (provider != null) TextButton(onClick = { provider = null; error = null }) { Text("Zurück") }
         }
         Text(
-            "Aktuell: " + modelChipLabel(null, catalog?.liveModel, catalog?.liveProvider) + " · gilt ab der nächsten Nachricht.",
+            "Aktuell: " + (pending ?: modelChipLabel(null, catalog?.liveModel, catalog?.liveProvider)) + " · gilt ab der nächsten Nachricht.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -872,10 +895,15 @@ private fun ModelSwitchSheet(state: WorkspaceState, connection: HarwConnection, 
             LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
                 items(providers[chosen].orEmpty(), key = { "${it.provider}/${it.id}" }) { model ->
                     val line = modelSwitchLine(model.provider, model.id)
-                    val live = catalog?.liveProvider == model.provider && catalog.liveModel == model.id
+                    val live = if (pending != null) pending == "${model.provider}/${model.id}"
+                    else catalog?.liveProvider == model.provider && catalog.liveModel == model.id
                     Row(
                         Modifier.fillMaxWidth()
                             .selectable(selected = live, enabled = allowed && !busy && line != null, role = Role.RadioButton) {
+                                if (onPick != null) {
+                                    onPick("${model.provider}/${model.id}")
+                                    return@selectable
+                                }
                                 busy = true
                                 error = null
                                 connection.setSessionModel(sessionId, "${model.provider}/${model.id}") { failure ->

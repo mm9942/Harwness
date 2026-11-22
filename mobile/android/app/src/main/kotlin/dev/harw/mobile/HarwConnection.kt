@@ -580,6 +580,7 @@ internal class HarwConnection(private val context: Context, private val localBac
     fun startChat(
         projectKey: String?,
         firstMessage: String,
+        model: String? = null,
         opened: (String, String?) -> Unit,
         notice: (String) -> Unit,
     ) {
@@ -603,6 +604,14 @@ internal class HarwConnection(private val context: Context, private val localBac
                         native.createSession(null)
                     }
                     if (existing != null && !supported) note = NoProjectsSupportText
+                    if (model != null) {
+                        try {
+                            native.setSessionModel(created.sessionId, model)
+                        } catch (error: Exception) {
+                            if (error is CancellationException) throw error
+                            note = "Modell „$model“ konnte nicht gesetzt werden: ${error.displayMessage()}"
+                        }
+                    }
                     if (existing == null && topic.isNotBlank()) {
                         val slug = slugify(topic)
                         if (!supported) {

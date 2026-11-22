@@ -30,6 +30,17 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import java.text.Normalizer
 import uniffi.harw_mobile_ffi.MobileProject
 
@@ -85,74 +96,143 @@ internal fun NewChatFab(enabled: Boolean, onClick: () -> Unit, modifier: Modifie
     )
 }
 
-/** Bottom Sheet "Neuer Chat": Ort, Projekt, optionale erste Nachricht. `projectKey == null` = neues Projekt zum Thema. */
+/** Entwurf eines noch nicht gesendeten neuen Chats; die Session entsteht erst mit der ersten Nachricht. */
+internal data class NewChatDraft(
+    val local: Boolean,
+    /** `null` = neues Projekt zum Thema der ersten Nachricht. */
+    val projectKey: String? = null,
+    /** Gewaehltes Cloud-Modell `<provider>/<modell>`; `null` = Standard des Servers. */
+    val model: String? = null,
+    val text: String = "",
+    val images: List<DraftImage> = emptyList(),
+    val error: String? = null,
+)
+
+/**
+ * Neuer Chat: die normale Unterhaltungsansicht als Entwurf. Oben Lokal|Cloud und Modell, in der Mitte die
+ * Projektwahl, unten der gewohnte Eingabebereich. Die Session wird erst beim ersten Senden angelegt.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun NewChatSheet(
-    local: Boolean,
-    projects: List<MobileProject>,
-    initialProjectKey: String?,
-    canStart: Boolean,
-    busy: Boolean,
+internal fun NewChatScreen(
+    draft: NewChatDraft,
+    targetState: WorkspaceState,
+    cloudState: WorkspaceState,
+    connection: HarwConnection,
+    onBack: () -> Unit,
     onSwitch: (Boolean) -> Unit,
-    onDismiss: () -> Unit,
-    onStart: (projectKey: String?, message: String) -> Unit,
+    onProject: (String?) -> Unit,
+    onModel: (String) -> Unit,
+    onEdit: (String) -> Unit,
+    onAttach: (DraftImage) -> Unit,
+    onDetach: (Int) -> Unit,
+    onImageError: (String) -> Unit,
+    onSend: () -> Unit,
 ) {
-    var picked by rememberSaveable { mutableStateOf(initialProjectKey) }
-    var message by rememberSaveable { mutableStateOf("") }
     var menu by rememberSaveable { mutableStateOf(false) }
-    val real = projects.filter { it.projectKey != NoProjectKey }
-    val choice = picked
+    var modelsOpen by rememberSaveable { mutableStateOf(false) }
+    val busy = targetState.creating
+    val real = targetState.projects.filter { it.projectKey != NoProjectKey }
+    val choice = draft.projectKey
     val topicMode = choice == null
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 16.dp).navigationBarsPadding(),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text("Neuer Chat", style = MaterialTheme.typography.titleLarge)
-            Text("Ort", style = MaterialTheme.typography.labelLarge)
-            BackendSwitch(local = local, enabled = !busy, onSelect = onSwitch, modifier = Modifier.padding(horizontal = 0.dp))
-            if (local) {
-                Text("Modell", style = MaterialTheme.typography.labelLarge)
+    val imagesSupported by produceState(false, targetState.online, targetState.generation, draft.local) {
+        value = targetState.online && connection.supportsImages()
+    }
+    val manage = cloudState.manage
+    Column(Modifier.fillMaxSize().imePadding()) {
+        HarwHeader(title = "Neuer Chat", onBack = onBack) { ConnectionBadge(targetState) }
+        BackendSwitch(local = draft.local, enabled = !busy, onSelect = onSwitch)
+        Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 2.dp)) {
+            if (draft.local) {
                 LocalModelChip()
-            }
-            Text("Projekt", style = MaterialTheme.typography.labelLarge)
-            OutlinedButton(onClick = { menu = true }, modifier = Modifier.fillMaxWidth()) {
-                Text(real.firstOrNull { it.projectKey == choice }?.displayLabel() ?: "Kein Projekt – neues zum Thema anlegen")
-            }
-            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                DropdownMenuItem(
-                    text = { Text("Kein Projekt – neues zum Thema anlegen") },
-                    onClick = { picked = null; menu = false },
+            } else {
+                val block = modelChipBlock(manage.support, true)
+                AssistChip(
+                    onClick = { modelsOpen = true },
+                    enabled = block == null && !busy,
+                    label = {
+                        Text(
+                            draft.model ?: modelChipLabel(null, manage.catalog?.liveModel, manage.catalog?.liveProvider),
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                    },
                 )
-                for (project in real) {
-                    DropdownMenuItem(
-                        text = { Text(project.displayLabel()) },
-                        onClick = { picked = project.projectKey; menu = false },
-                    )
+                block?.let {
+                    Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
-            OutlinedTextField(
-                value = message,
-                onValueChange = { message = it },
-                modifier = Modifier.fillMaxWidth(),
-                minLines = 2,
-                maxLines = 6,
-                label = { Text(if (topicMode) "Erste Nachricht (bestimmt das Thema)" else "Erste Nachricht (optional)") },
-            )
-            if (topicMode) {
-                Text(
-                    "Aus der ersten Nachricht wird ein Projektname abgeleitet und die Session dem Projekt zugewiesen.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+        }
+        if (modelsOpen && !draft.local) {
+            ModalBottomSheet(
+                onDismissRequest = { modelsOpen = false },
+                sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            ) {
+                ModelSwitchSheet(
+                    cloudState, connection, "", true,
+                    pending = draft.model,
+                    onPick = { onModel(it); modelsOpen = false },
                 )
             }
-            Button(
-                onClick = { onStart(choice, message.trim()) },
-                enabled = canStart && !busy && (!topicMode || message.isNotBlank()),
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text(if (busy) "Startet …" else "Starten") }
         }
+        Column(
+            Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically),
+        ) {
+            Text("Projekt", style = MaterialTheme.typography.labelLarge)
+            Box {
+                OutlinedButton(onClick = { menu = true }, enabled = !busy) {
+                    Text(real.firstOrNull { it.projectKey == choice }?.displayLabel() ?: "Kein Projekt – neues zum Thema anlegen")
+                }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Kein Projekt – neues zum Thema anlegen") },
+                        onClick = { onProject(null); menu = false },
+                    )
+                    for (project in real) {
+                        DropdownMenuItem(
+                            text = { Text(project.displayLabel()) },
+                            onClick = { onProject(project.projectKey); menu = false },
+                        )
+                    }
+                }
+            }
+            Text(
+                if (topicMode) {
+                    "Aus der ersten Nachricht wird ein Projektname abgeleitet und die Session dem Projekt zugewiesen."
+                } else {
+                    "Die Session wird mit deiner ersten Nachricht in diesem Projekt angelegt."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            if (targetState.projectsLoaded && !targetState.projectsSupported) {
+                Text(
+                    NoProjectsSupportText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            if (!targetState.online) {
+                StatusMessage(if (draft.local) "Lokal ist noch nicht verbunden." else "Cloud ist noch nicht verbunden.", error = true)
+            }
+        }
+        PromptComposer(
+            draft = SessionDraft(text = draft.text, images = draft.images, error = draft.error, sending = busy),
+            enabled = !busy,
+            canSend = targetState.online && targetState.canCreate && !busy,
+            busy = busy,
+            hint = "Erste Nachricht an Harw",
+            onEdit = onEdit,
+            onReview = {},
+            onSend = onSend,
+            onDiscard = {},
+            onAttachImage = if (imagesSupported) onAttach else null,
+            onDetachImage = onDetach,
+            onImageError = onImageError,
+        )
     }
 }
 

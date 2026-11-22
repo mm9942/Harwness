@@ -151,8 +151,6 @@ internal open class MainActivity : ComponentActivity() {
             markFirstRunDone(this@MainActivity)
         }
         var notificationDenied by rememberSaveable { mutableStateOf(false) }
-        var newChatOpen by rememberSaveable { mutableStateOf(false) }
-        var sheetLocal by rememberSaveable { mutableStateOf(false) }
         var newProjectOpen by rememberSaveable { mutableStateOf(false) }
         val profilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
             if (it != null) cloud.importProfile(it)
@@ -220,6 +218,9 @@ internal open class MainActivity : ComponentActivity() {
                 }
                 BackStep.Exit -> Unit
             }
+        }
+        BackHandler(window.newChat != null && settingsRoute == null) {
+            if (!(if (window.newChat?.local == true) localState else cloudState).creating) window.closeNewChat()
         }
         DeviceApprovalHost()
         // Verwalten ist eine Server-Funktion: Hub, Modelle und Befehle sprechen immer mit der Cloud,
@@ -316,6 +317,52 @@ internal open class MainActivity : ComponentActivity() {
                 onBack = { openSettings(SettingsRoute.Hub) },
                 onOpenModels = { openSettings(SettingsRoute.Models) },
             )
+        } else if (window.newChat != null && settingsRoute != SettingsRoute.Connection) {
+            val draft = window.newChat!!
+            val target = if (draft.local) onDevice else cloud
+            val targetState = if (draft.local) localState else cloudState
+            LaunchedEffect(draft.local, targetState.online, targetState.generation) {
+                if (targetState.online) target.refreshProjects()
+            }
+            LaunchedEffect(draft.local, cloudState.online, cloudState.generation) {
+                if (!draft.local && cloudState.online) {
+                    cloud.refreshManageSupport()
+                    cloud.refreshCatalog(null)
+                }
+            }
+            NewChatScreen(
+                draft = draft,
+                targetState = targetState,
+                cloudState = cloudState,
+                connection = target,
+                onBack = window::closeNewChat,
+                onSwitch = window::newChatBackend,
+                onProject = window::newChatProject,
+                onModel = window::newChatModel,
+                onEdit = window::newChatEdit,
+                onAttach = window::newChatAttach,
+                onDetach = window::newChatDetach,
+                onImageError = window::newChatError,
+                onSend = {
+                    val message = draft.text.trim()
+                    val images = draft.images
+                    if (message.isNotBlank() || images.isNotEmpty()) {
+                        target.startChat(
+                            projectKey = draft.projectKey,
+                            firstMessage = message,
+                            model = draft.model.takeIf { !draft.local },
+                            opened = { id, assigned ->
+                                viewChosen = true
+                                viewLocal = draft.local
+                                window.queueFirstMessage(id, message, images.map { it.image })
+                                window.finishNewChat()
+                                window.openLink(DeepLink(assigned, id))
+                            },
+                            notice = { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() },
+                        )
+                    }
+                },
+            )
         } else if (showSetup && settingsRoute == null && cloudState.profile == null && !firstRunDone) {
             FirstRunScreen(
                 onConnect = { finishFirstRun(); openSettings(SettingsRoute.Connection) },
@@ -397,7 +444,7 @@ internal open class MainActivity : ComponentActivity() {
             }
             NewChatFab(
                 enabled = state.online && state.canCreate && !state.creating,
-                onClick = { sheetLocal = viewLocal; newChatOpen = true },
+                onClick = { window.openNewChat(viewLocal, projectKey?.takeIf { it.isNotEmpty() }) },
                 modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
             )
             }
@@ -427,39 +474,11 @@ internal open class MainActivity : ComponentActivity() {
             if (sessionId == null) {
                 NewChatFab(
                     enabled = state.online && state.canCreate && !state.creating,
-                    onClick = { sheetLocal = viewLocal; newChatOpen = true },
+                    onClick = { window.openNewChat(viewLocal, projectKey?.takeIf { it.isNotEmpty() }) },
                     modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
                 )
             }
             }
-        }
-        if (newChatOpen) {
-            val target = if (sheetLocal) onDevice else cloud
-            val targetState = if (sheetLocal) localState else cloudState
-            LaunchedEffect(sheetLocal, targetState.online) { if (targetState.online) target.refreshProjects() }
-            NewChatSheet(
-                local = sheetLocal,
-                projects = targetState.projects,
-                initialProjectKey = projectKey?.takeIf { it.isNotEmpty() },
-                canStart = targetState.online && targetState.canCreate && !targetState.creating,
-                busy = targetState.creating,
-                onSwitch = { sheetLocal = it },
-                onDismiss = { newChatOpen = false },
-                onStart = { key, message ->
-                    target.startChat(
-                        projectKey = key,
-                        firstMessage = message,
-                        opened = { id, assigned ->
-                            newChatOpen = false
-                            viewChosen = true
-                            viewLocal = sheetLocal
-                            if (message.isNotBlank()) window.queueFirstMessage(id, message)
-                            window.openLink(DeepLink(assigned, id))
-                        },
-                        notice = { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() },
-                    )
-                },
-            )
         }
         if (newProjectOpen) {
             NewProjectDialog(
@@ -537,9 +556,57 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
     private var drafts by mutableStateOf<Map<String, SessionDraft>>(emptyMap())
     private var firstMessages by mutableStateOf<Map<String, String>>(emptyMap())
 
+    /** Lokale Kopie gesendeter Bilder je Session (nur diese App-Sitzung): Text + Bilder, aeltestes zuerst. */
+    private var sentGroups by mutableStateOf<Map<String, List<Pair<String, List<uniffi.harw_mobile_ffi.PromptImage>>>>>(emptyMap())
+
+    fun sentImages(id: String, cleanText: String, count: Int): List<uniffi.harw_mobile_ffi.PromptImage>? =
+        sentGroups[id]?.lastOrNull { it.second.size == count && sentTextKey(it.first) == sentTextKey(cleanText) }?.second
+
+    /** Ungesendeter neuer Chat (Entwurf ohne Session); `null` = keiner offen. */
+    var newChat by mutableStateOf<NewChatDraft?>(null)
+        private set
+    private var lastNewChatText = ""
+
+    fun openNewChat(local: Boolean, projectKey: String?) {
+        newChat = NewChatDraft(local = local, projectKey = projectKey, text = lastNewChatText)
+    }
+
+    /** Verwirft den Entwurf; der getippte Text bleibt fuer den naechsten neuen Chat erhalten. */
+    fun closeNewChat() {
+        lastNewChatText = newChat?.text.orEmpty()
+        newChat = null
+    }
+
+    /** Die Session ist angelegt: der Entwurf geht in der echten Unterhaltung auf. */
+    fun finishNewChat() {
+        lastNewChatText = ""
+        newChat = null
+    }
+
+    fun newChatBackend(local: Boolean) {
+        newChat = newChat?.let { if (it.local == local) it else it.copy(local = local, projectKey = null, model = null, error = null) }
+    }
+
+    fun newChatProject(key: String?) { newChat = newChat?.copy(projectKey = key) }
+
+    fun newChatModel(model: String) { newChat = newChat?.copy(model = model) }
+
+    fun newChatEdit(text: String) { newChat = newChat?.copy(text = text, error = null) }
+
+    fun newChatError(message: String) { newChat = newChat?.copy(error = message) }
+
+    fun newChatAttach(image: DraftImage) {
+        newChat = newChat?.takeIf { it.images.size < MaxPromptImages }?.let { it.copy(images = it.images + image, error = null) } ?: newChat
+    }
+
+    fun newChatDetach(index: Int) {
+        newChat = newChat?.let { d -> if (index in d.images.indices) d.copy(images = d.images.filterIndexed { i, _ -> i != index }) else d }
+    }
+
     /** Erste Nachricht eines neuen Chats; die Unterhaltung sendet sie, sobald die Session bereit ist. */
-    fun queueFirstMessage(id: String, text: String) {
+    fun queueFirstMessage(id: String, text: String, images: List<uniffi.harw_mobile_ffi.PromptImage> = emptyList()) {
         firstMessages = firstMessages + (id to text)
+        if (images.isNotEmpty()) drafts = drafts + (id to SessionDraft(images = images.mapIndexed { i, img -> DraftImage("Bild ${i + 1}", img, img.dataB64.length * 3 / 4) }))
     }
 
     fun firstMessage(id: String): String? = firstMessages[id]
@@ -631,7 +698,12 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
             val latest = draft(id)
             if (latest.attempt?.id != attempt.id) return@submit
             drafts = when (result) {
-                DraftResult.Accepted -> drafts - id
+                DraftResult.Accepted -> {
+                    if (attempt.images.isNotEmpty()) {
+                        sentGroups = sentGroups + (id to (sentGroups[id].orEmpty() + (attempt.text to attempt.images)))
+                    }
+                    drafts - id
+                }
                 is DraftResult.Rejected -> {
                     val uncertain = latest.uncertain || result.ambiguous
                     drafts + (id to latest.copy(
