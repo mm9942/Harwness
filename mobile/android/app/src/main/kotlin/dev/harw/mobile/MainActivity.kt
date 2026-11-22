@@ -152,6 +152,16 @@ internal open class MainActivity : ComponentActivity() {
         val state by connection.state.collectAsState()
         val sessionId = window.sessionId
         val projectKey = window.projectKey
+        // Automatisch verbinden: beim Start, nach Fehlern (mit Pause) und wenn ein Profil neu hinzukommt.
+        LaunchedEffect(cloudState.profile != null, cloudState.phase, cloudState.stopping, cloudState.hasConnection) {
+            val eligible = cloudState.profile != null && !cloudState.hasConnection && !cloudState.stopping &&
+                cloudState.phase in setOf(ConnectionPhase.DISCONNECTED, ConnectionPhase.FAILED) &&
+                readAutoConnect(this@MainActivity) && !readManualDisconnect(this@MainActivity)
+            if (eligible) {
+                if (cloudState.phase == ConnectionPhase.FAILED) kotlinx.coroutines.delay(20_000)
+                if (readAutoConnect(this@MainActivity) && !readManualDisconnect(this@MainActivity)) startConnection()
+            }
+        }
         var settingsRouteName by rememberSaveable { mutableStateOf<String?>(null) }
         val settingsRoute = settingsRouteName?.let { runCatching { SettingsRoute.valueOf(it) }.getOrNull() }
         fun openSettings(route: SettingsRoute?) {
@@ -442,6 +452,7 @@ internal open class MainActivity : ComponentActivity() {
                 },
                 onConnect = {
                     connectingFromSetup = true
+                    writeManualDisconnect(this@MainActivity, false)
                     if (Build.VERSION.SDK_INT >= 33 && !notificationDenied &&
                         ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                     ) {
@@ -456,6 +467,7 @@ internal open class MainActivity : ComponentActivity() {
                     onDevice.connectLocal()
                 },
                 onDisconnect = {
+                    writeManualDisconnect(this@MainActivity, true)
                     (application as HarwApplication).localAutostart.suppress()
                     cloud.disconnect(); onDevice.disconnect()
                 },

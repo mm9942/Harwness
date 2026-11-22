@@ -286,7 +286,13 @@ internal fun UpdateHost(openRequested: Boolean) {
                         }
                     }
                 }
-                if (busy) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
+                if (busy) {
+                    LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
+                    Text(
+                        "Lädt … ${(progress * 100).toInt()} %" + if (offer.size > 0) " von ${offer.size / 1_000_000} MB" else "",
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
                 message?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         },

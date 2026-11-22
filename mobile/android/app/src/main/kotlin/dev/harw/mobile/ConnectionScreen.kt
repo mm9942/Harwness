@@ -233,6 +233,17 @@ internal fun ConnectionScreen(
                                 }
                             }
                         }
+                        run {
+                            val ctx = androidx.compose.ui.platform.LocalContext.current
+                            var auto by remember { mutableStateOf(readAutoConnect(ctx)) }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Automatisch verbinden", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                                androidx.compose.material3.Switch(
+                                    checked = auto,
+                                    onCheckedChange = { auto = it; writeAutoConnect(ctx, it) },
+                                )
+                            }
+                        }
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(
                                 enabled = state.canSetUp && !state.hasConnection && !state.stopping && !scanning,

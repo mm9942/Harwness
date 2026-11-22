@@ -112,6 +112,7 @@ internal class HarwConnectionService : Service() {
         latestStart = startId
         when (intent?.action) {
             DisconnectAction -> {
+                writeManualDisconnect(this, true)
                 connection.disconnect()
                 localConnection.disconnect()
                 if (!foreground) stopSelfResult(startId)
