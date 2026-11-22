@@ -656,12 +656,21 @@ fn render_reasoning_window(frame: &mut Frame<'_>, app: &ChatApp, area: Rect, foc
     let inner_width = area.width.saturating_sub(2);
     let viewport = usize::from(area.height.saturating_sub(2));
     // Wie der Chat-Verlauf: umbrochene Zeilen zählen, der Versatz zählt vom
-    // Ende (0 folgt der neuesten Zeile).
-    let total = app.reasoning_feed.line_count(inner_width, pinned);
-    let scroll_from_bottom = app
-        .mission
+    // Ende (0 folgt der neuesten Zeile). `scroll_total` ist monoton (Zeilen
+    // plus verdrängte Zeilen), damit eine hochgescrollte Ansicht stabil
+    // bleibt, wenn der Ring alte Zeilen verwirft; der Zähler ist im Feed
+    // zwischengespeichert, hier wird nicht neu umbrochen. Der gespeicherte
+    // Versatz wird auf die Zeilen gekappt, die der Ring noch hält, damit der
+    // Nutzer nicht in verworfene Zeilen scrollen kann.
+    let total = app.reasoning_feed.scroll_total(inner_width, pinned);
+    app.mission
         .live_scroll
         .sync_layout(total, viewport, inner_width);
+    let max_offset = app
+        .reasoning_feed
+        .line_count(inner_width, pinned)
+        .saturating_sub(viewport);
+    let scroll_from_bottom = app.mission.live_scroll.cap_offset(max_offset);
     crate::mission::reasoning_feed::render(
         frame,
         area,
