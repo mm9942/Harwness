@@ -579,16 +579,20 @@ private fun PromptComposer(
     onImageError: (String) -> Unit = {},
 ) {
     val context = LocalContext.current
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
-        if (uri != null && onAttachImage != null) {
-            val label = "Bild ${draft.images.size + 1}"
-            // Dekodieren und Verkleinern gehoert nicht auf den Hauptthread.
-            Thread {
-                val image = prepareImage(context, uri, label)
-                android.os.Handler(android.os.Looper.getMainLooper()).post {
-                    if (image != null) onAttachImage(image) else onImageError("Das Bild konnte nicht gelesen oder nicht klein genug gemacht werden.")
-                }
-            }.start()
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MaxPromptImages)) { uris: List<Uri> ->
+        val free = (MaxPromptImages - draft.images.size).coerceAtLeast(0)
+        if (uris.isNotEmpty() && onAttachImage != null) {
+            if (uris.size > free) onImageError("Höchstens $MaxPromptImages Bilder pro Nachricht – die ersten $free werden übernommen.")
+            uris.take(free).forEachIndexed { index, uri ->
+                val label = "Bild ${draft.images.size + index + 1}"
+                // Dekodieren und Verkleinern gehoert nicht auf den Hauptthread.
+                Thread {
+                    val image = prepareImage(context, uri, label)
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        if (image != null) onAttachImage(image) else onImageError("Ein Bild konnte nicht gelesen oder nicht klein genug gemacht werden.")
+                    }
+                }.start()
+            }
         }
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
