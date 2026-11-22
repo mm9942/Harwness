@@ -2,6 +2,7 @@ package dev.harw.mobile
 
 import android.Manifest
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -20,7 +21,10 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Settings
@@ -51,6 +55,11 @@ internal open class MainActivity : ComponentActivity() {
     private val window by viewModels<HarwWindowModel>()
     private val connection get() = (application as HarwApplication).connection
     private val approvalAuthorization = ApprovalAuthorization(this)
+    private val stepUpAuthorization = StepUpAuthorization(this)
+    private var themePref by mutableStateOf("system")
+    private val themeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == PREF_THEME) themePref = readThemePref(this)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,8 +87,10 @@ internal open class MainActivity : ComponentActivity() {
         }
         if (savedInstanceState == null) handleLink(intent)
         enableEdgeToEdge()
+        themePref = readThemePref(this)
+        getSharedPreferences(UI_PREFS, MODE_PRIVATE).registerOnSharedPreferenceChangeListener(themeListener)
         setContent {
-            HarwTheme {
+            HarwTheme(dark = themeDarkOverride(themePref)) {
                 Surface(Modifier.fillMaxSize()) {
                     Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) { Workspace() }
                 }
@@ -103,6 +114,8 @@ internal open class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         approvalAuthorization.cancel()
+        stepUpAuthorization.cancel()
+        getSharedPreferences(UI_PREFS, MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(themeListener)
         super.onDestroy()
     }
 
@@ -116,7 +129,11 @@ internal open class MainActivity : ComponentActivity() {
         val state by connection.state.collectAsState()
         val sessionId = window.sessionId
         val projectKey = window.projectKey
-        var showSettings by rememberSaveable { mutableStateOf(false) }
+        var settingsRouteName by rememberSaveable { mutableStateOf<String?>(null) }
+        val settingsRoute = settingsRouteName?.let { runCatching { SettingsRoute.valueOf(it) }.getOrNull() }
+        fun openSettings(route: SettingsRoute?) {
+            settingsRouteName = route?.name
+        }
         var connectingFromSetup by rememberSaveable { mutableStateOf(false) }
         var notificationDenied by rememberSaveable { mutableStateOf(false) }
         val profilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
@@ -149,13 +166,13 @@ internal open class MainActivity : ComponentActivity() {
             startConnection()
         }
 
-        val showSetup = showSettings || (
+        val showSetup = settingsRoute == SettingsRoute.Connection || (
             sessionId == null && state.sessions.isEmpty() && !state.sessionsLoaded && !state.online &&
                 state.phase != ConnectionPhase.RECONNECTING
             )
         LaunchedEffect(state.online, connectingFromSetup) {
             if (state.online && connectingFromSetup) {
-                showSettings = false
+                openSettings(null)
                 connectingFromSetup = false
             }
         }
@@ -163,9 +180,9 @@ internal open class MainActivity : ComponentActivity() {
             if (sessionId != null) connection.retainSession(sessionId)
             onDispose { if (sessionId != null) connection.releaseSession(sessionId) }
         }
-        BackHandler(backStep(showSettings, sessionId, projectKey) != BackStep.Exit) {
-            when (backStep(showSettings, sessionId, projectKey)) {
-                BackStep.CloseSettings -> showSettings = false
+        BackHandler(backStep(settingsRoute != null, sessionId, projectKey) != BackStep.Exit) {
+            when (backStep(settingsRoute != null, sessionId, projectKey)) {
+                BackStep.CloseSettings -> openSettings(settingsRoute?.let(::settingsParent))
                 BackStep.CloseSession -> window.select(null)
                 BackStep.CloseProject -> {
                     window.selectProject(null)
@@ -174,12 +191,61 @@ internal open class MainActivity : ComponentActivity() {
                 BackStep.Exit -> Unit
             }
         }
-        if (showSetup) {
+        // Step-up-Host: immer ueber allen Zweigen, auch im Hub. Nichts davon ueberlebt Prozesstod.
+        state.manage.stepUp?.let { stepUp ->
+            StepUpDialog(
+                stepUp = stepUp,
+                receivedAt = state.manage.stepUpReceivedAt,
+                authorizing = stepUpAuthorization.busy || state.manage.running == STEPUP_CONFIRM_RUNNING,
+                error = state.manage.stepUpError,
+                onConfirm = {
+                    stepUpAuthorization.confirm(stepUp) { error ->
+                        when (error) {
+                            null -> connection.confirmStepUp(stepUp)
+                            STEPUP_CANCELED_TEXT -> Unit
+                            else -> connection.noteStepUpError(stepUp, error)
+                        }
+                    }
+                },
+                onCancel = { reason ->
+                    stepUpAuthorization.cancel()
+                    connection.cancelStepUp(stepUp, reason)
+                },
+            )
+        }
+        val closedStepUpError = state.manage.stepUpError
+        if (state.manage.stepUp == null && closedStepUpError != null) {
+            AlertDialog(
+                onDismissRequest = { connection.clearStepUpError() },
+                title = { Text("Änderung bestätigen") },
+                text = { Text(closedStepUpError) },
+                confirmButton = { TextButton(onClick = { connection.clearStepUpError() }) { Text("OK") } },
+            )
+        }
+        if (settingsRoute == SettingsRoute.Hub) {
+            SettingsHub(
+                state = state,
+                connection = connection,
+                onBack = { openSettings(null) },
+                onOpen = ::openSettings,
+            )
+        } else if (settingsRoute == SettingsRoute.Models) {
+            CloudModelsScreen(state, connection, sessionId, onBack = { openSettings(SettingsRoute.Hub) })
+        } else if (settingsRoute == SettingsRoute.Commands) {
+            CommandsScreen(
+                state = state,
+                connection = connection,
+                sessionId = null,
+                onBack = { openSettings(SettingsRoute.Hub) },
+                onOpenModels = { openSettings(SettingsRoute.Models) },
+            )
+        } else if (showSetup) {
             ConnectionScreen(
                 state = state,
                 notificationDenied = notificationDenied,
-                canGoBack = showSettings && (state.online || state.sessions.isNotEmpty() || sessionId != null),
-                onBack = { showSettings = false },
+                canGoBack = settingsRoute == SettingsRoute.Connection &&
+                    (state.online || state.sessions.isNotEmpty() || sessionId != null),
+                onBack = { openSettings(SettingsRoute.Hub) },
                 onImport = {
                     profilePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream"))
                 },
@@ -219,8 +285,8 @@ internal open class MainActivity : ComponentActivity() {
             Column(Modifier.fillMaxSize()) {
                 HarwHeader(title = "Projekte") {
                     ConnectionBadge(state)
-                    IconButton(onClick = { showSettings = true }) {
-                        Icon(Icons.Outlined.Settings, "Connection settings")
+                    IconButton(onClick = { openSettings(SettingsRoute.Hub) }) {
+                        Icon(Icons.Outlined.Settings, "Einstellungen")
                     }
                 }
                 ProjectsScreen(
@@ -250,7 +316,7 @@ internal open class MainActivity : ComponentActivity() {
                 connection = connection,
                 authorizingApproval = approvalAuthorization.busy,
                 onDecide = ::authenticateDecision,
-                onOpenSettings = { showSettings = true },
+                onOpenSettings = { openSettings(SettingsRoute.Hub) },
                 onNewWindow = ::openWindow,
                 projectView = view,
                 projectActions = if (view != null) actions else null,

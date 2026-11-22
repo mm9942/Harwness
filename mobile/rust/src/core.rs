@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::time::Duration;
 
 use harw_node_transport::{LocalNode, NodeBody, empty_body};
-use harw_protocol::PortError;
+use harw_protocol::{PortError, PortFuture, SessionPort};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams,
     Cursor, DEFAULT_TAIL_ITEMS, HolderInfo, InterruptParams, PageParams, ProjectsParams,
@@ -29,7 +29,7 @@ use crate::provider::request_provider;
 use crate::{
     ApprovalDecision, ApprovalOutcome, ApprovalReceipt, ChatgptProviderCredential,
     ChatgptProviderStatus, ConnectionPhase, ConnectionRoute, ConnectionStatus, DeviceEnrollment,
-    HostKind, HostRef, MobileError, MobileHolder, MobileProject, MobileProjectPage,
+    HostKind, HostRef, ManageSupport, MobileError, MobileHolder, MobileProject, MobileProjectPage,
     MobileRowOrigin, MobileSession, MobileSessionPage, MobileSessionRow, MobileShareInfo,
     MobileShareMode, MobileTier, PlatformKeystore, RoutePreference, ServerProfile, SessionCursor,
     SessionSnapshot, SubmitOutcome, SubmitReceipt,
@@ -1123,6 +1123,43 @@ impl MobileCore {
         }
     }
 
+    /// Bruecke fuer crate::manage: aktive Verbindung, Feature-Pruefung ohne Anfrage, Anfrage mit Timeout/Revocation.
+    pub(crate) fn manage_call<T, F>(&self, feature: &'static str, call: F) -> Result<T, MobileError>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a dyn SessionPort) -> PortFuture<'a, T> + Send + 'static,
+    {
+        let link = self.shared.state().active()?;
+        if !link.backend.features().iter().any(|f| f == feature) {
+            let detail = if feature == features::STEPUP {
+                crate::manage::NO_STEPUP_DETAIL
+            } else {
+                crate::manage::NO_MANAGE_DETAIL
+            };
+            return Err(MobileError::Denied {
+                detail: detail.into(),
+            });
+        }
+        self.run(async move { link.request(call(link.backend.port())).await })
+    }
+
+    /// Features/Caps der aktiven Verbindung, ohne Verbindung Default. Nie ein Fehler.
+    pub(crate) fn manage_support_now(&self) -> ManageSupport {
+        let Ok(link) = self.shared.state().active() else {
+            return ManageSupport::default();
+        };
+        let has = |f: &str| link.backend.features().iter().any(|x| x == f);
+        let caps = link.backend.granted();
+        ManageSupport {
+            manage: has(features::MANAGE),
+            stepup: has(features::MANAGE) && has(features::STEPUP),
+            observe: caps.observe,
+            steer: caps.steer,
+            approve: caps.approve,
+            control: caps.control,
+        }
+    }
+
     fn run<T, F>(&self, operation: F) -> Result<T, MobileError>
     where
         T: Send + 'static,
@@ -1553,6 +1590,8 @@ fn requested_features() -> Vec<String> {
         features::COMPACT_REASONING,
         features::JOB_FRAMES,
         features::PROJECTS,
+        features::MANAGE,
+        features::STEPUP,
     ]
     .iter()
     .map(|feature| (*feature).to_owned())
@@ -2018,6 +2057,13 @@ mod projects_tests {
     #[test]
     fn requested_features_include_projects() {
         assert!(requested_features().iter().any(|f| f == features::PROJECTS));
+    }
+
+    #[test]
+    fn requested_features_include_manage_and_stepup() {
+        let requested = requested_features();
+        assert!(requested.iter().any(|f| f == features::MANAGE));
+        assert!(requested.iter().any(|f| f == features::STEPUP));
     }
 
     #[test]

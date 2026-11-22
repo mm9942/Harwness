@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import kotlinx.coroutines.CancellationException
@@ -25,11 +26,19 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ApprovalOutcome
+import uniffi.harw_mobile_ffi.CloudCatalog
 import uniffi.harw_mobile_ffi.ChatgptProviderCredential
 import uniffi.harw_mobile_ffi.ChatgptProviderStatus
 import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.ConnectionRoute
 import uniffi.harw_mobile_ffi.ConnectionStatus
+import uniffi.harw_mobile_ffi.ManageCommand
+import uniffi.harw_mobile_ffi.ManageConfigEntry
+import uniffi.harw_mobile_ffi.ManageEffect
+import uniffi.harw_mobile_ffi.ManageKnownProvider
+import uniffi.harw_mobile_ffi.ManageRunResult
+import uniffi.harw_mobile_ffi.ManageStepUp
+import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.MobileCore
 import uniffi.harw_mobile_ffi.MobileException
 import uniffi.harw_mobile_ffi.MobileHolder
@@ -59,6 +68,56 @@ internal fun networkSignal(phase: ConnectionPhase, stopping: Boolean, forgetting
         ConnectionPhase.CONNECTING, ConnectionPhase.RECONNECTING -> NetworkSignal.Nudge
         ConnectionPhase.FAILED -> NetworkSignal.Restart
         ConnectionPhase.CONNECTED, ConnectionPhase.DISCONNECTED, ConnectionPhase.REVOKED -> NetworkSignal.None
+    }
+}
+
+/** Ergebnis einer ausgefuehrten Zeile fuer die Ergebniskarte. */
+internal data class ManageCard(
+    val line: String,
+    val result: ManageRunResult,
+)
+
+/** Verwalten (Welle 3). Nie ein Geheimnis in diesem Zustand. */
+internal data class ManageState(
+    val support: ManageSupport? = null,
+    val commands: List<ManageCommand> = emptyList(),
+    val commandsRev: String? = null,
+    val commandsLoaded: Boolean = false,
+    val commandsError: String? = null,
+    /** Laufende Zeile oder Aktion; bei `secret.put` nie mit Wert. */
+    val running: String? = null,
+    val card: ManageCard? = null,
+    val catalog: CloudCatalog? = null,
+    val catalogError: String? = null,
+    val known: List<ManageKnownProvider> = emptyList(),
+    val knownError: String? = null,
+    val config: List<ManageConfigEntry> = emptyList(),
+    val configError: String? = null,
+    /** Offene Herausforderung (genau eine). */
+    val stepUp: ManageStepUp? = null,
+    /** `SystemClock.elapsedRealtime()` bei Empfang. */
+    val stepUpReceivedAt: Long = 0L,
+    val stepUpError: String? = null,
+)
+
+internal const val STEPUP_OPEN_TEXT = "Erst den offenen Step-up abschließen."
+internal const val STEPUP_EXPIRED_TEXT = "Bestätigung abgelaufen."
+internal const val STEPUP_CONFIRM_RUNNING = "stepup.confirm"
+
+/** Wendet das Ergebnis einer Zeile an: Herausforderung oeffnet den Dialog, alles andere wird Karte. */
+internal fun applyManageResult(manage: ManageState, line: String, result: ManageRunResult, now: Long): ManageState {
+    val challenge = result.stepup
+    return if (result.effect == ManageEffect.STEPUP_REQUIRED && challenge != null) {
+        manage.copy(
+            running = null,
+            card = null,
+            commandsError = null,
+            stepUp = challenge,
+            stepUpReceivedAt = now,
+            stepUpError = null,
+        )
+    } else {
+        manage.copy(running = null, card = ManageCard(line, result), commandsError = null)
     }
 }
 
@@ -98,6 +157,7 @@ internal data class WorkspaceState(
     val projectsShare: MobileShareInfo? = null,
     /** Open project view; `null` while the project list is shown. */
     val projectView: ProjectSessionsState? = null,
+    val manage: ManageState = ManageState(),
 ) {
     val online: Boolean get() = phase == ConnectionPhase.CONNECTED && !stopping
     val canSetUp: Boolean get() = !setupPending && !forgetRequired && cleanupError == null
@@ -120,6 +180,7 @@ internal data class WorkspaceState(
         projectsLegacy = false,
         projectsShare = null,
         projectView = null,
+        manage = ManageState(),
         creating = false,
         generation = null,
         activeRoute = null,
@@ -703,6 +764,252 @@ internal class HarwConnection(private val context: Context) {
                 }
             }
         }
+    }
+
+    // ---- Verwalten (Welle 3, C7e) ----
+
+    private fun newMsgId(): String = java.util.UUID.randomUUID().toString()
+
+    private inline fun changeManage(crossinline transform: (ManageState) -> ManageState) {
+        change { it.copy(manage = transform(it.manage)) }
+    }
+
+    fun refreshManageSupport() {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        scope.launch {
+            try {
+                val support = withContext(Dispatchers.IO) { native.manageSupport() }
+                if (generation == gate.generation) changeManage { it.copy(support = support) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+            }
+        }
+    }
+
+    fun refreshCommands(sessionId: String?) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        scope.launch {
+            try {
+                val list = withContext(Dispatchers.IO) { native.commands(sessionId) }
+                if (generation == gate.generation) {
+                    changeManage {
+                        it.copy(commands = list.commands, commandsRev = list.rev, commandsLoaded = true, commandsError = null)
+                    }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    changeManage { it.copy(commandsLoaded = true, commandsError = "Befehle laden: ${error.displayMessage()}") }
+                }
+            }
+        }
+    }
+
+    /** Fuehrt eine Zeile aus; `onDone(null)` bei Fehler oder wenn ein Step-up offen ist. */
+    fun runCommand(sessionId: String?, line: String, onDone: (ManageRunResult?) -> Unit = {}) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        if (state.value.manage.stepUp != null) {
+            changeManage { it.copy(commandsError = STEPUP_OPEN_TEXT) }
+            onDone(null)
+            return
+        }
+        changeManage { it.copy(running = line, commandsError = null) }
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { native.command(sessionId, line, newMsgId()) }
+                if (generation == gate.generation) {
+                    changeManage { applyManageResult(it, line, result, SystemClock.elapsedRealtime()) }
+                    onDone(result)
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    changeManage { it.copy(running = null, commandsError = "$line: ${error.displayMessage()}") }
+                    onDone(null)
+                }
+            }
+        }
+    }
+
+    fun clearCommandCard() {
+        changeManage { it.copy(card = null) }
+    }
+
+    fun refreshCatalog(sessionId: String?) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        scope.launch {
+            try {
+                val catalog = withContext(Dispatchers.IO) { native.catalog(sessionId) }
+                if (generation == gate.generation) changeManage { it.copy(catalog = catalog, catalogError = null) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    changeManage { it.copy(catalogError = "Katalog laden: ${error.displayMessage()}") }
+                }
+            }
+        }
+    }
+
+    fun refreshKnownProviders() {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        scope.launch {
+            try {
+                val known = withContext(Dispatchers.IO) { native.knownProviders(newMsgId()) }
+                if (generation == gate.generation) changeManage { it.copy(known = known, knownError = null) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    changeManage { it.copy(knownError = "Provider laden: ${error.displayMessage()}") }
+                }
+            }
+        }
+    }
+
+    fun refreshConfig() {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        scope.launch {
+            try {
+                val entries = withContext(Dispatchers.IO) { native.configGet(null) }
+                if (generation == gate.generation) changeManage { it.copy(config = entries, configError = null) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    changeManage { it.copy(configError = "Einstellungen laden: ${error.displayMessage()}") }
+                }
+            }
+        }
+    }
+
+    private fun manageWrite(label: String, call: (MobileCore) -> ManageRunResult) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        if (state.value.manage.stepUp != null) {
+            changeManage { it.copy(configError = STEPUP_OPEN_TEXT) }
+            return
+        }
+        changeManage { it.copy(running = label, configError = null) }
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { call(native) }
+                if (generation == gate.generation) {
+                    changeManage { applyManageResult(it, label, result, SystemClock.elapsedRealtime()) }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    changeManage { it.copy(running = null, configError = "$label: ${error.displayMessage()}") }
+                }
+            }
+        }
+    }
+
+    fun setConfig(key: String, value: String) {
+        val id = newMsgId()
+        manageWrite("config.set") { it.configSet(key, value, id) }
+    }
+
+    fun resetConfig(key: String) {
+        val id = newMsgId()
+        manageWrite("config.reset") { it.configReset(key, id) }
+    }
+
+    /** Legt einen Provider an: optional `secretPut`, dann die Zeile. Der Wert wird nur durchgereicht. */
+    fun addProvider(request: ProviderAddRequest, secret: String?, onDone: (String?) -> Unit) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        if (state.value.manage.stepUp != null) {
+            onDone(STEPUP_OPEN_TEXT)
+            return
+        }
+        changeManage { it.copy(running = "provider.add", commandsError = null) }
+        scope.launch {
+            try {
+                val id = newMsgId()
+                val (line, result) = withContext(Dispatchers.IO) {
+                    val handle = if (secret != null) {
+                        native.secretPut(request.keyName, request.name, secret).handle
+                    } else {
+                        null
+                    }
+                    val built = providerAddLine(request, handle)
+                        ?: throw IllegalArgumentException("Ungültige Provider-Angaben.")
+                    built to native.command(null, built, id)
+                }
+                if (generation == gate.generation) {
+                    changeManage { applyManageResult(it, line, result, SystemClock.elapsedRealtime()) }
+                    onDone(null)
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    changeManage { it.copy(running = null) }
+                    onDone(error.displayMessage())
+                }
+            }
+        }
+    }
+
+    fun confirmStepUp(stepUp: ManageStepUp) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        if (state.value.manage.running == STEPUP_CONFIRM_RUNNING) return
+        changeManage { it.copy(running = STEPUP_CONFIRM_RUNNING, stepUpError = null) }
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { native.stepupConfirm(stepUp) }
+                if (generation == gate.generation) {
+                    changeManage {
+                        it.copy(stepUp = null, running = null, stepUpError = null, card = ManageCard(stepUp.action, result))
+                    }
+                    val action = stepUp.action
+                    if (action.startsWith("models.") || action.startsWith("provider.")) refreshCatalog(null)
+                    if (action.startsWith("config.") || action.startsWith("mode.")) refreshConfig()
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) {
+                    changeManage { it.copy(stepUp = null, running = null, stepUpError = error.displayMessage()) }
+                }
+            }
+        }
+    }
+
+    fun cancelStepUp(stepUp: ManageStepUp, reason: String? = null) {
+        val generation = gate.generation
+        val native = core
+        val shown = when (reason) {
+            null -> null
+            "expired" -> STEPUP_EXPIRED_TEXT
+            else -> reason
+        }
+        changeManage { it.copy(stepUp = null, stepUpError = shown) }
+        if (generation == null || native == null) return
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { native.stepupCancel(stepUp.stepupId) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (reason == null && generation == gate.generation) {
+                    changeManage { it.copy(stepUpError = error.displayMessage()) }
+                }
+            }
+        }
+    }
+
+    fun noteStepUpError(stepUp: ManageStepUp, text: String) {
+        changeManage {
+            if (it.stepUp?.stepupId == stepUp.stepupId) it.copy(stepUpError = text) else it
+        }
+    }
+
+    fun clearStepUpError() {
+        changeManage { it.copy(stepUpError = null) }
     }
 
     // ---- Projekte und Seiten (Paket A5) ----

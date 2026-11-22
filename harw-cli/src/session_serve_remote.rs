@@ -574,6 +574,7 @@ async fn start_remote_composed(
     let approvals = DurableApprovals::open(&sessions_root)
         .map_err(|error| format!("remote approvals: {error}"))?;
     let services = DaemonServices::new(driver, Arc::new(transcripts), Arc::new(approvals));
+    let manage = share.is_some();
     let host = match share {
         None => SessionHost::open(
             HostConfig::new(host_dir),
@@ -594,6 +595,11 @@ async fn start_remote_composed(
         ),
     };
     let host = Arc::new(host.map_err(|error| format!("remote host: {error}"))?);
+    // Management ops only with a shared profile (contract K-W3c WR-7).
+    if manage {
+        host.install_ops(Arc::new(crate::session_ops::HostedOps::open(config.home.clone())?))
+            .map_err(|error| format!("remote ops: {error}"))?;
+    }
     let addr = listener
         .local_addr()
         .map_err(|error| format!("remote listener address: {error}"))?;

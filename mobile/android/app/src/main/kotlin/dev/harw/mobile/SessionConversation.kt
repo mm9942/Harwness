@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -29,7 +30,13 @@ import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Construction
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.StopCircle
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledIconButton
@@ -72,9 +79,30 @@ import uniffi.harw_mobile_ffi.MobileHolder
 import uniffi.harw_mobile_ffi.MobileHolderKind
 import uniffi.harw_mobile_ffi.MobileSession
 import uniffi.harw_mobile_ffi.MobileToolState
+import uniffi.harw_mobile_ffi.ManageEffect
+import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.TranscriptEntry
 import uniffi.harw_mobile_ffi.TranscriptKind
 
+internal fun modelChipLabel(sessionModel: String?, liveModel: String?): String =
+    liveModel ?: sessionModel ?: "Modell"
+
+internal fun modelChipBlock(support: ManageSupport?, active: Boolean): String? = when {
+    !active -> "Session nicht live"
+    support == null || !support.manage -> NO_MANAGE_TEXT
+    !support.control -> "Modellwechsel braucht Profil Voll"
+    else -> null
+}
+
+/** Genau das erste `/` in einem leeren Entwurf oeffnet die Befehlsliste (nicht bei weiterem Text). */
+internal fun slashOpensCommands(draft: String, manageSupported: Boolean): Boolean =
+    manageSupported && draft == "/" && slashQuery(draft) != null
+
+/** Waehlbare Modelle fuer den Wechsel: ausgemusterte (`retired`) fehlen. */
+internal fun <T> switchableModels(models: List<T>, lifecycle: (T) -> String): List<T> =
+    models.filter { lifecycle(it) != "retired" }
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun SessionConversation(
     state: WorkspaceState,
@@ -107,6 +135,55 @@ internal fun SessionConversation(
         holder = holder,
         turnRunning = turnId != null,
     )
+    val manageSupport = state.manage.support
+    val manageOn = manageSupport?.manage == true
+    var commandsOpen by rememberSaveable(sessionId) { mutableStateOf(false) }
+    var modelsOpen by rememberSaveable(sessionId) { mutableStateOf(false) }
+    val draftText = window.draft(sessionId).text
+    LaunchedEffect(sessionId, state.online, state.generation) {
+        connection.refreshManageSupport()
+        connection.refreshCatalog(sessionId)
+    }
+    LaunchedEffect(draftText, manageOn) {
+        if (slashOpensCommands(draftText, manageOn)) commandsOpen = true
+    }
+    // Nach erfolgreichem Ausfuehren im Blatt wird ein mit `/` begonnener Entwurf geleert.
+    var seenCard by remember(sessionId) { mutableStateOf(state.manage.card) }
+    LaunchedEffect(state.manage.card) {
+        val card = state.manage.card
+        if (card != null && card !== seenCard) {
+            val effect = card.result.effect
+            if (commandsOpen && effect != ManageEffect.REFUSED && effect != ManageEffect.STEPUP_REQUIRED &&
+                window.draft(sessionId).text.startsWith("/")
+            ) {
+                window.edit(sessionId, "")
+            }
+        }
+        seenCard = card
+    }
+    if (commandsOpen && manageOn) {
+        ModalBottomSheet(
+            onDismissRequest = { commandsOpen = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        ) {
+            CommandsScreen(
+                state = state,
+                connection = connection,
+                sessionId = sessionId,
+                initialQuery = slashQuery(draftText) ?: "",
+                onBack = { commandsOpen = false },
+                onInsert = { line -> window.edit(sessionId, line) },
+            )
+        }
+    }
+    if (modelsOpen) {
+        ModalBottomSheet(
+            onDismissRequest = { modelsOpen = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        ) {
+            ModelSwitchSheet(state, connection, sessionId, active)
+        }
+    }
 
     if (approval != null) {
         ApprovalScreen(
@@ -158,6 +235,24 @@ internal fun SessionConversation(
                     Modifier.padding(horizontal = 15.dp, vertical = 4.dp),
                     error = true,
                 )
+            }
+            if (manageSupport != null) {
+                val block = modelChipBlock(manageSupport, active)
+                Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 2.dp)) {
+                    AssistChip(
+                        onClick = { modelsOpen = true },
+                        enabled = block == null,
+                        label = {
+                            Text(
+                                modelChipLabel(session?.model, state.manage.catalog?.liveModel),
+                                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            )
+                        },
+                    )
+                    block?.let {
+                        Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
             }
             if (inlineActivity || turnId != null) {
                 Row(
@@ -241,6 +336,7 @@ internal fun SessionConversation(
                     if (generation != null && head != null) window.submit(connection, sessionId, generation, head)
                 },
                 hint = composerHint(access),
+                onCommands = if (manageOn) ({ commandsOpen = true }) else null,
             )
         }
     }
@@ -421,6 +517,7 @@ private fun PromptComposer(
     onReview: () -> Unit,
     onSend: () -> Unit,
     onDiscard: () -> Unit,
+    onCommands: (() -> Unit)? = null,
 ) {
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -433,6 +530,9 @@ private fun PromptComposer(
             }
         }
         Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (onCommands != null) {
+                IconButton(onClick = onCommands) { Icon(Icons.Outlined.Terminal, "Befehle") }
+            }
             OutlinedTextField(
                 value = draft.text,
                 onValueChange = onEdit,
@@ -620,3 +720,45 @@ internal fun ApprovalDecision.displayName() = when (this) {
 }
 
 private val ShortTime = DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT)
+
+@Composable
+private fun ModelSwitchSheet(state: WorkspaceState, connection: HarwConnection, sessionId: String, active: Boolean) {
+    val manage = state.manage
+    val models = switchableModels(manage.catalog?.models.orEmpty()) { it.lifecycle }
+    val allowed = modelChipBlock(manage.support, active) == null
+    val running = manage.running != null
+    Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("Modell wechseln", style = MaterialTheme.typography.titleMedium)
+        manage.card?.let { CommandResultCard(card = it, onClose = connection::clearCommandCard) }
+        manage.catalogError?.let { StatusMessage(it, error = true) }
+        if (models.isEmpty()) {
+            StatusMessage("Keine Modelle im Katalog.")
+        } else {
+            LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                items(models, key = { "${it.provider}/${it.id}" }) { model ->
+                    val line = modelSwitchLine(model.provider, model.id)
+                    val live = manage.catalog?.liveProvider == model.provider && manage.catalog?.liveModel == model.id
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .selectable(selected = live, enabled = allowed && !running && line != null, role = Role.RadioButton) {
+                                if (line != null) connection.runCommand(sessionId, line)
+                            }
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        RadioButton(selected = live, onClick = null)
+                        Column(Modifier.weight(1f)) {
+                            Text(model.name ?: model.id, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "${model.provider} · ${model.id}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

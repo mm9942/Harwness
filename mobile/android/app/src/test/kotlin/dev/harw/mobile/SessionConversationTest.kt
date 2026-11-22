@@ -7,6 +7,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.harw_mobile_ffi.MobileHolder
+import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.MobileHolderKind
 import uniffi.harw_mobile_ffi.TranscriptKind
 
@@ -65,5 +66,48 @@ class SessionConversationTest {
         assertFalse(rendersMarkdown(TranscriptKind.USER))
         assertFalse(rendersMarkdown(TranscriptKind.TOOL))
         assertFalse(rendersMarkdown(TranscriptKind.ERROR))
+    }
+
+    private fun support(
+        manage: Boolean = true,
+        stepup: Boolean = true,
+        control: Boolean = true,
+    ) = ManageSupport(
+        manage = manage,
+        stepup = stepup,
+        observe = true,
+        steer = true,
+        approve = true,
+        control = control,
+    )
+
+    @Test
+    fun modelChipLabelPrefersLive() {
+        assertEquals("l", modelChipLabel("s", "l"))
+        assertEquals("s", modelChipLabel("s", null))
+        assertEquals("Modell", modelChipLabel(null, null))
+    }
+
+    @Test
+    fun modelChipBlockReasons() {
+        assertEquals("Session nicht live", modelChipBlock(support(), active = false))
+        assertEquals(NO_MANAGE_TEXT, modelChipBlock(null, active = true))
+        assertEquals(NO_MANAGE_TEXT, modelChipBlock(support(manage = false), active = true))
+        assertEquals("Modellwechsel braucht Profil Voll", modelChipBlock(support(control = false), active = true))
+        assertNull(modelChipBlock(support(control = true), active = true))
+    }
+
+    @Test
+    fun slashOpensCommandsOnlyForBareSlash() {
+        assertTrue(slashOpensCommands("/", true))
+        assertFalse(slashOpensCommands("/m", true))
+        assertFalse(slashOpensCommands("", true))
+        assertFalse(slashOpensCommands("/", false))
+    }
+
+    @Test
+    fun switchableModelsDropRetired() {
+        val result = switchableModels(listOf("a" to "active", "b" to "retired")) { it.second }
+        assertEquals(listOf("a" to "active"), result)
     }
 }

@@ -18,6 +18,7 @@
 //! - [`record`]: durable `HostedSessionRecord` files.
 //! - [`replay`]: transcript records → durable frames.
 //! - [`stepup`]: step-up for remote global writes (nonce, hash, expiry, audit).
+//! - [`ops`]: operations backend of the minor-4 `manage`/`stepup` methods (OpsPort).
 //! - [`live_ring`]: bounded live buffer of the running turn.
 //! - [`fanout`]: per-attachment bounded queues with coalescing and `Lagged`.
 //! - [`arbiter`]: per-session FIFO, compare-and-swap on the head, idempotency.
@@ -46,6 +47,7 @@ pub mod host;
 pub mod identity;
 pub mod index;
 pub mod live_ring;
+pub mod ops;
 pub mod record;
 pub mod replay;
 pub mod stepup;
@@ -61,6 +63,7 @@ pub use identity::{
     gateway_caps_for_tier,
 };
 pub use index::{ProfileIndex, ProfileRow, ProfileShare, ShareMode, ShareSettings};
+pub use ops::{OpsCaller, OpsPort, OpsRun, OpsSession, SessionAction, tier_for_caps};
 pub use record::CreateOutcome;
 pub use tool_host::{
     GatewaySandbox, NoGatewaySandbox, SessionScope, ToolApprovalIssuer, ToolHost, ToolHostBuilder,

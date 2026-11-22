@@ -394,7 +394,8 @@ fn handle_settings_with_save(
     commit(ctx, setting, args.value.as_deref(), None, save)
 }
 
-const STALE_CHANGE: &str = "Wert hat sich seit der Bestätigung geändert; neu anfragen";
+/// Refusal text of a confirmed config change whose value moved since the plan (remote step-up: reason `stale`).
+pub const STALE_CHANGE: &str = "Wert hat sich seit der Bestätigung geändert; neu anfragen";
 
 // Shared write path of `/settings set|reset` and `apply_config_change`: lock,
 // optional stale check against the fresh value, edit, candidate validation,

@@ -57,7 +57,17 @@ private val HarwDark = darkColorScheme(
     outlineVariant = Color(0xFF554448),
 )
 
+/**
+ * Maps the theme preference from SettingsHub PREF_THEME to a dark-mode override.
+ * Values: "system" (or anything else) -> null (follow the system), "light" -> false, "dark" -> true.
+ */
+internal fun themeDarkOverride(pref: String): Boolean? = when (pref) {
+    "light" -> false
+    "dark" -> true
+    else -> null
+}
+
 @Composable
-internal fun HarwTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) HarwDark else HarwLight, content = content)
+internal fun HarwTheme(dark: Boolean? = null, content: @Composable () -> Unit) {
+    MaterialTheme(colorScheme = if (dark ?: isSystemInDarkTheme()) HarwDark else HarwLight, content = content)
 }

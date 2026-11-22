@@ -7,6 +7,7 @@ mod home;
 mod identity;
 mod listener;
 mod local;
+mod manage;
 mod mission;
 mod models;
 mod projection;

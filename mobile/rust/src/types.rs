@@ -1,6 +1,8 @@
 use harw_protocol::session_wire::{
-    HolderInfo, HolderKind, HostedState, LastOrigin, ProjectSummary, ReadOnlyReason, RowOrigin,
-    SessionRow, ShareInfo, ShareMode,
+    CatalogLive, CatalogModel as WireCatalogModel, CatalogProvider, CatalogResult, CatalogRole,
+    CommandEffect, CommandEntry, CommandHint, CommandOrigin, CommandsListResult, ConfigEntry,
+    HolderInfo, HolderKind, HostedState, LastOrigin, ProjectSummary, ProviderAuthKind,
+    ReadOnlyReason, RowOrigin, SecretPutResult, SessionRow, ShareInfo, ShareMode,
 };
 use harw_protocol::{Cursor, PortError};
 use harw_types::PermissionTier;
@@ -709,6 +711,386 @@ pub struct HostRef {
     pub reachable: bool,
 }
 
+// ---- Verwalten (Welle 3, Wire Minor 4) ----
+
+/// Was der verbundene Server fuer "Verwalten" anbietet (aus HelloAck). Ohne Verbindung: alles `false`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct ManageSupport {
+    /// Feature `manage` (Befehle, Katalog, Config lesen, command.run).
+    pub manage: bool,
+    /// Feature `stepup` (config.set/reset, secret.put, stepup.confirm/cancel).
+    pub stepup: bool,
+    pub observe: bool,
+    pub steer: bool,
+    pub approve: bool,
+    /// "Profil Voll": Modell-Chip, Rollen, Provider.
+    pub control: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ManageOrigin {
+    Operation,
+    TuiLocal,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ManageEffect {
+    Applied,
+    Staged,
+    NextSession,
+    Refused,
+    StepupRequired,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ManageAuthKind {
+    None,
+    Env,
+    File,
+    Keyring,
+    Secrets,
+    FileJson,
+    InlineKey,
+    Unknown,
+}
+
+/// Anmeldeart beim Anlegen eines bekannten Providers (`harw_ops::provider::ProviderAuthKind`, kebab-case).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ManageKnownAuth {
+    ApiKey,
+    Oauth,
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageCommandHint {
+    pub name: String,
+    pub args: String,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageCommand {
+    /// Ohne `/`.
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub summary: String,
+    pub usage: String,
+    /// snake_case-Domaene vom Server (`session`, `agents`, `execution`, `catalog_config`, `knowledge`, `identity`,
+    /// `network`, `security`, `crypto`, `misc`, kuenftig weitere).
+    pub domain: String,
+    pub permission: MobileTier,
+    /// `immediate` | `staged` | `deferred`.
+    pub busy: String,
+    pub origin: ManageOrigin,
+    pub remote: bool,
+    pub available: bool,
+    /// Deutscher Grund, nur wenn `!available`.
+    pub reason: Option<String>,
+    pub reason_code: Option<String>,
+    pub subcommands: Vec<ManageCommandHint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageCommandList {
+    pub commands: Vec<ManageCommand>,
+    pub rev: String,
+}
+
+/// Eine Zeile `schluessel: wert` des kanonischen Step-up-Texts (nur Anzeige).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageStepUpLine {
+    pub label: String,
+    pub value: String,
+}
+
+/// Step-up-Herausforderung, vom Kern GEPRUEFT (Hash passt zu Nonce und Text). Enthaelt nichts Geheimes.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageStepUp {
+    pub stepup_id: String,
+    pub action: String,
+    pub target: String,
+    /// Volltext, den der Dialog VOLLSTAENDIG zeigt.
+    pub text: String,
+    pub nonce: String,
+    pub hash: String,
+    /// RFC 3339 (Server-Uhr).
+    pub expires_at: String,
+    /// Restgueltigkeit bei Empfang, 1..=`STEPUP_MAX_VALID_MS`; bei Uhrabweichung `STEPUP_FALLBACK_VALID_MS`.
+    pub valid_for_ms: u64,
+    /// Zeilen des Texts ab Zeile 2 (Kopf `harw step-up v1` ausgelassen), Format `label: value`; Zeilen ohne `": "`
+    /// stehen mit leerem `label`.
+    pub lines: Vec<ManageStepUpLine>,
+    /// Wert der Zeile `adresse:`, wenn nicht `-` (volle URL, unveraendert).
+    pub address: Option<String>,
+    /// Name aus `schluessel: neu "<name>" (nur schreiben)`, sonst `None`.
+    pub key_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageRunResult {
+    pub ok: bool,
+    pub text: String,
+    /// `data` als eingerueckter JSON-Text (Technische Details), hoechstens `MAX_DATA_JSON_BYTES`.
+    pub data_json: Option<String>,
+    /// `true`, wenn `data` groesser war und weggelassen wurde.
+    pub data_truncated: bool,
+    pub effect: ManageEffect,
+    pub reason_code: Option<String>,
+    pub stepup: Option<ManageStepUp>,
+}
+
+/// Geschwaerzter Provider (`catalog.get`). Kein Schluessel, kein Header, kein Pfad.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CloudProvider {
+    pub name: String,
+    pub api: String,
+    pub base_url: String,
+    pub enabled: bool,
+    pub auth_kind: ManageAuthKind,
+    pub auth_name: Option<String>,
+    pub has_secret: bool,
+    pub models: Vec<String>,
+    pub max_concurrency: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CloudModel {
+    pub key: String,
+    pub id: String,
+    pub name: Option<String>,
+    pub provider: String,
+    pub aliases: Vec<String>,
+    pub context_window: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub reasoning: bool,
+    pub input_types: Vec<String>,
+    /// `active` | `deprecated` | `retirement_window` | `retired` | `unknown` | kuenftige.
+    pub lifecycle: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CloudRole {
+    /// Rollenschluessel (`uia`, `orchestrator`, `worker-simple`, ...).
+    pub role: String,
+    pub label: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub source: String,
+    pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CloudCatalog {
+    pub providers: Vec<CloudProvider>,
+    pub models: Vec<CloudModel>,
+    pub roles: Vec<CloudRole>,
+    pub live_provider: Option<String>,
+    pub live_model: Option<String>,
+    /// z. B. "gilt ab nächster Session".
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageConfigEntry {
+    pub key: String,
+    pub value: String,
+    pub choices: Vec<String>,
+    pub scope: String,
+    /// `now` | `next_session`.
+    pub apply: String,
+}
+
+/// Ergebnis von `secret_put`. NIE der Wert.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageSecretHandle {
+    pub handle: String,
+    pub key_name: String,
+    pub for_provider: String,
+    pub expires_at: String,
+}
+
+/// Ein waehlbarer bekannter Provider aus `/provider catalog` (`data.providers[]`).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ManageKnownProvider {
+    pub id: String,
+    pub display_name: String,
+    pub api: String,
+    pub base_url: String,
+    /// Reihenfolge wie Server: `ApiKey` zuerst, dann `Oauth`.
+    pub auth_kinds: Vec<ManageKnownAuth>,
+    pub default_name_api_key: String,
+    pub default_name_oauth: Option<String>,
+    pub models: Vec<String>,
+    pub api_key_taken: bool,
+    pub oauth_taken: bool,
+    /// Nur bei OAuth mit Token (Anthropic): Pflicht-Praefix des Tokens, z. B. `sk-ant-oat`. `None` = verknuepftes Konto
+    /// (kein Schluessel) oder kein OAuth.
+    pub oauth_token_prefix: Option<String>,
+}
+
+impl From<CommandOrigin> for ManageOrigin {
+    fn from(value: CommandOrigin) -> Self {
+        match value {
+            CommandOrigin::Operation => Self::Operation,
+            CommandOrigin::TuiLocal => Self::TuiLocal,
+            CommandOrigin::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<CommandEffect> for ManageEffect {
+    fn from(value: CommandEffect) -> Self {
+        match value {
+            CommandEffect::Applied => Self::Applied,
+            CommandEffect::Staged => Self::Staged,
+            CommandEffect::NextSession => Self::NextSession,
+            CommandEffect::Refused => Self::Refused,
+            CommandEffect::StepupRequired => Self::StepupRequired,
+            CommandEffect::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<ProviderAuthKind> for ManageAuthKind {
+    fn from(value: ProviderAuthKind) -> Self {
+        match value {
+            ProviderAuthKind::None => Self::None,
+            ProviderAuthKind::Env => Self::Env,
+            ProviderAuthKind::File => Self::File,
+            ProviderAuthKind::Keyring => Self::Keyring,
+            ProviderAuthKind::Secrets => Self::Secrets,
+            ProviderAuthKind::FileJson => Self::FileJson,
+            ProviderAuthKind::InlineKey => Self::InlineKey,
+            ProviderAuthKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<CommandHint> for ManageCommandHint {
+    fn from(value: CommandHint) -> Self {
+        Self {
+            name: value.name,
+            args: value.args,
+            summary: value.summary,
+        }
+    }
+}
+
+impl From<CommandEntry> for ManageCommand {
+    fn from(entry: CommandEntry) -> Self {
+        Self {
+            name: entry.name,
+            aliases: entry.aliases,
+            summary: entry.summary,
+            usage: entry.usage,
+            domain: entry.domain,
+            permission: entry.permission.into(),
+            busy: entry.busy,
+            origin: entry.origin.into(),
+            remote: entry.remote,
+            available: entry.available,
+            reason: entry.reason,
+            reason_code: entry.reason_code,
+            subcommands: entry.subcommands.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<CommandsListResult> for ManageCommandList {
+    fn from(result: CommandsListResult) -> Self {
+        Self {
+            commands: result.commands.into_iter().map(Into::into).collect(),
+            rev: result.rev,
+        }
+    }
+}
+
+impl From<CatalogProvider> for CloudProvider {
+    fn from(value: CatalogProvider) -> Self {
+        Self {
+            name: value.name,
+            api: value.api,
+            base_url: value.base_url,
+            enabled: value.enabled,
+            auth_kind: value.auth_kind.into(),
+            auth_name: value.auth_name,
+            has_secret: value.has_secret,
+            models: value.models,
+            max_concurrency: value.max_concurrency,
+        }
+    }
+}
+
+impl From<WireCatalogModel> for CloudModel {
+    fn from(value: WireCatalogModel) -> Self {
+        Self {
+            key: value.key,
+            id: value.id,
+            name: value.name,
+            provider: value.provider,
+            aliases: value.aliases,
+            context_window: value.context_window,
+            max_tokens: value.max_tokens,
+            reasoning: value.reasoning,
+            input_types: value.input_types,
+            lifecycle: value.lifecycle,
+        }
+    }
+}
+
+impl From<CatalogRole> for CloudRole {
+    fn from(value: CatalogRole) -> Self {
+        Self {
+            role: value.role,
+            label: value.label,
+            provider: value.provider,
+            model: value.model,
+            source: value.source,
+            effort: value.effort,
+        }
+    }
+}
+
+impl From<CatalogResult> for CloudCatalog {
+    fn from(result: CatalogResult) -> Self {
+        let CatalogLive { provider, model } = result.live;
+        Self {
+            providers: result.providers.into_iter().map(Into::into).collect(),
+            models: result.models.into_iter().map(Into::into).collect(),
+            roles: result.roles.into_iter().map(Into::into).collect(),
+            live_provider: provider,
+            live_model: model,
+            note: result.note,
+        }
+    }
+}
+
+impl From<ConfigEntry> for ManageConfigEntry {
+    fn from(value: ConfigEntry) -> Self {
+        Self {
+            key: value.key,
+            value: value.value,
+            choices: value.choices,
+            scope: value.scope,
+            apply: value.apply,
+        }
+    }
+}
+
+impl From<SecretPutResult> for ManageSecretHandle {
+    fn from(result: SecretPutResult) -> Self {
+        Self {
+            handle: result.handle,
+            key_name: result.key_name,
+            for_provider: result.for_provider,
+            expires_at: result.expires_at.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,5 +1193,154 @@ mod tests {
         .into();
         assert_eq!(share.mode, MobileShareMode::Continue);
         assert_eq!(share.tier, MobileTier::Maintainer);
+    }
+
+    #[test]
+    fn manage_enums_map_unknown() {
+        assert_eq!(ManageOrigin::from(CommandOrigin::Unknown), ManageOrigin::Unknown);
+        assert_eq!(ManageOrigin::from(CommandOrigin::TuiLocal), ManageOrigin::TuiLocal);
+        assert_eq!(ManageEffect::from(CommandEffect::Unknown), ManageEffect::Unknown);
+        assert_eq!(
+            ManageAuthKind::from(ProviderAuthKind::Unknown),
+            ManageAuthKind::Unknown
+        );
+        assert_eq!(
+            ManageEffect::from(CommandEffect::StepupRequired),
+            ManageEffect::StepupRequired
+        );
+        assert_eq!(
+            ManageEffect::from(CommandEffect::NextSession),
+            ManageEffect::NextSession
+        );
+    }
+
+    #[test]
+    fn command_entry_maps_field_by_field() {
+        let entry = CommandEntry {
+            name: "stop".to_owned(),
+            aliases: vec!["halt".to_owned()],
+            summary: "Stoppt".to_owned(),
+            usage: "/stop".to_owned(),
+            domain: "session".to_owned(),
+            permission: PermissionTier::Operator,
+            busy: "immediate".to_owned(),
+            origin: CommandOrigin::Operation,
+            remote: true,
+            available: false,
+            reason: Some("braucht Recht Steuern".to_owned()),
+            reason_code: Some("missing_cap".to_owned()),
+            subcommands: vec![CommandHint {
+                name: "stop".to_owned(),
+                args: String::new(),
+                summary: "s".to_owned(),
+            }],
+        };
+        let command: ManageCommand = entry.into();
+        assert_eq!(command.name, "stop");
+        assert_eq!(command.aliases, vec!["halt".to_owned()]);
+        assert_eq!(command.summary, "Stoppt");
+        assert_eq!(command.usage, "/stop");
+        assert_eq!(command.domain, "session");
+        assert_eq!(command.permission, MobileTier::Operator);
+        assert_eq!(command.busy, "immediate");
+        assert_eq!(command.origin, ManageOrigin::Operation);
+        assert!(command.remote);
+        assert!(!command.available);
+        assert_eq!(command.reason.as_deref(), Some("braucht Recht Steuern"));
+        assert_eq!(command.reason_code.as_deref(), Some("missing_cap"));
+        assert_eq!(
+            command.subcommands,
+            vec![ManageCommandHint {
+                name: "stop".to_owned(),
+                args: String::new(),
+                summary: "s".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn catalog_maps_without_secret_fields() {
+        let result = CatalogResult {
+            providers: vec![CatalogProvider {
+                name: "anthropic".to_owned(),
+                api: "anthropic-messages".to_owned(),
+                base_url: "https://api.example.test/v1".to_owned(),
+                enabled: true,
+                auth_kind: ProviderAuthKind::Secrets,
+                auth_name: Some("anthropic-key".to_owned()),
+                has_secret: true,
+                models: vec!["m".to_owned()],
+                max_concurrency: Some(4),
+            }],
+            models: vec![WireCatalogModel {
+                key: "anthropic/m".to_owned(),
+                id: "m".to_owned(),
+                name: None,
+                provider: "anthropic".to_owned(),
+                aliases: Vec::new(),
+                context_window: Some(1000),
+                max_tokens: None,
+                reasoning: true,
+                input_types: vec!["text".to_owned()],
+                lifecycle: "active".to_owned(),
+            }],
+            roles: vec![CatalogRole {
+                role: "uia".to_owned(),
+                label: "UIA".to_owned(),
+                provider: Some("anthropic".to_owned()),
+                model: Some("m".to_owned()),
+                source: "profile".to_owned(),
+                effort: None,
+            }],
+            live: CatalogLive {
+                provider: Some("p".to_owned()),
+                model: Some("m".to_owned()),
+            },
+            note: "gilt ab nächster Session".to_owned(),
+        };
+        let catalog: CloudCatalog = result.into();
+        assert_eq!(catalog.live_model.as_deref(), Some("m"));
+        assert_eq!(catalog.live_provider.as_deref(), Some("p"));
+        let provider = &catalog.providers[0];
+        assert_eq!(provider.auth_kind, ManageAuthKind::Secrets);
+        assert_eq!(provider.auth_name.as_deref(), Some("anthropic-key"));
+        assert!(provider.has_secret);
+        assert_eq!(provider.base_url, "https://api.example.test/v1");
+        assert_eq!(provider.max_concurrency, Some(4));
+        assert_eq!(catalog.models[0].key, "anthropic/m");
+        assert!(catalog.models[0].reasoning);
+        assert_eq!(catalog.roles[0].role, "uia");
+        assert_eq!(catalog.note, "gilt ab nächster Session");
+    }
+
+    #[test]
+    fn secret_handle_has_no_value_field() {
+        let result = SecretPutResult {
+            handle: "0".repeat(32),
+            key_name: "anthropic-key".to_owned(),
+            for_provider: "anthropic".to_owned(),
+            expires_at: timestamp("2026-01-02T03:04:05Z"),
+        };
+        let handle: ManageSecretHandle = result.into();
+        assert_eq!(handle.expires_at, "2026-01-02T03:04:05Z");
+        let debug = format!("{handle:?}");
+        for field in ["handle", "key_name", "for_provider", "expires_at"] {
+            assert!(debug.contains(field), "{field} fehlt");
+        }
+        assert!(!debug.contains("value"));
+    }
+
+    #[test]
+    fn config_entry_maps_field_by_field() {
+        let entry: ManageConfigEntry = ConfigEntry {
+            key: "k".to_owned(),
+            value: "v".to_owned(),
+            choices: vec!["v".to_owned(), "w".to_owned()],
+            scope: "profile".to_owned(),
+            apply: "next_session".to_owned(),
+        }
+        .into();
+        assert_eq!(entry.choices.len(), 2);
+        assert_eq!(entry.apply, "next_session");
     }
 }

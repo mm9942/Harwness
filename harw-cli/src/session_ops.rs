@@ -61,10 +61,6 @@ use jiff::Timestamp;
 /// Cached results per connection for `client_msg_id` (FIFO, oldest drops out).
 pub(crate) const RUN_DEDUP_PER_CONNECTION: usize = 64;
 
-/// Prefix of `harw_ops::settings` `STALE_CHANGE` (private there). A confirmed
-/// change whose value moved since the plan is answered with `reason_code stale`.
-const STALE_PREFIX: &str = "Wert hat sich seit der Bestätigung geändert";
-
 /// Text of a session action the host runs.
 const SESSION_ACCEPTED: &str = "übernommen";
 
@@ -465,7 +461,7 @@ impl HostedOps {
                 };
                 match harw_ops::settings::apply_config_change(&ctx, &change) {
                     Ok(out) => applied(out, effect),
-                    Err(OpError::Execution(text)) if text.starts_with(STALE_PREFIX) => {
+                    Err(OpError::Execution(text)) if text == harw_ops::settings::STALE_CHANGE => {
                         refused_code(refusal_codes::STALE, text)
                     }
                     Err(error) => op_refusal(error),

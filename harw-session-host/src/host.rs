@@ -32,17 +32,25 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CreateInParams, CreateParams,
-    DEFAULT_PAGE_LIMIT, GatewayConnectionInfo, GatewayConnectionsResult, GatewayDrainParams,
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams,
+    CatalogResult, CommandEffect, CommandRunParams, CommandRunResult, CommandsListParams,
+    CommandsListResult, ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams,
+    CreateInParams, CreateParams, DEFAULT_PAGE_LIMIT, GatewayConnectionInfo, GatewayConnectionsResult, GatewayDrainParams,
     GatewayListenerInfo, GatewayListenerSetParams, GatewayListenersResult, GatewayRevokeParams,
     GatewayRevokeResult, GatewayStatus, GatewayToolRights, GatewayToolRightsParams,
     GatewayToolsResult, HelloAck, HelloParams, HistoryParams, HolderInfo, InterruptParams,
-    MAX_PAGE_LIMIT, NO_PROJECT_KEY, PROJECTS_WIRE_MINOR, PageParams, PageResult, PrincipalSummary,
+    MANAGE_WIRE_MINOR, MAX_PAGE_LIMIT, NO_PROJECT_KEY, PROJECTS_WIRE_MINOR, PageParams, PageResult, PrincipalSummary,
     ProjectsParams, ProjectsResult, ReadOnlyReason, RenameParams, RespondResult, RowOrigin,
-    SESSION_WIRE_MINOR, SessionRow, SessionSummary, SetEffortParams, SetModeParams, SetModelParams,
-    SetProjectParams, ShareInfo, SubmitParams, SubmitResult, TOOL_GATEWAY_WIRE_MINOR,
+    SESSION_WIRE_MINOR, SecretPutParams, SecretPutResult, SessionRow, SessionSummary,
+    SetEffortParams, SetModeParams, SetModelParams, SetProjectParams, ShareInfo,
+    StepUpCancelParams, StepUpConfirmParams, SubmitParams, SubmitResult, TOOL_GATEWAY_WIRE_MINOR,
     ToolCallParams, ToolCallResultFrame, ToolCancelParams, ToolListParams, ToolListResult,
-    features,
+    features, refusal_codes,
+};
+use harw_protocol::methods::{
+    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
+    METHOD_STEPUP_CONFIRM,
 };
 use harw_protocol::{
     ApprovalRequest, ClientCaps, Cursor, FrameEnvelope, FrameSource, GatewayPort, HostedState,
@@ -73,6 +81,7 @@ use crate::index::{
     decode_cursor, encode_cursor, wire_holder, wire_last_origin,
 };
 use crate::live_ring::LiveRing;
+use crate::ops::{OpsCaller, OpsPort, OpsRun, OpsSession, SessionAction, tier_for_caps};
 use crate::record::{CreateOutcome, HostedSessionRecord, RecordStore};
 use crate::replay::{TranscriptSource, history_before, replay, tail_start};
 use crate::tool_host::{SessionScope, ToolEvents, ToolHost};
@@ -121,6 +130,8 @@ const HOST_FEATURES: &[&str] = &[
     features::COMPACT_REASONING,
     features::JOB_FRAMES,
     features::PROJECTS,
+    features::MANAGE,
+    features::STEPUP,
 ];
 
 /// Features that exist only from [`TOOL_GATEWAY_WIRE_MINOR`] on.
@@ -129,6 +140,16 @@ const R18_FEATURES: &[&str] = &[features::TOOLS, features::GATEWAY];
 /// Features that exist only from [`PROJECTS_WIRE_MINOR`] on. Granted with or
 /// without sharing (a client then shows its empty state).
 const PROJECT_FEATURES: &[&str] = &[features::PROJECTS];
+
+/// Features that exist only from [`MANAGE_WIRE_MINOR`] on (contract K-W3c
+/// §8.2 no. 9). `manage` needs installed ops, `stepup` additionally
+/// `manage` and [`OpsPort::stepup_enabled`].
+const MANAGE_FEATURES: &[&str] = &[features::MANAGE, features::STEPUP];
+
+/// Answer of a session action on a profile session without a host record.
+const TEXT_SESSION_NOT_HOSTED: &str = "Session läuft nicht auf dem Gateway; erst übernehmen";
+/// Answer of a session action without a session (normally refused by the ops backend already).
+const TEXT_SESSION_REQUIRED: &str = "braucht eine Session";
 
 /// Denied: the project key is unknown or its root failed validation.
 const DENIED_UNKNOWN_PROJECT: &str = "unbekanntes Projekt";
@@ -234,6 +255,9 @@ struct HostInner {
     listeners: Mutex<Vec<GatewayListenerInfo>>,
     /// Sharing of profile (TUI) sessions; `None` without sharing.
     profile: Option<ProfileShare>,
+    /// Minor-4 operations backend (`manage`/`stepup`); empty until
+    /// [`SessionHost::install_ops`].
+    ops: std::sync::OnceLock<Arc<dyn OpsPort>>,
 }
 
 /// The persistent session host. Cheap to clone.
@@ -327,6 +351,7 @@ impl SessionHost {
                 connections: Mutex::new(BTreeMap::new()),
                 listeners: Mutex::new(Vec::new()),
                 profile,
+                ops: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -335,6 +360,16 @@ impl SessionHost {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.inner.epoch
+    }
+
+    /// Install the operations backend of the minor-4 `manage`/`stepup`
+    /// methods (contract K-W3c §8.2). Without it hello never grants these
+    /// features and the methods are denied. Installing twice is refused.
+    pub fn install_ops(&self, ops: Arc<dyn OpsPort>) -> Result<(), HostError> {
+        self.inner
+            .ops
+            .set(ops)
+            .map_err(|_| HostError::Protocol("ops already installed".into()))
     }
 
     /// A port bound to one authenticated client. The identity is fixed for
@@ -372,6 +407,8 @@ impl SessionHost {
             granted: Mutex::new(None),
             wire_minor: AtomicU32::new(0),
             projects: AtomicBool::new(false),
+            manage: AtomicBool::new(false),
+            stepup: AtomicBool::new(false),
         })
     }
 
@@ -1579,12 +1616,19 @@ pub struct HostConnection {
     wire_minor: AtomicU32,
     /// Feature `projects` was granted at hello.
     projects: AtomicBool,
+    /// Feature `manage` was granted at hello (minor 4).
+    manage: AtomicBool,
+    /// Feature `stepup` was granted at hello (minor 4).
+    stepup: AtomicBool,
 }
 
 impl Drop for HostConnection {
     fn drop(&mut self) {
         if let Ok(mut connections) = self.host.connections.lock() {
             connections.remove(&self.identity.connection);
+        }
+        if let Some(ops) = self.host.ops.get() {
+            ops.connection_closed(&self.identity);
         }
     }
 }
@@ -1660,7 +1704,7 @@ impl HostConnection {
         {
             entry.granted = Some(caps);
         }
-        let granted_features: Vec<String> = params
+        let mut granted_features: Vec<String> = params
             .features
             .iter()
             .filter(|feature| HOST_FEATURES.contains(&feature.as_str()))
@@ -1670,8 +1714,28 @@ impl HostConnection {
             .filter(|feature| {
                 wire_minor >= PROJECTS_WIRE_MINOR || !PROJECT_FEATURES.contains(&feature.as_str())
             })
+            .filter(|feature| {
+                wire_minor >= MANAGE_WIRE_MINOR || !MANAGE_FEATURES.contains(&feature.as_str())
+            })
             .cloned()
             .collect();
+        // Contract K-W3c §8.2 no. 9: `manage` only with installed ops,
+        // `stepup` only together with `manage` and an enabled step-up slice.
+        let ops = self.host.ops.get();
+        if ops.is_none() {
+            granted_features.retain(|feature| feature.as_str() != features::MANAGE);
+        }
+        let manage = granted_features
+            .iter()
+            .any(|feature| feature.as_str() == features::MANAGE);
+        if !manage || !ops.is_some_and(|ops| ops.stepup_enabled()) {
+            granted_features.retain(|feature| feature.as_str() != features::STEPUP);
+        }
+        let stepup = granted_features
+            .iter()
+            .any(|feature| feature.as_str() == features::STEPUP);
+        self.manage.store(manage, Ordering::SeqCst);
+        self.stepup.store(stepup, Ordering::SeqCst);
         self.wire_minor.store(wire_minor, Ordering::SeqCst);
         self.projects.store(
             granted_features
@@ -3062,6 +3126,221 @@ impl HostConnection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Minor 4: `manage` / `stepup` admission (contract K-W3c §8.2)
+// ---------------------------------------------------------------------------
+
+/// The negotiated feature a minor-4 method needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManageFeature {
+    /// `commands.list`, `command.run`, `catalog.get`, `config.get`.
+    Manage,
+    /// `config.set|reset`, `secret.put`, `stepup.confirm|cancel`.
+    Stepup,
+}
+
+/// Caps of the step-up confirmed global writes (K-W3b 7.4, R8).
+const NEED_CONTROL_APPROVE: &[Need] = &[Need::Control, Need::Approve];
+/// Caps of the read-only manage methods and `stepup.cancel`.
+const NEED_OBSERVE: &[Need] = &[Need::Observe];
+
+/// A refused `command.run` answer with a gateway refusal code.
+fn refused_run(code: &str, text: &str) -> CommandRunResult {
+    CommandRunResult {
+        ok: false,
+        text: text.to_owned(),
+        data: None,
+        effect: CommandEffect::Refused,
+        reason_code: Some(code.to_owned()),
+        stepup: None,
+    }
+}
+
+impl HostConnection {
+    /// Admission steps 1-5 and 7 of contract K-W3c §8.2 (first failure
+    /// wins): hello, negotiated feature, installed ops, profile tenant,
+    /// caps. Returns the backend and the host-built caller. Logs only the
+    /// method and the connection, never parameters.
+    fn manage_admit(
+        &self,
+        method: &'static str,
+        feature: ManageFeature,
+        needs: &[Need],
+    ) -> Result<(&Arc<dyn OpsPort>, OpsCaller), HostError> {
+        let granted = self.granted()?;
+        tracing::debug!(method, connection = self.identity.connection.0, "manage call");
+        match feature {
+            ManageFeature::Manage if !self.manage.load(Ordering::SeqCst) => {
+                return Err(HostError::Denied("feature `manage` not negotiated".into()));
+            }
+            ManageFeature::Stepup if !self.stepup.load(Ordering::SeqCst) => {
+                return Err(HostError::Denied("feature `stepup` not negotiated".into()));
+            }
+            ManageFeature::Manage | ManageFeature::Stepup => {}
+        }
+        let ops = self
+            .host
+            .ops
+            .get()
+            .ok_or_else(|| HostError::Denied("management not offered by this gateway".into()))?;
+        let share = self.host.share();
+        if self.identity.tenant.is_some()
+            && self.host.share_for(self.identity.tenant.as_ref()).is_none()
+        {
+            return Err(HostError::Denied(
+                "management not offered for this tenant".into(),
+            ));
+        }
+        for need in needs {
+            need.require(granted)?;
+        }
+        Ok((ops, self.ops_caller(granted, share)))
+    }
+
+    /// Step 7: the caller the ops backend sees. Effective tier is the
+    /// granted tier capped by the listener tier of the profile share.
+    fn ops_caller(&self, granted: ClientCaps, share: Option<&ProfileShare>) -> OpsCaller {
+        let tier = tier_for_caps(granted);
+        OpsCaller {
+            identity: self.identity.clone(),
+            granted,
+            tier: share.map_or(tier, |share| tier.min(share.settings.listener_tier)),
+            profile_tenant: share.map(|share| share.settings.tenant.clone()),
+        }
+    }
+
+    /// Step 6: the referenced session after observe admission. A hosted
+    /// session needs its record's tenant to admit the caller; a profile
+    /// session must be visible to the caller's tenant (else `NotFound`).
+    fn ops_session(&self, id: Option<SessionId>) -> Result<Option<OpsSession>, HostError> {
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        // `observed_slot`: a hosted slot (record store) first, otherwise a
+        // read-only view of a visible profile session; then tenant + observe.
+        let slot = self.observed_slot(&id)?;
+        let hosted = !slot.lock()?.ephemeral;
+        let model = self.host.driver.model_name(&id);
+        Ok(Some(OpsSession {
+            session_id: id,
+            hosted,
+            model,
+        }))
+    }
+
+    /// Step 8: run the typed session way an `OpsRun::Session` asks for,
+    /// with the host's own admission (`steer` for interrupt, `control` for
+    /// settings). Success answers `result`; a host error is the answer.
+    async fn run_session_action(
+        &self,
+        session: Option<OpsSession>,
+        action: SessionAction,
+        result: CommandRunResult,
+    ) -> Result<CommandRunResult, HostError> {
+        let Some(session) = session else {
+            return Ok(refused_run(
+                refusal_codes::SESSION_REQUIRED,
+                TEXT_SESSION_REQUIRED,
+            ));
+        };
+        if !session.hosted {
+            return Ok(refused_run(
+                refusal_codes::SESSION_NOT_HOSTED,
+                TEXT_SESSION_NOT_HOSTED,
+            ));
+        }
+        let id = session.session_id;
+        match action {
+            SessionAction::Interrupt => self.interrupt_sync(&InterruptParams {
+                session_id: id,
+                turn_id: None,
+            })?,
+            SessionAction::SetModel(model) => self.set(id, Setting::Model(model)).await?,
+            SessionAction::SetMode(mode) => self.set(id, Setting::Mode(mode)).await?,
+            SessionAction::SetEffort(effort) => self.set(id, Setting::Effort(effort)).await?,
+        }
+        Ok(result)
+    }
+
+    async fn commands_list_inner(
+        &self,
+        params: CommandsListParams,
+    ) -> Result<CommandsListResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_COMMANDS_LIST, ManageFeature::Manage, NEED_OBSERVE)?;
+        let session = self.ops_session(params.session_id.clone())?;
+        ops.commands_list(caller, session, params).await
+    }
+
+    async fn command_run_inner(
+        &self,
+        params: CommandRunParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_COMMAND_RUN, ManageFeature::Manage, NEED_OBSERVE)?;
+        let session = self.ops_session(params.session_id.clone())?;
+        match ops.command_run(caller, session.clone(), params).await? {
+            OpsRun::Done(result) => Ok(result),
+            OpsRun::Session { action, result } => {
+                self.run_session_action(session, action, result).await
+            }
+        }
+    }
+
+    async fn catalog_get_inner(&self, params: CatalogGetParams) -> Result<CatalogResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_CATALOG_GET, ManageFeature::Manage, NEED_OBSERVE)?;
+        let session = self.ops_session(params.session_id.clone())?;
+        ops.catalog_get(caller, session, params).await
+    }
+
+    async fn config_get_inner(&self, params: ConfigGetParams) -> Result<ConfigGetResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_CONFIG_GET, ManageFeature::Manage, NEED_OBSERVE)?;
+        ops.config_get(caller, params).await
+    }
+
+    async fn config_set_inner(&self, params: ConfigSetParams) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_CONFIG_SET, ManageFeature::Stepup, NEED_CONTROL_APPROVE)?;
+        ops.config_set(caller, params).await
+    }
+
+    async fn config_reset_inner(
+        &self,
+        params: ConfigResetParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_CONFIG_RESET, ManageFeature::Stepup, NEED_CONTROL_APPROVE)?;
+        ops.config_reset(caller, params).await
+    }
+
+    async fn secret_put_inner(&self, params: SecretPutParams) -> Result<SecretPutResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_SECRET_PUT, ManageFeature::Stepup, NEED_CONTROL_APPROVE)?;
+        ops.secret_put(caller, params).await
+    }
+
+    async fn stepup_confirm_inner(
+        &self,
+        params: StepUpConfirmParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) = self.manage_admit(
+            METHOD_STEPUP_CONFIRM,
+            ManageFeature::Stepup,
+            NEED_CONTROL_APPROVE,
+        )?;
+        ops.stepup_confirm(caller, params).await
+    }
+
+    async fn stepup_cancel_inner(&self, params: StepUpCancelParams) -> Result<(), HostError> {
+        // Observe only: the registry cancels the caller's own step-ups only.
+        let (ops, caller) =
+            self.manage_admit(METHOD_STEPUP_CANCEL, ManageFeature::Stepup, NEED_OBSERVE)?;
+        ops.stepup_cancel(caller, params).await
+    }
+}
+
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -3240,6 +3519,42 @@ impl SessionPort for HostConnection {
     fn archive(&self, params: ArchiveParams) -> PortFuture<'_, SessionRow> {
         port(self.archive_sync(&params))
     }
+
+    fn commands_list(&self, params: CommandsListParams) -> PortFuture<'_, CommandsListResult> {
+        Box::pin(self.commands_list_inner(params).map_err_port())
+    }
+
+    fn command_run(&self, params: CommandRunParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.command_run_inner(params).map_err_port())
+    }
+
+    fn catalog_get(&self, params: CatalogGetParams) -> PortFuture<'_, CatalogResult> {
+        Box::pin(self.catalog_get_inner(params).map_err_port())
+    }
+
+    fn config_get(&self, params: ConfigGetParams) -> PortFuture<'_, ConfigGetResult> {
+        Box::pin(self.config_get_inner(params).map_err_port())
+    }
+
+    fn config_set(&self, params: ConfigSetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.config_set_inner(params).map_err_port())
+    }
+
+    fn config_reset(&self, params: ConfigResetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.config_reset_inner(params).map_err_port())
+    }
+
+    fn secret_put(&self, params: SecretPutParams) -> PortFuture<'_, SecretPutResult> {
+        Box::pin(self.secret_put_inner(params).map_err_port())
+    }
+
+    fn stepup_confirm(&self, params: StepUpConfirmParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.stepup_confirm_inner(params).map_err_port())
+    }
+
+    fn stepup_cancel(&self, params: StepUpCancelParams) -> PortFuture<'_, ()> {
+        Box::pin(self.stepup_cancel_inner(params).map_err_port())
+    }
 }
 
 impl ToolPort for HostConnection {
@@ -3320,6 +3635,9 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ops_tests;
 
 /// Acceptance S3 (contract K-W1 §8.3): sharing profile sessions. Synthetic
 /// ids and temp dirs only.
