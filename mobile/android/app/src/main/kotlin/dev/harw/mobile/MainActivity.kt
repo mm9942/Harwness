@@ -714,6 +714,28 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
         drafts = drafts + (id to previous.copy(images = previous.images + image, error = null))
     }
 
+    /** Sendet eine fruehere Nachricht (Text und Bilder) erneut; ein offener Entwurf bleibt unangetastet. */
+    fun regenerate(
+        connection: HarwConnection,
+        id: String,
+        generation: Long,
+        head: SessionCursor,
+        text: String,
+        images: List<uniffi.harw_mobile_ffi.PromptImage>,
+    ) {
+        val previous = draft(id)
+        if (previous.uncertain || previous.sending) return
+        if (previous.text.isNotBlank() || previous.images.isNotEmpty()) {
+            drafts = drafts + (id to previous.copy(error = "Erst den Entwurf senden oder leeren, dann neu generieren."))
+            return
+        }
+        drafts = drafts + (id to SessionDraft(
+            text,
+            images = images.mapIndexed { i, image -> DraftImage("Bild ${i + 1}", image, image.dataB64.length) },
+        ))
+        submit(connection, id, generation, head)
+    }
+
     fun detachImage(id: String, index: Int) {
         val previous = draft(id)
         if (previous.uncertain || previous.sending || index !in previous.images.indices) return

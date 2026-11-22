@@ -12,6 +12,7 @@ internal class HarwApplication : Application() {
         super.onCreate()
         // Der Codex-Provider liest $HOME/.codex/auth.json (siehe CodexDirect.kt).
         ensureCodexHome(this)
+        applyImageParallelEnv(readImageParallelPref(this))
         // Lokal startet von selbst, sobald ein Modell oder eine Netzwerk-Route nutzbar ist.
         localAutostart.start()
     }

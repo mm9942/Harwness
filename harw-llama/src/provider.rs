@@ -174,8 +174,10 @@ fn run_job(
     gate: &Mutex<()>,
     job: &Job,
     abort: &AtomicBool,
+    serial: bool,
 ) -> Result<Generated, LlamaError> {
-    let _guard = gate.lock().unwrap_or_else(PoisonError::into_inner);
+    // Beschreibungsdurchlaeufe duerfen parallel laufen (jeder hat seinen eigenen Kontext).
+    let _guard = serial.then(|| gate.lock().unwrap_or_else(PoisonError::into_inner));
     let should_stop = || {
         abort.load(Ordering::Relaxed)
             || job.cancel.as_ref().is_some_and(harw_types::cancel::CancelToken::is_cancelled)
@@ -299,7 +301,7 @@ const DESCRIBE_PROMPT: &str =
 const DESCRIBE_MAX_TOKENS: u32 = 220;
 
 /// Newest images of a chat that are described (older ones stay a bare marker).
-const MAX_DESCRIBED_IMAGES: usize = 10;
+const MAX_DESCRIBED_IMAGES: usize = usize::MAX;
 
 fn description_key(data: &[u8], question: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -643,10 +645,16 @@ impl LocalGgufProvider {
     }
 
     /// Describes every image of the chat in its own short vision pass (cached).
+    /// `HARW_LOCAL_IMAGE_PARALLEL` (1..=3) lets several images run at the same time.
     async fn describe_images(&self, request: &ModelRequest) -> Result<HashMap<usize, String>, ModelError> {
         let mut result = HashMap::new();
         let todo = images_to_describe(request);
         let total = todo.len();
+        let parallel = std::env::var("HARW_LOCAL_IMAGE_PARALLEL")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(1, |n| n.clamp(1, 3));
+        let mut pending = Vec::new();
         for (i, (number, question, data)) in todo.into_iter().enumerate() {
             let key = description_key(&data, &question);
             let cached = self
@@ -655,27 +663,44 @@ impl LocalGgufProvider {
                 .unwrap_or_else(PoisonError::into_inner)
                 .get(&key)
                 .cloned();
-            let text = if let Some(text) = cached {
-                text
-            } else {
-                if let Some(sink) = request.stream.as_ref() {
-                    sink.emit(ModelStreamEvent::ReasoningDelta(format!(
-                        "Bild {} von {total} wird angesehen \u{2026}\n",
-                        i + 1
-                    )));
-                }
-                let job = self.describe_job(request, &question, data)?;
+            if let Some(text) = cached {
+                result.insert(number, text);
+                continue;
+            }
+            let job = self.describe_job(request, &question, data)?;
+            pending.push((i, number, key, job));
+        }
+        while !pending.is_empty() {
+            let take = parallel.min(pending.len());
+            let batch: Vec<_> = pending.drain(..take).collect();
+            if let Some(sink) = request.stream.as_ref() {
+                let first = batch.first().map_or(1, |b| b.0 + 1);
+                let last = batch.last().map_or(first, |b| b.0 + 1);
+                let text = if first == last {
+                    format!("Bild {first} von {total} wird angesehen \u{2026}\n")
+                } else {
+                    format!("Bilder {first}\u{2013}{last} von {total} werden gleichzeitig angesehen \u{2026}\n")
+                };
+                sink.emit(ModelStreamEvent::ReasoningDelta(text));
+            }
+            let mut handles = Vec::new();
+            for (_, number, key, job) in batch {
                 let abort = Arc::new(AtomicBool::new(false));
-                let _abort_on_drop = AbortOnDrop(Arc::clone(&abort));
+                let guard = AbortOnDrop(Arc::clone(&abort));
                 let engine = Arc::clone(&self.engine);
                 let gate = Arc::clone(&self.gate);
                 let worker_abort = Arc::clone(&abort);
-                let generated = tokio::task::spawn_blocking(move || {
-                    run_job(&engine, &gate, &job, &worker_abort)
-                })
-                .await
-                .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
-                .map_err(map_error)?;
+                let serial = parallel <= 1;
+                let handle = tokio::task::spawn_blocking(move || {
+                    run_job(&engine, &gate, &job, &worker_abort, serial)
+                });
+                handles.push((number, key, handle, guard));
+            }
+            for (number, key, handle, _guard) in handles {
+                let generated = handle
+                    .await
+                    .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
+                    .map_err(map_error)?;
                 if generated.finish == FinishReason::Cancelled {
                     return Err(ModelError::Cancelled);
                 }
@@ -684,9 +709,8 @@ impl LocalGgufProvider {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .insert(key, text.clone());
-                text
-            };
-            result.insert(number, text);
+                result.insert(number, text);
+            }
         }
         Ok(result)
     }
@@ -751,7 +775,7 @@ impl ModelProvider for LocalGgufProvider {
                 let gate = Arc::clone(&self.gate);
                 let worker_abort = Arc::clone(&abort);
                 let generated = tokio::task::spawn_blocking(move || {
-                    run_job(&engine, &gate, &job, &worker_abort)
+                    run_job(&engine, &gate, &job, &worker_abort, true)
                 })
                 .await
                 .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?

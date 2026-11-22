@@ -40,7 +40,7 @@ import java.io.ByteArrayOutputStream
 import uniffi.harw_mobile_ffi.PromptImage
 
 /** Wie viele Bilder die App an eine Nachricht haengt (Draht erlaubt 4; die Grenze haelt Platz im 1-MiB-Limit). */
-internal const val MaxPromptImages = 3
+internal const val MaxPromptImages = Int.MAX_VALUE
 
 /** Hoechstgroesse eines Bildes nach dem Verkleinern; drei Bilder passen so unter die Draht-Grenze von 800 KiB Base64. */
 private const val MaxImageBytes = 180_000

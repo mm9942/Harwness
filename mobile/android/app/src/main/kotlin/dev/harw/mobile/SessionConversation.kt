@@ -394,6 +394,10 @@ internal fun SessionConversation(
                 entries = snapshot?.transcript.orEmpty(),
                 sentImages = { text, count -> window.sentImages(sessionId, text, count) },
                 fetchMedia = { ref -> connection.mediaThumbnail(sessionId, ref) },
+                onRegenerate = { text, images ->
+                    val currentHead = snapshot?.head
+                    if (generation != null && currentHead != null) window.regenerate(connection, sessionId, generation, currentHead, text, images)
+                },
                 liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
                 jumpToLatest = transcriptJump,
                 emptyMessage = when {
@@ -444,6 +448,7 @@ private fun ConversationFeed(
     entries: List<TranscriptEntry>,
     sentImages: (String, Int) -> List<uniffi.harw_mobile_ffi.PromptImage>?,
     fetchMedia: suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?,
+    onRegenerate: ((String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
     liveText: String?,
     jumpToLatest: Int,
     emptyMessage: String,
@@ -489,12 +494,16 @@ private fun ConversationFeed(
             if (entry.kind == TranscriptKind.USER) {
                 val (clean, count) = splitImagePlaceholders(entry.text)
                 if (count > 0) {
+                    val thumbs = sentImages(clean, count)
                     MessageBlock(
-                        label, clean, entry.kind, imageCount = count, thumbs = sentImages(clean, count),
+                        label, clean, entry.kind, imageCount = count, thumbs = thumbs,
                         imageRefs = entry.images, fetchMedia = fetchMedia,
+                        onRegenerate = onRegenerate?.let { cb -> { cb(clean, thumbs.orEmpty()) } },
                     )
                     return@items
                 }
+                MessageBlock(label, entry.text, entry.kind, onRegenerate = onRegenerate?.let { cb -> { cb(entry.text, emptyList()) } })
+                return@items
             }
             MessageBlock(label, entry.text, entry.kind)
         }
@@ -510,6 +519,7 @@ private fun MessageBlock(
     thumbs: List<uniffi.harw_mobile_ffi.PromptImage>? = null,
     imageRefs: List<String> = emptyList(),
     fetchMedia: (suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?)? = null,
+    onRegenerate: (() -> Unit)? = null,
 ) {
     val colors = MaterialTheme.colorScheme
     val user = kind == TranscriptKind.USER
@@ -540,6 +550,13 @@ private fun MessageBlock(
                             style = MaterialTheme.typography.bodyMedium,
                             fontFamily = if (kind == TranscriptKind.TOOL) FontFamily.Monospace else null,
                         )
+                    }
+                }
+                if (user && onRegenerate != null) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = onRegenerate, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                            Text("\u21BB Neu generieren", style = MaterialTheme.typography.labelSmall)
+                        }
                     }
                 }
             }
@@ -646,10 +663,9 @@ internal fun PromptComposer(
     onImageError: (String) -> Unit = {},
 ) {
     val context = LocalContext.current
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(MaxPromptImages)) { uris: List<Uri> ->
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris: List<Uri> ->
         val free = (MaxPromptImages - draft.images.size).coerceAtLeast(0)
         if (uris.isNotEmpty() && onAttachImage != null) {
-            if (uris.size > free) onImageError("Höchstens $MaxPromptImages Bilder pro Nachricht – die ersten $free werden übernommen.")
             uris.take(free).forEachIndexed { index, uri ->
                 val label = "Bild ${draft.images.size + index + 1}"
                 // Dekodieren und Verkleinern gehoert nicht auf den Hauptthread.

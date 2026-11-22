@@ -49,6 +49,29 @@ internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route)
 internal const val UI_PREFS = "harw_ui"
 internal const val PREF_THEME = "theme" // "system" | "light" | "dark"
 internal const val PREF_SHOW_REASONING = "show_reasoning"
+internal const val PREF_IMAGE_PARALLEL = "image_parallel"
+
+/** Lokale Bildbeschreibung: bis zu drei Bilder gleichzeitig (Standard aus). Wirkt ab der naechsten Nachricht. */
+internal fun readImageParallelPref(context: Context): Boolean = try {
+    context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).getBoolean(PREF_IMAGE_PARALLEL, false)
+} catch (_: RuntimeException) {
+    false
+}
+
+internal fun applyImageParallelEnv(value: Boolean) {
+    try {
+        android.system.Os.setenv("HARW_LOCAL_IMAGE_PARALLEL", if (value) "3" else "1", true)
+    } catch (_: Exception) {
+    }
+}
+
+private fun writeImageParallelPref(context: Context, value: Boolean) {
+    try {
+        context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).edit().putBoolean(PREF_IMAGE_PARALLEL, value).apply()
+    } catch (_: RuntimeException) {
+    }
+    applyImageParallelEnv(value)
+}
 
 private val THEME_CHOICES = listOf("system" to "Wie System", "light" to "Hell", "dark" to "Dunkel")
 private const val NOTIFICATION_ERROR = "Benachrichtigungseinstellungen konnten nicht geöffnet werden"
@@ -160,6 +183,7 @@ internal fun SettingsHub(
     }
     var theme by remember { mutableStateOf(readThemePref(context)) }
     var showReasoning by remember { mutableStateOf(readShowReasoningPref(context)) }
+    var imageParallel by remember { mutableStateOf(readImageParallelPref(context)) }
     var editing by remember { mutableStateOf<ManageConfigEntry?>(null) }
     val block = manageOpenBlock(state)
     var modelsFolderOpen by remember { mutableStateOf(false) }
@@ -229,6 +253,26 @@ internal fun SettingsHub(
                     onCheckedChange = {
                         showReasoning = it
                         writeShowReasoningPref(context, it)
+                    },
+                )
+            }
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Bilder parallel verarbeiten", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Lokal: bis zu drei Bilder gleichzeitig beschreiben. Schneller, braucht aber mehr Speicher und Akku.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = imageParallel,
+                    onCheckedChange = {
+                        imageParallel = it
+                        writeImageParallelPref(context, it)
                     },
                 )
             }

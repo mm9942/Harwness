@@ -948,9 +948,9 @@ pub struct MediaGetResult {
 }
 
 /// Most images one `turn.submit` may carry.
-pub const MAX_SUBMIT_IMAGES: usize = 4;
+pub const MAX_SUBMIT_IMAGES: usize = 1000;
 /// Most base64 bytes over all images of one `turn.submit` (the transport message limit is 1 MiB).
-pub const MAX_SUBMIT_IMAGE_B64_BYTES: usize = 800 * 1024;
+pub const MAX_SUBMIT_IMAGE_B64_BYTES: usize = 512 * 1024 * 1024;
 
 /// One image of a `turn.submit`: the bytes travel inline (base64), the host
 /// checks, sanitizes and stores them; transcripts only carry a media reference.
