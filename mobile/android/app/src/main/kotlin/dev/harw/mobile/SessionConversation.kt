@@ -392,7 +392,16 @@ internal fun SessionConversation(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 4.dp),
             )
         }
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val agentName by produceState("Harw", state.local) {
+                value = if (!state.local) "Harw" else withContext(Dispatchers.IO) {
+                    runCatching {
+                        uniffi.harw_mobile_ffi.UiaStore(context.filesDir.path).listUias().firstOrNull { it.active }?.name?.takeIf { it.isNotBlank() }
+                    }.getOrNull() ?: "Harw"
+                }
+            }
             ConversationFeed(
+                agentName = agentName,
                 entries = snapshot?.transcript.orEmpty(),
                 sentImages = { text, count -> window.sentImages(sessionId, text, count) },
                 fetchMedia = { ref -> connection.mediaThumbnail(sessionId, ref) },
@@ -452,6 +461,7 @@ internal fun SessionConversation(
 
 @Composable
 private fun ConversationFeed(
+    agentName: String,
     entries: List<TranscriptEntry>,
     sentImages: (String, Int) -> List<uniffi.harw_mobile_ffi.PromptImage>?,
     fetchMedia: suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?,
@@ -490,12 +500,12 @@ private fun ConversationFeed(
         verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
         if (liveText != null) {
-            item(key = "live-reply") { MessageBlock("Harw · Streaming", liveText, TranscriptKind.ASSISTANT) }
+            item(key = "live-reply") { MessageBlock("$agentName · Streaming", liveText, TranscriptKind.ASSISTANT) }
         }
         items(reversed, key = { "entry-${it.id}" }) { entry ->
             val label = when (entry.kind) {
                 TranscriptKind.USER -> "Du"
-                TranscriptKind.ASSISTANT -> "Harw"
+                TranscriptKind.ASSISTANT -> agentName
                 TranscriptKind.TOOL -> entry.toolState?.let { "Werkzeug · ${it.displayName()}" } ?: "Werkzeug"
                 TranscriptKind.ERROR -> "Fehler"
             }
