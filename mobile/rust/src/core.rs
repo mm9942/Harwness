@@ -845,7 +845,10 @@ fn requested_features() -> Vec<String> {
 /// Profile for `session.attach`: reasoning-aware only when the host granted it.
 /// An older host cannot decode the new profile, so fall back to `Compact`.
 fn attach_profile(granted: &[String]) -> StreamProfile {
-    if granted.iter().any(|feature| feature == features::COMPACT_REASONING) {
+    if granted
+        .iter()
+        .any(|feature| feature == features::COMPACT_REASONING)
+    {
         StreamProfile::CompactReasoning
     } else {
         StreamProfile::Compact
@@ -1167,7 +1170,11 @@ mod profile_tests {
             StreamProfile::CompactReasoning
         ));
         let requested = requested_features();
-        assert!(requested.iter().any(|feature| feature == "compact_reasoning"));
+        assert!(
+            requested
+                .iter()
+                .any(|feature| feature == "compact_reasoning")
+        );
         assert!(requested.iter().any(|feature| feature == "job_frames"));
     }
 }

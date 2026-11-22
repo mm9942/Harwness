@@ -40,8 +40,9 @@ use harw_core::dod_taint::pending_ask_reason;
 use harw_core::mode::InteractionMode;
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
-    AgentEvent, AgentEventKind, AgentSession, ApprovalResolution, ModelProvider, StateStore, TurnInput as CoreTurnInput,
-    TurnOutcome as CoreOutcome, resume_after_approval, run_turn_durable,
+    AgentEvent, AgentEventKind, AgentSession, ApprovalResolution, ModelProvider, StateStore,
+    TurnInput as CoreTurnInput, TurnOutcome as CoreOutcome, resume_after_approval,
+    run_turn_durable,
 };
 use harw_protocol::approvals::ApprovalKind;
 use harw_protocol::{AgentOrchestrationStatus, ApprovalRequest, SessionEvent, TurnEvent};
@@ -703,8 +704,7 @@ impl TurnDriver for CoreTurnDriver {
                 None => record.actor,
             };
             let (tx, rx) = mpsc::unbounded_channel();
-            self.runtime
-                .bind_live_sink(&session_id, Arc::clone(&sink));
+            self.runtime.bind_live_sink(&session_id, Arc::clone(&sink));
             let leg = self
                 .runtime
                 .resume_after_approval(&session_id, bound, resolution, tx);
@@ -1334,8 +1334,8 @@ mod admission_races {
 #[cfg(test)]
 mod live_events {
     use super::*;
-    use harw_core::{AgentEventHub, ConversationHistory};
     use harw_core::state_store::StateStoreResult;
+    use harw_core::{AgentEventHub, ConversationHistory};
     use harw_protocol::AgentOrchestrationEvent;
     use harw_protocol::items::TurnItem;
     use harw_session_host::identity::ConnectionId;
@@ -1450,8 +1450,10 @@ mod live_events {
     fn orchestration_maps_to_job_states_without_progress() -> TestResult {
         let root = SessionId::new();
         let child = SessionId::new();
-        match live_driver_event(&root, orchestration(&child, AgentOrchestrationStatus::Completed))
-        {
+        match live_driver_event(
+            &root,
+            orchestration(&child, AgentOrchestrationStatus::Completed),
+        ) {
             Some(DriverEvent::Job {
                 work_id,
                 kind,
@@ -1466,8 +1468,11 @@ mod live_events {
             other => return Err(format!("unexpected mapping: {other:?}").into()),
         }
         assert!(
-            live_driver_event(&root, orchestration(&child, AgentOrchestrationStatus::Progress))
-                .is_none()
+            live_driver_event(
+                &root,
+                orchestration(&child, AgentOrchestrationStatus::Progress)
+            )
+            .is_none()
         );
         Ok(())
     }

@@ -1326,9 +1326,10 @@ async fn compact_drops_child_reasoning_but_compact_reasoning_keeps_it() -> TestR
         matches!(frame, SessionFrame::Child { event: TurnEvent::ReasoningDelta { text, .. }, .. } if text == "r")
     })
     .await?;
-    wait_for(&mut reasoning, |frame| {
-        matches!(frame, SessionFrame::Job { work_id, .. } if work_id == "w-2")
-    })
+    wait_for(
+        &mut reasoning,
+        |frame| matches!(frame, SessionFrame::Job { work_id, .. } if work_id == "w-2"),
+    )
     .await?;
 
     let saw_reasoning = std::cell::Cell::new(false);

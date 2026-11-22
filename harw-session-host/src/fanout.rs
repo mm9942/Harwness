@@ -972,7 +972,10 @@ mod tests {
         check(
             matches!(
                 frame,
-                SessionFrame::Child { event: TurnEvent::ChildProgress { .. }, .. }
+                SessionFrame::Child {
+                    event: TurnEvent::ChildProgress { .. },
+                    ..
+                }
             ),
             "expected child progress",
         )?;
@@ -983,7 +986,10 @@ mod tests {
             "expected merged assistant text",
         )?;
         let (_, frame) = next_live(&mut stream).await?;
-        check(matches!(frame, SessionFrame::Job { .. }), "expected the job frame")
+        check(
+            matches!(frame, SessionFrame::Job { .. }),
+            "expected the job frame",
+        )
     }
 
     #[test]
