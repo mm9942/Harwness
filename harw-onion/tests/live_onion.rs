@@ -43,12 +43,7 @@ async fn echo(mut stream: OnionStream) {
 
 async fn launch_server(state: &Path, cache: &Path) -> Result<OnionServer, harw_onion::OnionError> {
     let config = OnionServerConfig::new(state, cache);
-    OnionServer::launch(
-        config,
-        |p| eprintln!("server tor {}%", p.percent),
-        echo,
-    )
-    .await
+    OnionServer::launch(config, |p| eprintln!("server tor {}%", p.percent), echo).await
 }
 
 #[ignore = "needs the live Tor network"]
@@ -85,7 +80,10 @@ async fn launches_an_onion_service_and_dials_it() -> TestResult {
         &locator,
         "the onion address must persist with the state directory"
     );
-    eprintln!("relaunched onion service {}", relaunched.locator().redacted());
+    eprintln!(
+        "relaunched onion service {}",
+        relaunched.locator().redacted()
+    );
     relaunched.shutdown();
     Ok(())
 }

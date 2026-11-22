@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::core::route::{Dialer, ONION_DIAL_TIMEOUT};
-use crate::{ConnectionRoute, MobileError};
 use crate::identity::ValidatedProfile;
+use crate::{ConnectionRoute, MobileError};
 
 const LINK_PATH: &str = "/v1/provider-link/chatgpt";
 const MAX_BODY_BYTES: usize = 64 * 1024;

@@ -88,7 +88,6 @@ use harw_node_transport::{
 };
 use harw_protocol::items::{AssistantMessageItem, ContentPart, TurnItem, UserMessageItem};
 use harw_protocol::{ApprovalKind, ApprovalRequest, SessionPort, TurnEvent};
-use harw_session_remote::{ConnectOptions, RemotePort};
 use harw_session_host::approvals::{ApprovalBackend, MemoryApprovals};
 use harw_session_host::driver::{
     CancelSignal, DriverEvent, DriverFuture, EventSink, ExecutionAdmission, Setting, TurnDriver,
@@ -96,6 +95,7 @@ use harw_session_host::driver::{
 };
 use harw_session_host::replay::{MemoryTranscripts, TranscriptSource};
 use harw_session_host::{HostConfig, HostError, SessionHost};
+use harw_session_remote::{ConnectOptions, RemotePort};
 use harw_session_store::{RecordKind, TranscriptRecord};
 use harw_session_ws::WsLimits;
 use harw_types::{
@@ -623,7 +623,11 @@ fn host_profile(onion: Option<&str>) -> Result<ServerProfile, MobileError> {
 
 #[test]
 fn onion_profile_round_trips_lowercased_and_none_is_omitted() -> TestResult {
-    let upper = format!("{}{}", ONION_VECTOR[..56].to_uppercase(), &ONION_VECTOR[56..]);
+    let upper = format!(
+        "{}{}",
+        ONION_VECTOR[..56].to_uppercase(),
+        &ONION_VECTOR[56..]
+    );
     let profile = host_profile(Some(&upper))?;
     let parsed = parse_server_profile(profile_json(&profile))?;
     assert_eq!(parsed.onion.as_deref(), Some(ONION_VECTOR));
@@ -696,7 +700,10 @@ fn route_plan_orders_routes_by_preference_and_profile() -> TestResult {
 
 #[test]
 fn tor_storage_must_be_absolute_and_is_created_private() -> TestResult {
-    let core = MobileCore::new(generate_identity("Phone".into())?.private_key, "Phone".into())?;
+    let core = MobileCore::new(
+        generate_identity("Phone".into())?.private_key,
+        "Phone".into(),
+    )?;
     assert!(matches!(
         core.set_tor_directories("relative/state".into(), "relative/cache".into()),
         Err(MobileError::Internal { .. })

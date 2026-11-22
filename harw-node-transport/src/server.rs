@@ -193,9 +193,7 @@ impl NodeTransportServer {
             let timeout = inner.options.handshake_timeout;
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(err) =
-                    handle_connection(inner, tcp, service, upgrades, timeout).await
-                {
+                if let Err(err) = handle_connection(inner, tcp, service, upgrades, timeout).await {
                     // `remote` is logged for operators only; it is never
                     // used as identity.
                     tracing::debug!(%remote, error = %err, "node transport connection ended");

@@ -39,7 +39,9 @@ const ONION_READY_TIMEOUT: Duration = Duration::from_secs(600);
 const PROVIDER_ENV: &str = "HARW_MOBILE_TEST_PROVIDER_TOKEN";
 
 #[derive(Parser)]
-#[command(about = "Start an isolated gateway (loopback, tailnet or Tor onion) for the Harw phone test")]
+#[command(
+    about = "Start an isolated gateway (loopback, tailnet or Tor onion) for the Harw phone test"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Action,
@@ -554,7 +556,9 @@ fn prepare_onion_dir(dir: Option<&Path>, state: &Path) -> Result<Option<PathBuf>
         .create(dir)?;
     let metadata = fs::symlink_metadata(dir)?;
     if !metadata.is_dir() || metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
-        return Err("--onion-dir must be a directory owned by you without group/other access".into());
+        return Err(
+            "--onion-dir must be a directory owned by you without group/other access".into(),
+        );
     }
     Ok(Some(dir.to_owned()))
 }
@@ -1036,7 +1040,15 @@ mod tests {
 
     #[test]
     fn onion_dir_requires_onion() {
-        let base = ["mobile-bootstrap", "serve", "--state", "/tmp/s", "--enrollment", "/tmp/e", "--smoke"];
+        let base = [
+            "mobile-bootstrap",
+            "serve",
+            "--state",
+            "/tmp/s",
+            "--enrollment",
+            "/tmp/e",
+            "--smoke",
+        ];
         let with_dir = [base.as_slice(), &["--onion-dir", "/tmp/o"]].concat();
         assert!(Cli::try_parse_from(with_dir).is_err());
         let both = [base.as_slice(), &["--onion", "--onion-dir", "/tmp/o"]].concat();

@@ -23,8 +23,9 @@ use crate::projection::{FrameAction, SessionState, SessionWorker};
 use crate::provider::request_provider;
 use crate::{
     ApprovalDecision, ApprovalOutcome, ApprovalReceipt, ChatgptProviderCredential,
-    ChatgptProviderStatus, ConnectionPhase, ConnectionRoute, ConnectionStatus, DeviceEnrollment, MobileError,
-    MobileSession, RoutePreference, ServerProfile, SessionCursor, SessionSnapshot, SubmitOutcome, SubmitReceipt,
+    ChatgptProviderStatus, ConnectionPhase, ConnectionRoute, ConnectionStatus, DeviceEnrollment,
+    MobileError, MobileSession, RoutePreference, ServerProfile, SessionCursor, SessionSnapshot,
+    SubmitOutcome, SubmitReceipt,
 };
 
 pub(crate) mod route;
@@ -601,9 +602,12 @@ impl MobileCore {
                     detail: "The selected server changed after ChatGPT authorization".into(),
                 });
             }
-            let selected = state.profile.clone().ok_or_else(|| MobileError::InvalidProfile {
-                detail: "The selected server changed after ChatGPT authorization".into(),
-            })?;
+            let selected = state
+                .profile
+                .clone()
+                .ok_or_else(|| MobileError::InvalidProfile {
+                    detail: "The selected server changed after ChatGPT authorization".into(),
+                })?;
             (
                 link.stop.clone(),
                 state.route.unwrap_or(ConnectionRoute::Direct),
@@ -788,7 +792,9 @@ async fn drive_connection(
             None => {
                 let detail = failures
                     .iter()
-                    .map(|(route, error)| format!("{}: {}", route_label(*route), dial_detail(error)))
+                    .map(|(route, error)| {
+                        format!("{}: {}", route_label(*route), dial_detail(error))
+                    })
                     .collect::<Vec<_>>()
                     .join("; ");
                 let kind = failures

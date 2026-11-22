@@ -783,7 +783,10 @@ async fn upgrade_node(
 }
 
 /// Bounds a node connect attempt by the hello timeout.
-async fn bounded<F>(timeout: std::time::Duration, attempt: F) -> Result<RemoteConnection, RemoteError>
+async fn bounded<F>(
+    timeout: std::time::Duration,
+    attempt: F,
+) -> Result<RemoteConnection, RemoteError>
 where
     F: std::future::Future<Output = Result<RemoteConnection, RemoteError>>,
 {

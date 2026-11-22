@@ -1451,7 +1451,10 @@ mod generic_stream {
             .await
             .map_err(ctx("server did not return promptly"))?
             .map_err(ctx("join"))?;
-        ensure(served.is_ok(), "a full server must drop the stream with Ok(())")?;
+        ensure(
+            served.is_ok(),
+            "a full server must drop the stream with Ok(())",
+        )?;
         Ok(())
     }
 }

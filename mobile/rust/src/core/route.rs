@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use harw_node_transport::{ClientOptions, LocalNode, NodeTransportClient};
-use harw_session_remote::{ConnectOptions, RemoteError, RemoteConnection, connect_node};
+use harw_session_remote::{ConnectOptions, RemoteConnection, RemoteError, connect_node};
 
 use crate::identity::ValidatedProfile;
 use crate::{ConnectionRoute, MobileError, RoutePreference, TorBootstrap};
@@ -195,7 +195,10 @@ impl Dialer {
     }
 
     #[cfg(feature = "onion")]
-    async fn dial_onion(&self, profile: &ValidatedProfile) -> Result<harw_onion::OnionStream, String> {
+    async fn dial_onion(
+        &self,
+        profile: &ValidatedProfile,
+    ) -> Result<harw_onion::OnionStream, String> {
         let locator = profile
             .onion
             .as_ref()
@@ -209,7 +212,10 @@ impl Dialer {
 
     /// Without Tor support there is no stream; the placeholder type is never produced.
     #[cfg(not(feature = "onion"))]
-    async fn dial_onion(&self, _profile: &ValidatedProfile) -> Result<tokio::io::DuplexStream, String> {
+    async fn dial_onion(
+        &self,
+        _profile: &ValidatedProfile,
+    ) -> Result<tokio::io::DuplexStream, String> {
         Err(TOR_UNAVAILABLE.to_owned())
     }
 
@@ -222,10 +228,9 @@ impl Dialer {
             return Ok(Arc::clone(client));
         }
         let (state, cache) = dirs.ok_or_else(|| "Tor storage is not configured".to_owned())?;
-        let client = harw_onion::OnionClient::launch(&harw_onion::OnionClientConfig::new(
-            state, cache,
-        ))
-        .map_err(|error| error.to_string())?;
+        let client =
+            harw_onion::OnionClient::launch(&harw_onion::OnionClientConfig::new(state, cache))
+                .map_err(|error| error.to_string())?;
         let client = Arc::new(client);
         *tor = Some(Arc::clone(&client));
         Ok(client)

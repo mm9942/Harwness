@@ -137,7 +137,9 @@ impl OnionServer {
         F: Future<Output = ()> + Send + 'static,
     {
         if config.virtual_port == 0 {
-            return Err(OnionError::Config("virtual port must be 1..=65535".to_owned()));
+            return Err(OnionError::Config(
+                "virtual port must be 1..=65535".to_owned(),
+            ));
         }
         let service_config = service_config(&config)?;
         let client = create_client(&config.state_dir, &config.cache_dir)?;
@@ -218,9 +220,7 @@ impl OnionServer {
 
 /// Builds the arti onion-service configuration: nickname and per-circuit
 /// stream limit only (no proof-of-work, no restricted discovery).
-pub(crate) fn service_config(
-    config: &OnionServerConfig,
-) -> Result<OnionServiceConfig, OnionError> {
+pub(crate) fn service_config(config: &OnionServerConfig) -> Result<OnionServiceConfig, OnionError> {
     let nickname = HsNickname::new(config.nickname.clone())
         .map_err(|e| OnionError::Config(format!("onion service nickname: {e}")))?;
     OnionServiceConfigBuilder::default()
@@ -474,16 +474,25 @@ mod tests {
     fn invalid_nickname_is_a_config_error() {
         let mut config = OnionServerConfig::new("/state", "/cache");
         config.nickname = "bad nick!".to_owned();
-        assert!(matches!(service_config(&config), Err(OnionError::Config(_))));
+        assert!(matches!(
+            service_config(&config),
+            Err(OnionError::Config(_))
+        ));
     }
 
     #[test]
     fn stream_verdict_rules() {
         assert_eq!(stream_verdict(Some(443), 443, 0, 8), Ok(()));
         assert_eq!(stream_verdict(Some(443), 443, 7, 8), Ok(()));
-        assert_eq!(stream_verdict(Some(443), 443, 8, 8), Err(Refusal::CircuitFull));
+        assert_eq!(
+            stream_verdict(Some(443), 443, 8, 8),
+            Err(Refusal::CircuitFull)
+        );
         assert_eq!(stream_verdict(Some(80), 443, 0, 8), Err(Refusal::WrongPort));
         assert_eq!(stream_verdict(None, 443, 0, 8), Err(Refusal::NotBegin));
-        assert_eq!(stream_verdict(Some(443), 443, 0, 0), Err(Refusal::CircuitFull));
+        assert_eq!(
+            stream_verdict(Some(443), 443, 0, 0),
+            Err(Refusal::CircuitFull)
+        );
     }
 }
