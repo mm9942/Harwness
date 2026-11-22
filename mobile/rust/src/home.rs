@@ -20,6 +20,10 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const KEY_UIA: &str = "active_uia_definition";
 const KEY_PROVIDER: &str = "default_provider";
 const KEY_MODEL: &str = "default_model";
+/// Selected provider id of the on-device model (not a route file).
+pub(crate) const LOCAL_ROUTE_ID: &str = "local-gguf";
+/// File in the state dir that holds the models directory of the on-device model.
+const LOCAL_MODELS_DIR_FILE: &str = "local-gguf-dir";
 
 fn internal(detail: impl Into<String>) -> MobileError {
     MobileError::Internal {
@@ -211,6 +215,27 @@ impl AppHome {
         table.insert(KEY_PROVIDER.into(), toml::Value::String(provider.into()));
         table.insert(KEY_MODEL.into(), toml::Value::String(model.into()));
         self.write_config(&table)
+    }
+
+    /// Remembers where the on-device model files live (absolute path).
+    pub(crate) fn set_local_models_dir(&self, dir: &str) -> Result<(), MobileError> {
+        write_private_atomic(&self.state_dir().join(LOCAL_MODELS_DIR_FILE), dir.as_bytes())
+    }
+
+    /// The models directory saved by [`Self::set_local_models_dir`].
+    #[cfg_attr(not(feature = "local-host"), allow(dead_code))]
+    pub(crate) fn local_models_dir(&self) -> Option<String> {
+        let text = fs::read_to_string(self.state_dir().join(LOCAL_MODELS_DIR_FILE)).ok()?;
+        let dir = text.trim();
+        (!dir.is_empty()).then(|| dir.to_owned())
+    }
+
+    /// Model id when the on-device model is the active provider.
+    pub(crate) fn active_local_model(&self) -> Result<Option<String>, MobileError> {
+        Ok(self
+            .active_route()?
+            .filter(|(provider, model)| provider == LOCAL_ROUTE_ID && !model.is_empty())
+            .map(|(_, model)| model))
     }
 
     pub(crate) fn clear_active_route_if(&self, provider: &str) -> Result<(), MobileError> {

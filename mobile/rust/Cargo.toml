@@ -33,7 +33,12 @@ bootstrap = [
 ]
 # Standalone mode: in-process harw session host, provider-http validation and the
 # model source. Off in the APK build until the phone runtime is enabled.
-local-host = ["dep:harw-local-host", "dep:harw-provider-http", "dep:harw-core"]
+local-host = ["dep:harw-local-host", "dep:harw-provider-http", "dep:harw-core", "dep:harw-llama"]
+# On-device inference: builds llama.cpp (C/C++ via cmake and bindgen/libclang) into the
+# library. Off for host-side checks and tests of `local-host`; the APK build enables it
+# (mobile/scripts/build-native). Without it the "On this device" provider reports
+# "not available in this build" when the host opens.
+local-llama = ["local-host", "harw-llama/engine"]
 
 [dependencies]
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
@@ -44,6 +49,7 @@ harw-config = { path = "../../harw-config" }
 harw-core = { path = "../../harw-core", optional = true }
 harw-home = { path = "../../harw-home" }
 harw-infra-client = { path = "../../harw-infra-client", optional = true }
+harw-llama = { path = "../../harw-llama", optional = true }
 harw-local-host = { path = "../../harw-local-host", optional = true }
 harw-mobile-core = { path = "../../harw-mobile-core" }
 harw-node-listener = { path = "../../harw-node-listener", optional = true }

@@ -8,6 +8,11 @@ ndk_version=28.2.13676358
 
 export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/$ndk_version}"
+# llama-cpp-sys-2 (on-device model) looks for these when it builds llama.cpp with cmake.
+export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+# Arm baseline for ggml's CPU kernels: dot-product instructions make Q4_K_M several times
+# faster (ARMv8.2-A phones, 2017 and later). Override with GGML_CPU_ARM_ARCH=armv8-a for older CPUs.
+export GGML_CPU_ARM_ARCH="${GGML_CPU_ARM_ARCH:-armv8.2-a+dotprod}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$rust_dir/target}"
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
 jobs="${MOBILE_BUILD_JOBS:-2}"
@@ -26,7 +31,7 @@ staging=$(mktemp -d "$generated/.native.XXXXXXXX")
 trap 'rm -rf -- "$staging"' EXIT
 cd -- "$rust_dir"
 cargo ndk --target arm64-v8a --platform 28 --output-dir "$staging/jniLibs" \
-    build --lib --release --features local-host --locked --jobs "$jobs" "${cargo_network_flags[@]}"
+    build --lib --release --features local-llama --locked --jobs "$jobs" "${cargo_network_flags[@]}"
 
 library="$staging/jniLibs/arm64-v8a/libharw_mobile_ffi.so"
 cargo run --locked --jobs "$jobs" "${cargo_network_flags[@]}" --features bindgen \

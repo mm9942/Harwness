@@ -38,20 +38,56 @@ pub(crate) async fn open_local(
     keystore: Arc<dyn PlatformKeystore>,
     features: Vec<String>,
 ) -> Result<Backend, MobileError> {
-    use crate::{
-        home::AppHome,
-        providers::{ProviderStore, build_model_provider},
-    };
+    use crate::{home::AppHome, providers::ProviderStore};
 
     let home = AppHome::open(&files_dir)?;
     home.install_process_home()?;
     let store = ProviderStore::from_parts(home.clone(), keystore);
     let resolver = store.resolver().clone();
     let model_home = home.clone();
-    let model = tokio::task::spawn_blocking(move || build_model_provider(&model_home, &resolver))
+    let model = tokio::task::spawn_blocking(move || build_active_model(&model_home, &resolver))
         .await
         .map_err(|_| host_task_failed())??;
     open_local_with_model(home, model, features).await
+}
+
+/// The model of the active selection: the GGUF on this device when that is the
+/// active provider, else the HTTP route.
+#[cfg(feature = "local-host")]
+fn build_active_model(
+    home: &crate::home::AppHome,
+    resolver: &crate::secrets::KeystoreSecretResolver,
+) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
+    match home.active_local_model()? {
+        Some(model_id) => build_local_gguf(home, &model_id),
+        None => crate::providers::build_model_provider(home, resolver),
+    }
+}
+
+/// Loads the selected GGUF from the model store (memory-mapped, blocking).
+#[cfg(feature = "local-host")]
+fn build_local_gguf(
+    home: &crate::home::AppHome,
+    model_id: &str,
+) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
+    let session = |detail: String| MobileError::Session { detail };
+    if !harw_llama::engine_available() {
+        return Err(session(
+            "on-device models are not available in this build".to_owned(),
+        ));
+    }
+    let models_dir = home.local_models_dir().ok_or_else(|| {
+        session("the on-device model folder is unknown; choose the model again".to_owned())
+    })?;
+    // Fails unless the file is complete and readable (e.g. deleted since selecting).
+    let path = crate::models::model_path(models_dir, model_id.to_owned())?;
+    let provider = harw_llama::LocalGgufProvider::open(
+        std::path::Path::new(&path),
+        model_id,
+        harw_llama::LocalGgufConfig::default(),
+    )
+    .map_err(|e| session(e.to_string()))?;
+    Ok(Arc::new(provider))
 }
 
 /// Starts the host over `model`, connects as its owner and says hello.

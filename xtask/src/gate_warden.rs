@@ -366,6 +366,24 @@ const C_BUILD_EXCEPTIONS: &[CBuildException] = &[CBuildException {
     tool: "cc",
     reason: "blake3 kompiliert optional C/Assembler-SIMD; kein Laufzeit-Netz/Privileg",
     since: "2026-09-13",
+},
+// On-device inference (harw-llama, feature `engine`): the binding crate builds
+// llama.cpp with cmake and generates its bindings with bindgen. The crate is
+// reached only from the phone app (`mobile/rust`, feature `local-host`) and the
+// opt-in `engine` feature of harw-llama; harw-warden and its hull never link it.
+// The entries keep the gate green should a lockfile-level over-approximation
+// ever reach it; the `links = "llama"` key is deliberately not excepted.
+CBuildException {
+    krate: "llama-cpp-sys-2",
+    tool: "cc",
+    reason: "llama.cpp-Binding fuer das Handy (harw-llama, Feature engine): baut ggml/llama.cpp aus gepinnten Crate-Quellen; nur im Handy-Build, nie in der Warden-Huelle",
+    since: "2026-11-22",
+},
+CBuildException {
+    krate: "llama-cpp-sys-2",
+    tool: "bindgen",
+    reason: "llama.cpp-Binding fuer das Handy (harw-llama, Feature engine): erzeugt die FFI-Bindings gegen die mitgelieferten llama.cpp-Header; nur im Handy-Build, nie in der Warden-Huelle",
+    since: "2026-11-22",
 }];
 
 /// Prüft, ob eine gemeldete C-Bau-Werkzeug-Kante (Crate + Werkzeugname)

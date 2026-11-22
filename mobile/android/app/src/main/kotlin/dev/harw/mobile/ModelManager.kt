@@ -16,6 +16,8 @@ import uniffi.harw_mobile_ffi.CatalogModel
 import uniffi.harw_mobile_ffi.LocalModel
 import uniffi.harw_mobile_ffi.MobileException
 import uniffi.harw_mobile_ffi.ModelProgress
+import uniffi.harw_mobile_ffi.activateLocalModel
+import uniffi.harw_mobile_ffi.activeLocalModel
 import uniffi.harw_mobile_ffi.deleteModel
 import uniffi.harw_mobile_ffi.finalizeModel
 import uniffi.harw_mobile_ffi.localModels
@@ -115,6 +117,20 @@ internal class ModelManager(private val store: ModelStore) {
 
     suspend fun local(): List<LocalModel> = withContext(Dispatchers.IO) {
         localModels(store.modelsDir().path)
+    }
+
+    /** Id of the model running on this device when it is the active provider, else null. */
+    suspend fun activeLocal(filesDir: String): String? = withContext(Dispatchers.IO) {
+        activeLocalModel(filesDir)
+    }
+
+    /** Makes the model the active provider ("On this device") for standalone mode. */
+    suspend fun useLocal(filesDir: String, modelId: String) {
+        withContext(Dispatchers.IO) {
+            ModelDirLock.mutex.withLock {
+                activateLocalModel(filesDir, store.modelsDir().path, modelId)
+            }
+        }
     }
 
     suspend fun delete(model: CatalogModel) = delete(model.id)

@@ -485,6 +485,10 @@ layer = "A"
 # In-process session host (gateway + Android standalone app).
 [packages."harw-local-host"]
 layer = "A"
+# On-device GGUF inference for the phone (llama.cpp binding behind the opt-in
+# `engine` feature; the default build has no C dependency).
+[packages."harw-llama"]
+layer = "A"
 [packages."harw-node-listener"]
 layer = "A"
 [packages."harw-mobile-core"]
