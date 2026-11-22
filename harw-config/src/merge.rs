@@ -1035,6 +1035,15 @@ fn merge_tui(
         "tui.footer_counts",
         layer_path,
     );
+    // `[tui] cell_aspect` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.cell_aspect,
+        incoming.cell_aspect,
+        present("cell_aspect"),
+        role,
+        "tui.cell_aspect",
+        layer_path,
+    );
 }
 
 // `[session]` (Abschnitt 1.4) — `retention_days` ist `MinBound`
@@ -3295,6 +3304,35 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.jobs.max_running, Some(8));
+        Ok(())
+    }
+
+    // [tui] cell_aspect: ProfileReplaces; ein Profil setzt den Wert, eine
+    // Projektschicht ohne das Feld überschreibt ihn nicht.
+    #[test]
+    fn test_tui_cell_aspect_profile_replaces() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.tui.cell_aspect, None);
+
+        let profile = "[tui]\ncell_aspect = 0.48";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.cell_aspect, Some(0.48));
+
+        let project = "default_provider = \"anthropic\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.cell_aspect, Some(0.48));
         Ok(())
     }
 

@@ -158,7 +158,7 @@ fn test_field_table_exhaustive_logging_section() {
 }
 
 // ---------------------------------------------------------------------
-// [tui] (Abschnitt 1.3, 5 Felder; Runde 5, Teil I: +`child_stream`; h7/h9: +`status_expiry`, `goal_mode`)
+// [tui] (Abschnitt 1.3, 5 Felder; Runde 5, Teil I: +`child_stream`; h7/h9: +`status_expiry`, `goal_mode`; +`cell_aspect`)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -172,6 +172,7 @@ fn test_field_table_exhaustive_tui_section() {
         goal_mode,
         reasoning,
         footer_counts,
+        cell_aspect,
     } = TuiSection::default();
     let _ = (
         language,
@@ -182,6 +183,7 @@ fn test_field_table_exhaustive_tui_section() {
         goal_mode,
         reasoning,
         footer_counts,
+        cell_aspect,
     );
     for path in [
         "tui.language",
@@ -192,6 +194,7 @@ fn test_field_table_exhaustive_tui_section() {
         "tui.goal_mode",
         "tui.reasoning",
         "tui.footer_counts",
+        "tui.cell_aspect",
     ] {
         assert_path_in_field_table_exactly_once(path);
     }
