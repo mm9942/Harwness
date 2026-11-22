@@ -148,6 +148,9 @@ pub trait AssemblyContributor: Send + Sync {
 /// - [`CloudOpsContributor`]: die `cloud.*`-Operationen des Cloud-Home-Stacks
 ///   (`cloud.status`, `cloud.enrollments.list`, `cloudctl.*`) für die
 ///   UIA-Wurzel (No-op für jede andere Wurzel).
+/// - [`crate::peer_bridge_wiring::PeerBridgeContributor`]: `peer.send`
+///   (ausgehende Nachrichten an konfigurierte Agent-Peers) für die UIA-Wurzel,
+///   wenn `[peer_bridge].enabled` (No-op sonst).
 /// - [`BrowserRootContributor`] (Feature `browser`): `browser.*` für die
 ///   Wurzelsitzung, wenn `[browser].roles` `"root"` enthält.
 #[must_use]
@@ -159,6 +162,7 @@ pub fn default_contributors() -> Vec<Arc<dyn AssemblyContributor>> {
         Arc::new(InfrastructureContributor),
         Arc::new(GatewayDiagnosticsContributor),
         Arc::new(CloudOpsContributor),
+        Arc::new(crate::peer_bridge_wiring::PeerBridgeContributor),
     ];
     #[cfg(feature = "browser")]
     contributors.push(Arc::new(BrowserRootContributor));
@@ -419,9 +423,9 @@ mod tests {
 
     #[test]
     fn default_contributors_include_infrastructure() {
-        // MCP + Infrastruktur + Gateway-Diagnose + Cloud-Ops, plus Browser
-        // mit Feature `browser`.
-        let expected = if cfg!(feature = "browser") { 5 } else { 4 };
+        // MCP + Infrastruktur + Gateway-Diagnose + Cloud-Ops + Peer-Bridge,
+        // plus Browser mit Feature `browser`.
+        let expected = if cfg!(feature = "browser") { 6 } else { 5 };
         assert_eq!(default_contributors().len(), expected);
     }
 

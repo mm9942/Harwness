@@ -114,6 +114,8 @@ pub(crate) mod btw;
 pub(crate) mod background_agents;
 // Runde 5, Teil M: Kind-Meldungen (`parent.message`) an die UIA.
 mod agent_messages;
+// Agenten-Brücke (I5): Peer-Nachrichten aus <profil>/peer-bridge/inbox als DATA-Meldungen.
+mod peer_inbox;
 // PL-94 W01 M2b: Anzeigereihenfolge der Kind-Statusmeldungen (`crate::live_ranker`).
 mod live_order_glue;
 // PL-97 C5 (PL-94 W01 M2a/M2c): virtuelle Live-Zellen der Hintergrund-Läufe im Chat.
@@ -1447,6 +1449,8 @@ pub struct ChatApp {
     overlay_generation: u64,
     /// Runde 5, Teil K: Meldungen und Leerlauf-Zustand der Hintergrund-Agenten.
     background: background_agents::BackgroundUi,
+    /// Agenten-Brücke (I5): Postfach dieser Session (`None` = Brücke aus).
+    peer_inbox: Option<peer_inbox::PeerInboxState>,
     /// Runde 5, Teil O: Nachfrage vor einem Esc-Abbruch mit laufenden Kindern.
     esc_confirm: turn_safety::EscConfirm,
     /// Runde 5, Teil O: Freigabe-Fragen von Kind-Agenten.
@@ -1497,6 +1501,7 @@ impl std::fmt::Debug for ChatApp {
             .field("has_title_job_context", &self.title_job_context.is_some())
             .field("pending_quit_armed", &self.pending_quit.is_some())
             .field("hard_quit_requested", &self.hard_quit_requested)
+            .field("peer_inbox_active", &self.peer_inbox.is_some())
             .finish()
     }
 }
@@ -1663,6 +1668,7 @@ impl ChatApp {
             pending_commands: std::collections::VecDeque::new(),
             overlay_generation: 0,
             background: background_agents::BackgroundUi::default(),
+            peer_inbox: None,
             // Runde 5, Teil O.
             esc_confirm: turn_safety::EscConfirm::default(),
             child_approvals: child_approvals::ChildApprovalUi::default(),
@@ -2030,6 +2036,16 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn with_session_store_root(mut self, root: std::path::PathBuf) -> Self {
         self.session_store_root = Some(root);
+        self
+    }
+
+    /// Aktiviert das Peer-Postfach unter `root` (`<profil>/peer-bridge`).
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub(crate) fn with_peer_bridge_root(mut self, root: std::path::PathBuf) -> Self {
+        self.peer_inbox = Some(peer_inbox::PeerInboxState::new(root));
         self
     }
 
@@ -5808,6 +5824,10 @@ pub(crate) async fn run_loop(
         if agent_messages::collect_parent_messages(app) {
             frame_req.schedule_frame();
         }
+        // Agenten-Brücke (I5): Peer-Nachrichten als DATA-Meldung einreihen (nie als Nutzereingabe).
+        if peer_inbox::collect_peer_messages(app) {
+            frame_req.schedule_frame();
+        }
         // Plan R9, Teil F: Job-Ereignisse (Systemzeilen, Notizen an die UIA
         // mit Auto-Turn beim Ende eines Jobs) und die Jobs-Gruppe.
         if jobs_glue::poll(app) {
@@ -5846,6 +5866,7 @@ pub(crate) async fn run_loop(
             // Leerlauf-Takt für deren Freigabe-Fragen.
             let background_wake = background_agents::waker(app);
             let background_tick = background_agents::has_running(app);
+            let peer_tick = peer_inbox::is_active(app);
             // Runde 5, Teil C: Leerlauf-Takt nur bei offenem Kanban-Board.
             let kanban_tick = app.kanban_live_active();
             // Runde 5, Teil I: Leerlauf-Takt bei offener Agentenbaum-Ansicht.
@@ -6342,6 +6363,10 @@ pub(crate) async fn run_loop(
                 // `poll_idle_prompts`) und zeigt ihren Fortschritt.
                 _ = tokio::time::sleep(background_agents::IDLE_POLL_INTERVAL), if background_tick => {
                     app.drain_agent_events();
+                    frame_req.schedule_frame();
+                }
+                // Agenten-Brücke (I5): Leerlauf-Takt für das Peer-Postfach; der Schleifenanfang holt ab.
+                _ = tokio::time::sleep(peer_inbox::PEER_POLL_INTERVAL), if peer_tick => {
                     frame_req.schedule_frame();
                 }
                 // Plan R9, Teil F: ein Job-Ereignis — der Schleifenanfang

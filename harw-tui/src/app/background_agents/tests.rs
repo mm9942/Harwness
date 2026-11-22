@@ -817,6 +817,53 @@ fn auto_turn_text_exports_as_notice_not_as_user() {
     );
 }
 
+/// Eine Peer-Nachricht samt Auto-Turn ist keine Nutzernachricht.
+#[test]
+fn peer_notice_exports_as_notice_not_as_user() {
+    use crate::export::ExportEntry;
+    let header = "[Peer-Nachricht von codex (id m1)]";
+    let text = format!(
+        "{header}\n<<<BEGIN UNTRUSTED TOOL RESULT id=00 tool=\"peer.message\" status=success bytes=4>>>\n| hallo\n<<<END UNTRUSTED TOOL RESULT id=00>>>{NOTICE_SEPARATOR}{PEER_AUTO_TURN_PROMPT}"
+    );
+    assert_eq!(
+        user_text_export_entries(&text),
+        vec![ExportEntry::Notice(text.clone())]
+    );
+    // Die Anzeige-Überschreibung des Live-Auto-Turns ebenso.
+    let display = format!("↩ {header}");
+    assert_eq!(
+        user_text_export_entries(&display),
+        vec![ExportEntry::Notice(display.clone())]
+    );
+}
+
+/// Eine Peer-Nachricht vor einem getippten Turn wird abgetrennt; der getippte
+/// Text bleibt `User`.
+#[test]
+fn peer_notice_queued_before_typed_text_is_split() {
+    use crate::export::ExportEntry;
+    let header = "[Peer-Nachricht von codex (id m1)]";
+    let text = format!("{header}\n| hallo{NOTICE_SEPARATOR}weiter so");
+    assert_eq!(
+        user_text_export_entries(&text),
+        vec![
+            ExportEntry::Notice(format!("{header}\n| hallo")),
+            ExportEntry::User("weiter so".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn peer_notice_prefix_is_a_notice_prefix() {
+    assert!(NOTICE_PREFIXES.contains(&crate::app::peer_inbox::PEER_NOTICE_PREFIX));
+}
+
+#[test]
+fn peer_auto_turn_prompt_differs_from_the_background_prompt() {
+    assert_ne!(PEER_AUTO_TURN_PROMPT, AUTO_TURN_PROMPT);
+    assert!(PEER_AUTO_TURN_PROMPT.contains("ask_user"));
+}
+
 /// Vor einem getippten Turn eingereihte Meldungen werden abgetrennt; der
 /// getippte Text bleibt `User`.
 #[test]

@@ -43,6 +43,8 @@ pub mod memory_wiring;
 pub mod model;
 // Runde 5, Teil E: Lernen aus Freigaben.
 pub mod container_wiring;
+// Agent bridge: UIA-only `peer.send` (spool/webhook/MCP-poll connectors).
+pub mod peer_bridge_wiring;
 pub mod permission_rules;
 pub mod sandbox;
 pub mod security_signals;

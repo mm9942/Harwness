@@ -832,6 +832,13 @@ pub const GATEWAY_MUTATION_TOOLS: &[&str] = &[
     "gateway.tools.narrow",
 ];
 
+/// Das Peer-Bridge-Ausgangswerkzeug `peer.send`. Nur für die UIA-Wurzel:
+/// montiert von `harw-runtime` über `PeerBridgeContributor` (nicht von diesem
+/// Crate), daher in keinem [`RegistryProfile`] und nicht in
+/// `registered_tool_names`. Auto-genehmigt (siehe [`crate::AUTO_APPROVED_TOOLS`]),
+/// ratenbegrenzt und ohne Rechteklasse.
+pub const PEER_BRIDGE_TOOLS: &[&str] = &["peer.send"];
+
 /// Das Rückgabewerkzeug der WorkDriver-Worker (R18-Vertrag §8, D-E,
 /// `harw_plan_bridge::WORK_DRIVER_REPORT_TOOL`). Es schreibt nur den Bericht
 /// in den Slot des eigenen Worker-Turns (kein Workspace, kein Prozess, kein

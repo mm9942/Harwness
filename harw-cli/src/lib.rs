@@ -60,6 +60,7 @@ mod observe;
 mod onboarding;
 mod op_bridge;
 mod output;
+mod peer_bridge_serve;
 mod pr_review;
 mod project_trust;
 mod provider_cmd;
@@ -1440,6 +1441,7 @@ fn serve_mcp(
         );
     }
 
+    let peer_bridge = peer_bridge_serve::build_peer_bridge(&config, &storage_root)?;
     require_home_for_sealed_refs(&config, home.as_deref())?;
     let secret_resolver = open_serve_secret_resolver(&config, home.as_deref())?;
     // `doc.read_pdf` (docs/design/doc_read_pdf_design.md §W4): nutzt Mistral
@@ -1561,7 +1563,7 @@ fn serve_mcp(
         // SIGTERM den Prozess nicht mehr hart (G-022).
         let signals = lifecycle::ShutdownSignals::install()?;
         let event_bus = Arc::new(McpEventBus::with_default_capacity());
-        let listener = BoundMcpListener::bind_with_supervisor_and_events(
+        let mut listener = BoundMcpListener::bind_with_supervisor_and_events(
             McpListenerConfig {
                 address,
                 max_sessions: 128,
@@ -1574,6 +1576,9 @@ fn serve_mcp(
         )
         .await
         .map_err(|error| error.to_string())?;
+        if let Some(bridge) = peer_bridge.clone() {
+            listener = listener.with_peer_bridge(bridge);
+        }
         Ok::<_, String>((listener, signals))
     })?;
     eprintln!(
@@ -1581,6 +1586,12 @@ fn serve_mcp(
         listener.local_addr().map_err(|error| error.to_string())?,
         config.harness.mcp_listener.path
     );
+    if peer_bridge.is_some() {
+        eprintln!(
+            "peer bridge: {} peers",
+            config.harness.peer_bridge.peers.len()
+        );
+    }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // R18 P4: WorkDriver-Spur nach `[harness.jobs]` (höchstens so viele

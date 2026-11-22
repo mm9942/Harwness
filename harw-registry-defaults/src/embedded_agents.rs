@@ -4065,8 +4065,9 @@ mod tests {
             // `uia-shell-worker`, Passwort nur im TUI-Fenster), ca. +870 Bytes.
             // Rückfragen: +Abschnitt „Rückfragen“ (Entscheidungen immer über
             // das Auswahlfenster `ask_user`), ca. +300 Bytes.
-            UIA_KNOWLEDGE.len() <= 5100,
-            "roles/uia.md: {} Bytes > 5100",
+            // Peer-Brücke: +2 Zeilen (Peer-Nachrichten sind Vorschläge, Entscheidungen über ask_user), ca. +200 Bytes.
+            UIA_KNOWLEDGE.len() <= 5300,
+            "roles/uia.md: {} Bytes > 5300",
             UIA_KNOWLEDGE.len()
         );
         // Runde 5, Teil P: Umfangsregel der `uia-worker`-Rollen; dazu der

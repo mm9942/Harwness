@@ -7269,6 +7269,15 @@ impl RuntimeAssembly {
         self.spawn_context.organizational_role == AgentRoleId::UserInterface
     }
 
+    /// `<profile>/peer-bridge` when this run's root is a UIA and `[peer_bridge].enabled`; else `None`.
+    /// The TUI uses it to open its peer inbox (`ChatApp::with_peer_bridge_root`).
+    #[must_use]
+    pub fn peer_bridge_root(&self) -> Option<std::path::PathBuf> {
+        (self.root_is_uia() && self.config.harness.peer_bridge.enabled)
+            .then(|| crate::peer_bridge_wiring::peer_bridge_root(&self.spec.home))
+            .flatten()
+    }
+
     /// Provider des effektiven Wurzelmodells des Starts.
     fn root_provider_id(&self) -> Option<String> {
         effective_root_provider_id(&self.config, self.root_is_uia())

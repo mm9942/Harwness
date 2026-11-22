@@ -98,6 +98,8 @@ fn test_field_table_exhaustive_harness_config() {
         retention: _,
         // `[session_listener]`, eigener Abschnittstest unten.
         session_listener: _,
+        // [peer_bridge], eigener Abschnittstest unten.
+        peer_bridge: _,
         // #22 Welle 2B: `[agent_compiler]`, eigener Abschnittstest unten.
         agent_compiler: _,
         base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
@@ -392,6 +394,37 @@ fn test_field_table_exhaustive_session_listener_section() {
         "onion_dir",
     ] {
         assert_path_in_field_table_exactly_once(&format!("session_listener.{field}"));
+    }
+}
+
+// [peer_bridge] (6 Felder, alle global-only)
+#[test]
+fn test_field_table_exhaustive_peer_bridge_section() {
+    let harw_config::PeerBridgeSection {
+        enabled,
+        max_bytes,
+        queue_cap,
+        outbox_max_bytes,
+        webhook_allow_hosts,
+        peers,
+    } = harw_config::PeerBridgeSection::default();
+    let _ = (
+        enabled,
+        max_bytes,
+        queue_cap,
+        outbox_max_bytes,
+        webhook_allow_hosts,
+        peers,
+    );
+    for field in [
+        "enabled",
+        "max_bytes",
+        "queue_cap",
+        "outbox_max_bytes",
+        "webhook_allow_hosts",
+        "peers",
+    ] {
+        assert_path_in_field_table_exactly_once(&format!("peer_bridge.{field}"));
     }
 }
 

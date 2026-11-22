@@ -35,6 +35,7 @@ pub mod freeze;
 pub mod injection;
 pub mod job_store;
 pub mod meta;
+pub mod peer_bridge;
 pub mod reader;
 pub mod record;
 pub mod retention;

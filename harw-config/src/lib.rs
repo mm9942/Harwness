@@ -40,6 +40,7 @@ pub mod retention_toml;
 mod role_models;
 pub mod scope;
 mod serde_defaults;
+pub mod peer_bridge_toml;
 pub mod session_listener_toml;
 // Runde 5, Teil N: `[shell] max_timeout_secs`.
 pub mod shell_limits;
@@ -121,6 +122,7 @@ pub use research_toml::ResearchSection;
 pub use retention_toml::{RetentionClassToml, RetentionSection};
 pub use role_models::*;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
+pub use peer_bridge_toml::{PeerBridgeSection, PeerConnectorToml, PeerToml};
 pub use session_listener_toml::SessionListenerSection;
 pub use skill_toml::SkillToml;
 pub use skills_toml::{

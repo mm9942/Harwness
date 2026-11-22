@@ -155,6 +155,18 @@ impl ResolvedConfig {
     pub fn validate(&self) -> ConfigResult<()> {
         validate_mcp_listener(&self.harness)?;
         self.harness.tui.validate().map_err(ConfigError::Invalid)?;
+        // peer_bridge principals must reference [[mcp_listener.principals]] ids when enabled.
+        let mcp_principal_ids: Vec<&str> = self
+            .harness
+            .mcp_listener
+            .principals
+            .iter()
+            .map(|principal| principal.id.as_str())
+            .collect();
+        self.harness
+            .peer_bridge
+            .validate(&mcp_principal_ids)
+            .map_err(ConfigError::Invalid)?;
         // `active_agent_definition`/`active_uia_definition` prüft der
         // Konsument gegen die gesenkten Definitionen
         // (`harw_registry_defaults::config_agents::ConfigAgents::validate_selection`):

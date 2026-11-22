@@ -23,6 +23,7 @@ use tokio::task::JoinSet;
 
 use crate::auth::{McpAuthenticator, StaticBearerAuthenticator};
 use crate::events::{McpEventBus, McpEventReceiveError, McpLifecycleEventKind};
+use crate::peer::McpPeerBridge;
 use crate::session::{McpServerError, McpSessionRegistry};
 use crate::supervisor::{
     McpJobCapability, McpJobSubmission, McpPrincipal, McpRequestContext, McpSubmittedJobKind,
@@ -151,6 +152,7 @@ pub struct BoundMcpListener {
     principals: Arc<PrincipalRegistry>,
     supervisor: Option<Arc<dyn McpSupervisor>>,
     event_bus: Option<Arc<McpEventBus>>,
+    peer_bridge: Option<Arc<dyn McpPeerBridge>>,
 }
 
 impl BoundMcpListener {
@@ -202,10 +204,20 @@ impl BoundMcpListener {
             principals: Arc::new(principals),
             supervisor,
             event_bus,
+            peer_bridge: None,
         })
     }
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// Attaches the peer bridge. Peer tools are a separate authority from job
+    /// tools: they are offered only to principals the bridge recognises as
+    /// peers and need no durable job supervisor.
+    #[must_use]
+    pub fn with_peer_bridge(mut self, bridge: Arc<dyn McpPeerBridge>) -> Self {
+        self.peer_bridge = Some(bridge);
+        self
     }
     pub async fn serve(self) -> std::io::Result<()> {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -234,6 +246,7 @@ impl BoundMcpListener {
                     let principals = Arc::clone(&self.principals);
                     let supervisor = self.supervisor.clone();
                     let event_bus = self.event_bus.clone();
+                    let peer_bridge = self.peer_bridge.clone();
                     connections.spawn(async move {
                         let _ = Builder::new(TokioExecutor::new())
                             .serve_connection(
@@ -246,6 +259,7 @@ impl BoundMcpListener {
                                         Arc::clone(&principals),
                                         supervisor.clone(),
                                         event_bus.clone(),
+                                        peer_bridge.clone(),
                                     )
                                 }),
                             )
@@ -267,6 +281,7 @@ async fn handle(
     principals: Arc<PrincipalRegistry>,
     supervisor: Option<Arc<dyn McpSupervisor>>,
     event_bus: Option<Arc<McpEventBus>>,
+    peer_bridge: Option<Arc<dyn McpPeerBridge>>,
 ) -> Result<McpResponse, Infallible> {
     let principal = match authenticator.authenticate(
         request
@@ -292,6 +307,7 @@ async fn handle(
                 principals,
                 supervisor,
                 event_bus,
+                peer_bridge,
             )
             .await
         }
@@ -415,6 +431,7 @@ async fn post(
     principals: Arc<PrincipalRegistry>,
     supervisor: Option<Arc<dyn McpSupervisor>>,
     event_bus: Option<Arc<McpEventBus>>,
+    peer_bridge: Option<Arc<dyn McpPeerBridge>>,
 ) -> Result<McpResponse, Infallible> {
     let session_id = request
         .headers()
@@ -556,7 +573,7 @@ async fn post(
     if method == Some("tools/list") {
         return Ok(json_rpc_result(
             id,
-            json!({"tools": tool_catalog(principal)}),
+            json!({"tools": tool_catalog(principal, &principal_key, peer_bridge.as_deref())}),
             None,
         ));
     }
@@ -568,6 +585,8 @@ async fn post(
             principal,
             supervisor.as_deref(),
             event_bus.as_deref(),
+            &principal_key,
+            peer_bridge,
         )
         .await);
     }
@@ -685,8 +704,13 @@ fn sse_frame(event: &str, data: &str) -> Bytes {
 
 /// Tool descriptors filtered to the capabilities the caller's resolved
 /// principal actually holds. An unresolved `principal_key` (authenticated
-/// but not composed into the registry) sees an empty catalog.
-fn tool_catalog(principal: Option<&McpPrincipal>) -> Value {
+/// but not composed into the registry) sees an empty catalog. Peer tools are
+/// added only when the bridge recognises `principal_key` as a configured peer.
+fn tool_catalog(
+    principal: Option<&McpPrincipal>,
+    principal_key: &str,
+    peer_bridge: Option<&dyn McpPeerBridge>,
+) -> Value {
     let Some(principal) = principal else {
         return json!([]);
     };
@@ -761,12 +785,18 @@ fn tool_catalog(principal: Option<&McpPrincipal>) -> Value {
             }
         }));
     }
+    if let Some(bridge) = peer_bridge
+        && bridge.is_peer(principal_key)
+    {
+        tools.extend(crate::peer::peer_tool_descriptors());
+    }
     Value::Array(tools)
 }
 
 /// Executes `tools/call`. Tool identity, session id, and principal are all
 /// server-resolved; only tool-specific arguments come from the JSON-RPC
-/// request and are validated before use.
+/// request and are validated before use. Peer tools are routed before the
+/// supervisor gate because they do not depend on a job supervisor.
 async fn tools_call(
     id: Option<Value>,
     message: &Value,
@@ -774,11 +804,31 @@ async fn tools_call(
     principal: Option<&McpPrincipal>,
     supervisor: Option<&dyn McpSupervisor>,
     event_bus: Option<&McpEventBus>,
+    principal_key: &str,
+    peer_bridge: Option<Arc<dyn McpPeerBridge>>,
 ) -> McpResponse {
     let Some(principal) = principal else {
         return json_rpc_error(id, -32001, "principal is not authorized for any tool", None);
     };
     let tool_name = message.pointer("/params/name").and_then(Value::as_str);
+    if let Some(name) = tool_name
+        && crate::peer::is_peer_tool(name)
+    {
+        let Some(bridge) = peer_bridge else {
+            return json_rpc_error(id, -32601, "unknown tool", None);
+        };
+        return match crate::peer::dispatch_peer_tool(bridge, principal_key, name, message).await {
+            Ok(result) => json_rpc_result(
+                id,
+                json!({"content": [{
+                    "type": "text",
+                    "text": serde_json::to_string(&result).unwrap_or_default()
+                }]}),
+                None,
+            ),
+            Err(error) => json_rpc_error(id, error.code(), error.client_message(), None),
+        };
+    }
     let Some(supervisor) = supervisor else {
         return json_rpc_error(id, -32601, "no durable job supervisor is configured", None);
     };
@@ -1130,9 +1180,14 @@ mod tests {
 
     use harw_job_core::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy};
     use harw_session_store::JobStore;
-    use harw_types::ApprovalActor;
+    use harw_session_store::peer_bridge::{
+        PeerBridgeLayout, PeerInboxHandle, PeerOutboundMessage, append_outbound,
+    };
+    use harw_types::{ApprovalActor, SessionId};
+    use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+    use crate::peer::{FilePeerBridge, PeerBridgeServerConfig, PeerServerConfig};
     use crate::supervisor::DurableMcpSupervisor;
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -2188,6 +2243,254 @@ mod tests {
         )
         .await?;
         assert!(denied_call.contains("\"code\":-32001"), "{denied_call}");
+
+        shutdown_tx
+            .send(true)
+            .map_err(ctx("server accepts shutdown"))?;
+        server
+            .await
+            .map_err(ctx("server task joins"))?
+            .map_err(ctx("server shuts down cleanly"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_tools_are_principal_filtered_and_routed_end_to_end() -> TestResult {
+        let tmp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let root = tmp.path().join("peer-bridge");
+        std::fs::create_dir_all(&root).map_err(ctx("peer root creates"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .map_err(ctx("peer root is private"))?;
+        }
+        let layout = PeerBridgeLayout::new(&root);
+        let _live = PeerInboxHandle::create(
+            &layout,
+            &SessionId::from_str("sess-1"),
+            Some("/work".to_owned()),
+        )
+        .map_err(ctx("live inbox registers"))?;
+        for text in ["reply one", "reply two"] {
+            append_outbound(
+                &layout,
+                PeerOutboundMessage {
+                    v: 1,
+                    seq: 0,
+                    id: String::new(),
+                    from: "harw".to_owned(),
+                    to: "codex".to_owned(),
+                    session: "sess-1".to_owned(),
+                    sent_at: "2026-11-22T00:00:00Z".to_owned(),
+                    text: text.to_owned(),
+                    reply_to: None,
+                },
+                1_048_576,
+            )
+            .map_err(ctx("outbound record appends"))?;
+        }
+        let bridge = FilePeerBridge::new(PeerBridgeServerConfig {
+            root,
+            max_bytes: 64,
+            queue_cap: 8,
+            peers: vec![PeerServerConfig {
+                id: "codex".to_owned(),
+                principal: "peer-codex".to_owned(),
+                wake: true,
+                wake_burst: 3,
+                wake_interval: Duration::from_secs(30),
+                max_sends_per_minute: 30,
+                mcp_poll: true,
+            }],
+        })
+        .map_err(TestError::Unexpected)?;
+
+        let mut principals = PrincipalRegistry::new();
+        principals
+            .try_insert("peer-codex".to_owned(), test_principal("codex", vec![]))
+            .map_err(ctx("unique principal id registers"))?;
+        principals
+            .try_insert(
+                "someone-else".to_owned(),
+                test_principal("other", vec![McpJobCapability::ReadOwn]),
+            )
+            .map_err(ctx("unique principal id registers"))?;
+        let listener = BoundMcpListener::bind_with_supervisor_and_events(
+            McpListenerConfig {
+                address: "127.0.0.1:0"
+                    .parse()
+                    .map_err(ctx("valid loopback address"))?,
+                max_sessions: 4,
+                session_ttl: SignedDuration::from_secs(60),
+            },
+            Arc::new(StaticBearerAuthenticator::new(vec![
+                ("peer-codex".to_owned(), b"codex-token".to_vec()),
+                ("someone-else".to_owned(), b"other-token".to_vec()),
+            ])),
+            principals,
+            None,
+            None,
+        )
+        .await
+        .map_err(ctx("loopback listener binds"))?
+        .with_peer_bridge(Arc::new(bridge));
+        let address = listener
+            .local_addr()
+            .map_err(ctx("bound listener has address"))?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(listener.serve_until(shutdown_rx));
+
+        let (codex_session, codex_protocol) =
+            open_initialized_session(address, "codex-token").await?;
+        let (other_session, other_protocol) =
+            open_initialized_session(address, "other-token").await?;
+
+        async fn rpc(
+            address: SocketAddr,
+            bearer: &str,
+            session: &str,
+            protocol: &str,
+            body: Value,
+        ) -> TestResult<Value> {
+            let response = round_trip(
+                address,
+                post_request_as(
+                    bearer,
+                    &body,
+                    &format!("Mcp-Session-Id: {session}\r\nMcp-Protocol-Version: {protocol}\r\n"),
+                ),
+            )
+            .await?;
+            let (_, payload) = response
+                .split_once("\r\n\r\n")
+                .ok_or(TestError::Missing("response has HTTP body"))?;
+            serde_json::from_str(payload).map_err(ctx("response body is JSON"))
+        }
+        let call = |name: &'static str, arguments: Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            })
+        };
+        let tool_text = |envelope: &Value| -> TestResult<Value> {
+            let text = envelope
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .ok_or(TestError::Missing("result contains serialized content"))?;
+            serde_json::from_str(text).map_err(ctx("tool result is JSON"))
+        };
+        let error_code = |envelope: &Value| envelope.pointer("/error/code").and_then(Value::as_i64);
+
+        let list = json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"});
+        let peer_tools = rpc(address, "codex-token", &codex_session, &codex_protocol, list.clone())
+            .await?
+            .to_string();
+        for tool in ["harw_peer_sessions", "harw_peer_send", "harw_peer_poll"] {
+            assert!(peer_tools.contains(tool), "{peer_tools}");
+        }
+        assert!(!peer_tools.contains("harw_job_submit"), "{peer_tools}");
+
+        let other_tools = rpc(address, "other-token", &other_session, &other_protocol, list)
+            .await?
+            .to_string();
+        for tool in ["harw_peer_sessions", "harw_peer_send", "harw_peer_poll"] {
+            assert!(!other_tools.contains(tool), "{other_tools}");
+        }
+        let denied = rpc(
+            address,
+            "other-token",
+            &other_session,
+            &other_protocol,
+            call(
+                "harw_peer_send",
+                json!({"session": "sess-1", "text": "hi", "id": "x-1"}),
+            ),
+        )
+        .await?;
+        assert_eq!(error_code(&denied), Some(-32001), "{denied}");
+        assert_eq!(
+            denied.pointer("/error/message").and_then(Value::as_str),
+            Some("principal is not a configured peer")
+        );
+
+        let sessions = tool_text(
+            &rpc(
+                address,
+                "codex-token",
+                &codex_session,
+                &codex_protocol,
+                call("harw_peer_sessions", json!({})),
+            )
+            .await?,
+        )?;
+        assert_eq!(sessions["sessions"][0]["session"], "sess-1");
+
+        let send = |session: &'static str, text: String, id: &'static str| {
+            call(
+                "harw_peer_send",
+                json!({"session": session, "text": text, "id": id}),
+            )
+        };
+        let queued = tool_text(
+            &rpc(
+                address,
+                "codex-token",
+                &codex_session,
+                &codex_protocol,
+                send("sess-1", "hello".to_owned(), "m-1"),
+            )
+            .await?,
+        )?;
+        assert_eq!(queued["status"], "queued");
+        let duplicate = tool_text(
+            &rpc(
+                address,
+                "codex-token",
+                &codex_session,
+                &codex_protocol,
+                send("sess-1", "hello".to_owned(), "m-1"),
+            )
+            .await?,
+        )?;
+        assert_eq!(duplicate["status"], "duplicate");
+        let missing = rpc(
+            address,
+            "codex-token",
+            &codex_session,
+            &codex_protocol,
+            send("sess-missing", "hello".to_owned(), "m-2"),
+        )
+        .await?;
+        assert_eq!(error_code(&missing), Some(-32004), "{missing}");
+        let oversized = rpc(
+            address,
+            "codex-token",
+            &codex_session,
+            &codex_protocol,
+            send("sess-1", "x".repeat(65), "m-3"),
+        )
+        .await?;
+        assert_eq!(error_code(&oversized), Some(-32602), "{oversized}");
+
+        let polled = tool_text(
+            &rpc(
+                address,
+                "codex-token",
+                &codex_session,
+                &codex_protocol,
+                call("harw_peer_poll", json!({"after": 1})),
+            )
+            .await?,
+        )?;
+        let messages = polled["messages"]
+            .as_array()
+            .ok_or(TestError::Missing("poll result lists messages"))?;
+        assert_eq!(messages.len(), 1, "{polled}");
+        assert_eq!(messages[0]["seq"], 2);
+        assert_eq!(polled["next"], 2);
 
         shutdown_tx
             .send(true)

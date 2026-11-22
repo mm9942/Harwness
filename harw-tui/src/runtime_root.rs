@@ -1182,6 +1182,12 @@ fn build_root_runtime(
             });
         }
     }
+    // Agenten-Brücke (I5): Peer-Postfach nur in der UIA-Wurzel mit
+    // `[peer_bridge].enabled`; ein Sitzungswechsel baut die App neu und
+    // legt das Postfach unter der neuen Session-ID an.
+    if let Some(root) = assembly.peer_bridge_root() {
+        app = app.with_peer_bridge_root(root);
+    }
     app.set_active_mode(session.mode());
     // Live-Bus des Laufs: Agenten-Panel, Streaming-Vorschau und Σ-Tokens.
     app.attach_agent_events(assembly.agent_events());

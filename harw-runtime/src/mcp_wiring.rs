@@ -47,7 +47,8 @@ fn mcp_runtime() -> Option<&'static tokio::runtime::Runtime> {
 
 /// Löst eine [`SecretRef`] für ein MCP-Bearer-Token auf. `keyring:`/`secrets:`
 /// sind hier (ohne Secret-Store) nicht auflösbar und liefern `None`.
-fn resolve_token(reference: &SecretRef) -> Option<Vec<u8>> {
+/// Also used by `crate::peer_bridge_wiring` for the webhook signing secret.
+pub(crate) fn resolve_token(reference: &SecretRef) -> Option<Vec<u8>> {
     let value = match reference {
         SecretRef::Env(name) => std::env::var(name).ok()?,
         SecretRef::File(path) => std::fs::read_to_string(path).ok()?,

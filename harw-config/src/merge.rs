@@ -1318,6 +1318,73 @@ fn merge_tools_doc(
     }
 }
 
+// `[peer_bridge]` — jedes Blatt `GlobalOnly` und sicherheitskritisch: nur die
+// Baseline (Home) setzt es.
+fn merge_peer_bridge(
+    trusted: &mut HarnessConfig,
+    incoming: crate::peer_bridge_toml::PeerBridgeSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    let present = |field: &str| field_present(raw, &["peer_bridge", field]);
+    global_only(
+        &mut trusted.peer_bridge.enabled,
+        incoming.enabled,
+        present("enabled"),
+        role,
+        "peer_bridge.enabled",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.peer_bridge.max_bytes,
+        incoming.max_bytes,
+        present("max_bytes"),
+        role,
+        "peer_bridge.max_bytes",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.peer_bridge.queue_cap,
+        incoming.queue_cap,
+        present("queue_cap"),
+        role,
+        "peer_bridge.queue_cap",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.peer_bridge.outbox_max_bytes,
+        incoming.outbox_max_bytes,
+        present("outbox_max_bytes"),
+        role,
+        "peer_bridge.outbox_max_bytes",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.peer_bridge.webhook_allow_hosts,
+        incoming.webhook_allow_hosts,
+        present("webhook_allow_hosts"),
+        role,
+        "peer_bridge.webhook_allow_hosts",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.peer_bridge.peers,
+        incoming.peers,
+        present("peers"),
+        role,
+        "peer_bridge.peers",
+        layer_path,
+        out,
+    );
+}
+
 // `[session_listener]` — alle zehn Felder `GlobalOnly` und
 // sicherheitskritisch: nur die Baseline (Home) setzt sie.
 fn merge_session_listener(
@@ -2546,6 +2613,14 @@ pub(crate) fn merge_layer_into(
         layer_path,
         &mut out,
     );
+    merge_peer_bridge(
+        trusted,
+        incoming.peer_bridge.clone(),
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
     merge_retention(trusted, incoming.retention, raw, role, layer_path, &mut out);
     merge_permissions(
         trusted,
@@ -2957,6 +3032,61 @@ mod tests {
                 Some("gw"),
                 "{role:?}"
             );
+        }
+        Ok(())
+    }
+
+    // [peer_bridge]: nur die Baseline (Home) setzt; Profil und Projekt
+    // können weder aktivieren noch Limits, Hosts oder Peers ändern.
+    #[test]
+    fn test_peer_bridge_is_global_only() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.peer_bridge.enabled);
+        let home = "[peer_bridge]\nenabled = true\nmax_bytes = 4096\n\
+            [[peer_bridge.peers]]\nid = \"codex\"\nprincipal = \"codex\"\n\
+            connectors = [\"mcp\"]";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert!(trusted.peer_bridge.enabled);
+        assert_eq!(trusted.peer_bridge.max_bytes, 4096);
+        assert_eq!(trusted.peer_bridge.peers.len(), 1);
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack = "[peer_bridge]\nenabled = false\nmax_bytes = 32768\n\
+                queue_cap = 1024\noutbox_max_bytes = 99999999\n\
+                webhook_allow_hosts = [\"evil.example\"]\n\
+                [[peer_bridge.peers]]\nid = \"evil\"\nprincipal = \"evil\"";
+            let diagnostics = merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert!(trusted.peer_bridge.enabled, "{role:?}");
+            assert_eq!(trusted.peer_bridge.max_bytes, 4096, "{role:?}");
+            assert_eq!(trusted.peer_bridge.peers.len(), 1, "{role:?}");
+            assert_eq!(trusted.peer_bridge.peers[0].id, "codex", "{role:?}");
+            assert!(trusted.peer_bridge.webhook_allow_hosts.is_empty(), "{role:?}");
+            assert_ne!(trusted.peer_bridge.queue_cap, 1024, "{role:?}");
+            assert_ne!(trusted.peer_bridge.outbox_max_bytes, 99_999_999, "{role:?}");
+            for field in [
+                "peer_bridge.enabled",
+                "peer_bridge.max_bytes",
+                "peer_bridge.queue_cap",
+                "peer_bridge.outbox_max_bytes",
+                "peer_bridge.webhook_allow_hosts",
+                "peer_bridge.peers",
+            ] {
+                assert!(
+                    diagnostics.iter().any(|d| d.field == field),
+                    "{role:?} {field}"
+                );
+            }
         }
         Ok(())
     }

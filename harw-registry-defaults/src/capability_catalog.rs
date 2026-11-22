@@ -435,6 +435,8 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("gateway.channels.connect_info", AGENTS, Meta),
     row!("gateway.health", AGENTS, Meta),
     row!("gateway.logs", AGENTS, Meta),
+    // peer bridge: outbound notification to a configured peer (harw-runtime PeerBridgeContributor), UIA root only.
+    row!("peer.send", AGENTS, Meta),
     row!("gateway.connections.revoke", AGENTS, Host),
     row!("gateway.drain", AGENTS, Host),
     row!("gateway.listeners.set", AGENTS, Host),
@@ -655,6 +657,7 @@ mod tests {
             crate::profile::BROWSER_TOOLS,
             crate::profile::LATEX_TOOLS,
             crate::profile::WEB_TOOLS,
+            crate::profile::PEER_BRIDGE_TOOLS,
             crate::profile::AGENT_DEFINITION_WRITE_TOOLS,
             crate::skill_proposal_tools::SKILL_PROPOSAL_READ_TOOLS,
             crate::skill_proposal_tools::SKILL_PROPOSAL_PROPOSE_TOOLS,

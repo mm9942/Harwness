@@ -405,6 +405,10 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "gateway.channels.connect_info",
     "gateway.health",
     "gateway.logs",
+    // Peer-Bridge: ausgehende Benachrichtigung an einen konfigurierten Peer,
+    // ratenbegrenzt, keine Rechteklasse (`profile::PEER_BRIDGE_TOOLS`,
+    // gemountet von harw-runtime).
+    "peer.send",
     // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (`profile::DOD_READ_TOOLS`,
     // `model_tool(readonly, approval = "none")`, `harw-ops/src/dod.rs`). Sie
     // lesen nur den begrenzten, bereinigten Export, den Health-Bericht, die
@@ -1299,6 +1303,10 @@ mod tests {
         // R18: lesende Gateway-Werkzeuge (nur UIA-Wurzel) und der Bericht der
         // WorkDriver-Worker (schreibt nur den eigenen Berichts-Slot).
         read_only_surface.extend_from_slice(crate::profile::GATEWAY_READ_TOOLS);
+        // Dokumentierte Ausnahme wie `plan.write`: `peer.send` ist nur eine
+        // ausgehende Benachrichtigung (kein Workspace-Schreiben, ratenbegrenzt).
+        // Ohne diese Zeile scheitert die Teilmengen-Prüfung.
+        read_only_surface.extend_from_slice(crate::profile::PEER_BRIDGE_TOOLS);
         read_only_surface.extend_from_slice(crate::profile::WORK_DRIVER_REPORT_TOOLS);
         // PL-97 D3: die lesenden Harw-DoD-Werkzeuge (nur Lesen des Exports).
         read_only_surface.extend_from_slice(crate::profile::DOD_READ_TOOLS);
@@ -1694,6 +1702,19 @@ mod tests {
             .iter()
             .chain(crate::profile::PARENT_MESSAGE_TOOLS)
         {
+            assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
+            assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+            assert_eq!(crate::authority::tool_permission(tool), None, "{tool}");
+        }
+    }
+
+    /// Peer-Bridge: `peer.send` ist eine ausgehende Benachrichtigung ohne
+    /// Rechteklasse, steht nie in `ALWAYS_ASK_TOOLS` und wird freigabefrei
+    /// ausgeführt.
+    #[test]
+    fn peer_bridge_tool_is_auto_approved_without_permission_class() {
+        assert_eq!(crate::profile::PEER_BRIDGE_TOOLS, ["peer.send"]);
+        for tool in crate::profile::PEER_BRIDGE_TOOLS {
             assert!(AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
             assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
             assert_eq!(crate::authority::tool_permission(tool), None, "{tool}");

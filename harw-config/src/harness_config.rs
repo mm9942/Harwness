@@ -92,6 +92,9 @@ pub struct HarnessConfig {
     /// (nur global). Siehe `session_listener_toml.rs`.
     #[serde(default)]
     pub session_listener: SessionListenerSection,
+    /// `[peer_bridge]` — Agenten-Bruecke (MCP/Spool/Webhook) zu laufenden TUI-Sitzungen (nur global). Siehe `peer_bridge_toml.rs`.
+    #[serde(default)]
+    pub peer_bridge: crate::peer_bridge_toml::PeerBridgeSection,
     /// `[retention]` — Aufbewahrungsgrenzen je Datenklasse (Logs, Caches,
     /// Spools); sicherheitsrelevante Klassen sind opt-in. Siehe
     /// `retention_toml.rs`.
