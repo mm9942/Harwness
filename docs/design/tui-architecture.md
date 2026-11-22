@@ -295,12 +295,30 @@ result into `MissionAreas`; `app/render.rs` (`compose_body`) draws it.
   `TERMINAL_RETENTION_PER_CATEGORY` (50) constituents per row with counters
   that survive eviction. Provenance (`ManagedJobOrigin`) is display only.
 - `agents_window.rs`, `jobs_window.rs`, `finished_window.rs`,
-  `live_window.rs` — the four renderers; LIVE shows the reasoning tail, the
+  `live_window.rs` — the four renderers; LIVE (landscape; in portrait the framed Reasoning window, see below) shows the reasoning tail, the
   current tool, the last status and the recency slots of the selected agent
   (pinned, else the active root orchestrator, else the top
   `LiveActivityRanker` candidate), sanitized and bounded.
 - `stop_job.rs` — the `x` confirmation dialog; confirming emits the literal
   `/jobs stop <id>` line through the regular command path.
+
+Portrait (2026-11-22, PL-97 §3.3.1): `classify_mission` takes
+`MissionInput.cell_aspect_permille` and in `PortraitStack` calls
+`portrait_square_stack` (not `chat_first`, which only the shallow landscape
+keeps): two square Agents|Jobs windows (never `Combined`), a framed Reasoning
+window (8 content rows) in the `live` rectangle, the FINISHED strip directly
+below it, chat floor 8 rows, with a fixed allocation priority under pressure.
+The stack starts at 30×20 and for physically portrait terminals.
+`ChatApp.cell_aspect_permille` is resolved at start and on every resize
+(`[tui] cell_aspect` > `crossterm::terminal::window_size()` > 0.5).
+`mission/reasoning_feed.rs` is the ring buffer (≤ 2,000 entries / 256 KiB) of
+a time-ordered stream of all agents (role prefix, pinned agent filters),
+fed from the root reasoning/tool path and child events;
+`compose_portrait` draws squares, Reasoning, FINISHED, chat, and sets
+`presence.live = true` so the Reasoning window is focusable and scrollable
+(`Alt+L` opens the maximized agent detail). Agent lists no longer render the
+`∴`/`»` filler lines; the detail view keeps them. The `root-orchestrator`
+inline live cell (section 11) is uncapped.
 
 `FrameRegions` carries the jobs/finished/live rectangles so the mouse wheel
 and left click reach only the window under the pointer
