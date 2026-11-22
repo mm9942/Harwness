@@ -1,0 +1,48 @@
+# Eingebaute UIA (User Interface Agent) des Harw-Android-Standalone-Modus.
+# Built-in UIA of the Harw Android standalone mode.
+#
+# Die Telefon-App haelt Provider-Ketten und Stufen in `config.toml` des
+# Profils, nicht in dieser Datei. So bleibt diese Definition 1:1 gegen den
+# Desktop austauschbar: dieselbe Datei funktioniert auf dem Rechner und auf
+# dem Telefon, nur die Konfiguration unterscheidet sich.
+# The phone keeps provider chains and tiers in config.toml, not here, so this
+# definition stays exchangeable 1:1 with the desktop.
+#
+# Hinweis: Unter `EntryKind::SessionHost` aktiviert die Laufzeit diese UIA
+# noch nicht als Wurzel. Das ist ein Folgeschritt.
+# Note: under EntryKind::SessionHost the runtime does not activate this UIA
+# as root yet (follow-up).
+#
+# `system.md` liegt neben dieser Datei und wird per `instructions_file` in
+# den Kontext gelegt.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.phone-uia@1"
+version = "1.0.0"
+role = "user-interface"
+specialization = "phone-ui"
+
+name = "Harw Phone"
+description = "Built-in user-interface agent of the Harw Android app: chats, plans and edits files in the phone workspace with approval."
+instructions_file = "system.md"
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "fs.write",
+  "fs.edit",
+  "plan.current",
+  "skills.search",
+  "skills.load",
+]
+forbidden = [
+  "shell.exec",
+  "web.fetch",
+  "web.search",
+  "web.docs_rs",
+  "web.crates_io",
+]

@@ -300,3 +300,114 @@ impl From<PortError> for MobileError {
         }
     }
 }
+
+/// Provider family of a configured model route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ProviderKind {
+    Anthropic,
+    OpenAi,
+    OpenAiCompatible,
+    DashScope,
+    OpenRouter,
+}
+
+/// A model provider route stored in the app home.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ProviderRoute {
+    /// Route id, also the provider file stem and the secret slot suffix.
+    pub id: String,
+    /// Provider family.
+    pub kind: ProviderKind,
+    /// Base URL of the provider API.
+    pub base_url: String,
+    /// Model used when the route is activated without an explicit model.
+    pub default_model: String,
+    /// Whether a secret is stored for this route.
+    pub has_secret: bool,
+    /// Whether this route is the active one.
+    pub active: bool,
+}
+
+/// Suggested defaults for a provider family.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ProviderDefaults {
+    /// Default base URL for the family.
+    pub base_url: String,
+    /// Wire API identifier for the family.
+    pub api: String,
+    /// Whether the family needs a secret to be usable.
+    pub secret_required: bool,
+    /// Suggested model id for the family.
+    pub suggested_model: String,
+}
+
+/// Result class of a provider route validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ValidationOutcome {
+    Valid,
+    DiscoveryUnsupported,
+    Rejected,
+    Unreachable,
+    Failed,
+    InvalidRoute,
+    NotChecked,
+}
+
+/// Outcome of validating a provider route against its endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ProviderValidation {
+    /// Result class of the validation.
+    pub outcome: ValidationOutcome,
+    /// HTTP status of the failed discovery, if any.
+    pub http_status: Option<u16>,
+    /// Distinct models reported (capped at 2000).
+    pub model_count: u32,
+    /// First 200 model ids in provider order.
+    pub models: Vec<String>,
+    /// Safe English diagnostic, never a body or key.
+    pub detail: Option<String>,
+    /// Whether the route and secret were persisted.
+    pub saved: bool,
+}
+
+/// Paths and active selection of the on-device harw home.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct AppHomeInfo {
+    /// Absolute Android files directory.
+    pub files_dir: String,
+    /// Absolute harw home directory.
+    pub home: String,
+    /// Absolute active profile directory.
+    pub profile_dir: String,
+    /// Absolute workspace directory (the file jail).
+    pub workspace: String,
+    /// Absolute state directory of the local host.
+    pub state_dir: String,
+    /// Active UIA definition id, if set.
+    pub active_uia: Option<String>,
+    /// Active provider route id, if set.
+    pub active_provider: Option<String>,
+    /// Active model id, if set.
+    pub active_model: Option<String>,
+}
+
+/// Where a session host runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum HostKind {
+    Local,
+    Server,
+    Cloud,
+}
+
+/// A session host the phone can talk to.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct HostRef {
+    /// Stable host id.
+    pub id: String,
+    /// Where the host runs.
+    pub kind: HostKind,
+    /// Human-readable label.
+    pub label: String,
+    /// Whether the host is currently reachable.
+    pub reachable: bool,
+}

@@ -150,8 +150,12 @@ pub trait SecretResolver {
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const SECRET_RESOLVER_FAILURE_REASON: &str = "secret resolver failed";
 const EMPTY_CREDENTIAL_REASON: &str = "credential is empty";
+#[cfg(target_os = "android")]
+const KEYRING_UNSUPPORTED_REASON: &str =
+    "keyring credentials are not available on Android; use a secrets: reference";
 const INVALID_KEYRING_REFERENCE_REASON: &str =
     "invalid keyring reference (expected keyring:<service>/<account>)";
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const KEYRING_FAILURE_REASON: &str =
     "keyring credential unavailable (no entry for service/account or system keyring not reachable)";
 // Gründe für `file:`/`file-json:`-Fehler: bewusst ohne Pfad und ohne Inhalt,
@@ -2373,6 +2377,7 @@ fn transport_from_api(api: &str) -> Transport {
 /// mit [`HttpProviderError::UnsupportedCredentialReference`] fehl; Aufrufer
 /// müssen dann einen Resolver über die `*_with_resolver`-Konstruktoren
 /// injizieren oder auf `env:`/`file:`/`keyring:` ausweichen.
+/// Auf Android schlagen `keyring:`-Referenzen fail-closed fehl (nur `secrets:` ist dort nutzbar).
 /// Resolver- und Keyring-Fehler werden auf feste Gründe abgebildet, damit weder
 /// Secret-Werte noch Resolver-Diagnosen in Fehlertexte gelangen.
 /// `file:`/`file-json:` lesen nur unterhalb von `<home>/secrets/` (siehe
@@ -2472,22 +2477,42 @@ fn resolve_secret(
                     reason: INVALID_KEYRING_REFERENCE_REASON.to_owned(),
                 }
             })?;
-            let entry = keyring::Entry::new(service, account).map_err(|_| {
-                HttpProviderError::UnresolvedCredential {
-                    reference: reference.clone(),
-                    reason: KEYRING_FAILURE_REASON.to_owned(),
-                }
-            })?;
-            let password =
-                entry
-                    .get_password()
-                    .map_err(|_| HttpProviderError::UnresolvedCredential {
-                        reference: reference.clone(),
-                        reason: KEYRING_FAILURE_REASON.to_owned(),
-                    })?;
-            validate_resolved_secret(reference, SecretString::new(password.into()))
+            read_keyring_secret(&reference, service, account)
         }
     }
+}
+
+#[cfg(not(target_os = "android"))]
+fn read_keyring_secret(
+    reference: &str,
+    service: &str,
+    account: &str,
+) -> HttpProviderResult<SecretString> {
+    let entry = keyring::Entry::new(service, account).map_err(|_| {
+        HttpProviderError::UnresolvedCredential {
+            reference: reference.to_owned(),
+            reason: KEYRING_FAILURE_REASON.to_owned(),
+        }
+    })?;
+    let password = entry
+        .get_password()
+        .map_err(|_| HttpProviderError::UnresolvedCredential {
+            reference: reference.to_owned(),
+            reason: KEYRING_FAILURE_REASON.to_owned(),
+        })?;
+    validate_resolved_secret(reference.to_owned(), SecretString::new(password.into()))
+}
+
+#[cfg(target_os = "android")]
+fn read_keyring_secret(
+    reference: &str,
+    _service: &str,
+    _account: &str,
+) -> HttpProviderResult<SecretString> {
+    Err(HttpProviderError::UnresolvedCredential {
+        reference: reference.to_owned(),
+        reason: KEYRING_UNSUPPORTED_REASON.to_owned(),
+    })
 }
 
 /// Löst das Credential eines konfigurierten Providers auf (Design
@@ -6585,6 +6610,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn test_resolve_secret_missing_keyring_entry_is_redacted_and_skips_resolver() -> TestResult {
         // Mock-Backend statt echtem System-Keyring: jede neue `Entry` ist leer,

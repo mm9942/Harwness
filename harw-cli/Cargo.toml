@@ -171,6 +171,7 @@ harw-session-remote = { path = "../harw-session-remote" }
 # adapters on a local Unix socket via the daemon's composition entry.
 harw-session-daemon = { path = "../harw-session-daemon" }
 harw-session-driver = { path = "../harw-session-driver" }
+harw-local-host = { path = "../harw-local-host" }
 harw-session-host = { path = "../harw-session-host" }
 # Remote ingress composition (`src/session_serve_remote.rs`): node transport
 # + own-cloud listener on a TCP socket, separate host and tier.
