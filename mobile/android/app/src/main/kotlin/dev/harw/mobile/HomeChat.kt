@@ -113,6 +113,10 @@ internal fun NewChatSheet(
             Text("Neuer Chat", style = MaterialTheme.typography.titleLarge)
             Text("Ort", style = MaterialTheme.typography.labelLarge)
             BackendSwitch(local = local, enabled = !busy, onSelect = onSwitch, modifier = Modifier.padding(horizontal = 0.dp))
+            if (local) {
+                Text("Modell", style = MaterialTheme.typography.labelLarge)
+                LocalModelChip()
+            }
             Text("Projekt", style = MaterialTheme.typography.labelLarge)
             if (local) {
                 Text(

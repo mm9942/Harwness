@@ -8,8 +8,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material.icons.outlined.AddPhotoAlternate
 import androidx.compose.material3.InputChip
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -89,11 +94,24 @@ import uniffi.harw_mobile_ffi.MobileSession
 import uniffi.harw_mobile_ffi.MobileToolState
 import uniffi.harw_mobile_ffi.ManageEffect
 import uniffi.harw_mobile_ffi.ManageSupport
+import uniffi.harw_mobile_ffi.ModelFileState
+import uniffi.harw_mobile_ffi.ProviderKind
+import uniffi.harw_mobile_ffi.ProviderStore
 import uniffi.harw_mobile_ffi.TranscriptEntry
 import uniffi.harw_mobile_ffi.TranscriptKind
 
-internal fun modelChipLabel(sessionModel: String?, liveModel: String?): String =
-    liveModel ?: sessionModel ?: "Modell"
+internal fun modelChipLabel(sessionModel: String?, liveModel: String?, liveProvider: String? = null): String =
+    when {
+        liveModel != null && liveProvider != null -> "$liveProvider/$liveModel"
+        else -> liveModel ?: sessionModel ?: "Modell"
+    }
+
+/** Aktiver Provider/Modell des On-Device-Hosts als "provider/modell" (nächster Turn nutzt genau dieses). */
+internal fun localModelLabel(provider: String?, model: String?): String = when {
+    provider.isNullOrBlank() || model.isNullOrBlank() -> "Modell"
+    provider == "local-gguf" -> "Gerät/$model"
+    else -> "$provider/$model"
+}
 
 internal fun modelChipBlock(support: ManageSupport?, active: Boolean): String? = when {
     !active -> "Session nicht live"
@@ -184,7 +202,7 @@ internal fun SessionConversation(
             )
         }
     }
-    if (modelsOpen) {
+    if (modelsOpen && !state.local) {
         ModalBottomSheet(
             onDismissRequest = { modelsOpen = false },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
@@ -244,7 +262,11 @@ internal fun SessionConversation(
                     error = true,
                 )
             }
-            if (manageSupport != null) {
+            if (state.local) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 2.dp)) {
+                    LocalModelChip()
+                }
+            } else if (manageSupport != null) {
                 val block = modelChipBlock(manageSupport, active)
                 Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 2.dp)) {
                     AssistChip(
@@ -252,7 +274,11 @@ internal fun SessionConversation(
                         enabled = block == null,
                         label = {
                             Text(
-                                modelChipLabel(session?.model, state.manage.catalog?.liveModel),
+                                modelChipLabel(
+                                    session?.model,
+                                    state.manage.catalog?.liveModel,
+                                    state.manage.catalog?.liveProvider,
+                                ),
                                 maxLines = 1, overflow = TextOverflow.Ellipsis,
                             )
                         },
@@ -811,6 +837,185 @@ private fun ModelSwitchSheet(state: WorkspaceState, connection: HarwConnection, 
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+/** Modell-Knopf des On-Device-Hosts: zeigt Provider/Modell, öffnet die Auswahl, Wechsel gilt ab der nächsten Antwort. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun LocalModelChip() {
+    val context = LocalContext.current
+    var open by rememberSaveable { mutableStateOf(false) }
+    var refresh by remember { mutableIntStateOf(0) }
+    val label by produceState("Modell", refresh) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                val info = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
+                localModelLabel(info.activeProvider, info.activeModel)
+            } catch (_: Exception) {
+                "Modell"
+            }
+        }
+    }
+    AssistChip(
+        onClick = { open = true },
+        label = { Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+    )
+    if (open) {
+        ModalBottomSheet(
+            onDismissRequest = { open = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        ) {
+            LocalModelSheet(onChanged = { refresh++ })
+        }
+    }
+}
+
+/** Zweistufige Auswahl für den On-Device-Host: erst Provider, dann dessen Modelle; gilt ab der nächsten Antwort. */
+@Composable
+private fun LocalModelSheet(onChanged: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val files = context.filesDir.path
+    var reload by remember { mutableIntStateOf(0) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var provider by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val localId = "local-gguf"
+    class Provider(val id: String, val title: String, val defaultModel: String)
+    class Option(val id: String, val title: String)
+    val overview by produceState<Triple<List<Provider>, String?, String?>?>(null, reload) {
+        value = withContext(Dispatchers.IO) {
+            try {
+                val store = ProviderStore(files, AndroidPlatformKeystore(context))
+                val info = store.homeInfo()
+                val localModels = ModelManager(ModelStore(context.applicationContext)).local()
+                    .filter { it.state == ModelFileState.COMPLETE }
+                val cloud = store.routes().filter { it.kind != ProviderKind.LOCAL_GGUF }
+                    .map { Provider(it.id, it.id, it.defaultModel) }
+                val local = if (localModels.isNotEmpty()) listOf(Provider(localId, "Auf diesem Gerät", "")) else emptyList()
+                Triple(local + cloud, info.activeProvider, info.activeModel)
+            } catch (e: Exception) {
+                error = e.message ?: "Provider konnten nicht gelesen werden"
+                Triple(emptyList(), null, null)
+            }
+        }
+    }
+    val options by produceState<List<Option>?>(null, provider, reload) {
+        val chosen = provider
+        value = if (chosen == null) null else withContext(Dispatchers.IO) {
+            try {
+                if (chosen == localId) {
+                    ModelManager(ModelStore(context.applicationContext)).local()
+                        .filter { it.state == ModelFileState.COMPLETE }
+                        .map { Option(it.id, it.label.ifBlank { it.id }) }
+                } else {
+                    val store = ProviderStore(files, AndroidPlatformKeystore(context))
+                    val default = store.routes().firstOrNull { it.id == chosen }?.defaultModel.orEmpty()
+                    val found = try {
+                        store.validateRoute(chosen).models
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    (found.ifEmpty { listOfNotNull(default.takeIf { it.isNotBlank() }) } +
+                        listOfNotNull(default.takeIf { it.isNotBlank() && it !in found }))
+                        .distinct().map { Option(it, it) }
+                }
+            } catch (e: Exception) {
+                error = e.message ?: "Modelle konnten nicht gelesen werden"
+                emptyList()
+            }
+        }
+    }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (provider == null) "Provider wählen" else "Modell wählen",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
+            if (provider != null) TextButton(onClick = { provider = null; error = null }) { Text("Zurück") }
+        }
+        Text(
+            "Gilt ab der nächsten Antwort.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        error?.let { StatusMessage(it, error = true) }
+        val (providers, activeProvider, activeModel) = overview ?: Triple(emptyList(), null, null)
+        if (provider == null) {
+            if (overview == null) {
+                CircularProgressIndicator()
+            } else if (providers.isEmpty()) {
+                StatusMessage("Keine Provider eingerichtet. Richte sie unter Einstellungen ein.")
+            } else {
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                    items(providers, key = { it.id }) { item ->
+                        Row(
+                            Modifier.fillMaxWidth().clickable { provider = item.id; error = null }.padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(item.title, style = MaterialTheme.typography.bodyMedium)
+                                if (item.id == activeProvider) {
+                                    Text(
+                                        "aktiv: ${activeModel.orEmpty()}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                            }
+                            Text(">")
+                        }
+                    }
+                }
+            }
+        } else {
+            val list = options
+            if (list == null || busy) {
+                CircularProgressIndicator()
+            } else if (list.isEmpty()) {
+                StatusMessage("Keine Modelle gefunden.")
+            } else {
+                val chosen = provider
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                    items(list, key = { it.id }) { option ->
+                        val active = chosen == activeProvider && option.id == activeModel
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .selectable(selected = active, role = Role.RadioButton) {
+                                    scope.launch {
+                                        busy = true
+                                        try {
+                                            withContext(Dispatchers.IO) {
+                                                if (chosen == localId) {
+                                                    ModelManager(ModelStore(context.applicationContext)).useLocal(files, option.id)
+                                                } else {
+                                                    ProviderStore(files, AndroidPlatformKeystore(context)).activateRoute(chosen!!, option.id)
+                                                }
+                                            }
+                                            error = null
+                                            reload++
+                                            onChanged()
+                                        } catch (e: Exception) {
+                                            error = e.message ?: "Modell konnte nicht gewählt werden"
+                                        } finally {
+                                            busy = false
+                                        }
+                                    }
+                                }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            RadioButton(selected = active, onClick = null)
+                            Text(option.title, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                         }
                     }
                 }

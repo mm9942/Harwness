@@ -47,9 +47,20 @@ pub(crate) async fn open_local(
     let store = ProviderStore::from_parts(home.clone(), keystore);
     let resolver = store.resolver().clone();
     let model_home = home.clone();
-    let model = tokio::task::spawn_blocking(move || build_active_model(&model_home, &resolver))
-        .await
-        .map_err(|_| host_task_failed())??;
+    let selection = home.active_route()?;
+    let resolver_for_build = resolver.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        build_active_model(&model_home, &resolver_for_build)
+    })
+    .await
+    .map_err(|_| host_task_failed())??;
+    // The host keeps this wrapper for its whole life: a later provider/model
+    // activation is picked up by the next turn (see `SwitchingModel`).
+    let model: Arc<dyn harw_core::ModelProvider> = Arc::new(SwitchingModel {
+        home: home.clone(),
+        resolver,
+        current: tokio::sync::Mutex::new((selection, built)),
+    });
     // The device tools follow the profile switch (off by default for the on-device model).
     let (shell, files) = device;
     let mut contributors: Vec<Arc<dyn harw_local_host::ext::AssemblyContributor>> = Vec::new();
@@ -68,6 +79,73 @@ pub(crate) async fn open_local(
         }
     };
     open_local_with_tools(home, model, features, contributors, Some(surface)).await
+}
+
+/// Model provider of the on-device host that follows the active selection.
+///
+/// The host builds its model once; without this wrapper a provider activated
+/// later (another route, or the on-device GGUF) would not reach the running
+/// host. Before every turn the wrapper compares the active route and model of
+/// the app home with the one it was built for and rebuilds on a change. The
+/// per-session model ids of the request are cleared: the app-level selection
+/// is what the owner picked on the phone.
+#[cfg(feature = "local-host")]
+struct SwitchingModel {
+    home: crate::home::AppHome,
+    resolver: crate::secrets::KeystoreSecretResolver,
+    current: tokio::sync::Mutex<(
+        Option<(String, String)>,
+        Arc<dyn harw_core::ModelProvider>,
+    )>,
+}
+
+#[cfg(feature = "local-host")]
+impl SwitchingModel {
+    async fn provider(&self) -> Result<Arc<dyn harw_core::ModelProvider>, harw_core::ModelError> {
+        let failed = |detail: String| harw_core::ModelError::RequestFailed(detail);
+        let wanted = self.home.active_route().map_err(|e| failed(e.to_string()))?;
+        let mut current = self.current.lock().await;
+        if current.0 != wanted {
+            // Release the old model first: two loaded GGUFs do not fit in memory.
+            let placeholder: Arc<dyn harw_core::ModelProvider> = Arc::new(NoModel);
+            current.1 = placeholder;
+            let home = self.home.clone();
+            let resolver = self.resolver.clone();
+            let built = tokio::task::spawn_blocking(move || build_active_model(&home, &resolver))
+                .await
+                .map_err(|_| failed("on-device model switch failed".to_owned()))?
+                .map_err(|e| failed(e.to_string()))?;
+            *current = (wanted, built);
+        }
+        Ok(Arc::clone(&current.1))
+    }
+}
+
+#[cfg(feature = "local-host")]
+impl harw_core::ModelProvider for SwitchingModel {
+    fn respond<'a>(&'a self, mut request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+        Box::pin(async move {
+            let provider = self.provider().await?;
+            request.model_id = None;
+            request.provider_id = None;
+            provider.respond(request).await
+        })
+    }
+}
+
+/// Stand-in while the next model loads; never answers.
+#[cfg(feature = "local-host")]
+struct NoModel;
+
+#[cfg(feature = "local-host")]
+impl harw_core::ModelProvider for NoModel {
+    fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+        Box::pin(async {
+            Err(harw_core::ModelError::RequestFailed(
+                "the on-device model is not loaded".to_owned(),
+            ))
+        })
+    }
 }
 
 /// Tools a cloud route on the phone keeps visible: the phone UIA's set and the

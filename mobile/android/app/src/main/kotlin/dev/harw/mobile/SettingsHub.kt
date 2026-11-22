@@ -84,7 +84,7 @@ private fun writeShowReasoningPref(context: Context, value: Boolean) {
 /** Grund, warum Verwalten-Zeilen gesperrt sind; `null` = frei. */
 internal fun manageOpenBlock(state: WorkspaceState): String? = when {
     !state.online -> "offline"
-    state.manage.support?.manage != true -> NO_MANAGE_TEXT
+    state.manage.support?.manage != true -> if (state.local) "Nur mit Server-Verbindung" else NO_MANAGE_TEXT
     else -> null
 }
 
