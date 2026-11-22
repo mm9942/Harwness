@@ -1232,13 +1232,12 @@ private fun LocalModelSheet(onChanged: () -> Unit) {
                 } else {
                     val store = ProviderStore(files, AndroidPlatformKeystore(context))
                     val default = store.routes().firstOrNull { it.id == chosen }?.defaultModel.orEmpty()
-                    val found = try {
-                        store.validateRoute(chosen).models
+                    val saved = try {
+                        store.routeModels(chosen)
                     } catch (_: Exception) {
                         emptyList()
                     }
-                    (found.ifEmpty { listOfNotNull(default.takeIf { it.isNotBlank() }) } +
-                        listOfNotNull(default.takeIf { it.isNotBlank() && it !in found }))
+                    (saved + listOfNotNull(default.takeIf { it.isNotBlank() }))
                         .distinct().map { Option(it, it) }
                 }
             } catch (e: Exception) {
@@ -1295,7 +1294,7 @@ private fun LocalModelSheet(onChanged: () -> Unit) {
             if (list == null || busy) {
                 CircularProgressIndicator()
             } else if (list.isEmpty()) {
-                StatusMessage("Keine Modelle gefunden.")
+                StatusMessage("Keine Modelle hinterlegt. Trage sie unter Einstellungen > Provider > Modelle ein.")
             } else {
                 val chosen = provider
                 LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
