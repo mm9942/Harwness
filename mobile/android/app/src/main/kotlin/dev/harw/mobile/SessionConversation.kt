@@ -142,6 +142,7 @@ internal fun SessionConversation(
     }
 
     BoxWithConstraints(modifier.imePadding()) {
+        val availableHeight = maxHeight
         Column(Modifier.fillMaxSize()) {
             if (inlineActivity || turnId != null) {
                 Row(
@@ -197,7 +198,7 @@ internal fun SessionConversation(
                 reasoning = snapshot.reasoning,
                 finished = snapshot.finished,
                 nowMs = nowMs,
-                availableHeight = maxHeight,
+                availableHeight = availableHeight,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 4.dp),
             )
         }

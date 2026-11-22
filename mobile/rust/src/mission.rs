@@ -62,11 +62,6 @@ impl Mission {
         *self = Self::default();
     }
 
-    pub fn set_root_model(&mut self, model: Option<String>) {
-        let root = self.agent_mut(ROOT_ID, None, ROOT_ROLE);
-        root.model = model;
-    }
-
     pub fn root_waiting(&mut self, waiting: bool) {
         let root = self.agent_mut(ROOT_ID, None, ROOT_ROLE);
         root.state = if waiting {
@@ -95,6 +90,8 @@ impl Mission {
 
     fn agent_event(&mut self, id: &str, parent: Option<&str>, role: &str, event: &TurnEvent) {
         let is_root = id == ROOT_ID;
+        // The root agent exists from the first event on, and sorts first.
+        self.agent_mut(ROOT_ID, None, ROOT_ROLE);
         match event {
             TurnEvent::TurnStarted { .. } => {
                 let agent = self.agent_mut(id, parent, role);
@@ -503,7 +500,11 @@ mod tests {
         let agents: Vec<&str> = lines.iter().map(|line| line.agent.as_str()).collect();
         assert_eq!(agents, ["root", "c1", "root"]);
         assert!(lines.windows(2).all(|pair| pair[0].seq < pair[1].seq));
-        assert!(lines.iter().all(|line| line.kind == ReasoningKind::Thinking));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.kind == ReasoningKind::Thinking)
+        );
         Ok(())
     }
 

@@ -267,15 +267,14 @@ async fn serve(args: Serve) -> Result<()> {
             )
         })
         .unwrap_or_default();
-    let approval = args
-        .allow_approval
-        .then(|| {
-            format!(
-                "approval_device = {}\n",
-                toml_string(record.device.as_str())
-            )
-        })
-        .unwrap_or_default();
+    let approval = if args.allow_approval {
+        format!(
+            "approval_device = {}\n",
+            toml_string(record.device.as_str())
+        )
+    } else {
+        String::new()
+    };
     write_new(
         &home.join("config.toml"),
         format!(

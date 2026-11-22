@@ -266,9 +266,7 @@ impl SessionState {
                 kind,
                 state,
                 summary,
-            } => self
-                .mission
-                .job(work_id, kind, state, summary.as_deref()),
+            } => self.mission.job(work_id, kind, state, summary.as_deref()),
             _ => {}
         }
     }

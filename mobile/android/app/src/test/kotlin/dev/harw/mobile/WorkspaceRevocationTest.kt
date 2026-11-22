@@ -25,6 +25,7 @@ class WorkspaceRevocationTest {
             transcript = listOf(TranscriptEntry("message-1", TranscriptKind.USER, "Private message", null)),
             liveText = "Private reply", approvals = emptyList(), lastFailure = null,
             lastSyncMillis = null, detail = null,
+            agents = emptyList(), jobs = emptyList(), reasoning = emptyList(), finished = emptyList(),
         )
         val live = WorkspaceState(
             profile = profile, deviceNodeId = "phone-key", setupPending = false, hasSavedSetup = true,
