@@ -1197,9 +1197,18 @@ mod tests {
 
     #[test]
     fn manage_enums_map_unknown() {
-        assert_eq!(ManageOrigin::from(CommandOrigin::Unknown), ManageOrigin::Unknown);
-        assert_eq!(ManageOrigin::from(CommandOrigin::TuiLocal), ManageOrigin::TuiLocal);
-        assert_eq!(ManageEffect::from(CommandEffect::Unknown), ManageEffect::Unknown);
+        assert_eq!(
+            ManageOrigin::from(CommandOrigin::Unknown),
+            ManageOrigin::Unknown
+        );
+        assert_eq!(
+            ManageOrigin::from(CommandOrigin::TuiLocal),
+            ManageOrigin::TuiLocal
+        );
+        assert_eq!(
+            ManageEffect::from(CommandEffect::Unknown),
+            ManageEffect::Unknown
+        );
         assert_eq!(
             ManageAuthKind::from(ProviderAuthKind::Unknown),
             ManageAuthKind::Unknown

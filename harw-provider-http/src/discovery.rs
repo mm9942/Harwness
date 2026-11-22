@@ -330,8 +330,8 @@ async fn discover_prepared(
     let PreparedDiscovery {
         plan,
         codex_route,
+        base,
         url,
-        ..
     } = prepared;
 
     if provider.api == "anthropic-messages" {
@@ -419,7 +419,7 @@ async fn discover_prepared(
         && provider.api == "openai-chat"
         && models.iter().any(|model| model.context_length.is_none())
     {
-        merge_lmstudio_context_lengths(&client, base, api_key, &mut models).await;
+        merge_lmstudio_context_lengths(&client, &base, api_key, &mut models).await;
     }
     Ok(models)
 }

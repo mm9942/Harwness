@@ -35,6 +35,11 @@ use harw_protocol::methods::{
     METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT, TOOL_METHODS,
 };
 use harw_protocol::methods::{
+    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
+    METHOD_STEPUP_CONFIRM,
+};
+use harw_protocol::methods::{
     METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE,
     METHOD_SESSION_PROJECTS, METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT,
 };
@@ -45,17 +50,12 @@ use harw_protocol::session_wire::{
     SetModeParams, SetModelParams, SubmitParams, ToolCallParams, ToolCancelParams, ToolListParams,
     error_codes,
 };
-use harw_protocol::methods::{
-    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
-    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
-    METHOD_STEPUP_CONFIRM,
+use harw_protocol::session_wire::{
+    ArchiveParams, CreateInParams, PageParams, ProjectsParams, RenameParams, SetProjectParams,
 };
 use harw_protocol::session_wire::{
     CatalogGetParams, CommandRunParams, CommandsListParams, ConfigGetParams, ConfigResetParams,
     ConfigSetParams, SecretPutParams, StepUpCancelParams, StepUpConfirmParams,
-};
-use harw_protocol::session_wire::{
-    ArchiveParams, CreateInParams, PageParams, ProjectsParams, RenameParams, SetProjectParams,
 };
 use harw_protocol::{
     ClientCaps, FrameSource, GatewayPort, PortError, RequestEnvelope, ResponseEnvelope,
@@ -569,13 +569,13 @@ fn internal(id: String, error: &serde_json::Error) -> ResponseEnvelope {
 mod tests {
     use std::sync::Mutex;
 
+    use harw_protocol::methods::{MANAGE_METHODS, STEPUP_METHODS};
     use harw_protocol::session_wire::{
         AgentRole, AttachAck, Cursor, FrameEnvelope, GatewayConnectionsResult, GatewayListenerInfo,
         GatewayListenersResult, GatewayRevokeResult, GatewayStatus, GatewayToolRights,
         GatewayToolsResult, HelloAck, ListenerKind, RespondResult, SessionSummary, SubmitResult,
         ToolCallResultFrame, ToolListResult,
     };
-    use harw_protocol::methods::{MANAGE_METHODS, STEPUP_METHODS};
     use harw_protocol::session_wire::{
         CatalogLive, CatalogResult, CommandsListResult, ConfigGetResult,
     };

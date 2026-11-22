@@ -3156,6 +3156,7 @@ dependencies = [
  "harw-knowledge",
  "harw-lens",
  "harw-lens-types",
+ "harw-local-host",
  "harw-macros",
  "harw-mcp-client",
  "harw-mcp-server",
@@ -4445,6 +4446,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-local-host"
+version = "0.10.0"
+dependencies = [
+ "harw-authority",
+ "harw-core",
+ "harw-extension-api",
+ "harw-protocol",
+ "harw-registry-defaults",
+ "harw-runtime",
+ "harw-session-driver",
+ "harw-session-host",
+ "harw-session-store",
+ "harw-types",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "harw-macros"
 version = "0.10.0"
 dependencies = [
@@ -5347,6 +5367,7 @@ name = "harw-session-host"
 version = "0.10.0"
 dependencies = [
  "fs4",
+ "getrandom 0.4.3",
  "harw-authority",
  "harw-fsutil",
  "harw-protocol",
@@ -5357,6 +5378,7 @@ dependencies = [
  "jiff 0.2.37",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tracing",

@@ -32,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
 

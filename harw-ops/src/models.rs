@@ -1168,7 +1168,9 @@ pub fn plan_models_change(ctx: &OpContext, args: &[String]) -> Result<ModelsChan
                 .as_deref()
                 .map(str::trim)
                 .filter(|target| !target.is_empty())
-                .ok_or_else(|| OpError::InvalidArguments(format!("Ziel fehlt. Aufruf: {usage}.")))?;
+                .ok_or_else(|| {
+                    OpError::InvalidArguments(format!("Ziel fehlt. Aufruf: {usage}."))
+                })?;
             parse_role_effort(parsed.effort.as_deref(), role.key())?;
             let (provider, model) = check_set_target(&config, role, target)?;
             Ok(change(
@@ -1328,8 +1330,7 @@ fn read_current_models(
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(OpError::InvalidArguments(
-                "Der Provider hat keine eigene Datei im Profil (providers/<name>.toml)."
-                    .to_owned(),
+                "Der Provider hat keine eigene Datei im Profil (providers/<name>.toml).".to_owned(),
             ));
         }
         Err(error) => return Err(io_error("Provider-Datei lesen", error)),
@@ -1337,13 +1338,15 @@ fn read_current_models(
     let document = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| io_error("Provider-Datei lesen", error))?;
-    Ok(match document.get("models").and_then(|item| item.as_array()) {
-        Some(array) => array
-            .iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        None => fallback.iter().cloned().collect(),
-    })
+    Ok(
+        match document.get("models").and_then(|item| item.as_array()) {
+            Some(array) => array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect(),
+            None => fallback.iter().cloned().collect(),
+        },
+    )
 }
 
 /// Schreibt die sortierte Liste; andere Schlüssel der Datei bleiben erhalten.
@@ -1375,7 +1378,9 @@ fn prepare_list_edit(
         .iter()
         .find(|(key, provider)| key.as_str() == provider_name || provider.name == provider_name)
         .ok_or_else(|| {
-            OpError::InvalidArguments(format!("Provider '{provider_name}' ist nicht konfiguriert."))
+            OpError::InvalidArguments(format!(
+                "Provider '{provider_name}' ist nicht konfiguriert."
+            ))
         })?;
     if adding && !provider.enabled {
         return Err(OpError::InvalidArguments(format!(
@@ -1471,7 +1476,8 @@ fn handle_remove(
         && metadata.file_type().is_file()
         && !metadata.file_type().is_symlink()
     {
-        std::fs::remove_file(&model_path).map_err(|error| io_error("Modelldatei löschen", error))?;
+        std::fs::remove_file(&model_path)
+            .map_err(|error| io_error("Modelldatei löschen", error))?;
         file_removed = true;
     }
     Ok(OpOutput {
@@ -2885,7 +2891,10 @@ mod remote_tests {
             redact_base_url("http://h.example.test:8080/a/b?x=1#f"),
             "http://h.example.test:8080/a/b"
         );
-        assert_eq!(redact_base_url("https://u:p@h.example.test"), "https://h.example.test");
+        assert_eq!(
+            redact_base_url("https://u:p@h.example.test"),
+            "https://h.example.test"
+        );
         assert_eq!(redact_base_url("no-scheme"), "");
         assert_eq!(redact_base_url("https://"), "");
     }
@@ -2913,7 +2922,11 @@ mod remote_tests {
     fn models_remote_policy_shape() {
         let show = REMOTE.find_verb(&toks(&["show"]));
         assert!(show.is_some_and(|v| v.cap == RemoteCap::Observe && !v.stepup));
-        assert!(REMOTE.find_verb(&toks(&[])).is_some_and(|v| v.slice == RemoteSlice::Read));
+        assert!(
+            REMOTE
+                .find_verb(&toks(&[]))
+                .is_some_and(|v| v.slice == RemoteSlice::Read)
+        );
         let set = REMOTE.find_verb(&toks(&["set", "uia", "x/y"]));
         assert!(set.is_some_and(|v| v.stepup
             && v.cap == RemoteCap::Control
@@ -2923,10 +2936,26 @@ mod remote_tests {
         assert!(REMOTE.denied_tokens.contains(&"pick"));
         assert!(REMOTE.denied_tokens.contains(&"--allow-insecure-lan"));
         // Lese-Formen von image/worker bleiben Observe, Schreib-Formen nicht.
-        assert!(REMOTE.find_verb(&toks(&["image", "show"])).is_some_and(|v| !v.stepup));
-        assert!(REMOTE.find_verb(&toks(&["image", "x/y"])).is_some_and(|v| v.stepup));
-        assert!(REMOTE.find_verb(&toks(&["worker"])).is_some_and(|v| !v.stepup));
-        assert!(REMOTE.find_verb(&toks(&["add", "p/m"])).is_some_and(|v| v.stepup));
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["image", "show"]))
+                .is_some_and(|v| !v.stepup)
+        );
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["image", "x/y"]))
+                .is_some_and(|v| v.stepup)
+        );
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["worker"]))
+                .is_some_and(|v| !v.stepup)
+        );
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["add", "p/m"]))
+                .is_some_and(|v| v.stepup)
+        );
     }
 
     struct ListFixture {
@@ -2968,7 +2997,12 @@ mod remote_tests {
         services.insert(Arc::clone(&home));
         services.insert(Arc::clone(&config));
         let ctx = crate::knowledge_test_support::op_context(services)?;
-        Ok(ListFixture { ctx, config, profile, _dir: dir })
+        Ok(ListFixture {
+            ctx,
+            config,
+            profile,
+            _dir: dir,
+        })
     }
 
     fn file_models(path: &Path) -> TestResult<Vec<String>> {
@@ -3059,9 +3093,14 @@ mod remote_tests {
         let remove =
             plan_models_change(&fx.ctx, &toks(&["remove", "p1/m1"])).map_err(ctx("remove"))?;
         assert_eq!(remove.canonical, "models.remove p1/m1: present -> absent");
-        let set = plan_models_change(&fx.ctx, &toks(&["set", "uia", "p1/m1"])).map_err(ctx("set"))?;
+        let set =
+            plan_models_change(&fx.ctx, &toks(&["set", "uia", "p1/m1"])).map_err(ctx("set"))?;
         assert_eq!(set.action, "set");
-        assert!(set.canonical.starts_with("models.set uia: "), "{}", set.canonical);
+        assert!(
+            set.canonical.starts_with("models.set uia: "),
+            "{}",
+            set.canonical
+        );
         assert!(set.canonical.ends_with(" -> p1/m1"), "{}", set.canonical);
         // Planen schreibt nichts.
         assert_eq!(file_models(&fx.profile.join("providers/p1.toml"))?, ["m1"]);

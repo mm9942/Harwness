@@ -64,9 +64,8 @@ fn map_domain(domain: OperationDomain) -> CommandDomain {
 /// # Rückgabe
 /// Die lokalisierte Hinweisliste oder eine leere Liste für unbekannte Befehle.
 pub(crate) fn subcommand_hints(name: &str) -> Vec<SubcommandHint> {
-    command_meta::help_for(name).map_or_else(Vec::new, |help| {
-        help.hints.iter().map(localized).collect()
-    })
+    command_meta::help_for(name)
+        .map_or_else(Vec::new, |help| help.hints.iter().map(localized).collect())
 }
 
 /// Localized planned summaries, keyed by owned command identity.
@@ -79,10 +78,8 @@ pub(crate) fn planned_commands() -> Vec<(&'static str, &'static str)> {
 
 /// Nutzungszeile aus der Katalogtabelle, falls vorhanden.
 fn usage_for(name: &str) -> Option<&'static str> {
-    command_meta::help_for(name).map(|help| {
-        help.usage_key
-            .map_or(help.usage, |key| tr(key, help.usage))
-    })
+    command_meta::help_for(name)
+        .map(|help| help.usage_key.map_or(help.usage, |key| tr(key, help.usage)))
 }
 
 /// Ergänzt eine Spezifikation um Katalogwissen.
@@ -265,7 +262,9 @@ mod tests {
             assert!(usage.starts_with(&format!("/{name}")), "{name} usage");
             assert_eq!(Some(spec.usage.as_str()), usage_for(name));
             assert!(
-                command_meta::HINT_TABLE[index + 1..].iter().all(|h| h.name != *name),
+                command_meta::HINT_TABLE[index + 1..]
+                    .iter()
+                    .all(|h| h.name != *name),
                 "{name} appears twice in HINT_TABLE"
             );
             for hint in &spec.subcommands {
@@ -612,7 +611,10 @@ mod tests {
     /// erzeugte Datei. `HARW_BLESS_POPUP=1` schreibt sie neu.
     #[test]
     fn popup_catalog_snapshot_is_unchanged() -> TestResult {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/command_popup_en.snap");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/command_popup_en.snap"
+        );
         let dump = popup_dump();
         if std::env::var_os("HARW_BLESS_POPUP").is_some() {
             let dir = std::path::Path::new(path)
@@ -622,9 +624,13 @@ mod tests {
             std::fs::write(path, &dump).map_err(ctx("write snapshot"))?;
             return Ok(());
         }
-        let expected = std::fs::read_to_string(path)
-            .map_err(ctx("snapshot missing: run once with HARW_BLESS_POPUP=1 on the base"))?;
-        assert_eq!(dump, expected, "popup catalog changed; bless only if intended");
+        let expected = std::fs::read_to_string(path).map_err(ctx(
+            "snapshot missing: run once with HARW_BLESS_POPUP=1 on the base",
+        ))?;
+        assert_eq!(
+            dump, expected,
+            "popup catalog changed; bless only if intended"
+        );
         Ok(())
     }
 }

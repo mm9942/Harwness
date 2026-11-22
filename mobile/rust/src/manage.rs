@@ -36,7 +36,8 @@ pub(crate) const OAUTH_TOKEN_PREFIXES: &[(&str, &str)] = &[("anthropic", "sk-ant
 /// Befehlszeile fuer die Liste bekannter Provider.
 pub(crate) const PROVIDER_CATALOG_LINE: &str = "/provider catalog";
 
-pub(crate) const NO_MANAGE_DETAIL: &str = "Server kennt keine Verwaltung (Wire 4, Feature manage fehlt)";
+pub(crate) const NO_MANAGE_DETAIL: &str =
+    "Server kennt keine Verwaltung (Wire 4, Feature manage fehlt)";
 pub(crate) const NO_STEPUP_DETAIL: &str =
     "Server erlaubt noch keine Änderungen vom Handy (Feature stepup fehlt)";
 pub(crate) const LINE_INVALID_DETAIL: &str = "ungültige Befehlszeile";
@@ -122,7 +123,9 @@ impl MobileCore {
         };
         let result = self.manage_call(features::MANAGE, move |port| port.command_run(params))?;
         if !result.ok {
-            return Err(MobileError::Denied { detail: result.text });
+            return Err(MobileError::Denied {
+                detail: result.text,
+            });
         }
         result
             .data
@@ -285,7 +288,9 @@ pub(crate) fn check_secret_value(value: &str) -> Result<(), MobileError> {
 }
 
 fn is_lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `hex(sha256(STEPUP_HASH_DOMAIN || hex_decode(nonce) || [0x00] || text))`, klein.
@@ -519,7 +524,10 @@ mod tests {
     fn check_line_rules() -> T {
         check_line("/status").map_err(|e| e.to_string())?;
         for bad in ["status", "/", "", "/a\nb", "/a\tb"] {
-            assert_eq!(detail(check_line(bad).err().ok_or("accepted")?), LINE_INVALID_DETAIL);
+            assert_eq!(
+                detail(check_line(bad).err().ok_or("accepted")?),
+                LINE_INVALID_DETAIL
+            );
         }
         let long = format!("/{}", "x".repeat(512));
         assert!(check_line(&long).is_err());
@@ -599,7 +607,11 @@ mod tests {
         assert_eq!(address.as_deref(), Some("https://llm.example.test/v1"));
         assert_eq!(key.as_deref(), Some("custom-a"));
         assert_eq!(lines.len(), 5);
-        assert!(lines.iter().all(|l| l.label != STEPUP_TEXT_HEADER && l.value != STEPUP_TEXT_HEADER));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.label != STEPUP_TEXT_HEADER && l.value != STEPUP_TEXT_HEADER)
+        );
         let (_, none, _) = stepup_lines("harw step-up v1\nadresse: -");
         assert_eq!(none, None);
         let (lines, _, _) = stepup_lines("harw step-up v1\nalt -> neu: a: b");
@@ -690,7 +702,10 @@ mod tests {
         assert_eq!(rows[0].oauth_token_prefix.as_deref(), Some("sk-ant-oat"));
         assert!(rows[0].api_key_taken);
         assert_eq!(rows[1].oauth_token_prefix, None);
-        assert_eq!(rows[1].auth_kinds, vec![ManageKnownAuth::ApiKey, ManageKnownAuth::Oauth]);
+        assert_eq!(
+            rows[1].auth_kinds,
+            vec![ManageKnownAuth::ApiKey, ManageKnownAuth::Oauth]
+        );
         assert!(known_from_data(&serde_json::json!({})).is_none());
         Ok(())
     }

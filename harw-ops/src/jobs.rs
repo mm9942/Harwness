@@ -1046,11 +1046,15 @@ mod tests {
         let status = marker_job(&manager).await?;
         let out = run(&op_ctx, &["ls"]).await.map_err(ctx("ls"))?;
         let data = out.data.ok_or(TestError::Missing("data fehlt"))?;
-        let rows = data["jobs"].as_array().ok_or(TestError::Missing("jobs fehlt"))?;
+        let rows = data["jobs"]
+            .as_array()
+            .ok_or(TestError::Missing("jobs fehlt"))?;
         let text_rows = out.text.lines().filter(|l| l.starts_with("  job-")).count();
         assert_eq!(rows.len(), text_rows, "{}", out.text);
         assert_eq!(data["active"], 1);
-        let state = rows[0]["state"].as_str().ok_or(TestError::Missing("state"))?;
+        let state = rows[0]["state"]
+            .as_str()
+            .ok_or(TestError::Missing("state"))?;
         assert!(STATES.contains(&state), "{state}");
         assert_eq!(rows[0]["id"], status.meta.job_id.to_string());
         assert_eq!(rows[0]["terminal"], false);
@@ -1097,7 +1101,11 @@ mod tests {
         assert!(!phone.text.contains("fake-SECRET-marker"), "{}", phone.text);
         assert!(!phone.text.contains("PID"), "{}", phone.text);
         assert!(!phone.text.contains("Logs:"), "{}", phone.text);
-        assert!(phone.text.contains("Besitzer: some-agent"), "{}", phone.text);
+        assert!(
+            phone.text.contains("Besitzer: some-agent"),
+            "{}",
+            phone.text
+        );
         manager
             .stop(&status.meta.job_id, Caller::Operator, JobSignal::Kill)
             .await

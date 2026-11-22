@@ -462,7 +462,11 @@ impl RemoteVerb {
         if args.len() < exact.len() {
             return false;
         }
-        if !exact.iter().zip(args).all(|(want, got)| *want == got.as_str()) {
+        if !exact
+            .iter()
+            .zip(args)
+            .all(|(want, got)| *want == got.as_str())
+        {
             return false;
         }
         match *last {
@@ -1502,7 +1506,11 @@ mod tests {
             RemoteVerb::read(&["worker", "-"]),
             RemoteVerb::global(&["worker", "*"], RemoteEffect::NextSession),
         ];
-        let policy = RemotePolicy { path: "/x", verbs: &VERBS, denied_tokens: &[] };
+        let policy = RemotePolicy {
+            path: "/x",
+            verbs: &VERBS,
+            denied_tokens: &[],
+        };
         let v = policy
             .find_verb(&toks(&["worker"]))
             .ok_or(TestError::Missing("match"))?;
@@ -1542,7 +1550,12 @@ mod tests {
         let c = RemoteVerb::control(&["-"], RemoteEffect::Applied);
         assert_eq!(
             (c.cap, c.tier, c.slice, c.stepup),
-            (RemoteCap::Control, PermissionTier::Operator, RemoteSlice::Session, false)
+            (
+                RemoteCap::Control,
+                PermissionTier::Operator,
+                RemoteSlice::Session,
+                false
+            )
         );
         let g = RemoteVerb::global(&["-"], RemoteEffect::NextSession);
         assert_eq!(
@@ -1560,41 +1573,65 @@ mod tests {
     #[test]
     fn remote_refusal_codes_and_texts_are_stable() {
         let cases: Vec<(RemoteRefusal, &str, String)> = vec![
-            (RemoteRefusal::LineInvalid, "line_invalid", "ungültige Befehlszeile".into()),
+            (
+                RemoteRefusal::LineInvalid,
+                "line_invalid",
+                "ungültige Befehlszeile".into(),
+            ),
             (
                 RemoteRefusal::UnknownCommand { name: "foo".into() },
                 "unknown_command",
                 "unbekannter Befehl /foo".into(),
             ),
-            (RemoteRefusal::NotRemote, "not_remote", "nur in der TUI".into()),
-            (RemoteRefusal::VerbNotRemote, "verb_not_remote", "diese Form nur in der TUI".into()),
             (
-                RemoteRefusal::DeniedToken { token: "--x".into() },
+                RemoteRefusal::NotRemote,
+                "not_remote",
+                "nur in der TUI".into(),
+            ),
+            (
+                RemoteRefusal::VerbNotRemote,
+                "verb_not_remote",
+                "diese Form nur in der TUI".into(),
+            ),
+            (
+                RemoteRefusal::DeniedToken {
+                    token: "--x".into(),
+                },
                 "denied_token",
                 "--x ist remote gesperrt".into(),
             ),
             (
-                RemoteRefusal::MissingCap { cap: RemoteCap::Observe },
+                RemoteRefusal::MissingCap {
+                    cap: RemoteCap::Observe,
+                },
                 "missing_cap",
                 "braucht Recht Beobachten".into(),
             ),
             (
-                RemoteRefusal::MissingCap { cap: RemoteCap::Steer },
+                RemoteRefusal::MissingCap {
+                    cap: RemoteCap::Steer,
+                },
                 "missing_cap",
                 "braucht Recht Steuern".into(),
             ),
             (
-                RemoteRefusal::MissingCap { cap: RemoteCap::Control },
+                RemoteRefusal::MissingCap {
+                    cap: RemoteCap::Control,
+                },
                 "missing_cap",
                 "braucht Stufe Voll".into(),
             ),
             (
-                RemoteRefusal::TierTooLow { need: PermissionTier::Maintainer },
+                RemoteRefusal::TierTooLow {
+                    need: PermissionTier::Maintainer,
+                },
                 "tier_too_low",
                 "braucht Stufe maintainer".into(),
             ),
             (
-                RemoteRefusal::SliceDisabled { slice: RemoteSlice::Global },
+                RemoteRefusal::SliceDisabled {
+                    slice: RemoteSlice::Global,
+                },
                 "slice_disabled",
                 "noch nicht freigeschaltet (Scheibe 3)".into(),
             ),

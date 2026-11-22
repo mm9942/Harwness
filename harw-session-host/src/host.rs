@@ -31,26 +31,26 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use harw_protocol::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams,
-    CatalogResult, CommandEffect, CommandRunParams, CommandRunResult, CommandsListParams,
-    CommandsListResult, ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams,
-    CreateInParams, CreateParams, DEFAULT_PAGE_LIMIT, GatewayConnectionInfo, GatewayConnectionsResult, GatewayDrainParams,
-    GatewayListenerInfo, GatewayListenerSetParams, GatewayListenersResult, GatewayRevokeParams,
-    GatewayRevokeResult, GatewayStatus, GatewayToolRights, GatewayToolRightsParams,
-    GatewayToolsResult, HelloAck, HelloParams, HistoryParams, HolderInfo, InterruptParams,
-    MANAGE_WIRE_MINOR, MAX_PAGE_LIMIT, NO_PROJECT_KEY, PROJECTS_WIRE_MINOR, PageParams, PageResult, PrincipalSummary,
-    ProjectsParams, ProjectsResult, ReadOnlyReason, RenameParams, RespondResult, RowOrigin,
-    SESSION_WIRE_MINOR, SecretPutParams, SecretPutResult, SessionRow, SessionSummary,
-    SetEffortParams, SetModeParams, SetModelParams, SetProjectParams, ShareInfo,
-    StepUpCancelParams, StepUpConfirmParams, SubmitParams, SubmitResult, TOOL_GATEWAY_WIRE_MINOR,
-    ToolCallParams, ToolCallResultFrame, ToolCancelParams, ToolListParams, ToolListResult,
-    features, refusal_codes,
-};
 use harw_protocol::methods::{
     METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
     METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
     METHOD_STEPUP_CONFIRM,
+};
+use harw_protocol::session_wire::{
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
+    CommandEffect, CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult,
+    ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams,
+    CreateParams, DEFAULT_PAGE_LIMIT, GatewayConnectionInfo, GatewayConnectionsResult,
+    GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams, GatewayListenersResult,
+    GatewayRevokeParams, GatewayRevokeResult, GatewayStatus, GatewayToolRights,
+    GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams, HistoryParams, HolderInfo,
+    InterruptParams, MANAGE_WIRE_MINOR, MAX_PAGE_LIMIT, NO_PROJECT_KEY, PROJECTS_WIRE_MINOR,
+    PageParams, PageResult, PrincipalSummary, ProjectsParams, ProjectsResult, ReadOnlyReason,
+    RenameParams, RespondResult, RowOrigin, SESSION_WIRE_MINOR, SecretPutParams, SecretPutResult,
+    SessionRow, SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SetProjectParams,
+    ShareInfo, StepUpCancelParams, StepUpConfirmParams, SubmitParams, SubmitResult,
+    TOOL_GATEWAY_WIRE_MINOR, ToolCallParams, ToolCallResultFrame, ToolCancelParams, ToolListParams,
+    ToolListResult, features, refusal_codes,
 };
 use harw_protocol::{
     ApprovalRequest, ClientCaps, Cursor, FrameEnvelope, FrameSource, GatewayPort, HostedState,
@@ -3168,7 +3168,11 @@ impl HostConnection {
         needs: &[Need],
     ) -> Result<(&Arc<dyn OpsPort>, OpsCaller), HostError> {
         let granted = self.granted()?;
-        tracing::debug!(method, connection = self.identity.connection.0, "manage call");
+        tracing::debug!(
+            method,
+            connection = self.identity.connection.0,
+            "manage call"
+        );
         match feature {
             ManageFeature::Manage if !self.manage.load(Ordering::SeqCst) => {
                 return Err(HostError::Denied("feature `manage` not negotiated".into()));
@@ -3178,11 +3182,10 @@ impl HostConnection {
             }
             ManageFeature::Manage | ManageFeature::Stepup => {}
         }
-        let ops = self
-            .host
-            .ops
-            .get()
-            .ok_or_else(|| HostError::Denied("management not offered by this gateway".into()))?;
+        let ops =
+            self.host.ops.get().ok_or_else(|| {
+                HostError::Denied("management not offered by this gateway".into())
+            })?;
         let share = self.host.share();
         if self.identity.tenant.is_some()
             && self.host.share_for(self.identity.tenant.as_ref()).is_none()
@@ -3287,22 +3290,34 @@ impl HostConnection {
         }
     }
 
-    async fn catalog_get_inner(&self, params: CatalogGetParams) -> Result<CatalogResult, HostError> {
+    async fn catalog_get_inner(
+        &self,
+        params: CatalogGetParams,
+    ) -> Result<CatalogResult, HostError> {
         let (ops, caller) =
             self.manage_admit(METHOD_CATALOG_GET, ManageFeature::Manage, NEED_OBSERVE)?;
         let session = self.ops_session(params.session_id.clone())?;
         ops.catalog_get(caller, session, params).await
     }
 
-    async fn config_get_inner(&self, params: ConfigGetParams) -> Result<ConfigGetResult, HostError> {
+    async fn config_get_inner(
+        &self,
+        params: ConfigGetParams,
+    ) -> Result<ConfigGetResult, HostError> {
         let (ops, caller) =
             self.manage_admit(METHOD_CONFIG_GET, ManageFeature::Manage, NEED_OBSERVE)?;
         ops.config_get(caller, params).await
     }
 
-    async fn config_set_inner(&self, params: ConfigSetParams) -> Result<CommandRunResult, HostError> {
-        let (ops, caller) =
-            self.manage_admit(METHOD_CONFIG_SET, ManageFeature::Stepup, NEED_CONTROL_APPROVE)?;
+    async fn config_set_inner(
+        &self,
+        params: ConfigSetParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) = self.manage_admit(
+            METHOD_CONFIG_SET,
+            ManageFeature::Stepup,
+            NEED_CONTROL_APPROVE,
+        )?;
         ops.config_set(caller, params).await
     }
 
@@ -3310,14 +3325,23 @@ impl HostConnection {
         &self,
         params: ConfigResetParams,
     ) -> Result<CommandRunResult, HostError> {
-        let (ops, caller) =
-            self.manage_admit(METHOD_CONFIG_RESET, ManageFeature::Stepup, NEED_CONTROL_APPROVE)?;
+        let (ops, caller) = self.manage_admit(
+            METHOD_CONFIG_RESET,
+            ManageFeature::Stepup,
+            NEED_CONTROL_APPROVE,
+        )?;
         ops.config_reset(caller, params).await
     }
 
-    async fn secret_put_inner(&self, params: SecretPutParams) -> Result<SecretPutResult, HostError> {
-        let (ops, caller) =
-            self.manage_admit(METHOD_SECRET_PUT, ManageFeature::Stepup, NEED_CONTROL_APPROVE)?;
+    async fn secret_put_inner(
+        &self,
+        params: SecretPutParams,
+    ) -> Result<SecretPutResult, HostError> {
+        let (ops, caller) = self.manage_admit(
+            METHOD_SECRET_PUT,
+            ManageFeature::Stepup,
+            NEED_CONTROL_APPROVE,
+        )?;
         ops.secret_put(caller, params).await
     }
 

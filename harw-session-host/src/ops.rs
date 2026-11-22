@@ -1,10 +1,10 @@
 //! Operations backend of the minor-4 `manage`/`stepup` methods (contract K-W3c §8.1).
-use harw_protocol::session_wire::{
-    CatalogGetParams, CatalogResult, CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult,
-    ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams, SecretPutParams, SecretPutResult,
-    StepUpCancelParams, StepUpConfirmParams,
-};
 use harw_protocol::ClientCaps;
+use harw_protocol::session_wire::{
+    CatalogGetParams, CatalogResult, CommandRunParams, CommandRunResult, CommandsListParams,
+    CommandsListResult, ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams,
+    SecretPutParams, SecretPutResult, StepUpCancelParams, StepUpConfirmParams,
+};
 use harw_types::{PermissionTier, SessionId, TenantId};
 
 use crate::driver::DriverFuture;
@@ -88,15 +88,35 @@ pub trait OpsPort: Send + Sync + 'static {
         params: CatalogGetParams,
     ) -> DriverFuture<'_, CatalogResult>;
     /// Reads redacted config values.
-    fn config_get(&self, caller: OpsCaller, params: ConfigGetParams) -> DriverFuture<'_, ConfigGetResult>;
+    fn config_get(
+        &self,
+        caller: OpsCaller,
+        params: ConfigGetParams,
+    ) -> DriverFuture<'_, ConfigGetResult>;
     /// Sets one config value.
-    fn config_set(&self, caller: OpsCaller, params: ConfigSetParams) -> DriverFuture<'_, CommandRunResult>;
+    fn config_set(
+        &self,
+        caller: OpsCaller,
+        params: ConfigSetParams,
+    ) -> DriverFuture<'_, CommandRunResult>;
     /// Resets one config value.
-    fn config_reset(&self, caller: OpsCaller, params: ConfigResetParams) -> DriverFuture<'_, CommandRunResult>;
+    fn config_reset(
+        &self,
+        caller: OpsCaller,
+        params: ConfigResetParams,
+    ) -> DriverFuture<'_, CommandRunResult>;
     /// Stages a write-only secret.
-    fn secret_put(&self, caller: OpsCaller, params: SecretPutParams) -> DriverFuture<'_, SecretPutResult>;
+    fn secret_put(
+        &self,
+        caller: OpsCaller,
+        params: SecretPutParams,
+    ) -> DriverFuture<'_, SecretPutResult>;
     /// Confirms a pending step-up.
-    fn stepup_confirm(&self, caller: OpsCaller, params: StepUpConfirmParams) -> DriverFuture<'_, CommandRunResult>;
+    fn stepup_confirm(
+        &self,
+        caller: OpsCaller,
+        params: StepUpConfirmParams,
+    ) -> DriverFuture<'_, CommandRunResult>;
     /// Cancels a pending step-up.
     fn stepup_cancel(&self, caller: OpsCaller, params: StepUpCancelParams) -> DriverFuture<'_, ()>;
     /// Connection closed: drop its step-ups and staged secrets. Never panics, never blocks long.

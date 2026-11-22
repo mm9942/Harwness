@@ -187,7 +187,8 @@ const INLINE_PARENT: &str = "dod or dod.watch is not a plain table in the profil
 // Whether every parent of `key` in `document` is absent or a real (header or
 // dotted) table, so `set_value`/`remove_value` edit in place instead of
 // replacing an inline table.
-const INLINE_MODE_PARENT: &str = "mode is not a plain table in the profile config; change mode.default there by hand";
+const INLINE_MODE_PARENT: &str =
+    "mode is not a plain table in the profile config; change mode.default there by hand";
 
 fn table_parents_are_plain(document: &str, key: &str) -> bool {
     let Ok(document) = document.parse::<toml_edit::DocumentMut>() else {
@@ -1276,9 +1277,15 @@ mod tests {
         }
         assert_eq!(rows[6].apply, "next_session");
         assert_eq!(rows[0].apply, "now");
-        assert_eq!(rows[6].choices, ["chat", "plan", "explore", "work", "shell"]);
-        let only = config_view(live.current().as_ref(), Some(["tui.theme".to_owned()].as_slice()))
-            .map_err(ctx("subset"))?;
+        assert_eq!(
+            rows[6].choices,
+            ["chat", "plan", "explore", "work", "shell"]
+        );
+        let only = config_view(
+            live.current().as_ref(),
+            Some(["tui.theme".to_owned()].as_slice()),
+        )
+        .map_err(ctx("subset"))?;
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].value, "dark");
         Ok(())
@@ -1397,7 +1404,10 @@ mod tests {
         assert_eq!(data["rows"].as_array().map(Vec::len), Some(6));
         let reset = plan_config_change(&context, "tui.theme", None, &ceiling(&[]))
             .map_err(ctx("plan reset"))?;
-        assert_eq!(reset.canonical, "config.reset tui.theme: light -> (default)");
+        assert_eq!(
+            reset.canonical,
+            "config.reset tui.theme: light -> (default)"
+        );
         apply_config_change(&context, &reset).map_err(ctx("apply reset"))?;
         assert_eq!(live.current().harness.tui.theme, "dark");
         let profile = std::fs::read_to_string(home.profile_dir.join("config.toml"))

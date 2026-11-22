@@ -1302,12 +1302,7 @@ mod tests {
             })
         );
         assert_eq!(
-            tui.allows_remote_invocation(
-                Some(&SINGLE_CONTROL),
-                &OBSERVER,
-                RemoteSlice::Global,
-                &a
-            ),
+            tui.allows_remote_invocation(Some(&SINGLE_CONTROL), &OBSERVER, RemoteSlice::Global, &a),
             Err(RemoteRefusal::MissingCap {
                 cap: RemoteCap::Control
             })

@@ -10,12 +10,12 @@ use harw_protocol::session_wire::{
     ConfigResetParams, ConfigSetParams, CreateInParams, GatewayStatus, HelloAck, HelloParams,
     HolderInfo, HolderKind, LastOrigin, MANAGE_WIRE_MINOR, MAX_CLIENT_MSG_ID_BYTES,
     MAX_COMMAND_LINE_BYTES, MAX_CONFIG_KEYS, MAX_SECRET_VALUE_BYTES, PROJECTS_WIRE_MINOR,
-    PageParams, ProviderAuthKind, SecretPutParams, SecretPutResult, StepUpCancelParams,
-    StepUpChallenge, StepUpConfirmParams, WireSecret,
-    PageResult, PlacementGeneration, ProjectsParams, ProjectsResult, ReadOnlyReason, RenameParams,
-    RespondResult, RowOrigin, SESSION_WIRE_MINOR, SESSION_WS_PATH, SESSION_WS_SUBPROTOCOL,
-    SessionRow, SessionSummary, SetProjectParams, SubmitResult, TOOL_GATEWAY_WIRE_MINOR,
-    ToolCallParams, ToolCallResultFrame, ToolListResult, error_codes,
+    PageParams, PageResult, PlacementGeneration, ProjectsParams, ProjectsResult, ProviderAuthKind,
+    ReadOnlyReason, RenameParams, RespondResult, RowOrigin, SESSION_WIRE_MINOR, SESSION_WS_PATH,
+    SESSION_WS_SUBPROTOCOL, SecretPutParams, SecretPutResult, SessionRow, SessionSummary,
+    SetProjectParams, StepUpCancelParams, StepUpChallenge, StepUpConfirmParams, SubmitResult,
+    TOOL_GATEWAY_WIRE_MINOR, ToolCallParams, ToolCallResultFrame, ToolListResult, WireSecret,
+    error_codes,
 };
 use harw_protocol::{AgentRole, ClientCaps, Cursor, FrameEnvelope, SessionFrame, ToolApproval};
 use serde::Serialize;

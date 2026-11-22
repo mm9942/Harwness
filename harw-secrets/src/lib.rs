@@ -38,9 +38,9 @@ pub mod kek;
 pub mod policy;
 pub mod record;
 pub mod store;
-pub mod write_only;
 #[cfg(test)]
 mod test_support;
+pub mod write_only;
 
 pub use audit::chain::AuditLog;
 pub use audit::checkpoint::{Checkpoint, CheckpointLog};

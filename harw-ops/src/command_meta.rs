@@ -1958,7 +1958,12 @@ mod tests {
                     .form
                     .split_last()
                     .ok_or(TestError::Missing("form nicht leer"))?;
-                assert!(*last == "-" || *last == "*", "{}: {:?}", policy.path, verb.form);
+                assert!(
+                    *last == "-" || *last == "*",
+                    "{}: {:?}",
+                    policy.path,
+                    verb.form
+                );
                 assert!(
                     head.iter().all(|t| *t != "-" && *t != "*"),
                     "{}: {:?}",
@@ -2057,7 +2062,10 @@ mod tests {
                 local.name
             );
             if !collides {
-                assert_eq!(view(&views, local.name)?.origin, CommandOriginKind::TuiLocal);
+                assert_eq!(
+                    view(&views, local.name)?.origin,
+                    CommandOriginKind::TuiLocal
+                );
             }
         }
         let names: Vec<&str> = views.iter().map(|v| v.name.as_str()).collect();
@@ -2080,13 +2088,25 @@ mod tests {
                 })
             );
         } else {
-            assert_eq!(err, Some(RemoteRefusal::MissingCap { cap: RemoteCap::Control }));
+            assert_eq!(
+                err,
+                Some(RemoteRefusal::MissingCap {
+                    cap: RemoteCap::Control
+                })
+            );
         }
-        let adapter = all.iter().find(|a| a.path() == "/models")
+        let adapter = all
+            .iter()
+            .find(|a| a.path() == "/models")
             .ok_or(TestError::Missing("/models"))?;
         let args: Vec<String> = ["set", "uia", "x/y"].map(str::to_owned).to_vec();
         let refused = adapter
-            .allows_remote_invocation(remote_policy("/models"), &OPERATOR, RemoteSlice::Global, &args)
+            .allows_remote_invocation(
+                remote_policy("/models"),
+                &OPERATOR,
+                RemoteSlice::Global,
+                &args,
+            )
             .err();
         assert_eq!(
             refused,
@@ -2100,7 +2120,11 @@ mod tests {
     #[test]
     fn parse_remote_line_rules() {
         for bad in ["", "status", "/", "/a\tb", "  /\t"] {
-            assert_eq!(parse_remote_line(bad), Err(RemoteRefusal::LineInvalid), "{bad:?}");
+            assert_eq!(
+                parse_remote_line(bad),
+                Err(RemoteRefusal::LineInvalid),
+                "{bad:?}"
+            );
         }
         let long = format!("/{}", "a".repeat(512));
         assert_eq!(long.len(), 513);
@@ -2165,11 +2189,21 @@ mod tests {
             .ok_or(TestError::Missing("/provider"))?;
         let args: Vec<String> = ["add", "anthropic"].map(str::to_owned).to_vec();
         let verb = adapter
-            .allows_remote_invocation(remote_policy("/provider"), &FULL, RemoteSlice::Global, &args)
+            .allows_remote_invocation(
+                remote_policy("/provider"),
+                &FULL,
+                RemoteSlice::Global,
+                &args,
+            )
             .map_err(|e| TestError::Unexpected(e.reason_de()))?;
         assert!(verb.stepup);
         let refused = adapter
-            .allows_remote_invocation(remote_policy("/provider"), &OPERATOR, RemoteSlice::Global, &args)
+            .allows_remote_invocation(
+                remote_policy("/provider"),
+                &OPERATOR,
+                RemoteSlice::Global,
+                &args,
+            )
             .err();
         assert_eq!(
             refused,

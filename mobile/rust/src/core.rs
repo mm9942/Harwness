@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::time::Duration;
 
 use harw_node_transport::{LocalNode, NodeBody, empty_body};
-use harw_protocol::{PortError, PortFuture, SessionPort};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams,
     Cursor, DEFAULT_TAIL_ITEMS, HolderInfo, InterruptParams, PageParams, ProjectsParams,
     RenameParams, RespondResult, SessionFrame, SetProjectParams, StreamProfile, SubmitParams,
     SubmitResult, features,
 };
+use harw_protocol::{PortError, PortFuture, SessionPort};
 use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError};
 use harw_types::{ApprovalId, SessionId, TurnId};
 use http::Method;
@@ -610,7 +610,11 @@ impl MobileCore {
     pub fn adopt_session(&self, session_id: String) -> Result<MobileSession, MobileError> {
         let id = parse_session_id(session_id)?;
         let link = self.projects_link()?;
-        self.run(async move { link.request(link.backend.port().adopt(id)).await.map(Into::into) })
+        self.run(async move {
+            link.request(link.backend.port().adopt(id))
+                .await
+                .map(Into::into)
+        })
     }
 
     pub fn create_in_project(
@@ -620,9 +624,13 @@ impl MobileCore {
     ) -> Result<MobileSession, MobileError> {
         let link = self.projects_link()?;
         self.run(async move {
-            link.request(link.backend.port().create_in(CreateInParams { project_key, title }))
-                .await
-                .map(Into::into)
+            link.request(
+                link.backend
+                    .port()
+                    .create_in(CreateInParams { project_key, title }),
+            )
+            .await
+            .map(Into::into)
         })
     }
 
@@ -651,9 +659,13 @@ impl MobileCore {
         let session_id = parse_session_id(session_id)?;
         let link = self.projects_link()?;
         self.run(async move {
-            link.request(link.backend.port().rename(RenameParams { session_id, title }))
-                .await
-                .map(Into::into)
+            link.request(
+                link.backend
+                    .port()
+                    .rename(RenameParams { session_id, title }),
+            )
+            .await
+            .map(Into::into)
         })
     }
 

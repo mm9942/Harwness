@@ -92,12 +92,12 @@ mod replay_bounds;
 mod responses_reasoning;
 pub mod retry;
 pub mod routing;
-pub mod url_guard;
 mod sse;
 mod text_tool_calls;
 mod thinking_profiles;
 mod tool_call_ids;
 mod tool_names;
+pub mod url_guard;
 
 use error::{model_error_for_status, model_error_for_transport, retry_after_hint};
 use harw_core::envelope::render_tool_result;
@@ -123,6 +123,7 @@ pub use anthropic::{
     DEFAULT_ANTHROPIC_BASE_URL, anthropic_messages_url, build_messages_body,
     extract_anthropic_text,
 };
+pub use chatgpt_plan::{API as CHATGPT_PLAN_API, BASE_URL as CHATGPT_PLAN_BASE_URL};
 pub use codex::{is_codex_base_url, is_codex_login_reference};
 pub use error::{HttpProviderError, HttpProviderResult};
 pub use retry::{
@@ -131,7 +132,6 @@ pub use retry::{
     rate_limit_decision, retry_decision,
 };
 pub use routing::{RoutingBackends, RoutingModelProvider};
-pub use chatgpt_plan::{API as CHATGPT_PLAN_API, BASE_URL as CHATGPT_PLAN_BASE_URL};
 
 mod chatgpt_plan;
 mod codex;

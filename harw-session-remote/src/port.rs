@@ -6,24 +6,24 @@
 //! is [`PortError::Transport`].
 
 use harw_protocol::methods::{
-    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
-    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
-    METHOD_STEPUP_CONFIRM, METHOD_APPROVAL_RESP, METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_ATTACH,
-    METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_DETACH,
-    METHOD_SESSION_HISTORY, METHOD_SESSION_LIST, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS,
-    METHOD_SESSION_RENAME, METHOD_SESSION_RESUME, METHOD_SESSION_SET_EFFORT,
-    METHOD_SESSION_SET_MODE, METHOD_SESSION_SET_MODEL, METHOD_SESSION_SET_PROJECT,
-    METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT,
+    METHOD_APPROVAL_RESP, METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST,
+    METHOD_CONFIG_GET, METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT,
+    METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_ATTACH, METHOD_SESSION_CLOSE,
+    METHOD_SESSION_CREATE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_DETACH, METHOD_SESSION_HISTORY,
+    METHOD_SESSION_LIST, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS, METHOD_SESSION_RENAME,
+    METHOD_SESSION_RESUME, METHOD_SESSION_SET_EFFORT, METHOD_SESSION_SET_MODE,
+    METHOD_SESSION_SET_MODEL, METHOD_SESSION_SET_PROJECT, METHOD_STEPUP_CANCEL,
+    METHOD_STEPUP_CONFIRM, METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT,
 };
 use harw_protocol::session_wire::{
     ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
     CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams,
-    ConfigGetResult, ConfigResetParams, ConfigSetParams, SecretPutParams, SecretPutResult,
-    StepUpCancelParams, StepUpConfirmParams, CreateInParams, CreateParams,
+    ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams, CreateParams,
     FrameEnvelope, HelloAck, HelloParams, HistoryParams, HistoryResult, InterruptParams,
     ListResult, PageParams, PageResult, ProjectsParams, ProjectsResult, RenameParams,
-    RespondResult, SessionRef, SessionRow, SessionSummary, SetEffortParams, SetModeParams,
-    SetModelParams, SetProjectParams, SubmitParams, SubmitResult,
+    RespondResult, SecretPutParams, SecretPutResult, SessionRef, SessionRow, SessionSummary,
+    SetEffortParams, SetModeParams, SetModelParams, SetProjectParams, StepUpCancelParams,
+    StepUpConfirmParams, SubmitParams, SubmitResult,
 };
 use harw_protocol::{FrameSource, PortFuture, SessionPort};
 use harw_types::SessionId;
@@ -337,12 +337,12 @@ impl SessionPort for RemotePort {
 
 #[cfg(test)]
 mod tests {
+    use harw_protocol::PortError;
     use harw_protocol::methods::{
         METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
         METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
         METHOD_STEPUP_CONFIRM,
     };
-    use harw_protocol::PortError;
     use harw_protocol::session_wire::error_codes;
 
     use crate::RemoteError;

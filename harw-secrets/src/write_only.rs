@@ -199,19 +199,27 @@ impl fmt::Display for WriteOnlyError {
             ),
             Self::EmptyValue => f.write_str("Schluessel ist leer"),
             Self::ValueTooShort => {
-                write!(f, "Schluessel ist zu kurz (mindestens {MIN_SECRET_LEN} Zeichen)")
+                write!(
+                    f,
+                    "Schluessel ist zu kurz (mindestens {MIN_SECRET_LEN} Zeichen)"
+                )
             }
             Self::ValueTooLong => {
-                write!(f, "Schluessel ist zu lang (hoechstens {MAX_SECRET_LEN} Zeichen)")
+                write!(
+                    f,
+                    "Schluessel ist zu lang (hoechstens {MAX_SECRET_LEN} Zeichen)"
+                )
             }
             Self::ValueNotPrintable => f.write_str(
                 "Schluessel enthaelt unzulaessige Zeichen (nur druckbares ASCII ohne Leerraum)",
             ),
-            Self::TooManyStaged => f.write_str(
-                "zu viele vorgemerkte Schluessel; bitte bestaetigen oder kurz warten",
-            ),
+            Self::TooManyStaged => {
+                f.write_str("zu viele vorgemerkte Schluessel; bitte bestaetigen oder kurz warten")
+            }
             Self::NotFound => f.write_str("vorgemerkter Schluessel nicht gefunden"),
-            Self::Expired => f.write_str("vorgemerkter Schluessel ist abgelaufen; bitte neu eingeben"),
+            Self::Expired => {
+                f.write_str("vorgemerkter Schluessel ist abgelaufen; bitte neu eingeben")
+            }
             Self::BindingMismatch => {
                 f.write_str("vorgemerkter Schluessel gehoert zu einem anderen Provider")
             }
@@ -312,7 +320,10 @@ fn valid_name(name: &str, max: usize, allow_dot: bool) -> bool {
     !name.is_empty()
         && name.len() <= max
         && name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' || (allow_dot && byte == b'.')
+            byte.is_ascii_alphanumeric()
+                || byte == b'_'
+                || byte == b'-'
+                || (allow_dot && byte == b'.')
         })
 }
 
@@ -380,7 +391,10 @@ impl StagedSecrets {
         if entries.len() >= MAX_STAGED_TOTAL {
             return Err(WriteOnlyError::TooManyStaged);
         }
-        let owned = entries.values().filter(|entry| entry.owner == owner).count();
+        let owned = entries
+            .values()
+            .filter(|entry| entry.owner == owner)
+            .count();
         if owned >= MAX_STAGED_PER_OWNER {
             return Err(WriteOnlyError::TooManyStaged);
         }
@@ -514,10 +528,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::id::KeyVersion;
     use crate::kek::{KekProvenance, derive_public_key};
     use crate::policy::CryptoPolicy;
     use crate::store::KekMaterial;
-    use crate::id::KeyVersion;
     use crate::test_support::{TestError, TestResult};
 
     const FAKE: &str = "sk-test-FAKE-0000000000000000";
@@ -557,7 +571,9 @@ mod tests {
     fn expect_err<T>(result: Result<T, WriteOnlyError>, want: &WriteOnlyError) -> TestResult {
         match result {
             Err(error) if error == *want => Ok(()),
-            Err(error) => Err(TestError::Unexpected(format!("Fehler {error:?}, erwartet {want:?}"))),
+            Err(error) => Err(TestError::Unexpected(format!(
+                "Fehler {error:?}, erwartet {want:?}"
+            ))),
             Ok(_) => Err(TestError::Unexpected(format!("Ok, erwartet {want:?}"))),
         }
     }
@@ -566,12 +582,15 @@ mod tests {
     fn stage_never_returns_value() -> TestResult {
         let staged = StagedSecrets::new();
         let now = t0()?;
-        let (handle, info) = staged.stage(owner(1), request("openai-key", "openai-key", FAKE), now)?;
+        let (handle, info) =
+            staged.stage(owner(1), request("openai-key", "openai-key", FAKE), now)?;
         assert_eq!(handle.as_str().len(), HANDLE_BYTES * 2);
-        assert!(handle
-            .as_str()
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(
+            handle
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
         assert_eq!(info.shape, KeyShape::OpenAiStyleKey);
         assert_eq!(info.expires_at, later(now, STAGED_SECRET_TTL_SECS)?);
 
@@ -619,10 +638,20 @@ mod tests {
         let now = t0()?;
         let (handle, _) = staged.stage(owner(1), request("k1", "p1", FAKE), now)?;
         // Kurz vor Ablauf: noch gueltig (describe verbraucht nicht).
-        let info = staged.describe(&owner(1), handle.as_str(), "p1", later(now, STAGED_SECRET_TTL_SECS - 1)?)?;
+        let info = staged.describe(
+            &owner(1),
+            handle.as_str(),
+            "p1",
+            later(now, STAGED_SECRET_TTL_SECS - 1)?,
+        )?;
         assert_eq!(info.key_name, "k1");
         expect_err(
-            staged.take(&owner(1), handle.as_str(), "p1", later(now, STAGED_SECRET_TTL_SECS)?),
+            staged.take(
+                &owner(1),
+                handle.as_str(),
+                "p1",
+                later(now, STAGED_SECRET_TTL_SECS)?,
+            ),
             &WriteOnlyError::Expired,
         )?;
         // Abgelaufen wurde entfernt.
@@ -735,7 +764,10 @@ mod tests {
             // 7 Zeichen: eins unter MIN_SECRET_LEN.
             ("sk-shor", WriteOnlyError::ValueTooShort),
             ("sk-test-FAKE 0000000000", WriteOnlyError::ValueNotPrintable),
-            ("sk-test-FAKE-\u{00e4}000000000", WriteOnlyError::ValueNotPrintable),
+            (
+                "sk-test-FAKE-\u{00e4}000000000",
+                WriteOnlyError::ValueNotPrintable,
+            ),
         ];
         for (value, want) in &cases {
             expect_err(staged.stage(owner(1), request("k", "p", value), now), want)?;
@@ -771,7 +803,11 @@ mod tests {
         assert!(staged.is_empty());
 
         // Zeilenumbruch am Ende wird getrimmt: der entnommene Wert ist ohne Umbruch.
-        let (handle, _) = staged.stage(owner(1), request("k.v1", "p_1", &format!("{FAKE}\r\n")), now)?;
+        let (handle, _) = staged.stage(
+            owner(1),
+            request("k.v1", "p_1", &format!("{FAKE}\r\n")),
+            now,
+        )?;
         let taken = staged.take(&owner(1), handle.as_str(), "p_1", now)?;
         assert_eq!(taken.value.expose_secret().as_str(), FAKE);
         Ok(())
@@ -780,8 +816,14 @@ mod tests {
     #[test]
     fn classify_shapes() {
         let shape = |value: &str| classify_key(&SecretString::new(value.to_owned()));
-        assert_eq!(shape("sk-ant-oat01-FAKE-0000000000"), KeyShape::AnthropicOAuthToken);
-        assert_eq!(shape("sk-ant-api03-FAKE-0000000000"), KeyShape::AnthropicApiKey);
+        assert_eq!(
+            shape("sk-ant-oat01-FAKE-0000000000"),
+            KeyShape::AnthropicOAuthToken
+        );
+        assert_eq!(
+            shape("sk-ant-api03-FAKE-0000000000"),
+            KeyShape::AnthropicApiKey
+        );
         assert_eq!(shape(FAKE), KeyShape::OpenAiStyleKey);
         assert_eq!(shape("FAKE-token-0000000000"), KeyShape::Other);
     }
@@ -849,7 +891,10 @@ mod tests {
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-        !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
     }
 
     fn sink_round_trip(root: &Path) -> TestResult {

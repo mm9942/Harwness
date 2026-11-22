@@ -20,15 +20,14 @@ use harw_types::SessionId;
 use crate::methods::{
     METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
     METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_SESSION_ADOPT,
-    METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE,
-    METHOD_SESSION_PROJECTS, METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT,
-    METHOD_STEPUP_CANCEL, METHOD_STEPUP_CONFIRM,
+    METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS,
+    METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT, METHOD_STEPUP_CANCEL, METHOD_STEPUP_CONFIRM,
 };
 use crate::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams,
-    CatalogResult, CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult,
-    ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams,
-    CreateParams, FrameEnvelope, GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo,
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
+    CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams,
+    ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams, CreateParams,
+    FrameEnvelope, GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo,
     GatewayListenerSetParams, GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult,
     GatewayStatus, GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck,
     HelloParams, HistoryParams, InterruptParams, PageParams, PageResult, ProjectsParams,
@@ -479,26 +478,26 @@ mod tests {
     #[test]
     fn minor4_default_bodies_answer_protocol_error() {
         use super::SessionPort;
-        let run: Result<crate::session_wire::CommandRunParams, _> = serde_json::from_value(
-            serde_json::json!({"line": "/status", "client_msg_id": "m-1"}),
-        );
+        let run: Result<crate::session_wire::CommandRunParams, _> =
+            serde_json::from_value(serde_json::json!({"line": "/status", "client_msg_id": "m-1"}));
         if let Ok(params) = run {
             let err = ready(Bare.command_run(params)).err();
             assert!(matches!(err, Some(PortError::Protocol(m)) if m.contains("command.run")));
         } else {
             panic!("command.run params must decode");
         }
-        let secret: Result<crate::session_wire::SecretPutParams, _> = serde_json::from_value(
-            serde_json::json!({
+        let secret: Result<crate::session_wire::SecretPutParams, _> =
+            serde_json::from_value(serde_json::json!({
                 "name": "key-1",
                 "for_provider": "provider-test",
                 "value": "sk-test-FAKE-0000000000000000"
-            }),
-        );
+            }));
         if let Ok(params) = secret {
             let err = ready(Bare.secret_put(params)).err();
-            assert!(matches!(err, Some(PortError::Protocol(m)) if m.contains("secret.put")
-                && !m.contains("FAKE")));
+            assert!(
+                matches!(err, Some(PortError::Protocol(m)) if m.contains("secret.put")
+                && !m.contains("FAKE"))
+            );
         } else {
             panic!("secret.put params must decode");
         }

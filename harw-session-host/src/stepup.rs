@@ -519,7 +519,9 @@ fn check_identity(identity: &ClientIdentity) -> Result<(), StepUpError> {
     if identity.agent.is_some() {
         // A step-up is a human second factor; an agent principal never
         // confirms a global write on the owner's behalf.
-        return Err(StepUpError::Denied("Agenten duerfen keinen Step-up anfragen"));
+        return Err(StepUpError::Denied(
+            "Agenten duerfen keinen Step-up anfragen",
+        ));
     }
     if !Need::Control.is_granted(identity.caps) {
         return Err(StepUpError::Denied("Recht `control` fehlt"));
@@ -557,9 +559,9 @@ fn validate_text(text: &str) -> Result<(), StepUpError> {
 fn validate_action(action: &str) -> Result<(), StepUpError> {
     let well_formed = !action.is_empty()
         && action.len() <= MAX_ACTION_BYTES
-        && action
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'));
+        && action.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        });
     if well_formed {
         Ok(())
     } else {
@@ -696,7 +698,8 @@ mod tests {
         assert_eq!(challenge.expires_at, add(t0(), STEPUP_TTL_SECS));
         assert_eq!(registry.pending_len(), 1);
 
-        let payload = registry.confirm(&owner, &challenge.stepup_id, &challenge.hash, add(t0(), 5))?;
+        let payload =
+            registry.confirm(&owner, &challenge.stepup_id, &challenge.hash, add(t0(), 5))?;
         assert_eq!(payload, "plan-1");
         assert_eq!(registry.pending_len(), 0);
 
@@ -768,7 +771,11 @@ mod tests {
         assert_eq!(registry.sweep(add(t0(), 90)), 1);
         assert_eq!(registry.pending_len(), 0);
         assert_eq!(
-            audit.outcomes().iter().filter(|o| **o == StepUpOutcome::Expired).count(),
+            audit
+                .outcomes()
+                .iter()
+                .filter(|o| **o == StepUpOutcome::Expired)
+                .count(),
             2
         );
         Ok(())
@@ -924,7 +931,9 @@ mod tests {
         }
         // 5th open step-up.
         assert_eq!(
-            registry.request(&owner, req("p"), add(t0(), 10)).map(|c| c.stepup_id),
+            registry
+                .request(&owner, req("p"), add(t0(), 10))
+                .map(|c| c.stepup_id),
             Err(StepUpError::TooManyPending)
         );
         // The limit is per device, not per connection.
@@ -952,14 +961,18 @@ mod tests {
         }
         // 31st request within the hour.
         assert_eq!(
-            registry.request(&owner, req("p"), add(t0(), 120)).map(|c| c.stepup_id),
+            registry
+                .request(&owner, req("p"), add(t0(), 120))
+                .map(|c| c.stepup_id),
             Err(StepUpError::RateLimited)
         );
         // Sliding window: an hour after the first request one slot is free again.
         let later = registry.request(&owner, req("p"), add(t0(), 3600))?;
         assert_eq!(later.stepup_id.len(), STEPUP_ID_BYTES * 2);
         assert_eq!(
-            registry.request(&owner, req("p"), add(t0(), 3600)).map(|c| c.stepup_id),
+            registry
+                .request(&owner, req("p"), add(t0(), 3600))
+                .map(|c| c.stepup_id),
             Err(StepUpError::RateLimited)
         );
         Ok(())
@@ -973,7 +986,10 @@ mod tests {
             stepup_hash(&nonce, "harw step-up v1\naktion: provider.remove"),
             FIXED_HASH
         );
-        assert_ne!(stepup_hash(&[8u8; STEPUP_NONCE_BYTES], FIXED_TEXT), FIXED_HASH);
+        assert_ne!(
+            stepup_hash(&[8u8; STEPUP_NONCE_BYTES], FIXED_TEXT),
+            FIXED_HASH
+        );
         // Without the domain prefix the digest differs.
         let mut plain = Sha256::new();
         plain.update(nonce);
@@ -1006,7 +1022,10 @@ mod tests {
                 assert!(!json.contains(nonce.as_str()), "audit leaks nonce");
             }
         }
-        assert_eq!(events.first().map(|e| e.text_hash.as_str()), Some(first.hash.as_str()));
+        assert_eq!(
+            events.first().map(|e| e.text_hash.as_str()),
+            Some(first.hash.as_str())
+        );
         Ok(())
     }
 
@@ -1032,7 +1051,9 @@ mod tests {
             "a\u{2028}b",
         ] {
             assert_eq!(
-                registry.request(&owner, with_text(bad), t0()).map(|c| c.stepup_id),
+                registry
+                    .request(&owner, with_text(bad), t0())
+                    .map(|c| c.stepup_id),
                 Err(StepUpError::InvalidText),
                 "accepted text {bad:?}"
             );
@@ -1048,7 +1069,9 @@ mod tests {
             ..with_text("ok")
         };
         assert_eq!(
-            registry.request(&owner, bad_action, t0()).map(|c| c.stepup_id),
+            registry
+                .request(&owner, bad_action, t0())
+                .map(|c| c.stepup_id),
             Err(StepUpError::InvalidText)
         );
         let bad_target = StepUpRequest {
@@ -1056,11 +1079,17 @@ mod tests {
             ..with_text("ok")
         };
         assert_eq!(
-            registry.request(&owner, bad_target, t0()).map(|c| c.stepup_id),
+            registry
+                .request(&owner, bad_target, t0())
+                .map(|c| c.stepup_id),
             Err(StepUpError::InvalidText)
         );
         assert_eq!(registry.pending_len(), 0);
-        assert!(registry.request(&owner, with_text(&"x".repeat(MAX_TEXT_BYTES)), t0()).is_ok());
+        assert!(
+            registry
+                .request(&owner, with_text(&"x".repeat(MAX_TEXT_BYTES)), t0())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1075,10 +1104,17 @@ mod tests {
         assert_eq!(registry.drop_connection(owner.connection, add(t0(), 1)), 2);
         assert_eq!(registry.pending_len(), 1);
         assert_eq!(
-            audit.outcomes().iter().filter(|o| **o == StepUpOutcome::Cancelled).count(),
+            audit
+                .outcomes()
+                .iter()
+                .filter(|o| **o == StepUpOutcome::Cancelled)
+                .count(),
             2
         );
-        assert_eq!(registry.confirm(&other, &kept.stepup_id, &kept.hash, add(t0(), 2))?, "c");
+        assert_eq!(
+            registry.confirm(&other, &kept.stepup_id, &kept.hash, add(t0(), 2))?,
+            "c"
+        );
         Ok(())
     }
 
@@ -1097,6 +1133,9 @@ mod tests {
             HostError::from(StepUpError::TextTooLarge),
             HostError::Protocol(_)
         ));
-        assert!(matches!(HostError::from(StepUpError::Entropy), HostError::Storage(_)));
+        assert!(matches!(
+            HostError::from(StepUpError::Entropy),
+            HostError::Storage(_)
+        ));
     }
 }

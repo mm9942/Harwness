@@ -302,11 +302,10 @@ pub async fn list_models_guarded(
 ) -> Result<Vec<crate::discovery::DiscoveredModel>, crate::discovery::DiscoveryError> {
     use crate::discovery::DiscoveryError;
 
-    let codex_route = crate::codex::CodexRoute::from_provider(provider).map_err(|_| {
-        DiscoveryError::Decode {
+    let codex_route =
+        crate::codex::CodexRoute::from_provider(provider).map_err(|_| DiscoveryError::Decode {
             detail: "Invalid Codex credential route".into(),
-        }
-    })?;
+        })?;
     let base = if codex_route.is_some() {
         crate::codex::BASE_URL
     } else {
@@ -315,7 +314,9 @@ pub async fn list_models_guarded(
     let network = |error: UrlGuardError| DiscoveryError::Network {
         detail: error.to_string(),
     };
-    let endpoint = guard_remote_url_with(base, resolver).await.map_err(network)?;
+    let endpoint = guard_remote_url_with(base, resolver)
+        .await
+        .map_err(network)?;
     let client = endpoint.client().map_err(network)?;
     crate::discovery::list_models_with_client(provider_name, provider, api_key, home, client).await
 }
@@ -328,7 +329,10 @@ fn parse_remote(raw: &str) -> Result<EgressUrl, UrlGuardError> {
     if raw.chars().any(char::is_control) {
         return Err(UrlGuardError::Malformed);
     }
-    if raw.chars().any(|c| c == '<' || c == '>' || c.is_whitespace()) {
+    if raw
+        .chars()
+        .any(|c| c == '<' || c == '>' || c.is_whitespace())
+    {
         return Err(UrlGuardError::Placeholder);
     }
     let parsed = EgressUrl::parse(raw).map_err(|error| match error {
@@ -464,7 +468,10 @@ mod tests {
             check_remote_url_syntax("ftp://api.example.test/"),
             Err(UrlGuardError::NotHttps)
         );
-        assert_eq!(check_remote_url_syntax("https://api.example.test/v1"), Ok(()));
+        assert_eq!(
+            check_remote_url_syntax("https://api.example.test/v1"),
+            Ok(())
+        );
     }
 
     #[test]
@@ -483,7 +490,11 @@ mod tests {
             "https://api.example.test/v1#frag",
             "https://api.example.test/v1#",
         ] {
-            assert_eq!(check_remote_url_syntax(raw), Err(UrlGuardError::QueryOrFragment), "{raw}");
+            assert_eq!(
+                check_remote_url_syntax(raw),
+                Err(UrlGuardError::QueryOrFragment),
+                "{raw}"
+            );
         }
         for raw in [
             "https://<host>/v1",
@@ -491,14 +502,24 @@ mod tests {
             "https://api.example.test/v 1",
             " https://api.example.test/v1",
         ] {
-            assert_eq!(check_remote_url_syntax(raw), Err(UrlGuardError::Placeholder), "{raw}");
+            assert_eq!(
+                check_remote_url_syntax(raw),
+                Err(UrlGuardError::Placeholder),
+                "{raw}"
+            );
         }
         assert_eq!(
             check_remote_url_syntax("https://api.example.test/\u{7}"),
             Err(UrlGuardError::Malformed)
         );
-        assert_eq!(check_remote_url_syntax("not a url"), Err(UrlGuardError::Placeholder));
-        assert_eq!(check_remote_url_syntax("api.example.test"), Err(UrlGuardError::Malformed));
+        assert_eq!(
+            check_remote_url_syntax("not a url"),
+            Err(UrlGuardError::Placeholder)
+        );
+        assert_eq!(
+            check_remote_url_syntax("api.example.test"),
+            Err(UrlGuardError::Malformed)
+        );
         let long = format!("https://api.example.test/{}", "a".repeat(MAX_URL_LEN));
         assert_eq!(check_remote_url_syntax(&long), Err(UrlGuardError::TooLong));
     }
@@ -519,7 +540,11 @@ mod tests {
             "https://[fd00::1]",
             "https://0x7f.1",
         ] {
-            assert_eq!(check_remote_url_syntax(raw), Err(UrlGuardError::BlockedHost), "{raw}");
+            assert_eq!(
+                check_remote_url_syntax(raw),
+                Err(UrlGuardError::BlockedHost),
+                "{raw}"
+            );
         }
     }
 
@@ -537,7 +562,11 @@ mod tests {
             "https://intranetserver",
             "https://local",
         ] {
-            assert_eq!(check_remote_url_syntax(raw), Err(UrlGuardError::BlockedHost), "{raw}");
+            assert_eq!(
+                check_remote_url_syntax(raw),
+                Err(UrlGuardError::BlockedHost),
+                "{raw}"
+            );
         }
         // `.test` ist bewusst nicht gesperrt.
         assert_eq!(check_remote_url_syntax("https://api.example.test"), Ok(()));
@@ -579,9 +608,10 @@ mod tests {
     async fn public_ip_literal_needs_no_resolver() -> TestResult {
         let public = public_ip()?;
         let resolver = FakeResolver::new(Answer::Fail);
-        let endpoint = guard_remote_url_with(&format!("https://{PUBLIC_TEST_IP}:8443/v1"), &resolver)
-            .await
-            .map_err(ctx("Guard"))?;
+        let endpoint =
+            guard_remote_url_with(&format!("https://{PUBLIC_TEST_IP}:8443/v1"), &resolver)
+                .await
+                .map_err(ctx("Guard"))?;
         assert_eq!(resolver.calls(), 0);
         assert_eq!(endpoint.addrs(), &[SocketAddr::new(public, 8443)]);
         endpoint.client().map_err(ctx("Client bauen"))?;
@@ -592,18 +622,24 @@ mod tests {
     async fn resolve_failure_and_empty_answer_are_rejected() {
         let failing = FakeResolver::new(Answer::Fail);
         assert_eq!(
-            guard_remote_url_with("https://api.example.test/v1", &failing).await.err(),
+            guard_remote_url_with("https://api.example.test/v1", &failing)
+                .await
+                .err(),
             Some(UrlGuardError::ResolveFailed)
         );
         let empty = FakeResolver::new(Answer::Ips(Vec::new()));
         assert_eq!(
-            guard_remote_url_with("https://api.example.test/v1", &empty).await.err(),
+            guard_remote_url_with("https://api.example.test/v1", &empty)
+                .await
+                .err(),
             Some(UrlGuardError::NoAddress)
         );
         // Syntaxfehler: Resolver wird gar nicht gefragt.
         let unused = FakeResolver::new(Answer::Fail);
         assert_eq!(
-            guard_remote_url_with("https://router.local/v1", &unused).await.err(),
+            guard_remote_url_with("https://router.local/v1", &unused)
+                .await
+                .err(),
             Some(UrlGuardError::BlockedHost)
         );
         assert_eq!(unused.calls(), 0);
@@ -629,7 +665,9 @@ mod tests {
         ips.push(ip("192.168.0.9")?);
         let resolver = FakeResolver::new(Answer::Ips(ips));
         assert_eq!(
-            guard_remote_url_with("https://api.example.test", &resolver).await.err(),
+            guard_remote_url_with("https://api.example.test", &resolver)
+                .await
+                .err(),
             Some(UrlGuardError::PrivateAddress)
         );
         Ok(())
@@ -687,9 +725,11 @@ mod tests {
         .await;
         assert!(scan.is_err());
 
-        let accepted =
-            tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
-        assert!(accepted.is_err(), "Auffang-Server hat eine Verbindung erhalten");
+        let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "Auffang-Server hat eine Verbindung erhalten"
+        );
         Ok(())
     }
 

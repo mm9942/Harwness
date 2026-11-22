@@ -2023,10 +2023,7 @@ impl ParsedFlags {
 
 /// Zerlegt `tokens` strikt: unbekannte und doppelte Flags sind Fehler. Die Eingabe wird
 /// nie im Fehlertext wiederholt (nur der Flag-Name vor einem `=`, gekuerzt).
-fn parse_flags(
-    tokens: &[String],
-    spec: &[(&'static str, bool)],
-) -> Result<ParsedFlags, OpError> {
+fn parse_flags(tokens: &[String], spec: &[(&'static str, bool)]) -> Result<ParsedFlags, OpError> {
     let mut parsed = ParsedFlags::default();
     let mut iter = tokens.iter();
     while let Some(token) = iter.next() {
@@ -2075,9 +2072,7 @@ fn single_positional(parsed: &ParsedFlags, what: &str) -> Result<String, OpError
     match parsed.positional.as_slice() {
         [one] => Ok(one.clone()),
         [] => Err(OpError::InvalidArguments(format!("{what} fehlt"))),
-        _ => Err(OpError::InvalidArguments(
-            "Zu viele Argumente".to_owned(),
-        )),
+        _ => Err(OpError::InvalidArguments("Zu viele Argumente".to_owned())),
     }
 }
 
@@ -2368,7 +2363,9 @@ fn plan_add_known(env: &PlanEnv<'_>, change: &ProviderChange) -> Result<Provider
         key,
     } = change
     else {
-        return Err(OpError::Execution("Planfehler: falscher Aenderungstyp".to_owned()));
+        return Err(OpError::Execution(
+            "Planfehler: falscher Aenderungstyp".to_owned(),
+        ));
     };
     let known = known_provider(catalog_id).ok_or_else(|| {
         OpError::InvalidArguments(
@@ -2412,7 +2409,10 @@ fn plan_add_known(env: &PlanEnv<'_>, change: &ProviderChange) -> Result<Provider
     let needs_key = matches!(
         (auth, credential),
         (ProviderAuthKind::ApiKey, _)
-            | (ProviderAuthKind::Oauth, Some(OAuthCredential::StagedToken { .. }))
+            | (
+                ProviderAuthKind::Oauth,
+                Some(OAuthCredential::StagedToken { .. })
+            )
     );
     if needs_key && key.is_none() {
         return Err(OpError::InvalidArguments(match env.origin {
@@ -2500,7 +2500,9 @@ fn plan_add_custom(env: &PlanEnv<'_>, change: &ProviderChange) -> Result<Provide
         allow_insecure_lan,
     } = change
     else {
-        return Err(OpError::Execution("Planfehler: falscher Aenderungstyp".to_owned()));
+        return Err(OpError::Execution(
+            "Planfehler: falscher Aenderungstyp".to_owned(),
+        ));
     };
     validate_provider_name(name, env.origin)?;
     if let Some(header) = auth_header
@@ -2542,8 +2544,9 @@ fn plan_add_custom(env: &PlanEnv<'_>, change: &ProviderChange) -> Result<Provide
                         .to_owned(),
                 ));
             }
-            harw_provider_http::validate_endpoint_with(base_url, *allow_insecure_lan)
-                .map_err(|error| OpError::InvalidArguments(format!("Basis-URL ungueltig: {error}")))?;
+            harw_provider_http::validate_endpoint_with(base_url, *allow_insecure_lan).map_err(
+                |error| OpError::InvalidArguments(format!("Basis-URL ungueltig: {error}")),
+            )?;
             if let Some(raw) = local_auth_ref {
                 if key.is_some() || no_auth {
                     return Err(OpError::InvalidArguments(
@@ -2602,8 +2605,7 @@ fn plan_add_custom(env: &PlanEnv<'_>, change: &ProviderChange) -> Result<Provide
         || "-".to_owned(),
         |i| format!("neu \"{}\" (nur schreiben)", i.key_name),
     );
-    let canonical_text =
-        canonical_add_text(name, "eigen", api, base_url, login, &key_line, 0)?;
+    let canonical_text = canonical_add_text(name, "eigen", api, base_url, login, &key_line, 0)?;
     Ok(ProviderPlan {
         change: change.clone(),
         origin: env.origin,
@@ -2621,7 +2623,9 @@ fn plan_simple(env: &PlanEnv<'_>, change: &ProviderChange) -> Result<ProviderPla
         ProviderChange::Enable { name } => (name, "provider.enable"),
         ProviderChange::Disable { name } => (name, "provider.disable"),
         _ => {
-            return Err(OpError::Execution("Planfehler: falscher Aenderungstyp".to_owned()));
+            return Err(OpError::Execution(
+                "Planfehler: falscher Aenderungstyp".to_owned(),
+            ));
         }
     };
     validate_provider_name(name, env.origin)?;
@@ -2728,7 +2732,11 @@ fn open_private_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn write_private_tmp(dir: &std::path::Path, stem: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+fn write_private_tmp(
+    dir: &std::path::Path,
+    stem: &str,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
     let tmp = dir.join(format!(".{stem}.tmp-{}", unique_hex()));
     let mut file = open_private_new(&tmp)?;
@@ -2779,8 +2787,9 @@ fn set_enabled_in_file(path: &std::path::Path, enabled: bool) -> Result<(), OpEr
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| OpError::Execution("Provider-Dateiname ungueltig".to_owned()))?;
-    let tmp = write_private_tmp(dir, stem, doc.to_string().as_bytes())
-        .map_err(|error| OpError::Execution(format!("Schreiben fehlgeschlagen: {}", error.kind())))?;
+    let tmp = write_private_tmp(dir, stem, doc.to_string().as_bytes()).map_err(|error| {
+        OpError::Execution(format!("Schreiben fehlgeschlagen: {}", error.kind()))
+    })?;
     std::fs::rename(&tmp, path).map_err(|error| {
         let _ = std::fs::remove_file(&tmp);
         OpError::Execution(format!("Schreiben fehlgeschlagen: {}", error.kind()))
@@ -2929,7 +2938,11 @@ fn handle_catalog(ctx: &OpContext) -> OpOutput {
             known.display_name,
             known.base_url,
             known.default_name_api_key,
-            if known.api_key_taken { ", vorhanden" } else { "" },
+            if known.api_key_taken {
+                ", vorhanden"
+            } else {
+                ""
+            },
         );
         if let Some(name) = &known.default_name_oauth {
             line.push_str(&format!(
@@ -2973,9 +2986,10 @@ async fn handle_manage(ctx: &OpContext, sub: &str, rest: &[String]) -> Result<Op
         let text = plan.canonical_text.clone();
         let action = plan.action;
         let name = plan.name.clone();
-        let staged = remote.stepup.stage(plan).map_err(|_| {
-            OpError::Execution("Step-up konnte nicht angelegt werden".to_owned())
-        })?;
+        let staged = remote
+            .stepup
+            .stage(plan)
+            .map_err(|_| OpError::Execution("Step-up konnte nicht angelegt werden".to_owned()))?;
         return Ok(OpOutput {
             text,
             data: Some(serde_json::json!({
@@ -3896,19 +3910,17 @@ mod tests {
 #[cfg(test)]
 mod manage_tests {
     use super::{
-        OAUTH_ROUTES, PlanOrigin, ProviderApplied, ProviderArgs, ProviderAuthKind,
-        ProviderChange, ProviderPlan, ProviderStepUpPort, RemoteManage, StagedKeyInfo,
-        StagedKeyShape, StagedSecretPort, StagedStepUp, apply_plan, guard_plan, known_provider,
-        known_providers, parse_manage_command, plan_change,
+        OAUTH_ROUTES, PlanOrigin, ProviderApplied, ProviderArgs, ProviderAuthKind, ProviderChange,
+        ProviderPlan, ProviderStepUpPort, RemoteManage, StagedKeyInfo, StagedKeyShape,
+        StagedSecretPort, StagedStepUp, apply_plan, guard_plan, known_provider, known_providers,
+        parse_manage_command, plan_change,
     };
     use crate::test_support::{TestError, TestResult, ctx};
     use crate::testutil::toks;
     use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
-    use harw_operations::operation::{
-        RemoteCap, RemoteGrant, RemoteInvocation, RemoteSlice,
-    };
+    use harw_operations::operation::{RemoteCap, RemoteGrant, RemoteInvocation, RemoteSlice};
     use harw_operations::{OpContext, OpError, PermissionTier, context::ServiceMap};
     use harw_provider_http::url_guard::HostResolver;
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
@@ -4144,15 +4156,28 @@ mod manage_tests {
             (
                 "add-custom",
                 vec![
-                    "x", "--api", "openai-chat", "--base-url", "https://a.example.test",
-                    "--key", "h", "--auth", "env:X",
+                    "x",
+                    "--api",
+                    "openai-chat",
+                    "--base-url",
+                    "https://a.example.test",
+                    "--key",
+                    "h",
+                    "--auth",
+                    "env:X",
                 ],
             ),
             (
                 "add-custom",
                 vec![
-                    "x", "--api", "openai-chat", "--base-url", "https://a.example.test",
-                    "--key", "h", "--no-auth",
+                    "x",
+                    "--api",
+                    "openai-chat",
+                    "--base-url",
+                    "https://a.example.test",
+                    "--key",
+                    "h",
+                    "--no-auth",
                 ],
             ),
             ("remove", vec![]),
@@ -4203,7 +4228,12 @@ mod manage_tests {
     fn api_key_and_oauth_coexist_as_two_entries() -> TestResult {
         let tmp = tempdir()?;
         let fake = FakeSecrets::default();
-        fake.add("h-key", "k1", "anthropic-key", StagedKeyShape::AnthropicApiKey);
+        fake.add(
+            "h-key",
+            "k1",
+            "anthropic-key",
+            StagedKeyShape::AnthropicApiKey,
+        );
         fake.add(
             "h-oauth",
             "k2",
@@ -4276,12 +4306,7 @@ mod manage_tests {
         std::fs::create_dir_all(tmp.path().join("providers")).map_err(ctx("mkdir"))?;
         let path = file(tmp.path(), "anthropic-key");
         std::fs::write(&path, b"# vorhanden\n").map_err(ctx("seed"))?;
-        let fake = FakeSecrets::with(
-            "h1",
-            "k",
-            "anthropic-key",
-            StagedKeyShape::AnthropicApiKey,
-        );
+        let fake = FakeSecrets::with("h1", "k", "anthropic-key", StagedKeyShape::AnthropicApiKey);
         expect_err(
             plan_change(
                 &config(),
@@ -4301,7 +4326,14 @@ mod manage_tests {
         // Auch ein Provider nur in der Config (ohne Datei) blockiert den Namen.
         let other = tempdir()?;
         let mut cfg = config();
-        let toml = super::new_provider_toml("anthropic-key", "anthropic-messages", "https://a.example.test", None, vec![], false);
+        let toml = super::new_provider_toml(
+            "anthropic-key",
+            "anthropic-messages",
+            "https://a.example.test",
+            None,
+            vec![],
+            false,
+        );
         cfg.providers.insert("anthropic-key".to_owned(), toml);
         expect_err(
             plan_change(
@@ -4334,7 +4366,13 @@ mod manage_tests {
             ],
         )?;
         expect_err(
-            plan_change(&config(), tmp.path(), parsed, PlanOrigin::Remote, Some(&fake)),
+            plan_change(
+                &config(),
+                tmp.path(),
+                parsed,
+                PlanOrigin::Remote,
+                Some(&fake),
+            ),
             "bestehende Referenz remote",
         )?;
         assert_eq!(fake.commits(), 0);
@@ -4356,7 +4394,13 @@ mod manage_tests {
                 &["x", "--api", "openai-chat", "--base-url", url, "--key", "h"],
             )?;
             expect_err(
-                plan_change(&config(), tmp.path(), parsed, PlanOrigin::Remote, Some(&fake)),
+                plan_change(
+                    &config(),
+                    tmp.path(),
+                    parsed,
+                    PlanOrigin::Remote,
+                    Some(&fake),
+                ),
                 "unzulaessige Adresse",
             )?;
         }
@@ -4371,20 +4415,42 @@ mod manage_tests {
         let fake = FakeSecrets::with("h", "k", "x", StagedKeyShape::OpenAiStyleKey);
         for tokens in [
             vec![
-                "x", "--api", "openai-chat", "--base-url", "https://api.example.test",
-                "--key", "h", "--allow-insecure-lan",
+                "x",
+                "--api",
+                "openai-chat",
+                "--base-url",
+                "https://api.example.test",
+                "--key",
+                "h",
+                "--allow-insecure-lan",
             ],
             vec![
-                "x", "--api", "ollama", "--base-url", "https://api.example.test", "--key", "h",
+                "x",
+                "--api",
+                "ollama",
+                "--base-url",
+                "https://api.example.test",
+                "--key",
+                "h",
             ],
             vec![
-                "x", "--api", "openai-chat", "--base-url", "https://api.example.test",
+                "x",
+                "--api",
+                "openai-chat",
+                "--base-url",
+                "https://api.example.test",
             ],
         ] {
             let tokens: Vec<String> = tokens.into_iter().map(str::to_owned).collect();
             let parsed = parse_manage_command("add-custom", &tokens).map_err(ctx("parse"))?;
             expect_err(
-                plan_change(&config(), tmp.path(), parsed, PlanOrigin::Remote, Some(&fake)),
+                plan_change(
+                    &config(),
+                    tmp.path(),
+                    parsed,
+                    PlanOrigin::Remote,
+                    Some(&fake),
+                ),
                 "lokale Option oder API remote",
             )?;
         }
@@ -4406,8 +4472,13 @@ mod manage_tests {
             change(
                 "add-custom",
                 &[
-                    "evil", "--api", "openai-chat", "--base-url",
-                    "https://capture.example.test/v1", "--key", "h",
+                    "evil",
+                    "--api",
+                    "openai-chat",
+                    "--base-url",
+                    "https://capture.example.test/v1",
+                    "--key",
+                    "h",
                 ],
             )?,
             PlanOrigin::Remote,
@@ -4421,7 +4492,10 @@ mod manage_tests {
         );
         let accepted =
             tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
-        assert!(accepted.is_err(), "Auffang-Server darf keine Verbindung sehen");
+        assert!(
+            accepted.is_err(),
+            "Auffang-Server darf keine Verbindung sehen"
+        );
         assert_eq!(fake.commits(), 0, "Schluessel nie versiegelt");
         assert!(!file(tmp.path(), "evil").exists());
         Ok(())
@@ -4438,8 +4512,13 @@ mod manage_tests {
             change(
                 "add-custom",
                 &[
-                    "x", "--api", "openai-chat", "--base-url",
-                    "https://api.example.test/geheim-pfad", "--key", "h",
+                    "x",
+                    "--api",
+                    "openai-chat",
+                    "--base-url",
+                    "https://api.example.test/geheim-pfad",
+                    "--key",
+                    "h",
                 ],
             )?,
             PlanOrigin::Remote,
@@ -4469,14 +4548,21 @@ mod manage_tests {
             Some(&fake),
         )
         .map_err(ctx("plan"))?;
-        guard_plan(&plan, &resolver).await.map_err(ctx("guard known"))
+        guard_plan(&plan, &resolver)
+            .await
+            .map_err(ctx("guard known"))
     }
 
     #[test]
     fn oauth_token_only_to_anthropic_oauth() -> TestResult {
         let tmp = tempdir()?;
         let fake = FakeSecrets::default();
-        fake.add("h", "k", "anthropic-key", StagedKeyShape::AnthropicOAuthToken);
+        fake.add(
+            "h",
+            "k",
+            "anthropic-key",
+            StagedKeyShape::AnthropicOAuthToken,
+        );
         // als api-key abgelehnt
         expect_err(
             plan_change(
@@ -4497,8 +4583,13 @@ mod manage_tests {
                 change(
                     "add-custom",
                     &[
-                        "mine", "--api", "anthropic-messages", "--base-url",
-                        "https://api.example.test", "--key", "hc",
+                        "mine",
+                        "--api",
+                        "anthropic-messages",
+                        "--base-url",
+                        "https://api.example.test",
+                        "--key",
+                        "hc",
                     ],
                 )?,
                 PlanOrigin::Remote,
@@ -4560,7 +4651,10 @@ mod manage_tests {
     #[cfg(any())]
     #[test]
     fn chatgpt_constants_match_provider_http() {
-        assert_eq!(super::CHATGPT_PLAN_API, harw_provider_http::CHATGPT_PLAN_API);
+        assert_eq!(
+            super::CHATGPT_PLAN_API,
+            harw_provider_http::CHATGPT_PLAN_API
+        );
         assert_eq!(
             super::CHATGPT_PLAN_BASE_URL,
             harw_provider_http::CHATGPT_PLAN_BASE_URL
@@ -4570,15 +4664,25 @@ mod manage_tests {
     #[test]
     fn canonical_text_shows_full_url_and_key_name() -> TestResult {
         let tmp = tempdir()?;
-        let fake = FakeSecrets::with("h", "mein-schluessel", "mine", StagedKeyShape::OpenAiStyleKey);
+        let fake = FakeSecrets::with(
+            "h",
+            "mein-schluessel",
+            "mine",
+            StagedKeyShape::OpenAiStyleKey,
+        );
         let plan = plan_change(
             &config(),
             tmp.path(),
             change(
                 "add-custom",
                 &[
-                    "mine", "--api", "openai-chat", "--base-url",
-                    "https://api.example.test/v1/sub", "--key", "h",
+                    "mine",
+                    "--api",
+                    "openai-chat",
+                    "--base-url",
+                    "https://api.example.test/v1/sub",
+                    "--key",
+                    "h",
                 ],
             )?,
             PlanOrigin::Remote,
@@ -4626,7 +4730,9 @@ mod manage_tests {
     #[test]
     fn canonical_text_rejects_control_characters() {
         assert!(super::canonical_simple_text("provider.remove", "a", "https://x\nevil").is_err());
-        assert!(super::canonical_simple_text("provider.remove", "a", "https://x.example.test").is_ok());
+        assert!(
+            super::canonical_simple_text("provider.remove", "a", "https://x.example.test").is_ok()
+        );
     }
 
     #[tokio::test]
@@ -4685,9 +4791,15 @@ mod manage_tests {
         assert_eq!(data["stepup_id"], "stepup-test-1");
         assert_eq!(data["provider"], "anthropic-key");
         assert!(out.text.contains("adresse: https://api.anthropic.com/v1"));
-        assert!(!file(&profile_dir, "anthropic-key").exists(), "nichts geschrieben");
+        assert!(
+            !file(&profile_dir, "anthropic-key").exists(),
+            "nichts geschrieben"
+        );
         assert_eq!(secrets.commits(), 0, "Siegeln erst beim bestaetigten apply");
-        let staged = stepup.staged.lock().map_err(|_| TestError::Missing("lock"))?;
+        let staged = stepup
+            .staged
+            .lock()
+            .map_err(|_| TestError::Missing("lock"))?;
         assert_eq!(staged.len(), 1);
         Ok(())
     }
@@ -4704,7 +4816,10 @@ mod manage_tests {
         let remote = Arc::new(RemoteManage {
             stepup: Arc::clone(&stepup) as Arc<dyn ProviderStepUpPort>,
             secrets: Arc::clone(&secrets) as Arc<dyn StagedSecretPort>,
-            resolver: Arc::new(FakeResolver(vec![SocketAddr::from(([192, 168, 1, 10], 443))])),
+            resolver: Arc::new(FakeResolver(vec![SocketAddr::from((
+                [192, 168, 1, 10],
+                443,
+            ))])),
         });
         let (op_ctx, _tmp) = manage_ctx(true, Some(remote), true, None)?;
         let result = super::provider(
@@ -4717,8 +4832,14 @@ mod manage_tests {
             },
         )
         .await;
-        assert!(matches!(result, Err(OpError::InvalidArguments(_))), "{result:?}");
-        let staged = stepup.staged.lock().map_err(|_| TestError::Missing("lock"))?;
+        assert!(
+            matches!(result, Err(OpError::InvalidArguments(_))),
+            "{result:?}"
+        );
+        let staged = stepup
+            .staged
+            .lock()
+            .map_err(|_| TestError::Missing("lock"))?;
         assert!(staged.is_empty(), "nie geparkt");
         assert_eq!(secrets.commits(), 0);
         Ok(())
@@ -4741,7 +4862,10 @@ mod manage_tests {
         let path = file(tmp.path(), "anthropic-key");
         std::fs::write(&path, b"# fremd\n").map_err(ctx("race"))?;
         let result = apply_plan(tmp.path(), &plan, Some(&fake), None);
-        assert!(matches!(result, Err(OpError::InvalidArguments(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(OpError::InvalidArguments(_))),
+            "{result:?}"
+        );
         assert_eq!(fake.commits(), 1);
         assert_eq!(fake.rollbacks(), 1, "rollback genau einmal");
         assert_eq!(std::fs::read(&path).map_err(ctx("reread"))?, b"# fremd\n");
@@ -4785,8 +4909,15 @@ mod manage_tests {
             Some(&fake),
         );
         match result {
-            Err(OpError::InvalidArguments(msg)) => assert!(!msg.contains("geheimer-griff"), "{msg}"),
-            other => return Err(TestError::Unexpected(format!("{:?}", other.map(|p| p.name)))),
+            Err(OpError::InvalidArguments(msg)) => {
+                assert!(!msg.contains("geheimer-griff"), "{msg}")
+            }
+            other => {
+                return Err(TestError::Unexpected(format!(
+                    "{:?}",
+                    other.map(|p| p.name)
+                )));
+            }
         }
         expect_err(
             plan_change(
@@ -4812,16 +4943,31 @@ mod manage_tests {
             let tokens: Vec<String> = tokens.into_iter().map(str::to_owned).collect();
             let parsed = parse_manage_command("add", &tokens).map_err(ctx("parse"))?;
             expect_err(
-                plan_change(&config(), tmp.path(), parsed, PlanOrigin::Remote, Some(&fake)),
+                plan_change(
+                    &config(),
+                    tmp.path(),
+                    parsed,
+                    PlanOrigin::Remote,
+                    Some(&fake),
+                ),
                 "ungueltiger Aufruf",
             )?;
         }
         // Remote-Namenslaenge.
         let long = "a".repeat(super::MAX_REMOTE_PROVIDER_NAME + 1);
-        let parsed = parse_manage_command("add", &toks(&["anthropic", "--name", long.as_str(), "--key", "h"]))
-            .map_err(ctx("parse"))?;
+        let parsed = parse_manage_command(
+            "add",
+            &toks(&["anthropic", "--name", long.as_str(), "--key", "h"]),
+        )
+        .map_err(ctx("parse"))?;
         expect_err(
-            plan_change(&config(), tmp.path(), parsed, PlanOrigin::Remote, Some(&fake)),
+            plan_change(
+                &config(),
+                tmp.path(),
+                parsed,
+                PlanOrigin::Remote,
+                Some(&fake),
+            ),
             "zu langer Name",
         )
     }
@@ -4837,8 +4983,13 @@ mod manage_tests {
                 change(
                     "add-custom",
                     &[
-                        "lokal", "--api", "openai-chat", "--base-url",
-                        "https://api.example.test/v1", "--auth", "sk-test-FAKE-0000000000000000",
+                        "lokal",
+                        "--api",
+                        "openai-chat",
+                        "--base-url",
+                        "https://api.example.test/v1",
+                        "--auth",
+                        "sk-test-FAKE-0000000000000000",
                     ],
                 )?,
                 PlanOrigin::Local,
@@ -4853,8 +5004,13 @@ mod manage_tests {
             change(
                 "add-custom",
                 &[
-                    "lokal", "--api", "openai-chat", "--base-url",
-                    "https://api.example.test/v1", "--auth", "env:FAKE_TEST_KEY",
+                    "lokal",
+                    "--api",
+                    "openai-chat",
+                    "--base-url",
+                    "https://api.example.test/v1",
+                    "--auth",
+                    "env:FAKE_TEST_KEY",
                 ],
             )?,
             PlanOrigin::Local,
@@ -4879,7 +5035,11 @@ mod manage_tests {
             change(
                 "add-custom",
                 &[
-                    "rt", "--api", "openai-chat", "--base-url", "https://api.example.test/v1",
+                    "rt",
+                    "--api",
+                    "openai-chat",
+                    "--base-url",
+                    "https://api.example.test/v1",
                     "--no-auth",
                 ],
             )?,
@@ -4892,24 +5052,52 @@ mod manage_tests {
         assert_eq!(applied.action, "provider.add");
         assert!(read_provider(tmp.path(), "rt")?.enabled);
 
-        let disable = plan_change(&config(), tmp.path(), change("disable", &["rt"])?, PlanOrigin::Remote, None)
-            .map_err(ctx("plan disable"))?;
-        assert!(disable.canonical_text.contains("adresse: https://api.example.test/v1"));
+        let disable = plan_change(
+            &config(),
+            tmp.path(),
+            change("disable", &["rt"])?,
+            PlanOrigin::Remote,
+            None,
+        )
+        .map_err(ctx("plan disable"))?;
+        assert!(
+            disable
+                .canonical_text
+                .contains("adresse: https://api.example.test/v1")
+        );
         apply_plan(tmp.path(), &disable, None, None).map_err(ctx("apply disable"))?;
         assert!(!read_provider(tmp.path(), "rt")?.enabled);
 
-        let enable = plan_change(&config(), tmp.path(), change("enable", &["rt"])?, PlanOrigin::Local, None)
-            .map_err(ctx("plan enable"))?;
+        let enable = plan_change(
+            &config(),
+            tmp.path(),
+            change("enable", &["rt"])?,
+            PlanOrigin::Local,
+            None,
+        )
+        .map_err(ctx("plan enable"))?;
         apply_plan(tmp.path(), &enable, None, None).map_err(ctx("apply enable"))?;
         assert!(read_provider(tmp.path(), "rt")?.enabled);
 
-        let remove = plan_change(&config(), tmp.path(), change("remove", &["rt"])?, PlanOrigin::Local, None)
-            .map_err(ctx("plan remove"))?;
+        let remove = plan_change(
+            &config(),
+            tmp.path(),
+            change("remove", &["rt"])?,
+            PlanOrigin::Local,
+            None,
+        )
+        .map_err(ctx("plan remove"))?;
         apply_plan(tmp.path(), &remove, None, None).map_err(ctx("apply remove"))?;
         assert!(!file(tmp.path(), "rt").exists());
         // Unbekannt: Fehler.
         expect_err(
-            plan_change(&config(), tmp.path(), change("remove", &["rt"])?, PlanOrigin::Local, None),
+            plan_change(
+                &config(),
+                tmp.path(),
+                change("remove", &["rt"])?,
+                PlanOrigin::Local,
+                None,
+            ),
             "bereits entfernt",
         )
     }
