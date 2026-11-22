@@ -34,7 +34,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Decodes a server profile QR text. Performs no IP/key validation.
 pub(crate) fn decode_profile_text(text: &str) -> Result<ServerProfile, MobileError> {
     if text.starts_with(ENROLL_PREFIX) {
-        return Err(invalid("This is a phone enrollment code, not a server profile."));
+        return Err(invalid(
+            "This is a phone enrollment code, not a server profile.",
+        ));
     }
     let (payload, v2) = if let Some(rest) = text.strip_prefix(PREFIX_V1) {
         (rest, false)

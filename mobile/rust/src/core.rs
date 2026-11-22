@@ -29,10 +29,10 @@ use crate::provider::request_provider;
 use crate::{
     ApprovalDecision, ApprovalOutcome, ApprovalReceipt, ChatgptProviderCredential,
     ChatgptProviderStatus, ConnectionPhase, ConnectionRoute, ConnectionStatus, DeviceEnrollment,
-    HostKind, HostRef, MobileError, MobileHolder, MobileProject, MobileProjectPage, MobileRowOrigin,
-    MobileSession, MobileSessionPage, MobileSessionRow, MobileShareInfo, MobileShareMode,
-    MobileTier, PlatformKeystore, RoutePreference, ServerProfile, SessionCursor, SessionSnapshot,
-    SubmitOutcome, SubmitReceipt,
+    HostKind, HostRef, MobileError, MobileHolder, MobileProject, MobileProjectPage,
+    MobileRowOrigin, MobileSession, MobileSessionPage, MobileSessionRow, MobileShareInfo,
+    MobileShareMode, MobileTier, PlatformKeystore, RoutePreference, ServerProfile, SessionCursor,
+    SessionSnapshot, SubmitOutcome, SubmitReceipt,
 };
 
 pub(crate) mod route;
@@ -530,7 +530,7 @@ impl MobileCore {
         self.run(async move {
             if !link_supports_projects(&link) {
                 let sessions: Vec<MobileSession> = link
-                    .request(link.port.list())
+                    .request(link.backend.port().list())
                     .await?
                     .into_iter()
                     .map(Into::into)
@@ -538,7 +538,7 @@ impl MobileCore {
                 return Ok(legacy_project_page(&sessions));
             }
             let result = link
-                .request(link.port.projects(ProjectsParams {
+                .request(link.backend.port().projects(ProjectsParams {
                     query,
                     limit,
                     cursor,
@@ -569,9 +569,9 @@ impl MobileCore {
         let shared = Arc::clone(&self.shared);
         self.run(async move {
             if !link_supports_projects(&link) {
-                let steer = link.port.connection().hello_ack().granted.steer;
+                let steer = link.backend.granted().steer;
                 let sessions: Vec<MobileSession> = link
-                    .request(link.port.list())
+                    .request(link.backend.port().list())
                     .await?
                     .into_iter()
                     .map(Into::into)
@@ -579,7 +579,7 @@ impl MobileCore {
                 return Ok(legacy_session_page(sessions, project_key.as_deref(), steer));
             }
             let result = link
-                .request(link.port.page(PageParams {
+                .request(link.backend.port().page(PageParams {
                     project_key,
                     query,
                     include_archived,
@@ -610,7 +610,7 @@ impl MobileCore {
     pub fn adopt_session(&self, session_id: String) -> Result<MobileSession, MobileError> {
         let id = parse_session_id(session_id)?;
         let link = self.projects_link()?;
-        self.run(async move { link.request(link.port.adopt(id)).await.map(Into::into) })
+        self.run(async move { link.request(link.backend.port().adopt(id)).await.map(Into::into) })
     }
 
     pub fn create_in_project(
@@ -620,7 +620,7 @@ impl MobileCore {
     ) -> Result<MobileSession, MobileError> {
         let link = self.projects_link()?;
         self.run(async move {
-            link.request(link.port.create_in(CreateInParams { project_key, title }))
+            link.request(link.backend.port().create_in(CreateInParams { project_key, title }))
                 .await
                 .map(Into::into)
         })
@@ -634,7 +634,7 @@ impl MobileCore {
         let session_id = parse_session_id(session_id)?;
         let link = self.projects_link()?;
         self.run(async move {
-            link.request(link.port.set_project(SetProjectParams {
+            link.request(link.backend.port().set_project(SetProjectParams {
                 session_id,
                 project_key,
             }))
@@ -651,7 +651,7 @@ impl MobileCore {
         let session_id = parse_session_id(session_id)?;
         let link = self.projects_link()?;
         self.run(async move {
-            link.request(link.port.rename(RenameParams { session_id, title }))
+            link.request(link.backend.port().rename(RenameParams { session_id, title }))
                 .await
                 .map(Into::into)
         })
@@ -665,7 +665,7 @@ impl MobileCore {
         let session_id = parse_session_id(session_id)?;
         let link = self.projects_link()?;
         self.run(async move {
-            link.request(link.port.archive(ArchiveParams {
+            link.request(link.backend.port().archive(ArchiveParams {
                 session_id,
                 archived,
             }))
@@ -1560,9 +1560,8 @@ fn requested_features() -> Vec<String> {
 }
 
 fn link_supports_projects(link: &Link) -> bool {
-    link.port
-        .connection()
-        .hello_ack()
+    link.backend
+        .ack()
         .features
         .iter()
         .any(|feature| feature == features::PROJECTS)

@@ -24,8 +24,15 @@ fn binary(fields: &[&str], key: &[u8]) -> Result<Vec<u8>, std::num::TryFromIntEr
     Ok(out)
 }
 
-fn profile_text(version: u8, fields: &[&str], key: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(format!("HARW:PROFILE:{version}:{}", encode(&binary(fields, key)?)))
+fn profile_text(
+    version: u8,
+    fields: &[&str],
+    key: &[u8],
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(format!(
+        "HARW:PROFILE:{version}:{}",
+        encode(&binary(fields, key)?)
+    ))
 }
 
 fn is_invalid_profile<T>(result: &Result<T, MobileError>) -> bool {
@@ -33,7 +40,9 @@ fn is_invalid_profile<T>(result: &Result<T, MobileError>) -> bool {
 }
 
 /// A profile text carrying a real ML-DSA-65 key and node id, so it also passes `ValidatedProfile`.
-fn host_profile_text(onion: Option<&str>) -> Result<(String, crate::IdentityMaterial), Box<dyn std::error::Error>> {
+fn host_profile_text(
+    onion: Option<&str>,
+) -> Result<(String, crate::IdentityMaterial), Box<dyn std::error::Error>> {
     let id = crate::generate_identity("Host".to_string())?;
     let key = hex::decode(&id.enrollment.public_key_hex)?;
     let node = id.enrollment.node_id.clone();
@@ -65,7 +74,12 @@ fn render(text: &str) -> Result<(Vec<u8>, u32, u32, u32), Box<dyn std::error::Er
             }
         }
     }
-    Ok((buf, u32::try_from(px)?, u32::try_from(px)?, u32::try_from(stride)?))
+    Ok((
+        buf,
+        u32::try_from(px)?,
+        u32::try_from(px)?,
+        u32::try_from(stride)?,
+    ))
 }
 
 #[test]
@@ -85,10 +99,18 @@ fn profile_qr_matches_the_host_interoperability_vector() -> TestResult {
 
 #[test]
 fn rejects_non_profile_version_and_malformed_base45() {
-    assert!(is_invalid_profile(&decode_profile_text("HARW:PROFILE:3:ABC")));
-    assert!(is_invalid_profile(&decode_profile_text("HARW:PROFILE:2:ABC")));
-    assert!(is_invalid_profile(&decode_profile_text("HARW:PROFILE:1:::!")));
-    assert!(is_invalid_profile(&decode_profile_text("HARW:PROFILE:1::::")));
+    assert!(is_invalid_profile(&decode_profile_text(
+        "HARW:PROFILE:3:ABC"
+    )));
+    assert!(is_invalid_profile(&decode_profile_text(
+        "HARW:PROFILE:2:ABC"
+    )));
+    assert!(is_invalid_profile(&decode_profile_text(
+        "HARW:PROFILE:1:::!"
+    )));
+    assert!(is_invalid_profile(&decode_profile_text(
+        "HARW:PROFILE:1::::"
+    )));
     assert!(is_invalid_profile(&decode_profile_text("")));
     match decode_profile_text("HARW:ENROLL:1:ABC") {
         Err(MobileError::InvalidProfile { detail }) => assert!(detail.contains("enrollment")),
@@ -113,7 +135,11 @@ fn base45_uses_the_rfc_vector_and_keeps_whitespace_significant() -> TestResult {
 #[test]
 fn profile_qr_v2_carries_the_onion_route() -> TestResult {
     let key = test_key();
-    let text = profile_text(2, &["Harw", "gateway-mobile", "127.0.0.1:7443", ONION], &key)?;
+    let text = profile_text(
+        2,
+        &["Harw", "gateway-mobile", "127.0.0.1:7443", ONION],
+        &key,
+    )?;
     assert!(text.len() < 3600);
     let p = decode_profile_text(&text)?;
     assert_eq!(p.onion.as_deref(), Some(ONION));
@@ -127,7 +153,11 @@ fn profile_qr_v2_rejects_onion_locators_just_outside_the_accepted_lengths() -> T
     let key = test_key();
     for n in [61usize, 69] {
         let onion = "a".repeat(n);
-        let t = profile_text(2, &["Harw", "gateway-mobile", "127.0.0.1:7443", &onion], &key)?;
+        let t = profile_text(
+            2,
+            &["Harw", "gateway-mobile", "127.0.0.1:7443", &onion],
+            &key,
+        )?;
         assert!(is_invalid_profile(&decode_profile_text(&t)), "{n}");
     }
     Ok(())
@@ -138,8 +168,15 @@ fn profile_qr_v2_accepts_onion_locators_at_the_accepted_length_boundaries() -> T
     let key = test_key();
     for n in [62usize, 68] {
         let onion = "a".repeat(n);
-        let t = profile_text(2, &["Harw", "gateway-mobile", "127.0.0.1:7443", &onion], &key)?;
-        assert_eq!(decode_profile_text(&t)?.onion.as_deref(), Some(onion.as_str()));
+        let t = profile_text(
+            2,
+            &["Harw", "gateway-mobile", "127.0.0.1:7443", &onion],
+            &key,
+        )?;
+        assert_eq!(
+            decode_profile_text(&t)?.onion.as_deref(),
+            Some(onion.as_str())
+        );
     }
     Ok(())
 }
@@ -159,7 +196,12 @@ fn profile_qr_v1_round_trips_at_the_maximum_field_lengths() -> TestResult {
 #[test]
 fn profile_qr_v2_round_trips_at_the_maximum_field_lengths_below_the_text_limit() -> TestResult {
     let key = test_key();
-    let (l, n, e, o) = ("L".repeat(128), "n".repeat(128), "e".repeat(63), "o".repeat(68));
+    let (l, n, e, o) = (
+        "L".repeat(128),
+        "n".repeat(128),
+        "e".repeat(63),
+        "o".repeat(68),
+    );
     let t = profile_text(2, &[&l, &n, &e, &o], &key)?;
     assert_eq!(t.len() - "HARW:PROFILE:2:".len(), 3515);
     let p = decode_profile_text(&t)?;
@@ -176,7 +218,11 @@ fn fingerprint_is_eight_groups_of_four_hex() -> TestResult {
     let fp = fingerprint(&hex::encode([0xabu8; 32]))?;
     let groups: Vec<&str> = fp.split(' ').collect();
     assert_eq!(groups.len(), 8);
-    assert!(groups.iter().all(|g| g.len() == 4 && g.chars().all(|c| c.is_ascii_hexdigit())));
+    assert!(
+        groups
+            .iter()
+            .all(|g| g.len() == 4 && g.chars().all(|c| c.is_ascii_hexdigit()))
+    );
     assert!(is_invalid_profile(&fingerprint("zz")));
     Ok(())
 }
@@ -185,10 +231,19 @@ fn fingerprint_is_eight_groups_of_four_hex() -> TestResult {
 fn decode_pairing_text_validates_a_real_profile() -> TestResult {
     let (text, id) = host_profile_text(None)?;
     let s = decode_pairing_text(text.clone())?;
-    assert_eq!(s.profile.server_public_key_hex, id.enrollment.public_key_hex);
+    assert_eq!(
+        s.profile.server_public_key_hex,
+        id.enrollment.public_key_hex
+    );
     assert_eq!(s.profile.server_node_id, id.enrollment.node_id);
-    assert_eq!(s.fingerprint, fingerprint(&s.profile.server_public_key_hex)?);
-    assert_eq!(serde_json::from_str::<ServerProfile>(&s.document_json)?, s.profile);
+    assert_eq!(
+        s.fingerprint,
+        fingerprint(&s.profile.server_public_key_hex)?
+    );
+    assert_eq!(
+        serde_json::from_str::<ServerProfile>(&s.document_json)?,
+        s.profile
+    );
     assert_eq!(s.profile.endpoint, decode_profile_text(&text)?.endpoint);
     Ok(())
 }
@@ -206,7 +261,10 @@ fn scan_finds_a_real_profile_in_a_rendered_frame() -> TestResult {
     let (text, id) = host_profile_text(None)?;
     let (buf, w, h, stride) = render(&text)?;
     let s = scan_pairing_frame(buf, w, h, stride)?.ok_or("no profile found in frame")?;
-    assert_eq!(s.profile.server_public_key_hex, id.enrollment.public_key_hex);
+    assert_eq!(
+        s.profile.server_public_key_hex,
+        id.enrollment.public_key_hex
+    );
     Ok(())
 }
 
@@ -232,8 +290,23 @@ fn scan_rejects_an_enrollment_qr() -> TestResult {
 
 #[test]
 fn scan_rejects_invalid_frame_dimensions() {
-    assert!(is_invalid_profile(&scan_pairing_frame(vec![0u8; 10], 4, 4, 4)));
+    assert!(is_invalid_profile(&scan_pairing_frame(
+        vec![0u8; 10],
+        4,
+        4,
+        4
+    )));
     assert!(is_invalid_profile(&scan_pairing_frame(vec![], 0, 0, 0)));
-    assert!(is_invalid_profile(&scan_pairing_frame(vec![0u8; 100], 10, 10, 9)));
-    assert!(is_invalid_profile(&scan_pairing_frame(vec![0u8; 20_000_000], 4097, 4, 4097)));
+    assert!(is_invalid_profile(&scan_pairing_frame(
+        vec![0u8; 100],
+        10,
+        10,
+        9
+    )));
+    assert!(is_invalid_profile(&scan_pairing_frame(
+        vec![0u8; 20_000_000],
+        4097,
+        4,
+        4097
+    )));
 }

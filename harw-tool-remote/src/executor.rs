@@ -170,6 +170,7 @@ pub fn refusal_message(tool: &str, error: &PortError) -> String {
         PortError::Revoked => "revoked",
         PortError::Protocol(_) => "protocol",
         PortError::Transport(_) => "transport",
+        PortError::Busy(_) => "busy",
     };
     format!(
         "gateway refused tool '{tool}' ({kind}, code {}): {error}. The call did not run; \
