@@ -108,6 +108,7 @@ internal fun ProvidersScreen(
     var baseUrl by remember { mutableStateOf(providerDefaults(ProviderKind.ANTHROPIC).baseUrl) }
     var model by remember { mutableStateOf(providerDefaults(ProviderKind.ANTHROPIC).suggestedModel) }
     var key by remember { mutableStateOf("") }
+    var editingModels by remember { mutableStateOf<ProviderRoute?>(null) }
     val defaults = providerDefaults(kind)
 
     // Runs one store call off the main thread and reloads the route list afterwards.
@@ -156,6 +157,12 @@ internal fun ProvidersScreen(
                 Text("Provider", style = MaterialTheme.typography.titleLarge)
             }
             tabs()
+            editingModels?.let { target ->
+                ModelListDialog(store, target) { saved ->
+                    editingModels = null
+                    if (saved) run {}
+                }
+            }
             message?.let { Text(friendlyProviderError(it), color = MaterialTheme.colorScheme.error) }
             Text(
                 "Wähle eine Verbindung. Cloud-Anfragen gehen an den gewählten Anbieter; lokale Modelle verarbeiten Text auf diesem Gerät.",
@@ -251,7 +258,8 @@ internal fun ProvidersScreen(
                                     },
                                 ) { Text("Aktivieren") }
                             }
-                            TextButton(enabled = !busy, onClick = { pendingDelete = route }) { Text("Löschen") }
+                            OutlinedButton(enabled = !busy, onClick = { editingModels = route }) { Text("Modelle") }
+            TextButton(enabled = !busy, onClick = { pendingDelete = route }) { Text("Löschen") }
                         }
                     }
                 }

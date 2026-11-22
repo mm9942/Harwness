@@ -249,6 +249,61 @@ impl ProviderStore {
         )
     }
 
+    /// The models stored in a route, the default first.
+    pub fn route_models(&self, route_id: String) -> Result<Vec<String>, MobileError> {
+        check_id(&route_id).map_err(|_| unknown_route())?;
+        let provider = self.load_route(&route_id)?.ok_or_else(unknown_route)?;
+        Ok(provider.models.clone())
+    }
+
+    /// Replaces the model list of a route (order kept, the first is the
+    /// default). Does not touch the secret and makes no network call.
+    pub fn set_route_models(
+        &self,
+        route_id: String,
+        models: Vec<String>,
+    ) -> Result<(), MobileError> {
+        let session = |detail: &str| MobileError::Session {
+            detail: detail.to_owned(),
+        };
+        check_id(&route_id).map_err(|_| unknown_route())?;
+        let mut list: Vec<String> = Vec::new();
+        for model in models {
+            let model = model.trim().to_owned();
+            if model.is_empty() || list.contains(&model) {
+                continue;
+            }
+            check_model(&model, false).map_err(|message| MobileError::Session { detail: message })?;
+            list.push(model);
+        }
+        if list.is_empty() {
+            return Err(session("a provider route needs at least one model"));
+        }
+        if list.len() > MAX_IMPORT_MODELS {
+            return Err(session("too many models"));
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.load_route(&route_id)?.ok_or_else(unknown_route)?;
+        let path = self.route_path(&route_id);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|_| internal("the provider route file could not be read"))?;
+        let mut table: toml::Table =
+            toml::from_str(&text).map_err(|_| internal("the provider route file is invalid"))?;
+        table.insert(
+            "models".to_owned(),
+            toml::Value::Array(list.into_iter().map(toml::Value::String).collect()),
+        );
+        let rendered = toml::to_string(&table)
+            .map_err(|_| internal("could not render the provider route file"))?;
+        toml::from_str::<ProviderToml>(&rendered)
+            .map_err(|_| internal("the rendered provider route is invalid"))?;
+        write_private_atomic(&path, rendered.as_bytes())?;
+        Ok(())
+    }
+
     /// Removes the route file and its secret, and deselects it when active.
     pub fn delete_route(&self, route_id: String) -> Result<(), MobileError> {
         check_id(&route_id).map_err(|_| unknown_route())?;
