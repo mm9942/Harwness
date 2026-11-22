@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::mission::Mission;
 use crate::{
-    ApprovalDecision, ApprovalRisk, MobileApproval, MobileError, MobileSession, MobileSessionState,
-    MobileToolState, SessionSnapshot, TranscriptEntry, TranscriptKind,
+    ApprovalDecision, ApprovalRisk, MobileAgentState, MobileApproval, MobileError, MobileSession,
+    MobileSessionState, MobileToolState, SessionSnapshot, TranscriptEntry, TranscriptKind,
 };
 
 const MAX_LIVE_TEXT_BYTES: usize = 1024 * 1024;
@@ -22,6 +22,8 @@ const MAX_LIVE_TEXT_BYTES: usize = 1024 * 1024;
 pub(crate) struct SessionState {
     view: SessionView,
     mission: Mission,
+    ring: MissionRing,
+    replay: Option<RingReplay>,
     pending: HashMap<ApprovalId, ApprovalRequest>,
     deciding: HashSet<ApprovalId>,
     partial: Option<PartialText>,
@@ -48,6 +50,123 @@ struct PartialText {
     turn_id: TurnId,
     text: String,
     first_unseen_live: u32,
+}
+
+/// Reasoning deltas the host coalesces into one envelope: one agent (the
+/// root is the empty id) in one turn.
+type ReasoningStream = (String, TurnId);
+
+/// Live-ring position of the mission view in the current generation.
+///
+/// A non-fresh re-attach replays the ring from position 0 and the compact
+/// profiles merge consecutive reasoning deltas, so the replay repeats frames
+/// the mission already applied, and one envelope can carry an applied prefix
+/// followed by new text. The transcript cursor cannot tell: the head frame
+/// itself passes `cursor == head`, and a merged envelope carries the cursor of
+/// its last part.
+#[derive(Default)]
+struct MissionRing {
+    mark: Option<RingMark>,
+    /// The mission saw the ring's root `TurnStarted`, so `reasoning` counts
+    /// every reasoning byte the ring holds up to `mark`.
+    from_start: bool,
+    /// Reasoning bytes applied per stream since that `TurnStarted`.
+    reasoning: HashMap<ReasoningStream, usize>,
+}
+
+/// Newest frame applied to the mission view.
+#[derive(Clone, Copy)]
+struct RingMark {
+    generation: u32,
+    live: u32,
+    /// The frame at `live` was a ring frame (a turn or child event), not a
+    /// side frame stamped with the next free ring index.
+    ring: bool,
+}
+
+impl MissionRing {
+    /// Highest ring index of `generation` the mission has applied.
+    fn seen_upto(&self, generation: u32) -> Option<u32> {
+        let mark = self.mark.filter(|mark| mark.generation == generation)?;
+        if mark.ring {
+            Some(mark.live)
+        } else {
+            mark.live.checked_sub(1)
+        }
+    }
+
+    fn advance(&mut self, cursor: Cursor, ring: bool) {
+        if let Some(mark) = self
+            .mark
+            .as_mut()
+            .filter(|mark| mark.generation == cursor.generation)
+        {
+            if cursor.live > mark.live {
+                mark.live = cursor.live;
+                mark.ring = ring;
+            } else if cursor.live == mark.live {
+                mark.ring |= ring;
+            }
+            return;
+        }
+        // A new generation starts a new ring.
+        *self = Self {
+            mark: Some(RingMark {
+                generation: cursor.generation,
+                live: cursor.live,
+                ring,
+            }),
+            ..Self::default()
+        };
+    }
+
+    /// Account an applied frame; `replayed` is the stream's replayed total.
+    fn account(&mut self, frame: &SessionFrame, replayed: Option<usize>) {
+        match frame {
+            SessionFrame::Turn(TurnEvent::TurnStarted { .. }) => {
+                self.from_start = true;
+                self.reasoning.clear();
+            }
+            SessionFrame::Snapshot { .. } => {
+                self.from_start = false;
+                self.reasoning.clear();
+            }
+            _ => {
+                if let Some((stream, text)) = reasoning_of(frame) {
+                    let seen = self.reasoning.entry(stream).or_default();
+                    *seen = match replayed {
+                        Some(total) => (*seen).max(total),
+                        None => seen.saturating_add(text.len()),
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// Ring replay of a non-fresh attach, until the stream is ready.
+struct RingReplay {
+    /// Host head at attach: replayed ring frames carry its generation and
+    /// durable position and a live index below its live index.
+    head: Cursor,
+    /// Live index of the previous replayed ring envelope.
+    last: Option<u32>,
+    /// Reasoning bytes replayed per stream.
+    reasoning: HashMap<ReasoningStream, usize>,
+}
+
+/// How one frame reaches the mission view.
+enum MissionStep {
+    /// Apply and move the ring mark.
+    Live,
+    /// Apply without moving the mark: durable replay and approvals of an
+    /// attach precede the ring replay and carry a later cursor.
+    Side,
+    /// Replayed ring envelope with unseen content; drop its first `skip`
+    /// reasoning bytes, which the mission already holds.
+    Replayed { skip: usize },
+    /// Already applied, or stale.
+    Seen,
 }
 
 pub(crate) enum FrameAction {
@@ -89,7 +208,12 @@ impl SessionState {
         self.replay_target = Some(ack.head);
         self.pending.clear();
         self.deciding.clear();
-        self.mission.root_waiting(false);
+        self.mission.set_root_state(root_state(&ack.session.state));
+        self.replay = (!fresh && self.ring.mark.is_some()).then(|| RingReplay {
+            head: ack.head,
+            last: None,
+            reasoning: HashMap::new(),
+        });
         self.partial = None;
         self.closed = ack.session.state == HostedState::Closed;
         self.readonly = ack.session.state == HostedState::Interrupted || self.closed;
@@ -120,6 +244,8 @@ impl SessionState {
     fn reset_view(&mut self) {
         self.view = SessionView::new();
         self.mission.clear();
+        self.ring = MissionRing::default();
+        self.replay = None;
         self.head = None;
         self.pending.clear();
         self.deciding.clear();
@@ -156,11 +282,13 @@ impl SessionState {
         if let SessionFrame::Turn(TurnEvent::AssistantDelta { turn_id, text }) = &envelope.frame {
             self.append_delta(cursor, turn_id, text);
         }
-        if self.head.is_some_and(|head| cursor < head) {
+        let stale = self.head.is_some_and(|head| cursor < head);
+        let mission = self.mission_step(envelope, stale);
+        self.apply_mission(envelope, mission);
+        if stale {
             return FrameAction::Continue;
         }
         self.head = Some(cursor);
-        self.observe_mission(&envelope.frame);
         self.observe_transcript(envelope);
         self.last_sync_millis = Some(jiff::Timestamp::now().as_millisecond());
 
@@ -171,6 +299,7 @@ impl SessionState {
                     .is_some_and(|head| !head.is_durably_ahead_of(&cursor)) =>
             {
                 self.ready = true;
+                self.replay = None;
                 self.detail = match (self.closed, self.readonly) {
                     (true, _) => Some("Session closed".into()),
                     (_, true) => Some("Host interrupted this session".into()),
@@ -245,6 +374,92 @@ impl SessionState {
     fn refresh_transcript(&mut self) -> FrameAction {
         self.begin_attach("Synchronizing the session transcript");
         FrameAction::RefreshTranscript
+    }
+
+    /// Decide how `envelope` reaches the mission view; during a ring replay
+    /// this also counts the replayed reasoning bytes.
+    fn mission_step(&mut self, envelope: &FrameEnvelope, stale: bool) -> MissionStep {
+        let cursor = envelope.cursor;
+        let Some(replay) = self.replay.as_mut() else {
+            return if stale {
+                MissionStep::Seen
+            } else {
+                MissionStep::Live
+            };
+        };
+        let replayed = is_ring_frame(envelope)
+            && cursor.generation == replay.head.generation
+            && cursor.durable == replay.head.durable
+            && cursor.live < replay.head.live;
+        if !replayed {
+            return if stale {
+                MissionStep::Seen
+            } else {
+                MissionStep::Side
+            };
+        }
+        let previous = replay.last.replace(cursor.live);
+        let reasoning = reasoning_of(&envelope.frame);
+        let before = reasoning.as_ref().map_or(0, |(stream, text)| {
+            let total = replay.reasoning.entry(stream.clone()).or_default();
+            let before = *total;
+            *total = before.saturating_add(text.len());
+            before
+        });
+        let Some(seen) = self.ring.seen_upto(cursor.generation) else {
+            return MissionStep::Replayed { skip: 0 };
+        };
+        if cursor.live <= seen {
+            return MissionStep::Seen;
+        }
+        if previous.is_some_and(|previous| previous >= seen) {
+            return MissionStep::Replayed { skip: 0 };
+        }
+        // The envelope starts at or before the mark: only a merged reasoning
+        // envelope holds parts on both sides.
+        let skip = match reasoning {
+            Some((stream, text)) if self.ring.from_start => self
+                .ring
+                .reasoning
+                .get(&stream)
+                .map_or(0, |seen| seen.saturating_sub(before))
+                .min(text.len()),
+            // The mission began mid-turn from a snapshot, so the applied
+            // prefix has no known length: drop the envelope, never repeat it.
+            Some((_, text)) => text.len(),
+            None => 0,
+        };
+        MissionStep::Replayed { skip }
+    }
+
+    fn apply_mission(&mut self, envelope: &FrameEnvelope, step: MissionStep) {
+        let frame = &envelope.frame;
+        match step {
+            MissionStep::Seen => {}
+            MissionStep::Side => self.observe_mission(frame),
+            MissionStep::Live => {
+                self.ring.advance(envelope.cursor, is_ring_frame(envelope));
+                self.ring.account(frame, None);
+                self.observe_mission(frame);
+            }
+            MissionStep::Replayed { skip } => {
+                self.ring.advance(envelope.cursor, true);
+                let Some((stream, text)) = reasoning_of(frame) else {
+                    self.ring.account(frame, None);
+                    self.observe_mission(frame);
+                    return;
+                };
+                let replayed = self
+                    .replay
+                    .as_ref()
+                    .and_then(|replay| replay.reasoning.get(&stream).copied());
+                self.ring.account(frame, replayed);
+                let rest = &text[text.ceil_char_boundary(skip)..];
+                if !rest.is_empty() {
+                    self.observe_mission(&with_reasoning(frame, rest));
+                }
+            }
+        }
     }
 
     fn observe_mission(&mut self, frame: &SessionFrame) {
@@ -482,6 +697,56 @@ impl SessionState {
     }
 }
 
+/// Turn and child events sit in the live ring while a turn runs; durable
+/// replay frames are items at live index 0.
+fn is_ring_frame(envelope: &FrameEnvelope) -> bool {
+    match &envelope.frame {
+        SessionFrame::Turn(TurnEvent::ItemAdded { .. }) => envelope.cursor.live > 0,
+        SessionFrame::Turn(_) | SessionFrame::Child { .. } => true,
+        _ => false,
+    }
+}
+
+fn reasoning_of(frame: &SessionFrame) -> Option<(ReasoningStream, &str)> {
+    match frame {
+        SessionFrame::Turn(TurnEvent::ReasoningDelta { turn_id, text }) => {
+            Some(((String::new(), turn_id.clone()), text.as_str()))
+        }
+        SessionFrame::Child {
+            agent,
+            event: TurnEvent::ReasoningDelta { turn_id, text },
+            ..
+        } => Some(((agent.to_string(), turn_id.clone()), text.as_str())),
+        _ => None,
+    }
+}
+
+/// `frame`, a reasoning delta, with its text replaced by `rest`.
+fn with_reasoning(frame: &SessionFrame, rest: &str) -> SessionFrame {
+    let mut frame = frame.clone();
+    if let SessionFrame::Turn(TurnEvent::ReasoningDelta { text, .. })
+    | SessionFrame::Child {
+        event: TurnEvent::ReasoningDelta { text, .. },
+        ..
+    } = &mut frame
+    {
+        *text = rest.to_owned();
+    }
+    frame
+}
+
+/// Root agent state that a session state implies at attach.
+fn root_state(state: &HostedState) -> MobileAgentState {
+    match state {
+        HostedState::Running | HostedState::Queued { .. } | HostedState::WaitingForChild => {
+            MobileAgentState::Running
+        }
+        HostedState::WaitingForApproval => MobileAgentState::Waiting,
+        HostedState::Idle | HostedState::Closed => MobileAgentState::Done,
+        HostedState::Failed | HostedState::Interrupted => MobileAgentState::Failed,
+    }
+}
+
 fn project_entry(entry: &harw_mobile_core::Entry) -> TranscriptEntry {
     let (kind, text, tool_state) = match &entry.kind {
         EntryKind::User(text) => (TranscriptKind::User, text, None),
@@ -563,5 +828,195 @@ impl From<SessionSummary> for MobileSession {
             updated_at: summary.updated_at.to_string(),
             model: summary.model,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use harw_protocol::session_wire::{
+        AttachAck, ClientCaps, Cursor, FrameEnvelope, HostedState, SessionSummary,
+    };
+    use harw_protocol::{SessionFrame, TurnEvent};
+    use harw_types::{SessionId, ThreadId, ToolCallId, TurnId};
+
+    use super::SessionState;
+    use crate::{MobileAgentState, ReasoningKind};
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    const GENERATION: u32 = 1;
+    const DURABLE: u64 = 4;
+
+    fn at(live: u32) -> Cursor {
+        Cursor {
+            generation: GENERATION,
+            durable: DURABLE,
+            live,
+        }
+    }
+
+    fn ack(state: HostedState, head: Cursor) -> AttachAck {
+        AttachAck {
+            session: SessionSummary {
+                session_id: SessionId::from_str("s1"),
+                title: None,
+                tenant: None,
+                state,
+                attached: 1,
+                updated_at: jiff::Timestamp::UNIX_EPOCH,
+                model: None,
+            },
+            granted: ClientCaps::NONE,
+            head,
+            replay_from: head,
+            host_epoch: 1,
+        }
+    }
+
+    fn feed(state: &mut SessionState, live: u32, frame: SessionFrame) {
+        state.observe(&FrameEnvelope {
+            session_id: SessionId::from_str("s1"),
+            cursor: at(live),
+            frame,
+        });
+    }
+
+    fn presence() -> SessionFrame {
+        SessionFrame::Presence {
+            attached: Vec::new(),
+        }
+    }
+
+    fn turn(event: TurnEvent) -> SessionFrame {
+        SessionFrame::Turn(event)
+    }
+
+    fn started() -> SessionFrame {
+        turn(TurnEvent::TurnStarted {
+            turn_id: TurnId::from_str("t1"),
+            thread_id: ThreadId::from_str("th1"),
+        })
+    }
+
+    fn reasoning(text: &str) -> SessionFrame {
+        turn(TurnEvent::ReasoningDelta {
+            turn_id: TurnId::from_str("t1"),
+            text: text.into(),
+        })
+    }
+
+    fn tool_call(call: &str) -> SessionFrame {
+        turn(TurnEvent::ToolCallRequested {
+            turn_id: TurnId::from_str("t1"),
+            call_id: ToolCallId::from_str(call),
+            tool_name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        })
+    }
+
+    fn job(work_id: &str) -> SessionFrame {
+        SessionFrame::Job {
+            work_id: work_id.into(),
+            kind: "build".into(),
+            state: "running".into(),
+            summary: None,
+        }
+    }
+
+    /// Thinking text, number of tool-start lines and root tool calls.
+    fn mission_view(state: &SessionState) -> TestResult<(String, usize, u32)> {
+        let lines = state.mission.reasoning();
+        let thinking = lines
+            .iter()
+            .filter(|line| line.kind == ReasoningKind::Thinking)
+            .map(|line| line.text.as_str())
+            .collect();
+        let starts = lines
+            .iter()
+            .filter(|line| line.kind == ReasoningKind::ToolStart)
+            .count();
+        let root = state
+            .mission
+            .agents()
+            .into_iter()
+            .next()
+            .ok_or("root agent missing")?;
+        Ok((thinking, starts, root.tool_calls))
+    }
+
+    fn reattach(state: &mut SessionState, head: Cursor) {
+        state.begin_attach("Reconnecting");
+        state.attached(&ack(HostedState::Running, head), false);
+    }
+
+    #[test]
+    fn reattach_replay_trims_merged_reasoning_and_skips_head_frame() -> TestResult {
+        let mut state = SessionState::default();
+        state.attached(&ack(HostedState::Running, at(0)), true);
+        feed(&mut state, 0, presence());
+        feed(&mut state, 0, started());
+        feed(&mut state, 1, tool_call("c1"));
+        feed(&mut state, 2, reasoning("Hello "));
+        assert_eq!(mission_view(&state)?, ("Hello ".into(), 1, 1));
+
+        // Ring position 3 ("world") arrived while the phone was away; the
+        // compact replay merges it with the already applied position 2.
+        reattach(&mut state, at(4));
+        feed(&mut state, 0, started());
+        feed(&mut state, 1, tool_call("c1"));
+        feed(&mut state, 3, reasoning("Hello world"));
+        feed(&mut state, 4, presence());
+        assert_eq!(mission_view(&state)?, ("Hello world".into(), 1, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn reattach_replay_skips_equal_cursor_head_but_live_side_frames_apply() -> TestResult {
+        let mut state = SessionState::default();
+        state.attached(&ack(HostedState::Running, at(0)), true);
+        feed(&mut state, 0, presence());
+        feed(&mut state, 0, started());
+        feed(&mut state, 1, reasoning("Plan"));
+        feed(&mut state, 2, tool_call("c1"));
+
+        reattach(&mut state, at(3));
+        feed(&mut state, 0, started());
+        feed(&mut state, 1, reasoning("Plan"));
+        feed(&mut state, 2, tool_call("c1"));
+        feed(&mut state, 3, presence());
+        assert_eq!(mission_view(&state)?, ("Plan".into(), 1, 1));
+
+        // After the replay, frames that share a cursor are all new.
+        feed(&mut state, 3, job("w1"));
+        feed(&mut state, 3, job("w2"));
+        feed(&mut state, 3, tool_call("c2"));
+        assert_eq!(state.mission.jobs().len(), 2);
+        assert_eq!(mission_view(&state)?, ("Plan".into(), 2, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn attach_sets_root_state_from_session_state() -> TestResult {
+        let cases = [
+            (HostedState::Idle, MobileAgentState::Done),
+            (HostedState::Closed, MobileAgentState::Done),
+            (HostedState::Running, MobileAgentState::Running),
+            (HostedState::Queued { depth: 1 }, MobileAgentState::Running),
+            (HostedState::WaitingForApproval, MobileAgentState::Waiting),
+            (HostedState::Failed, MobileAgentState::Failed),
+            (HostedState::Interrupted, MobileAgentState::Failed),
+        ];
+        for (hosted, expected) in cases {
+            let mut state = SessionState::default();
+            state.attached(&ack(hosted, at(0)), true);
+            let root = state
+                .mission
+                .agents()
+                .into_iter()
+                .next()
+                .ok_or("root agent missing")?;
+            assert_eq!(root.state, expected);
+        }
+        Ok(())
     }
 }

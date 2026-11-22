@@ -1291,6 +1291,82 @@ async fn background_child_and_job_frames_reach_clients_after_the_turn() -> TestR
             if work_id == "w-1" && state == "completed")
     })
     .await?;
+
+    // The turn is over: the ring is gone, so a late joiner replaying from the
+    // start of the generation must not see the after-turn frames again.
+    let viewer = connect(&fx.host, local(2, PermissionTier::Operator)).await?;
+    let (_, mut replayed) = viewer
+        .attach(attach(&session, Some(Cursor::default())))
+        .await?;
+    assert_no_side_frames(&mut replayed).await?;
+    Ok(())
+}
+
+/// Drain a freshly attached stream until it goes quiet; Child/Job frames are
+/// not allowed to show up in it.
+async fn assert_no_side_frames(source: &mut Box<dyn FrameSource>) -> TestResult {
+    while let Ok(next) = tokio::time::timeout(Duration::from_millis(150), source.next()).await {
+        let Some(envelope) = next? else { break };
+        assert!(
+            !matches!(
+                envelope.frame,
+                SessionFrame::Child { .. } | SessionFrame::Job { .. }
+            ),
+            "unexpected replayed frame: {:?}",
+            envelope.frame
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn child_frames_during_a_turn_are_ring_buffered_but_job_frames_are_not() -> TestResult {
+    let gate = Arc::new(Notify::new());
+    let gate_for_driver = Arc::clone(&gate);
+    let fx = fixture_with(move |driver| driver.gate = Some(gate_for_driver))?;
+    let owner = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let session = owner.create(CreateParams::default()).await?.session_id;
+    let (_, mut frames) = owner.attach(attach(&session, None)).await?;
+    owner
+        .submit(submit(&session, "hold", "m1", Cursor::default()))
+        .await?;
+    // The scripted delta is the last frame before the driver parks on the gate.
+    let delta = wait_for(&mut frames, |frame| {
+        matches!(frame, SessionFrame::Turn(TurnEvent::AssistantDelta { .. }))
+    })
+    .await?;
+
+    let sink = fx.driver.sink().ok_or("no sink captured")?;
+    sink.emit(child_reasoning(&session, "during"));
+    sink.emit(job_event("w-3"));
+    wait_for(
+        &mut frames,
+        |frame| matches!(frame, SessionFrame::Job { work_id, .. } if work_id == "w-3"),
+    )
+    .await?;
+
+    let viewer = connect(&fx.host, local(2, PermissionTier::Operator)).await?;
+    let (_, mut replayed) = viewer.attach(attach(&session, Some(delta.cursor))).await?;
+    let mut saw_child = false;
+    for _ in 0..16 {
+        let Ok(next) = tokio::time::timeout(Duration::from_millis(300), replayed.next()).await
+        else {
+            break;
+        };
+        let Some(envelope) = next? else { break };
+        match envelope.frame {
+            SessionFrame::Child {
+                event: TurnEvent::ReasoningDelta { text, .. },
+                ..
+            } if text == "during" => saw_child = true,
+            SessionFrame::Job { .. } => return Err("job frame was ring-buffered".into()),
+            _ => {}
+        }
+    }
+    assert!(saw_child, "child frame of an active turn must be replayed");
+
+    gate.notify_one();
+    wait_idle(&owner, &session).await?;
     Ok(())
 }
 

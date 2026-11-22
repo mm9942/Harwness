@@ -20,10 +20,14 @@ const MAX_LINE_BYTES: usize = 4096;
 const MAX_AGENTS: usize = 64;
 const MAX_JOBS: usize = 64;
 const MAX_CALLS: usize = 256;
+const MAX_FINISHED: usize = 32;
+const MAX_LABEL_BYTES: usize = 64;
+const OTHER_LABEL: &str = "other";
 
 struct AgentRec {
     agent: MobileAgent,
     terminal: bool,
+    outcome: Option<Outcome>,
 }
 
 struct JobRec {
@@ -55,6 +59,9 @@ pub(crate) struct Mission {
     finished: Vec<(String, Tally)>,
     /// Open tool calls per call id: (agent id, tool name).
     calls: HashMap<String, (String, String)>,
+    /// Recently started call ids (bounded), so durable replay of a call that
+    /// already ended is not counted again.
+    seen_calls: VecDeque<String>,
 }
 
 impl Mission {
@@ -62,13 +69,24 @@ impl Mission {
         *self = Self::default();
     }
 
+    /// Mark the root as waiting, or (when `waiting` is false) move it from
+    /// Waiting back to Running; a Done/Failed root is never changed by `false`.
     pub fn root_waiting(&mut self, waiting: bool) {
         let root = self.agent_mut(ROOT_ID, None, ROOT_ROLE);
-        root.state = if waiting {
-            MobileAgentState::Waiting
-        } else {
-            MobileAgentState::Running
-        };
+        if waiting {
+            root.state = MobileAgentState::Waiting;
+        } else if root.state == MobileAgentState::Waiting {
+            root.state = MobileAgentState::Running;
+        }
+    }
+
+    /// Set the root state directly (creating the record if missing); no tally.
+    pub fn set_root_state(&mut self, state: MobileAgentState) {
+        let root = self.agent_mut(ROOT_ID, None, ROOT_ROLE);
+        root.state = state;
+        if matches!(state, MobileAgentState::Done | MobileAgentState::Failed) {
+            root.current_tool = None;
+        }
     }
 
     /// Apply one turn event of the root agent.
@@ -94,9 +112,13 @@ impl Mission {
         self.agent_mut(ROOT_ID, None, ROOT_ROLE);
         match event {
             TurnEvent::TurnStarted { .. } => {
-                let agent = self.agent_mut(id, parent, role);
-                agent.state = MobileAgentState::Running;
-                agent.current_tool = None;
+                // A new run of a finished agent counts (and finishes) again.
+                let index = self.agent_index(id, parent, role);
+                let rec = &mut self.agents[index];
+                rec.terminal = false;
+                rec.outcome = None;
+                rec.agent.state = MobileAgentState::Running;
+                rec.agent.current_tool = None;
             }
             TurnEvent::ReasoningDelta { text, .. } => {
                 self.touch_running(id, parent, role);
@@ -109,7 +131,12 @@ impl Mission {
                 item: TurnItem::ToolCall(call),
                 ..
             } => {
-                if !self.calls.contains_key(call.call_id.as_str()) {
+                if !self.calls.contains_key(call.call_id.as_str())
+                    && !self
+                        .seen_calls
+                        .iter()
+                        .any(|seen| seen == call.call_id.as_str())
+                {
                     self.tool_start(id, parent, role, call.call_id.as_str(), &call.tool_name);
                 }
             }
@@ -132,7 +159,7 @@ impl Mission {
                     } else {
                         Outcome::Ok
                     };
-                    self.finish_agent(id, parent, role, outcome);
+                    self.finish_agent(id, parent, role, outcome, false);
                 }
                 let (ok, text) = if cancelled {
                     (None, "cancelled")
@@ -147,7 +174,7 @@ impl Mission {
                     agent.state = MobileAgentState::Failed;
                     agent.current_tool = None;
                 } else {
-                    self.finish_agent(id, parent, role, Outcome::Failed);
+                    self.finish_agent(id, parent, role, Outcome::Failed, false);
                 }
                 self.push_line(
                     id,
@@ -172,7 +199,7 @@ impl Mission {
                     "cancelled" => Outcome::Cancelled,
                     _ => Outcome::Failed,
                 };
-                self.finish_agent(child.as_str(), Some(id), "agent", outcome);
+                self.finish_agent(child.as_str(), Some(id), "agent", outcome, false);
             }
             _ => {}
         }
@@ -215,7 +242,15 @@ impl Mission {
             }
         };
         if newly_terminal && let Some(outcome) = outcome {
-            self.tally(&format!("job:{kind}"), outcome);
+            if kind == "agent" {
+                // The orchestration event of a child is the authoritative
+                // outcome of that agent; it is tallied once under its role.
+                if self.agents.iter().any(|rec| rec.agent.id == work_id) {
+                    self.finish_agent(work_id, None, "agent", outcome, true);
+                }
+            } else {
+                self.tally(&format!("job:{kind}"), outcome);
+            }
         }
     }
 
@@ -245,7 +280,12 @@ impl Mission {
     }
 
     fn agent_mut(&mut self, id: &str, parent: Option<&str>, role: &str) -> &mut MobileAgent {
-        let index = match self.agents.iter().position(|rec| rec.agent.id == id) {
+        let index = self.agent_index(id, parent, role);
+        &mut self.agents[index].agent
+    }
+
+    fn agent_index(&mut self, id: &str, parent: Option<&str>, role: &str) -> usize {
+        match self.agents.iter().position(|rec| rec.agent.id == id) {
             Some(index) => index,
             None => {
                 self.agents.push(AgentRec {
@@ -260,6 +300,7 @@ impl Mission {
                         tool_calls: 0,
                     },
                     terminal: false,
+                    outcome: None,
                 });
                 if self.agents.len() > MAX_AGENTS {
                     let evictable = |rec: &AgentRec| rec.agent.id != ROOT_ID;
@@ -277,8 +318,7 @@ impl Mission {
                     .position(|rec| rec.agent.id == id)
                     .unwrap_or(self.agents.len() - 1)
             }
-        };
-        &mut self.agents[index].agent
+        }
     }
 
     fn touch_running(&mut self, id: &str, parent: Option<&str>, role: &str) {
@@ -300,6 +340,10 @@ impl Mission {
             self.calls.clear();
         }
         self.calls.insert(call_id.into(), (id.into(), name.into()));
+        if self.seen_calls.len() >= MAX_CALLS {
+            self.seen_calls.pop_front();
+        }
+        self.seen_calls.push_back(call_id.into());
         let agent = self.agent_mut(id, parent, role);
         agent.state = MobileAgentState::Running;
         agent.current_tool = Some(name.into());
@@ -322,34 +366,71 @@ impl Mission {
         self.tally(&format!("tool:{name}"), outcome);
     }
 
-    fn finish_agent(&mut self, id: &str, parent: Option<&str>, role: &str, outcome: Outcome) {
-        let index = self
-            .agents
-            .iter()
-            .position(|rec| rec.agent.id == id)
-            .unwrap_or_else(|| {
-                self.agent_mut(id, parent, role);
-                self.agents.len() - 1
-            });
+    /// Finish an agent once. An `authoritative` outcome (the orchestration
+    /// event) may revise an earlier, non-authoritative one without recounting.
+    fn finish_agent(
+        &mut self,
+        id: &str,
+        parent: Option<&str>,
+        role: &str,
+        outcome: Outcome,
+        authoritative: bool,
+    ) {
+        let index = self.agent_index(id, parent, role);
         let rec = &mut self.agents[index];
-        if rec.terminal {
+        let previous = if rec.terminal { rec.outcome } else { None };
+        if rec.terminal && (!authoritative || previous == Some(outcome)) {
             return;
         }
         rec.terminal = true;
+        rec.outcome = Some(outcome);
         rec.agent.current_tool = None;
         rec.agent.state = match outcome {
             Outcome::Ok => MobileAgentState::Done,
             Outcome::Failed | Outcome::Cancelled => MobileAgentState::Failed,
         };
         let label = rec.agent.role.clone();
+        if let Some(previous) = previous {
+            self.untally(&label, previous);
+        }
         self.tally(&label, outcome);
     }
 
+    fn untally(&mut self, label: &str, outcome: Outcome) {
+        let label = bounded_label(label);
+        let index = self
+            .finished
+            .iter()
+            .position(|(name, _)| *name == label)
+            .or_else(|| {
+                self.finished
+                    .iter()
+                    .position(|(name, _)| name == OTHER_LABEL)
+            });
+        if let Some(index) = index {
+            let tally = &mut self.finished[index].1;
+            tally.total = tally.total.saturating_sub(1);
+            match outcome {
+                Outcome::Ok => tally.ok = tally.ok.saturating_sub(1),
+                Outcome::Failed => tally.failed = tally.failed.saturating_sub(1),
+                Outcome::Cancelled => tally.cancelled = tally.cancelled.saturating_sub(1),
+            }
+        }
+    }
+
     fn tally(&mut self, label: &str, outcome: Outcome) {
-        let index = match self.finished.iter().position(|(name, _)| name == label) {
+        let mut label = bounded_label(label);
+        if !self.finished.iter().any(|(name, _)| *name == label)
+            && self.finished.len() + 1 >= MAX_FINISHED
+            && label != OTHER_LABEL
+        {
+            // Keep the last slot for the overflow bucket.
+            label = OTHER_LABEL.into();
+        }
+        let index = match self.finished.iter().position(|(name, _)| *name == label) {
             Some(index) => index,
             None => {
-                self.finished.push((label.into(), Tally::default()));
+                self.finished.push((label, Tally::default()));
                 self.finished.len() - 1
             }
         };
@@ -406,11 +487,17 @@ fn bound_line(text: &mut String) {
     }
 }
 
+/// Cut a tally label to `MAX_LABEL_BYTES` on a char boundary.
+fn bounded_label(label: &str) -> String {
+    let end = label.floor_char_boundary(MAX_LABEL_BYTES);
+    label[..end].to_owned()
+}
+
 fn job_outcome(state: &str) -> Option<Outcome> {
     match state.to_ascii_lowercase().as_str() {
         "completed" | "complete" | "done" | "succeeded" | "success" | "ok" => Some(Outcome::Ok),
         "failed" | "error" | "timed_out" | "timeout" | "dead" => Some(Outcome::Failed),
-        "cancelled" | "canceled" | "aborted" => Some(Outcome::Cancelled),
+        "cancelled" | "canceled" | "aborted" | "stopped" => Some(Outcome::Cancelled),
         _ => None,
     }
 }
@@ -556,6 +643,9 @@ mod tests {
         mission.root_event(&requested("k1", "read"));
         mission.root_event(&added);
         assert_eq!(mission.agents()[0].tool_calls, 1);
+        mission.root_event(&completed("k1", true));
+        mission.root_event(&added);
+        assert_eq!(mission.agents()[0].tool_calls, 1);
         Ok(())
     }
 
@@ -655,6 +745,100 @@ mod tests {
         let last = lines.last().ok_or("no line")?;
         assert!(last.text.len() <= MAX_LINE_BYTES);
         assert!(last.text.chars().all(|c| c == 'ä'));
+        Ok(())
+    }
+
+    #[test]
+    fn finished_tally_is_bounded_and_labels_truncated() -> TestResult {
+        let mut mission = Mission::default();
+        for index in 0..(MAX_FINISHED + 10) {
+            let call = format!("k{index}");
+            mission.root_event(&requested(&call, &format!("tool{index}")));
+            mission.root_event(&completed(&call, true));
+        }
+        let finished = mission.finished();
+        assert_eq!(finished.len(), MAX_FINISHED);
+        let other = find(&finished, OTHER_LABEL)?;
+        assert_eq!(other.total, 11);
+        let long = "é".repeat(MAX_LABEL_BYTES);
+        mission.job("w", &long, "done", None);
+        let finished = mission.finished();
+        assert_eq!(finished.len(), MAX_FINISHED);
+        assert!(finished.iter().all(|c| c.label.len() <= MAX_LABEL_BYTES));
+        assert_eq!(find(&finished, OTHER_LABEL)?.total, 12);
+        Ok(())
+    }
+
+    #[test]
+    fn child_counts_once_across_frames_and_job() -> TestResult {
+        let mut mission = Mission::default();
+        mission.root_event(&spawned("c1", "explorer"));
+        let started = TurnEvent::TurnStarted {
+            turn_id: turn(),
+            thread_id: ThreadId::from_str("th"),
+        };
+        mission.child_event("c1", Some("root"), "explorer", &started);
+        mission.child_event(
+            "c1",
+            Some("root"),
+            "explorer",
+            &TurnEvent::TurnCompleted {
+                turn_id: turn(),
+                usage: None,
+            },
+        );
+        mission.root_event(&child_done("c1", "completed"));
+        mission.job("c1", "agent", "failed", None);
+        mission.job("c1", "agent", "failed", None);
+        let finished = mission.finished();
+        let total: u32 = finished.iter().map(|c| c.total).sum();
+        assert_eq!(total, 1);
+        let explorer = find(&finished, "explorer")?;
+        assert_eq!((explorer.ok, explorer.failed), (0, 1));
+        assert_eq!(mission.agents()[1].state, MobileAgentState::Failed);
+        mission.job("unknown", "agent", "done", None);
+        assert_eq!(mission.finished().iter().map(|c| c.total).sum::<u32>(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn restarted_child_finishes_again() -> TestResult {
+        let mut mission = Mission::default();
+        let started = TurnEvent::TurnStarted {
+            turn_id: turn(),
+            thread_id: ThreadId::from_str("th"),
+        };
+        let done = TurnEvent::TurnCompleted {
+            turn_id: turn(),
+            usage: None,
+        };
+        mission.child_event("c1", Some("root"), "worker", &done);
+        assert_eq!(mission.agents()[1].state, MobileAgentState::Done);
+        mission.child_event("c1", Some("root"), "worker", &started);
+        assert_eq!(mission.agents()[1].state, MobileAgentState::Running);
+        mission.child_event("c1", Some("root"), "worker", &done);
+        assert_eq!(mission.agents()[1].state, MobileAgentState::Done);
+        let finished = mission.finished();
+        assert_eq!(find(&finished, "worker")?.total, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn root_waiting_false_keeps_terminal_states_and_set_root_state() -> TestResult {
+        let mut mission = Mission::default();
+        mission.set_root_state(MobileAgentState::Done);
+        assert_eq!(mission.agents()[0].state, MobileAgentState::Done);
+        mission.root_waiting(false);
+        assert_eq!(mission.agents()[0].state, MobileAgentState::Done);
+        mission.set_root_state(MobileAgentState::Failed);
+        mission.root_waiting(false);
+        assert_eq!(mission.agents()[0].state, MobileAgentState::Failed);
+        mission.set_root_state(MobileAgentState::Waiting);
+        mission.root_waiting(false);
+        assert_eq!(mission.agents()[0].state, MobileAgentState::Running);
+        mission.root_waiting(true);
+        assert_eq!(mission.agents()[0].state, MobileAgentState::Waiting);
+        assert!(mission.finished().is_empty());
         Ok(())
     }
 
