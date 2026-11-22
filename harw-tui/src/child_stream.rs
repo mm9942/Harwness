@@ -847,11 +847,7 @@ impl ChildStreamBlock {
                     &[("p0", &count)],
                 )
             } else {
-                crate::i18n::tr_args(
-                    "agents.earlier",
-                    "… {p0} earlier steps",
-                    &[("p0", &count)],
-                )
+                crate::i18n::tr_args("agents.earlier", "… {p0} earlier steps", &[("p0", &count)])
             };
             body.push(Line::from(Span::styled(marker, dim)));
         }
@@ -1223,7 +1219,8 @@ impl ChildStreamRegistry {
         if self.blocks.contains_key(child_id) {
             return None;
         }
-        let mut fresh = ChildStreamBlock::new(child_id, orchestrator, 1, self.mode.clone(), self.cap);
+        let mut fresh =
+            ChildStreamBlock::new(child_id, orchestrator, 1, self.mode.clone(), self.cap);
         fresh.set_unbounded(uncapped_role(role));
         let block = Arc::new(Mutex::new(fresh));
         self.blocks.insert(child_id.to_owned(), Arc::clone(&block));
@@ -1717,11 +1714,7 @@ mod tests {
 
     /// Füllt einen Block mit 40 Werkzeugen, 30 Textzeilen und langem
     /// Live-Reasoning.
-    fn fill_block(
-        reg: &mut ChildStreamRegistry,
-        root: &SessionId,
-        orch: &SessionId,
-    ) {
+    fn fill_block(reg: &mut ChildStreamRegistry, root: &SessionId, orch: &SessionId) {
         for index in 0..40 {
             let call = ToolCallId::new();
             reg.apply(
@@ -1779,7 +1772,10 @@ mod tests {
         assert!(rendered.contains("zeile 29"), "{rendered}");
         assert!(rendered.contains("wort0 "), "{rendered}");
         assert!(rendered.contains("wort599"), "{rendered}");
-        let live = rendered.lines().filter(|line| line.contains("wort")).count();
+        let live = rendered
+            .lines()
+            .filter(|line| line.contains("wort"))
+            .count();
         assert!(live > LIVE_MAX_LINES, "Live-Reasoning vollständig: {live}");
         Ok(())
     }
@@ -1803,7 +1799,10 @@ mod tests {
         assert!(rendered.contains("earlier steps"), "{rendered}");
         assert!(rendered.contains("more lines)"), "{rendered}");
         assert!(!rendered.contains("zeile 29"), "{rendered}");
-        let live = rendered.lines().filter(|line| line.contains("wort")).count();
+        let live = rendered
+            .lines()
+            .filter(|line| line.contains("wort"))
+            .count();
         assert_eq!(live, LIVE_MAX_LINES, "{rendered}");
         Ok(())
     }
@@ -1833,7 +1832,7 @@ mod tests {
         );
         assert!(!rendered.contains("hinweis 2\n"), "ältester fiel heraus");
         assert!(rendered.contains(&format!("hinweis {}", UNBOUNDED_MAX_ENTRIES + 2)));
-        assert!(rendered.contains("∴ … "), "Live-Kürzungsmarke");
+        assert!(rendered.contains("∴ …"), "Live-Kürzungsmarke");
         Ok(())
     }
 

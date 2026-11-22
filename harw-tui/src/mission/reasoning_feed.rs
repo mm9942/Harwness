@@ -193,8 +193,7 @@ impl ReasoningFeed {
     }
 
     fn enforce_bounds(&mut self) {
-        while self.entries.len() > MAX_ENTRIES
-            || (self.bytes > MAX_BYTES && self.entries.len() > 1)
+        while self.entries.len() > MAX_ENTRIES || (self.bytes > MAX_BYTES && self.entries.len() > 1)
         {
             if let Some(old) = self.entries.pop_front() {
                 self.bytes = self.bytes.saturating_sub(old.text.len());
@@ -350,7 +349,10 @@ mod tests {
     use crate::test_support::{TestError, TestResult, ctx};
 
     fn text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn rows(feed: &ReasoningFeed, width: u16, max: usize, scroll: usize) -> Vec<String> {
@@ -441,7 +443,11 @@ mod tests {
     #[test]
     fn wraps_at_width_30_with_indented_continuations() -> TestResult {
         let mut feed = ReasoningFeed::new();
-        feed.push_reasoning("a1", "worker", "alpha beta gamma delta epsilon zeta eta theta");
+        feed.push_reasoning(
+            "a1",
+            "worker",
+            "alpha beta gamma delta epsilon zeta eta theta",
+        );
         let all = rows(&feed, 30, 8, 0);
         assert!(all.len() > 1);
         for row in &all {
@@ -473,16 +479,18 @@ mod tests {
         feed.push_reasoning("a1", "worker", "");
         for width in [14, 30, 80] {
             let total = feed.line_count(width, None);
-            assert_eq!(feed.lines(width, usize::MAX, 0, None, Theme::Dark).len(), total);
+            assert_eq!(
+                feed.lines(width, usize::MAX, 0, None, Theme::Dark).len(),
+                total
+            );
         }
     }
 
     #[test]
     fn render_shows_title_and_empty_hint() -> TestResult {
         let feed = ReasoningFeed::new();
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 5))
-                .map_err(ctx("test terminal"))?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 5))
+            .map_err(ctx("test terminal"))?;
         terminal
             .draw(|frame| {
                 let area = frame.area();

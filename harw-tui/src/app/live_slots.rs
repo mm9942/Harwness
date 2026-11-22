@@ -1494,13 +1494,13 @@ mod tests {
     fn short_terminals_get_one_bounded_live_cell() -> TestResult {
         let mut app = bg_app()?;
         app.push_line(Role::User, "los");
-        spawn_as(&mut app, "run-1", role_names::EXPLORER, "eins")?;
-        spawn_as(&mut app, "run-2", role_names::EXPLORER, "zwei")?;
+        spawn_as(&mut app, "run-1", role_names::CODING_ORCHESTRATOR, "eins")?;
+        spawn_as(&mut app, "run-2", role_names::CODING_ORCHESTRATOR, "zwei")?;
         let long: String = (0..60).map(|index| format!("zeile {index}\n")).collect();
         bus_as(
             &mut app,
             "run-1",
-            role_names::EXPLORER,
+            role_names::CODING_ORCHESTRATOR,
             TurnEvent::AssistantDelta {
                 turn_id: TurnId::new(),
                 text: long,
@@ -1577,8 +1577,8 @@ mod tests {
     fn non_root_live_cell_keeps_the_hidden_lines_row() -> TestResult {
         let mut app = bg_app()?;
         app.push_line(Role::User, "los");
-        spawn_as(&mut app, "run-w", role_names::EXPLORER, "start")?;
-        tool_events(&mut app, "run-w", role_names::EXPLORER, 40);
+        spawn_as(&mut app, "run-w", role_names::CODING_ORCHESTRATOR, "start")?;
+        tool_events(&mut app, "run-w", role_names::CODING_ORCHESTRATOR, 40);
         let lines = live_segment_lines(&app, "run-w")?;
         assert!(
             lines.iter().any(|line| line.contains("lines above")),

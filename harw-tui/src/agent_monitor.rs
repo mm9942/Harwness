@@ -4139,13 +4139,7 @@ mod tests {
         let id = SessionId::try_from_str("a1")?;
         let detail_area = Rect::new(0, 0, 72, 16);
         let mut detail_buf = Buffer::empty(detail_area);
-        monitor.render_agent_detail(
-            &id,
-            detail_area,
-            &mut detail_buf,
-            &ChatScroll::new(),
-            true,
-        );
+        monitor.render_agent_detail(&id, detail_area, &mut detail_buf, &ChatScroll::new(), true);
         let detail = buffer_rows(&detail_buf).join("\n");
         assert!(detail.contains("∴ Prüfe zuerst die DoD"), "{detail}");
         assert!(detail.contains("Validator ist geprüft"), "{detail}");
