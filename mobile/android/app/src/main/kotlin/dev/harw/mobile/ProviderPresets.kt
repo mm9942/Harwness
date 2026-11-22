@@ -26,7 +26,8 @@ internal data class ProviderPreset(
         get() = when (api) {
             "anthropic-messages" -> ProviderKind.ANTHROPIC
             "openai-responses" -> ProviderKind.OPEN_AI
-            "openai-chat", "bedrock-chat", "vertex-openai" -> ProviderKind.OPEN_AI_COMPATIBLE
+            // Azure-v1-Endpunkte (/openai/v1) nehmen den Ressourcenschluessel auch als Bearer-Token an.
+            "openai-chat", "bedrock-chat", "vertex-openai", "azure-openai-chat", "azure-foundry-chat" -> ProviderKind.OPEN_AI_COMPATIBLE
             else -> null
         }
 

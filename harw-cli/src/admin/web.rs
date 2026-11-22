@@ -1020,7 +1020,16 @@ pub(super) fn serve(home: &std::path::Path, config: &ResolvedConfig) -> Result<(
     let totp_secret = match &account.totp_secret_ref {
         None => None,
         Some(reference) => {
-            let sealed = crate::secret_store::resolve_sealed(home, config, reference)?;
+            let sealed = if let Some(name) = reference.strip_prefix(super::TOTP_FILE_REF_PREFIX) {
+                if name != super::TOTP_SEED_FILE {
+                    return Err("TOTP-Referenz ist ungueltig".to_owned());
+                }
+                let text = std::fs::read_to_string(super::account::admin_dir(home).join(name))
+                    .map_err(|_| "TOTP-Datei ist nicht lesbar".to_owned())?;
+                secrecy::SecretString::from(text.trim().to_owned())
+            } else {
+                crate::secret_store::resolve_sealed(home, config, reference)?
+            };
             let bytes = totp::from_base32(secrecy::ExposeSecret::expose_secret(&sealed))
                 .ok_or_else(|| "versiegeltes TOTP-Geheimnis ist unlesbar".to_owned())?;
             Some(Zeroizing::new(bytes))

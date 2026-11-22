@@ -186,12 +186,28 @@ fn passwd(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Datei fuer das TOTP-Geheimnis, wenn der Secret-Store nicht nutzbar ist.
+pub(crate) const TOTP_SEED_FILE: &str = "totp.seed";
+/// Praefix einer Datei-Referenz in `Account::totp_secret_ref`.
+pub(crate) const TOTP_FILE_REF_PREFIX: &str = "file:";
+
+/// Loescht ein TOTP-Geheimnis, egal ob versiegelt oder in einer Datei.
+fn discard_totp_ref(home: &Path, config: &ResolvedConfig, reference: &str) {
+    if let Some(name) = reference.strip_prefix(TOTP_FILE_REF_PREFIX) {
+        if name == TOTP_SEED_FILE {
+            let _ = std::fs::remove_file(account::admin_dir(home).join(name));
+        }
+        return;
+    }
+    crate::secret_store::discard_sealed(home, config, reference);
+}
+
 fn totp_cmd(home: &Path, config: &ResolvedConfig, disable: bool) -> Result<(), String> {
     let mut account = Account::load(home)?
         .ok_or_else(|| "Kein Admin-Konto vorhanden: zuerst `harw admin init`.".to_owned())?;
     if disable {
         if let Some(reference) = account.totp_secret_ref.take() {
-            crate::secret_store::discard_sealed(home, config, &reference);
+            discard_totp_ref(home, config, &reference);
         }
         account.totp_last_step = 0;
         account.save(home)?;
@@ -217,21 +233,37 @@ fn setup_totp(home: &Path, config: &ResolvedConfig, account: &mut Account) -> Re
     let step = totp::verify(&secret, &code, account::now_unix(), 0)
         .ok_or_else(|| "Code falsch; TOTP wurde nicht aktiviert.".to_owned())?;
     let sealed = SecretString::from(totp::base32(&secret));
-    let reference = crate::secret_store::store_secret(
+    let (reference, in_store) = match crate::secret_store::store_secret(
         home,
         config,
         "admin-totp",
         "admin-web-totp",
         &sealed,
-    )?
-    .as_ref_string();
+    ) {
+        Ok(stored) => (stored.as_ref_string(), true),
+        Err(error) => {
+            // Rueckfall: Der Secret-Store (z. B. AuthHub-Schluessel) ist nicht nutzbar.
+            // Das Geheimnis liegt dann in einer eigenen Datei, nur fuer den Besitzer lesbar
+            // (wie bei Linux-PAM-TOTP), im selben Verzeichnis wie das Passwort-Hash-Konto.
+            eprintln!("Hinweis: Secret-Store nicht nutzbar ({error}); TOTP-Geheimnis wird in {} abgelegt.", account::admin_dir(home).join(TOTP_SEED_FILE).display());
+            account::ensure_admin_dir(home)?;
+            account::write_private_atomic(
+                &account::admin_dir(home).join(TOTP_SEED_FILE),
+                totp::base32(&secret).as_bytes(),
+            )?;
+            (format!("{TOTP_FILE_REF_PREFIX}{TOTP_SEED_FILE}"), false)
+        }
+    };
     if let Some(old) = account.totp_secret_ref.replace(reference) {
-        crate::secret_store::discard_sealed(home, config, &old);
+        discard_totp_ref(home, config, &old);
     }
     account.totp_last_step = step;
     account.save(home)?;
     audit::record(home, "admin_totp_enabled", "cli", serde_json::json!({}));
-    println!("TOTP aktiviert (Geheimnis versiegelt im Secret-Store).");
+    println!(
+        "TOTP aktiviert ({}).",
+        if in_store { "Geheimnis versiegelt im Secret-Store" } else { "Geheimnis in Datei mit Modus 0600" }
+    );
     Ok(())
 }
 
