@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::time::Duration;
 
 use harw_node_transport::{LocalNode, NodeBody, empty_body};
@@ -10,7 +10,7 @@ use harw_protocol::session_wire::{
     InterruptParams, RespondResult, StreamProfile, SubmitParams, SubmitResult, features,
 };
 use harw_protocol::{PortError, SessionPort};
-use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError, RemotePort};
+use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError};
 use harw_types::{ApprovalId, SessionId, TurnId};
 use http::Method;
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -18,14 +18,17 @@ use tokio::sync::{Semaphore, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+use crate::backend::{Backend, BackendKind};
 use crate::identity::{ValidatedProfile, restore_identity};
+use crate::listener::{CoreListener, Notifier};
+use crate::local::{LOCAL_HOST_UNAVAILABLE, open_local};
 use crate::projection::{FrameAction, SessionState, SessionWorker};
 use crate::provider::request_provider;
 use crate::{
     ApprovalDecision, ApprovalOutcome, ApprovalReceipt, ChatgptProviderCredential,
     ChatgptProviderStatus, ConnectionPhase, ConnectionRoute, ConnectionStatus, DeviceEnrollment,
-    MobileError, MobileSession, RoutePreference, ServerProfile, SessionCursor, SessionSnapshot,
-    SubmitOutcome, SubmitReceipt,
+    HostKind, HostRef, MobileError, MobileSession, PlatformKeystore, RoutePreference,
+    ServerProfile, SessionCursor, SessionSnapshot, SubmitOutcome, SubmitReceipt,
 };
 
 pub(crate) mod route;
@@ -38,6 +41,9 @@ const MAX_PROCESS_SUBMISSIONS: usize = 8192;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_ATTEMPTS: u32 = 8;
+/// Polls of the previous on-device host while it stops (5 s in total).
+const LOCAL_STOP_POLLS: u32 = 100;
+const LOCAL_STOP_POLL: Duration = Duration::from_millis(50);
 
 #[derive(uniffi::Object)]
 pub struct MobileCore {
@@ -53,6 +59,8 @@ struct Shared {
     dialer: Dialer,
     /// Ends a running backoff pause early when the network returns.
     wake: tokio::sync::Notify,
+    /// Pushes change signals to the platform listener.
+    notifier: Notifier,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +90,14 @@ impl Shared {
     fn state(&self) -> MutexGuard<'_, CoreState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Signals a connection change: status plus every open session.
+    fn notify_link(&self, state: &CoreState) {
+        self.notifier.status();
+        for id in state.sessions.keys() {
+            self.notifier.session(id.as_str());
+        }
+    }
 }
 
 struct CoreState {
@@ -99,6 +115,8 @@ struct CoreState {
     attempt: u32,
     next_retry_at_ms: Option<u64>,
     retryable_failure: bool,
+    /// The last on-device link; it must be gone before a new one opens.
+    last_local: Weak<Link>,
 }
 
 impl Default for CoreState {
@@ -118,6 +136,7 @@ impl Default for CoreState {
             attempt: 0,
             next_retry_at_ms: None,
             retryable_failure: false,
+            last_local: Weak::new(),
         }
     }
 }
@@ -176,7 +195,8 @@ impl CoreState {
         self.sessions.clear();
     }
 
-    fn apply_pending_revocation(&mut self) {
+    /// Applies a revocation the link reported; returns whether it did.
+    fn apply_pending_revocation(&mut self) -> bool {
         let revocation = self.link.as_ref().and_then(|link| {
             link.failure
                 .borrow()
@@ -186,6 +206,9 @@ impl CoreState {
         });
         if let Some(detail) = revocation {
             self.revoke(detail);
+            true
+        } else {
+            false
         }
     }
 }
@@ -202,7 +225,7 @@ enum SubmissionState {
 }
 
 struct Link {
-    port: RemotePort,
+    backend: Backend,
     stop: CancellationToken,
     failure: watch::Sender<Option<LinkIssue>>,
     attaching: Semaphore,
@@ -349,7 +372,10 @@ impl MobileCore {
 
     pub fn disconnect(&self) {
         let mut state = self.shared.state();
-        state.apply_pending_revocation();
+        if state.apply_pending_revocation() {
+            self.shared.notifier.status();
+            self.shared.notifier.sessions();
+        }
         if state.phase == ConnectionPhase::Revoked {
             return;
         }
@@ -358,6 +384,7 @@ impl MobileCore {
         state.detail = None;
         state.next_retry_at_ms = None;
         state.retryable_failure = false;
+        self.shared.notify_link(&state);
     }
 
     /// Signals that the platform reports a usable network again.
@@ -365,7 +392,7 @@ impl MobileCore {
     pub fn network_available(&self) -> Result<(), MobileError> {
         let action = {
             let mut state = self.shared.state();
-            state.apply_pending_revocation();
+            let revoked = state.apply_pending_revocation();
             let action = network_action(
                 state.phase,
                 state.run.as_ref().is_some_and(|run| !run.is_cancelled()),
@@ -374,6 +401,9 @@ impl MobileCore {
             if action == NetworkAction::WakeBackoff {
                 state.attempt = 0;
                 state.next_retry_at_ms = None;
+            }
+            if revoked || action != NetworkAction::Ignore {
+                self.shared.notifier.status();
             }
             action
         };
@@ -401,6 +431,7 @@ impl MobileCore {
     /// Selects the route preference used by the next connect or reconnect.
     pub fn set_route_preference(&self, preference: RoutePreference) {
         self.shared.state().route_preference = preference;
+        self.shared.notifier.status();
     }
 
     pub fn status(&self) -> ConnectionStatus {
@@ -408,12 +439,15 @@ impl MobileCore {
         // held while Tor starts, which must never stall state operations.
         let tor = self.shared.dialer.tor_status();
         let mut state = self.shared.state();
-        state.apply_pending_revocation();
+        if state.apply_pending_revocation() {
+            self.shared.notifier.status();
+            self.shared.notifier.sessions();
+        }
         let profile = state.profile.as_ref().map(|profile| &profile.profile);
         let active_caps = state
             .active()
             .ok()
-            .map(|link| link.port.connection().hello_ack().granted);
+            .map(|link| link.backend.granted());
         let phase = if state.phase == ConnectionPhase::Connected && active_caps.is_none() {
             ConnectionPhase::Reconnecting
         } else {
@@ -453,7 +487,7 @@ impl MobileCore {
         let link = self.shared.state().active()?;
         self.run(async move {
             Ok(link
-                .request(link.port.list())
+                .request(link.backend.port().list())
                 .await?
                 .into_iter()
                 .map(Into::into)
@@ -463,17 +497,20 @@ impl MobileCore {
 
     pub fn create_session(&self, title: Option<String>) -> Result<MobileSession, MobileError> {
         let link = self.shared.state().active()?;
-        if !link.port.connection().hello_ack().granted.steer {
+        if !link.backend.granted().steer {
             return Err(MobileError::Denied {
                 detail: "This device cannot create sessions".into(),
             });
         }
+        let shared = Arc::clone(&self.shared);
         self.run(async move {
             let params = CreateParams {
                 workspace: None,
                 title,
             };
-            link.request(link.port.create(params)).await.map(Into::into)
+            let created = link.request(link.backend.port().create(params)).await?;
+            shared.notifier.sessions();
+            Ok(created.into())
         })
     }
 
@@ -506,7 +543,9 @@ impl MobileCore {
             if session.worker.is_none() {
                 start_attachment(&shared, session, id.clone(), link);
             }
-            Ok(session.snapshot(&id, true))
+            let snapshot = session.snapshot(&id, true);
+            shared.notifier.session(id.as_str());
+            Ok(snapshot)
         })
     }
 
@@ -526,6 +565,7 @@ impl MobileCore {
                     return Ok(());
                 };
                 state.detaching.insert(id.clone());
+                shared.notifier.session(id.as_str());
                 (session, state.active().ok(), state.profile_epoch)
             };
             if let Some(worker) = session.worker {
@@ -535,12 +575,13 @@ impl MobileCore {
                 let _ = worker.task.await;
             }
             let result = match link {
-                Some(link) => link.request(link.port.detach(id.clone())).await,
+                Some(link) => link.request(link.backend.port().detach(id.clone())).await,
                 None => Ok(()),
             };
             let mut state = shared.state();
             if state.profile_epoch == profile_epoch {
                 state.detaching.remove(&id);
+                shared.notifier.session(id.as_str());
             }
             result
         })
@@ -582,7 +623,7 @@ impl MobileCore {
                 session_id: id,
                 turn_id: Some(turn_id),
             };
-            link.request(link.port.interrupt(params)).await
+            link.request(link.backend.port().interrupt(params)).await
         })
     }
 
@@ -604,10 +645,11 @@ impl MobileCore {
                 state
                     .session_mut(&id)?
                     .begin_decision(&approval, decision)?;
+                shared.notifier.session(id.as_str());
                 link
             };
             let result = link
-                .request(link.port.respond(ApprovalRespondParams {
+                .request(link.backend.port().respond(ApprovalRespondParams {
                     request_id: approval.clone(),
                     decision,
                     reason: None,
@@ -625,6 +667,7 @@ impl MobileCore {
                             | RespondResult::Expired)
                     );
                     session.finish_decision(&approval, remove);
+                    shared.notifier.session(id.as_str());
                 }
             }
             let (outcome, detail) = match result? {
@@ -637,6 +680,123 @@ impl MobileCore {
             };
             Ok(ApprovalReceipt { outcome, detail })
         })
+    }
+
+    /// Registers the listener that hears pushed change signals.
+    pub fn set_listener(&self, listener: Arc<dyn CoreListener>) {
+        self.shared.notifier.set(listener);
+    }
+
+    /// Removes the listener; it is never called again once this returns.
+    pub fn clear_listener(&self) {
+        self.shared.notifier.clear();
+    }
+
+    /// Switches from any server to the on-device host kept under `files_dir`.
+    pub fn connect_local(
+        &self,
+        files_dir: String,
+        keystore: Arc<dyn PlatformKeystore>,
+    ) -> Result<(), MobileError> {
+        if !cfg!(feature = "local-host") {
+            return Err(MobileError::Session {
+                detail: LOCAL_HOST_UNAVAILABLE.into(),
+            });
+        }
+        let shared = Arc::clone(&self.shared);
+        self.run(async move {
+            let run = {
+                let mut state = shared.state();
+                let _ = state.apply_pending_revocation();
+                state.stop("Switching to the on-device host");
+                state.profile = None;
+                state.profile_epoch = state.profile_epoch.wrapping_add(1);
+                state.sessions.clear();
+                state.detaching.clear();
+                state.submissions.clear();
+                let run = CancellationToken::new();
+                state.run = Some(run.clone());
+                state.phase = ConnectionPhase::Connecting;
+                state.detail = Some("Starting the on-device host".into());
+                state.attempt = 0;
+                state.next_retry_at_ms = None;
+                state.retryable_failure = false;
+                state.route = None;
+                shared.notify_link(&state);
+                shared.notifier.sessions();
+                run
+            };
+            let mut polls = 0_u32;
+            loop {
+                let stopping = shared.state().last_local.strong_count() > 0;
+                if run.is_cancelled() {
+                    return Err(MobileError::Disconnected);
+                }
+                if !stopping {
+                    break;
+                }
+                if polls >= LOCAL_STOP_POLLS {
+                    let detail = "the previous on-device host is still stopping";
+                    fail_local(&shared, &run, detail.into());
+                    return Err(session_error(detail));
+                }
+                polls += 1;
+                tokio::time::sleep(LOCAL_STOP_POLL).await;
+            }
+            let backend =
+                match open_local(PathBuf::from(files_dir), keystore, requested_features()).await {
+                    Ok(backend) => backend,
+                    Err(error) => {
+                        fail_local(&shared, &run, error.to_string());
+                        return Err(error);
+                    }
+                };
+            let (link, failure_rx) = {
+                let mut state = shared.state();
+                if run.is_cancelled() {
+                    return Err(MobileError::Disconnected);
+                }
+                let (failure, failure_rx) = watch::channel(None);
+                let link = Arc::new(Link {
+                    backend,
+                    stop: run.child_token(),
+                    failure,
+                    attaching: Semaphore::new(4),
+                });
+                state.link = Some(Arc::clone(&link));
+                state.last_local = Arc::downgrade(&link);
+                state.phase = ConnectionPhase::Connected;
+                state.route = None;
+                state.detail = Some("On-device host".into());
+                state.attempt = 0;
+                state.next_retry_at_ms = None;
+                state.retryable_failure = false;
+                shared.notifier.status();
+                shared.notifier.sessions();
+                (link, failure_rx)
+            };
+            tokio::spawn(supervise_local(Arc::clone(&shared), link, failure_rx, run));
+            Ok(())
+        })
+    }
+
+    /// The host the phone currently talks to, if any.
+    pub fn active_host(&self) -> Option<HostRef> {
+        let state = self.shared.state();
+        match state.active() {
+            Ok(link) if link.backend.kind() == BackendKind::Local => Some(HostRef {
+                id: "local".into(),
+                kind: HostKind::Local,
+                label: "Phone".into(),
+                reachable: true,
+            }),
+            active => state.profile.as_ref().map(|profile| HostRef {
+                id: "remote".into(),
+                kind: HostKind::Server,
+                label: profile.profile.label.clone(),
+                reachable: active.is_ok(),
+            }),
+        }
     }
 }
 
@@ -700,7 +860,10 @@ impl MobileCore {
             let explicit_reconnect = profile.is_none();
             let (run, profile) = {
                 let mut state = shared.state();
-                state.apply_pending_revocation();
+                if state.apply_pending_revocation() {
+                    shared.notifier.status();
+                    shared.notifier.sessions();
+                }
                 let profile = profile.or_else(|| state.profile.clone()).ok_or_else(|| {
                     MobileError::InvalidProfile {
                         detail: "Select a server profile before connecting".into(),
@@ -718,6 +881,7 @@ impl MobileCore {
                     .is_some_and(|old| old.same_authority(&profile));
                 if same_profile && !explicit_reconnect && state.active().is_ok() {
                     state.profile = Some(profile);
+                    shared.notifier.status();
                     return Ok(());
                 }
                 state.stop("Connection is being restarted");
@@ -739,6 +903,10 @@ impl MobileCore {
                 state.attempt = 0;
                 state.next_retry_at_ms = None;
                 state.retryable_failure = false;
+                shared.notify_link(&state);
+                if !same_profile {
+                    shared.notifier.sessions();
+                }
                 (run, profile)
             };
             let (first_tx, first_rx) = oneshot::channel();
@@ -799,6 +967,7 @@ async fn drive_connection(
                 state.attempt = retry;
                 state.next_retry_at_ms =
                     Some(now_ms().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64));
+                shared.notifier.status();
             }
             let woken = tokio::select! {
                 () = run.cancelled() => break,
@@ -815,6 +984,7 @@ async fn drive_connection(
             }
             state.attempt = retry;
             state.next_retry_at_ms = None;
+            shared.notifier.status();
         } else if run.is_cancelled() {
             break;
         }
@@ -840,6 +1010,7 @@ async fn drive_connection(
                 state.phase = ConnectionPhase::Failed;
                 state.retryable_failure = false;
                 state.next_retry_at_ms = None;
+                shared.notifier.status();
                 if let Some(first) = first.take() {
                     let _ = first.send(Err(MobileError::Connect { detail }));
                 }
@@ -850,7 +1021,11 @@ async fn drive_connection(
         let mut connected = None;
         let mut cancelled = false;
         for route in routes {
-            shared.state().route = Some(route);
+            {
+                let mut state = shared.state();
+                state.route = Some(route);
+                shared.notifier.status();
+            }
             let attempt = run
                 .run_until_cancelled(shared.dialer.connect_session(
                     route,
@@ -890,6 +1065,7 @@ async fn drive_connection(
                     break;
                 }
                 state.detail = Some(detail.clone());
+                shared.notifier.status();
                 if first.is_some() || kind != DialFailure::Retry || retry >= MAX_RECONNECT_ATTEMPTS
                 {
                     state.phase = ConnectionPhase::Failed;
@@ -907,7 +1083,7 @@ async fn drive_connection(
         };
         let (failure, failure_rx) = watch::channel(None);
         let link = Arc::new(Link {
-            port: RemotePort::new(connection),
+            backend: Backend::remote(connection),
             stop: run.child_token(),
             failure,
             // Bulk reattachment leaves request capacity for user actions.
@@ -927,6 +1103,8 @@ async fn drive_connection(
             for (id, session) in &mut state.sessions {
                 start_attachment(&shared, session, id.clone(), Arc::clone(&link));
             }
+            shared.notifier.status();
+            shared.notifier.sessions();
         }
         if let Some(first) = first.take() {
             let _ = first.send(Ok(()));
@@ -942,6 +1120,8 @@ async fn drive_connection(
             }
             if issue.disposition == LinkDisposition::Revoked {
                 state.revoke(issue.detail);
+                shared.notifier.status();
+                shared.notifier.sessions();
                 return;
             }
             state.clear_link(&issue.detail);
@@ -950,9 +1130,11 @@ async fn drive_connection(
                 state.phase = ConnectionPhase::Failed;
                 state.retryable_failure = false;
                 state.next_retry_at_ms = None;
+                shared.notify_link(&state);
                 return;
             }
             state.phase = ConnectionPhase::Reconnecting;
+            shared.notify_link(&state);
         }
         if let LinkDisposition::Retry(retry_after) = issue.disposition {
             delay = retry_delay(0, entropy).max(retry_after);
@@ -1097,14 +1279,57 @@ async fn monitor_connection(
                 }
             }
             () = tokio::time::sleep(PROBE_INTERVAL) => {
-                // The existing RemotePort owns the socket, so a read-only
+                // The remote port owns the socket, so a read-only
                 // probe also detects disconnects with no session attached.
-                if let Err(MobileError::Session { detail }) = link.request(link.port.list()).await {
+                if let Err(MobileError::Session { detail }) = link.request(link.backend.port().list()).await {
                     link.fail(LinkIssue::protocol(detail));
                 }
             }
         }
     }
+}
+
+/// Marks a failed on-device start, unless the run was replaced meanwhile.
+fn fail_local(shared: &Shared, run: &CancellationToken, detail: String) {
+    let mut state = shared.state();
+    if run.is_cancelled() {
+        return;
+    }
+    run.cancel();
+    state.run = None;
+    state.phase = ConnectionPhase::Failed;
+    state.detail = Some(detail);
+    state.retryable_failure = false;
+    state.next_retry_at_ms = None;
+    shared.notifier.status();
+}
+
+/// Watches the on-device link; a failure is final and never reconnects.
+async fn supervise_local(
+    shared: Arc<Shared>,
+    link: Arc<Link>,
+    failure: watch::Receiver<Option<LinkIssue>>,
+    run: CancellationToken,
+) {
+    let issue = monitor_connection(&link, failure, &run).await;
+    drop(link);
+    let Some(issue) = issue else {
+        return;
+    };
+    let mut state = shared.state();
+    if run.is_cancelled() {
+        return;
+    }
+    state.clear_link(&issue.detail);
+    if let Some(active) = state.run.take() {
+        active.cancel();
+    }
+    state.route = None;
+    state.phase = ConnectionPhase::Failed;
+    state.detail = Some(issue.detail);
+    state.retryable_failure = false;
+    state.next_retry_at_ms = None;
+    shared.notify_link(&state);
 }
 
 fn retry_delay(attempt: u32, entropy: u64) -> Duration {
@@ -1146,7 +1371,8 @@ fn start_attachment(
     link: Arc<Link>,
 ) {
     session.begin_attach("Attaching to session");
-    let from = session.resume(link.port.connection().hello_ack().host_epoch);
+    shared.notifier.session(id.as_str());
+    let from = session.resume(link.backend.host_epoch());
     let stop = link.stop.child_token();
     let task = tokio::spawn(drive_attachment(
         Arc::clone(shared),
@@ -1176,10 +1402,10 @@ async fn drive_attachment(
             // from the live ring or its snapshot: compact replay can merge an
             // already seen delta and a new delta into the same envelope.
             from: from.map(|cursor| Cursor { live: 0, ..cursor }),
-            profile: attach_profile(&link.port.connection().hello_ack().features),
+            profile: attach_profile(link.backend.features()),
             tail_items: DEFAULT_TAIL_ITEMS,
         };
-        let (mut ack, mut source) = match link.request(link.port.attach(params)).await {
+        let (mut ack, mut source) = match link.request(link.backend.port().attach(params)).await {
             Ok(attachment) => attachment,
             Err(error) => {
                 end_attachment(&shared, &id, &link, &error.to_string());
@@ -1189,7 +1415,7 @@ async fn drive_attachment(
         drop(permit);
         ack.granted = ack
             .granted
-            .intersect(link.port.connection().hello_ack().granted);
+            .intersect(link.backend.granted());
         if with_session(&shared, &id, &link, |session| {
             session.attached(&ack, from.is_none())
         })
@@ -1268,7 +1494,7 @@ async fn drive_attachment(
             );
             return;
         }
-        if let Err(error) = link.request(link.port.detach(id.clone())).await {
+        if let Err(error) = link.request(link.backend.port().detach(id.clone())).await {
             end_attachment(&shared, &id, &link, &error.to_string());
             return;
         }
@@ -1286,7 +1512,11 @@ fn with_session<T>(
     if !state.same_link(link) {
         return None;
     }
-    state.sessions.get_mut(id).map(operation)
+    let result = state.sessions.get_mut(id).map(operation);
+    if result.is_some() {
+        shared.notifier.session(id.as_str());
+    }
+    result
 }
 
 fn end_attachment(shared: &Shared, id: &SessionId, link: &Arc<Link>, detail: &str) {
@@ -1336,7 +1566,7 @@ async fn submit(
         (link, head, state.profile_epoch)
     };
     let result = link
-        .request(link.port.submit(SubmitParams {
+        .request(link.backend.port().submit(SubmitParams {
             session_id: id.clone(),
             text: text.clone(),
             expect_head: head,
@@ -1368,6 +1598,7 @@ async fn submit(
                 && let Ok(session) = state.session_mut(&id)
             {
                 session.echo_prompt(&id, displayed, &client_message_id, text);
+                shared.notifier.session(id.as_str());
             }
             let keep = match &result {
                 Ok(receipt) if receipt.outcome == SubmitOutcome::Accepted => {

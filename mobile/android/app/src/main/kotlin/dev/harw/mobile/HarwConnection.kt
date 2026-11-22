@@ -208,6 +208,7 @@ internal class HarwConnection(private val context: Context) {
     private val opened = mutableSetOf<String>()
     private val detachJobs = mutableMapOf<String, Job>()
     private val detaching = mutableSetOf<String>()
+    private val events = CoreEvents()
 
     init {
         loadSavedSetup()
@@ -825,13 +826,13 @@ internal class HarwConnection(private val context: Context) {
                 applyStatus(status)
                 if (status.phase in setOf(ConnectionPhase.DISCONNECTED, ConnectionPhase.FAILED, ConnectionPhase.REVOKED)) break
                 if (status.phase == ConnectionPhase.CONNECTED) refreshWindows(native, request)
-                delay(200)
+                events.awaitStatus(1_000)
             }
         }
         listLoop = scope.launch {
             while (isActive && request == lifecycle && state.value.hasConnection) {
                 refreshSessions()
-                delay(3_000)
+                events.awaitSessions(3_000)
             }
         }
     }
@@ -935,7 +936,7 @@ internal class HarwConnection(private val context: Context) {
             commands.coroutineContext[Job]?.children?.toList()?.joinAll()
             val native = coreLock.withLock { core.also { core = null } }
             val disposalFailed = try {
-                withContext(Dispatchers.IO) { native?.destroy() }
+                withContext(Dispatchers.IO) { native?.let { it.clearListener(); it.destroy() } }
                 false
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
@@ -975,6 +976,7 @@ internal class HarwConnection(private val context: Context) {
             }
             try {
                 val native = MobileCore(privateKey, DeviceLabel)
+                native.setListener(events)
                 try {
                     native.setTorDirectories(File(context.noBackupFilesDir, "tor/state").path, File(context.cacheDir, "tor").path)
                 } catch (error: MobileException) {

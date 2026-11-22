@@ -1,6 +1,6 @@
 # Android native interface
 
-The generated Kotlin package is `uniffi.harw_mobile_ffi` and its native library is `libharw_mobile_ffi.so`. Keep one `MobileCore` per app process. Methods are synchronous. Invoke them on `Dispatchers.IO`, including identity generation, and poll `status()` and `snapshot()` to render immutable typed records. The Rust runtime receives events independently of polling.
+The generated Kotlin package is `uniffi.harw_mobile_ffi` and its native library is `libharw_mobile_ffi.so`. Keep one `MobileCore` per app process. Methods are synchronous. Invoke them on `Dispatchers.IO`, including identity generation, and render immutable typed records. The Rust runtime receives events independently of the app. The app may register `setListener(CoreListener)` for push hints and still reads all state through `status()`, `snapshot()` and `listSessions()`.
 
 ## Kotlin methods
 
@@ -30,6 +30,10 @@ class MobileCore(privateKey: ByteArray, label: String) {
     fun decide(sessionId: String, approvalId: String, decision: ApprovalDecision): ApprovalReceipt
     fun setTorDirectories(stateDir: String, cacheDir: String)
     fun setRoutePreference(preference: RoutePreference)
+    fun setListener(listener: CoreListener)
+    fun clearListener()
+    fun connectLocal(filesDir: String, keystore: PlatformKeystore)
+    fun activeHost(): HostRef?
 }
 ```
 
@@ -55,6 +59,86 @@ Capture the displayed `head` and a fresh UUID when the user submits a draft. Reu
 
 Tor is only a transport. The pinned ML-DSA-65 handshake, `session.hello` and device enrollment still decide access. Reaching a `.onion` address grants nothing. Onion dial timeouts are 120 s for Tor including cold bootstrap, 30 s for the node handshake, and 60 s for upgrade plus hello. The arti library may terminate the app process when the Tor network starts requiring protocol features that this build lacks. This is a known limit of the MVP. Update the app when that happens. On the next start, the onion route fails with an outdated-build error, and the user should update the app.
 
+## Change notifications
+
+```kotlin
+interface CoreListener {
+    fun statusChanged()
+    fun sessionsChanged()
+    fun sessionChanged(sessionId: String)
+}
+```
+
+Register one listener with `setListener`. It is immediately told that status and sessions may have changed. Calls are hints, not data: read the new state with `status()`, `listSessions()` and `snapshot(sessionId)`.
+
+- Calls come from one dedicated native thread named `harw-mobile-notify`, never under a core lock.
+- Calls are coalesced (about 20 ms), so one call can stand for several changes.
+- A callback must return quickly and never throw. Hand work to a coroutine.
+- A callback may call `MobileCore` afterwards on its own thread, including `clearListener()`.
+
+After `clearListener()` returns, the listener is never called again. Call `clearListener()` before `destroy()`.
+
+## On-device host
+
+`connectLocal(filesDir, keystore)` stops the remote connection, clears the profile and the session caches, and connects to the in-process host. `filesDir` is an absolute app-private directory. Status then shows phase `CONNECTED`, `route` null, `detail` "On-device host", and `label`, `endpoint` and `nodeId` null. A failure of the local host gives `FAILED` with no automatic retry.
+
+In builds without the local host it throws `MobileException.Session` "the on-device host is not available in this build" and leaves the current connection alone. If the previous on-device host is still stopping, it throws `MobileException.Session` "the previous on-device host is still stopping".
+
+`activeHost()` returns `HostRef(id = "local", kind = LOCAL, label = "Phone", reachable = true)` for the on-device host, `HostRef(id = "remote", kind = SERVER, label = <profile label>, reachable = <link active>)` while a profile is set, and `null` otherwise.
+
+## Local models
+
+```kotlin
+fun modelCatalog(): List<CatalogModel>
+fun localModels(modelsDir: String): List<LocalModel>
+fun finalizeModel(modelsDir: String, modelId: String): LocalModel
+fun deleteModel(modelsDir: String, modelId: String)
+```
+
+`modelsDir` must be absolute, else `MobileException.Internal` "models directory must be absolute". The core creates it with mode 0700. The catalog is fixed and ordered. Each model has the final file `<fileName>` and the partial download `<fileName>.part` in `modelsDir`. The app downloads into the `.part` file.
+
+`localModels` returns one entry per catalog model, in catalog order. `Complete` means the final file has exactly `sizeBytes`. `Invalid` means the final file has another length. Otherwise `Partial` (with `bytesOnDisk` the `.part` length) or `Missing`.
+
+`finalizeModel` needs a `.part` file of exactly `sizeBytes`. It checks SHA-256 and renames it to the final name, returning `Complete`. Failures throw `MobileException.Session`: "model file failed verification" (the `.part` file is deleted), "model download is incomplete", "unknown model". `deleteModel` removes both files and succeeds when they are missing.
+
+## Device tools
+
+```kotlin
+fun deviceLimits(): DeviceLimits
+fun checkShellRequest(request: ShellRequest): ShellRequest
+fun normalizeDevicePath(path: String): String
+
+interface ShellExecutor {
+    fun available(): Boolean
+    fun run(request: ShellRequest): ShellOutput
+}
+
+interface FileAccess {
+    fun roots(): List<SafRoot>
+    fun list(rootId: String, path: String): List<SafEntry>
+    fun read(rootId: String, path: String, maxBytes: ULong): ByteArray
+    fun write(rootId: String, path: String, data: ByteArray)
+}
+```
+
+The foreign interfaces throw `DeviceException`. `FileAccess.write` is create-only: an existing file throws `DeviceException.Exists`. The Termux shell tool is off by default: SharedPreferences `harw_device_tools`, key `termux_shell_enabled`, default false. While off, `run` throws `Disabled`.
+
+`DeviceException` variants: `Disabled`, `Unavailable(detail)`, `Declined`, `TimedOut`, `Invalid(detail)`, `InvalidPath(detail)`, `NotFound`, `Exists`, `TooLarge`, `Failed(detail)`.
+
+`checkShellRequest` returns the request with limits applied, or throws. Empty argv gives `Invalid` "empty command". More than 64 arguments gives "too many arguments". An empty first argument, or any argument over 4096 bytes or with a NUL, gives "invalid argument". `cwd` follows the path rules or is absolute under `/data/data/com.termux/files/`, else `InvalidPath` "working directory outside Termux home". `timeoutMs` 0 becomes 30000 and is capped at 120000. `maxOutputBytes` 0 or above 65536 becomes 65536.
+
+Path rules (`normalizeDevicePath`, mirrored in Kotlin as `normalizeSafPath`): paths are relative and `/`-separated, one trailing `/` is stripped, and `""` is the root. Rejected with `InvalidPath`:
+
+| Condition | `detail` |
+| --- | --- |
+| leading `/` | `absolute path` |
+| `\` | `backslash` |
+| NUL | `nul byte` |
+| empty segment | `empty segment` |
+| `.` or `..` segment | `dot segment` |
+| segment over 255 bytes | `segment too long` |
+| path over 1024 bytes | `path too long` |
+
 ## Sign in with ChatGPT
 
 Android completes browser authorization and verifies the ID token, including the nonce for the current attempt. After the user approves the transfer, pass the same immutable server profile used for consent. The Rust bridge checks the active profile and proves the server key again before sending a bounded request to `/v1/provider-link/chatgpt`. The server manages later refreshes. [OpenAI guidance for self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
@@ -72,13 +156,25 @@ Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` respo
 | `TorBootstrap` | `percent: UInt`, `ready: Boolean`, `blocked: String?`, `summary: String` |
 | `MobileSession` | `sessionId: String`, `title: String?`, `state: MobileSessionState`, `attached: UInt`, `updatedAt: String`, `model: String?` |
 | `SessionCursor` | `generation: UInt`, `durable: ULong`, `live: UInt` |
-| `SessionSnapshot` | `sessionId: String`, `head: SessionCursor?`, `online: Boolean`, `canSubmit: Boolean`, `canApprove: Boolean`, `canInterrupt: Boolean`, `runningTurnId: String?`, `transcript: List<TranscriptEntry>`, `liveText: String?`, `approvals: List<MobileApproval>`, `lastFailure: String?`, `lastSyncMillis: Long?`, `detail: String?` |
+| `SessionSnapshot` | `sessionId: String`, `head: SessionCursor?`, `online: Boolean`, `canSubmit: Boolean`, `canApprove: Boolean`, `canInterrupt: Boolean`, `runningTurnId: String?`, `transcript: List<TranscriptEntry>`, `liveText: String?`, `approvals: List<MobileApproval>`, `lastFailure: String?`, `lastSyncMillis: Long?`, `detail: String?`, `agents: List<MobileAgent>`, `jobs: List<MobileJob>`, `reasoning: List<ReasoningLine>`, `finished: List<FinishedCategory>` |
 | `TranscriptEntry` | `id: String`, `kind: TranscriptKind`, `text: String`, `toolState: MobileToolState?` |
 | `MobileApproval` | `id: String`, `summary: String`, `risk: ApprovalRisk`, `requestedAt: String`, `timeoutAt: String`, `decisions: List<ApprovalDecision>` |
 | `SubmitReceipt` | `outcome: SubmitOutcome`, `position: UInt?`, `head: SessionCursor?`, `detail: String?` |
 | `ApprovalReceipt` | `outcome: ApprovalOutcome`, `detail: String?` |
 | `ChatgptProviderCredential` | `clientId: String`, `accessToken: String`, `refreshToken: String`, `idToken: String`, `scope: String`, `expiresAt: ULong`, `earliestRefreshAt: ULong?`, `subject: String`, `email: String?` |
 | `ChatgptProviderStatus` | `linked: Boolean` |
+| `MobileAgent` | `id: String`, `parent: String?`, `role: String`, `model: String?`, `state: MobileAgentState`, `currentTool: String?`, `startedMs: ULong`, `toolCalls: UInt` |
+| `MobileJob` | `workId: String`, `kind: String`, `state: String`, `summary: String?`, `updatedMs: ULong` |
+| `ReasoningLine` | `seq: ULong`, `agent: String`, `role: String`, `kind: ReasoningKind`, `ok: Boolean?`, `text: String` |
+| `FinishedCategory` | `label: String`, `total: UInt`, `ok: UInt`, `failed: UInt`, `cancelled: UInt` |
+| `HostRef` | `id: String`, `kind: HostKind`, `label: String`, `reachable: Boolean` |
+| `CatalogModel` | `id: String`, `label: String`, `repo: String`, `revision: String`, `fileName: String`, `url: String`, `sizeBytes: ULong`, `sha256: String`, `minRamBytes: ULong`, `recommended: Boolean` |
+| `LocalModel` | `id: String`, `fileName: String`, `state: ModelFileState`, `bytesOnDisk: ULong`, `sizeBytes: ULong` |
+| `DeviceLimits` | `maxArgs: UInt`, `maxArgBytes: UInt`, `defaultTimeoutMs: ULong`, `maxTimeoutMs: ULong`, `maxOutputBytes: UInt`, `maxReadBytes: ULong`, `maxWriteBytes: ULong`, `maxPathBytes: UInt` |
+| `ShellRequest` | `argv: List<String>`, `cwd: String?`, `timeoutMs: ULong`, `maxOutputBytes: UInt` |
+| `ShellOutput` | `exitCode: Int?`, `stdout: String`, `stderr: String`, `truncated: Boolean`, `timedOut: Boolean` |
+| `SafRoot` | `id: String`, `label: String`, `writable: Boolean` |
+| `SafEntry` | `name: String`, `path: String`, `isDir: Boolean`, `sizeBytes: ULong`, `modifiedMs: Long?` |
 
 | Enum | Kotlin values |
 | --- | --- |
@@ -92,8 +188,12 @@ Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` respo
 | `ApprovalOutcome` | `RESOLVED`, `ALREADY_RESOLVED`, `EXPIRED`, `DENIED` |
 | `RoutePreference` | `AUTO`, `ONION`, `DIRECT` |
 | `ConnectionRoute` | `DIRECT`, `ONION` |
+| `MobileAgentState` | `RUNNING`, `WAITING`, `DONE`, `FAILED` |
+| `ReasoningKind` | `THINKING`, `TOOL_START`, `TOOL_END`, `FINISHED` |
+| `HostKind` | `LOCAL`, `SERVER`, `CLOUD` |
+| `ModelFileState` | `MISSING`, `PARTIAL`, `COMPLETE`, `INVALID` |
 
-Fallible methods throw `MobileException`. Variants with `detail: String` are `InvalidIdentity`, `InvalidProfile`, `Connect`, `Session`, `Denied`, `Transport`, `Ambiguous`, and `Internal`. `Disconnected` and `Revoked` carry no fields.
+Fallible methods throw `MobileException`. Variants with `detail: String` are `InvalidIdentity`, `InvalidProfile`, `Connect`, `Session`, `Denied`, `Transport`, `Ambiguous`, and `Internal`. `Disconnected` and `Revoked` carry no fields. Device tools throw `DeviceException` instead.
 
 ## Public documents and identity
 

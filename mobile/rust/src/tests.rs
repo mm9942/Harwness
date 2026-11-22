@@ -904,3 +904,127 @@ async fn direct_preference_never_touches_tor() -> TestResult {
     assert!(status.tor.is_none());
     Ok(())
 }
+
+use std::sync::{Mutex, PoisonError};
+
+#[derive(Default)]
+struct CountingListener {
+    status: AtomicUsize,
+    sessions: AtomicUsize,
+    ids: Mutex<Vec<String>>,
+}
+
+impl CountingListener {
+    fn counts(&self) -> (usize, usize, usize) {
+        let ids = self.ids.lock().unwrap_or_else(PoisonError::into_inner).len();
+        (
+            self.status.load(Ordering::SeqCst),
+            self.sessions.load(Ordering::SeqCst),
+            ids,
+        )
+    }
+
+    fn heard(&self, id: &str) -> bool {
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|heard| heard == id)
+    }
+}
+
+impl CoreListener for CountingListener {
+    fn status_changed(&self) {
+        self.status.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn sessions_changed(&self) {
+        self.sessions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn session_changed(&self, session_id: String) {
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(session_id);
+    }
+}
+
+async fn until(cond: impl Fn() -> bool) -> TestResult {
+    tokio::time::timeout(WAIT, async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "condition not met".into())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_hears_status_and_session_changes() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    let listener = Arc::new(CountingListener::default());
+    fixture.core.set_listener(Arc::clone(&listener) as Arc<dyn CoreListener>);
+    fixture.core.connect(fixture.profile.clone())?;
+    let id = fixture.core.create_session(None)?.session_id;
+    fixture.core.open_session(id.clone())?;
+    wait_for(&fixture.core, &id, |view| view.online).await?;
+    until(|| {
+        let (status, sessions, _) = listener.counts();
+        status > 0 && sessions > 0 && listener.heard(&id)
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_listener_stops_notifications() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    let listener = Arc::new(CountingListener::default());
+    fixture.core.set_listener(Arc::clone(&listener) as Arc<dyn CoreListener>);
+    fixture.core.connect(fixture.profile.clone())?;
+    until(|| listener.counts().0 > 0).await?;
+    fixture.core.clear_listener();
+    let before = listener.counts();
+    let id = fixture.core.create_session(None)?.session_id;
+    fixture.core.open_session(id.clone())?;
+    wait_for(&fixture.core, &id, |view| view.online).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(listener.counts(), before);
+    Ok(())
+}
+
+#[cfg(not(feature = "local-host"))]
+#[test]
+fn connect_local_reports_unavailable_without_the_feature() -> TestResult {
+    let core = MobileCore::new(generate_identity("Phone".into())?.private_key, "Phone".into())?;
+    let dir = tempfile::tempdir()?;
+    let result = core.connect_local(
+        dir.path().to_string_lossy().into_owned(),
+        crate::secrets::test_support::MemoryKeystore::new(),
+    );
+    assert!(matches!(
+        result,
+        Err(MobileError::Session { ref detail })
+            if detail == "the on-device host is not available in this build"
+    ));
+    assert_eq!(core.status().phase, ConnectionPhase::Disconnected);
+    assert_eq!(core.active_host(), None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_host_names_the_remote_server() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    assert_eq!(fixture.core.active_host(), None);
+    fixture.core.connect(fixture.profile.clone())?;
+    let host = |reachable| HostRef {
+        id: "remote".into(),
+        kind: HostKind::Server,
+        label: fixture.profile.label.clone(),
+        reachable,
+    };
+    assert_eq!(fixture.core.active_host(), Some(host(true)));
+    fixture.core.disconnect();
+    assert_eq!(fixture.core.active_host(), Some(host(false)));
+    Ok(())
+}
