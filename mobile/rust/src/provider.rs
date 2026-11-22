@@ -18,8 +18,8 @@ const LINK_PATH: &str = "/v1/provider-link/chatgpt";
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const LINK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Header the node listener sets on a 404 when it has no ChatGPT link device.
-pub const UNAVAILABLE_HEADER: &str = "x-harw-provider-link";
-pub const UNAVAILABLE_VALUE: &str = "unavailable";
+pub(crate) const UNAVAILABLE_HEADER: &str = "x-harw-provider-link";
+pub(crate) const UNAVAILABLE_VALUE: &str = "unavailable";
 const REQUIRED_SCOPES: &[&str] = &[
     "openid",
     "offline_access",
