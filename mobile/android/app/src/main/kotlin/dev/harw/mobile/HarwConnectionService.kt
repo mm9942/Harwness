@@ -20,6 +20,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -86,6 +87,7 @@ private const val AlertIdBase = 1000
 
 internal class HarwConnectionService : Service() {
     private val connection get() = (application as HarwApplication).connection
+    private val localConnection get() = (application as HarwApplication).localConnection
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var notifications: NotificationManager
     private var foreground = false
@@ -93,6 +95,7 @@ internal class HarwConnectionService : Service() {
     private var observation: Job? = null
     private var alertObservation: Job? = null
     private val alertTracker = SessionAlertTracker()
+    private val localAlertTracker = SessionAlertTracker()
 
     override fun onCreate() {
         super.onCreate()
@@ -110,16 +113,23 @@ internal class HarwConnectionService : Service() {
         when (intent?.action) {
             DisconnectAction -> {
                 connection.disconnect()
+                localConnection.disconnect()
                 if (!foreground) stopSelfResult(startId)
             }
-            ConnectAction -> if (!foreground && !connection.state.value.stopping) {
+            ConnectAction -> if (foreground) {
+                connection.connect()
+                localConnection.connectLocal()
+            } else if (!connection.state.value.stopping) {
                 try {
                     val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
                     ServiceCompat.startForeground(
                         this, NotificationId, notification(R.string.notification_connecting), type,
                     )
                     foreground = true
-                    if (connection.connect()) {
+                    // Cloud und Lokal laufen gleichzeitig; ein fehlendes Cloud-Profil stoppt Lokal nicht.
+                    val cloudStarted = connection.connect()
+                    val localStarted = localConnection.connectLocal()
+                    if (cloudStarted || localStarted) {
                         if (observation?.isActive != true) observeConnection()
                         if (alertObservation?.isActive != true) observeAlerts()
                     } else {
@@ -142,6 +152,7 @@ internal class HarwConnectionService : Service() {
     override fun onDestroy() {
         scope.cancel()
         connection.disconnect()
+        localConnection.disconnect()
         super.onDestroy()
     }
 
@@ -154,8 +165,11 @@ internal class HarwConnectionService : Service() {
 
     private fun observeConnection() {
         observation = scope.launch {
-            connection.state
-                .map { Observed(it.phase, it.stopping, it.forgetting, it.attempt) }
+            combine(connection.state, localConnection.state) { c, l ->
+                val active = setOf(ConnectionPhase.CONNECTING, ConnectionPhase.CONNECTED, ConnectionPhase.RECONNECTING)
+                val primary = if (c.phase !in active && l.phase in active) l else c
+                Observed(primary.phase, c.stopping || l.stopping, c.forgetting, primary.attempt)
+            }
                 .distinctUntilChanged()
                 .collect { (phase, stopping, forgetting, attempt) ->
                     val reconnecting = !forgetting && !stopping && phase == ConnectionPhase.RECONNECTING
@@ -190,19 +204,24 @@ internal class HarwConnectionService : Service() {
 
     private fun observeAlerts() {
         alertObservation = scope.launch {
-            connection.state
-                .map { if (it.online && it.sessionsLoaded) it.sessions else null }
-                .distinctUntilChanged()
-                .collect { sessions ->
-                    if (sessions == null) {
-                        alertTracker.reset()
-                        return@collect
-                    }
-                    val (alerts, cleared) = alertTracker.update(sessions)
-                    for (id in cleared) notifications.cancel(alertNotificationId(id, SessionAlertKind.Approval))
-                    if (notifications.areNotificationsEnabled()) alerts.forEach { postAlert(it) }
-                }
+            launch { observeAlerts(connection, alertTracker) }
+            launch { observeAlerts(localConnection, localAlertTracker) }
         }
+    }
+
+    private suspend fun observeAlerts(source: HarwConnection, tracker: SessionAlertTracker) {
+        source.state
+            .map { if (it.online && it.sessionsLoaded) it.sessions else null }
+            .distinctUntilChanged()
+            .collect { sessions ->
+                if (sessions == null) {
+                    tracker.reset()
+                    return@collect
+                }
+                val (alerts, cleared) = tracker.update(sessions)
+                for (id in cleared) notifications.cancel(alertNotificationId(id, SessionAlertKind.Approval))
+                if (notifications.areNotificationsEnabled()) alerts.forEach { postAlert(it) }
+            }
     }
 
     // Kein Titel und kein Projektname: die Meldung erscheint auch auf dem gesperrten Bildschirm.

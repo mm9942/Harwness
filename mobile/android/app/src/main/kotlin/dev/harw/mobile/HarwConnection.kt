@@ -158,12 +158,9 @@ internal data class WorkspaceState(
     /** Open project view; `null` while the project list is shown. */
     val projectView: ProjectSessionsState? = null,
     val manage: ManageState = ManageState(),
-    /** True while the on-device host is the active backend (the core serves exactly one backend at a time). */
+    /** True for the on-device connection (Cloud und Lokal laufen als zwei getrennte Verbindungen gleichzeitig). */
     val local: Boolean = false,
 ) {
-    /** Backend switch: drops everything the previous backend showed and marks the new one. */
-    fun switched(toLocal: Boolean) = clearSessions().copy(local = toLocal)
-
     val online: Boolean get() = phase == ConnectionPhase.CONNECTED && !stopping
     val canSetUp: Boolean get() = !setupPending && !forgetRequired && cleanupError == null
     val canForget: Boolean get() = canSetUp && !hasConnection && !stopping && hasSavedSetup
@@ -318,14 +315,18 @@ internal sealed interface DraftResult {
 }
 
 /** Process owner. Public commands and state transitions run on Main; storage and UniFFI calls run on IO. */
-internal class HarwConnection(private val context: Context) {
+/** Gemeinsame Sperre: Cloud- und Lokal-Verbindung lesen/erzeugen dieselbe Geraeteidentitaet. */
+private val SharedStorageLock = Mutex()
+
+/** Eine Verbindung zu genau einem Backend: Gateway (Cloud) oder On-Device-Host ([localBackend]). */
+internal class HarwConnection(private val context: Context, private val localBackend: Boolean = false) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val commands = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mutableState = MutableStateFlow(WorkspaceState())
     val state = mutableState.asStateFlow()
 
     private val store by lazy { DeviceStore(context) }
-    private val storageLock = Mutex()
+    private val storageLock = SharedStorageLock
     private val coreLock = Mutex()
     private var core: MobileCore? = null
     private var lifecycle = 0L
@@ -349,7 +350,11 @@ internal class HarwConnection(private val context: Context) {
     private val events = CoreEvents()
 
     init {
-        loadSavedSetup()
+        if (localBackend) {
+            change { it.copy(local = true, setupPending = false) }
+        } else {
+            loadSavedSetup()
+        }
     }
 
     private fun loadSavedSetup() {
@@ -565,23 +570,6 @@ internal class HarwConnection(private val context: Context) {
             }
         }
         return true
-    }
-
-    /**
-     * Wechselt zwischen On-Device-Host (Lokal) und Gateway (Cloud). Der Core haelt genau ein Backend:
-     * das andere wird beendet, die Liste zeigt danach nur das aktive Backend.
-     */
-    fun switchBackend(toLocal: Boolean) {
-        val current = state.value
-        if (current.stopping || !current.canSetUp) return
-        if (current.local == toLocal && current.hasConnection) return
-        if (!toLocal && current.profile == null) {
-            change { it.copy(setupError = "Für Cloud ist noch kein Server-Profil eingerichtet.") }
-            return
-        }
-        clearSessionActions()
-        change { it.switched(toLocal) }
-        if (toLocal) connectLocal(force = true) else connect(force = true)
     }
 
     /**
@@ -1801,7 +1789,7 @@ internal class HarwConnection(private val context: Context) {
             try {
                 val native = MobileCore(privateKey, DeviceLabel)
                 native.setListener(events)
-                try {
+                if (!localBackend) try {
                     native.setTorDirectories(File(context.noBackupFilesDir, "tor/state").path, File(context.cacheDir, "tor").path)
                 } catch (error: MobileException) {
                     // Only the onion route needs Tor storage; direct connections must keep working.

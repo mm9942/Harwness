@@ -56,7 +56,12 @@ import uniffi.harw_mobile_ffi.SessionCursor
 
 internal open class MainActivity : ComponentActivity() {
     private val window by viewModels<HarwWindowModel>()
-    private val connection get() = (application as HarwApplication).connection
+    private val cloud get() = (application as HarwApplication).connection
+    private val onDevice get() = (application as HarwApplication).localConnection
+
+    /** Welche Liste gezeigt wird; beide Verbindungen laufen unabhaengig davon weiter. */
+    private var viewLocal by mutableStateOf(false)
+    private val connection get() = if (viewLocal) onDevice else cloud
     private val approvalAuthorization = ApprovalAuthorization(this)
     private val stepUpAuthorization = StepUpAuthorization(this)
     private var themePref by mutableStateOf("system")
@@ -68,7 +73,7 @@ internal open class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         approvalAuthorization.restoreCredentialState(savedInstanceState?.getBoolean(AwaitingCredentialKey) == true)
         lifecycleScope.launch {
-            connection.state
+            cloud.state
                 .map { state ->
                     val reset = state.sessionResetEpoch.takeIf {
                         state.phase == ConnectionPhase.REVOKED || state.forgetRequired ||
@@ -129,6 +134,8 @@ internal open class MainActivity : ComponentActivity() {
 
     @Composable
     private fun Workspace() {
+        val cloudState by cloud.state.collectAsState()
+        val localState by onDevice.state.collectAsState()
         val state by connection.state.collectAsState()
         val sessionId = window.sessionId
         val projectKey = window.projectKey
@@ -145,21 +152,22 @@ internal open class MainActivity : ComponentActivity() {
         }
         var notificationDenied by rememberSaveable { mutableStateOf(false) }
         var newChatOpen by rememberSaveable { mutableStateOf(false) }
+        var sheetLocal by rememberSaveable { mutableStateOf(false) }
         var newProjectOpen by rememberSaveable { mutableStateOf(false) }
         val profilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
-            if (it != null) connection.importProfile(it)
+            if (it != null) cloud.importProfile(it)
         }
         val enrollmentPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) {
-            if (it != null) connection.exportEnrollment(it)
+            if (it != null) cloud.exportEnrollment(it)
         }
-        val selectedProfileKey = remember(state.profile) { state.profile?.windowKey() }
+        val selectedProfileKey = remember(cloudState.profile) { cloudState.profile?.windowKey() }
         var scannerOpen by rememberSaveable { mutableStateOf(false) }
         var enrollmentQr by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
         val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) scannerOpen = true else connection.reportCameraUnavailable()
+            if (granted) scannerOpen = true else cloud.reportCameraUnavailable()
         }
-        LaunchedEffect(state.deviceNodeId) {
-            if (state.deviceNodeId == null) enrollmentQr = null
+        LaunchedEffect(cloudState.deviceNodeId) {
+            if (cloudState.deviceNodeId == null) enrollmentQr = null
         }
         enrollmentQr?.let { EnrollmentQrDialog(it, onClose = { enrollmentQr = null }) }
         if (scannerOpen) {
@@ -167,7 +175,7 @@ internal open class MainActivity : ComponentActivity() {
                 onDismiss = { scannerOpen = false },
                 onImport = {
                     scannerOpen = false
-                    connection.importScannedProfile(it)
+                    cloud.importScannedProfile(it)
                 },
             )
         }
@@ -178,15 +186,27 @@ internal open class MainActivity : ComponentActivity() {
 
         val showSetup = settingsRoute == SettingsRoute.Connection || (
             sessionId == null && state.sessions.isEmpty() && !state.sessionsLoaded && !state.online &&
-                state.phase != ConnectionPhase.RECONNECTING
+                state.phase != ConnectionPhase.RECONNECTING && !(state.local && cloudState.sessionsLoaded)
             )
-        LaunchedEffect(state.online, connectingFromSetup) {
-            if (state.online && connectingFromSetup) {
+        // Ohne Cloud-Profil beginnt die Ansicht bei Lokal; die Zuordnung einer geoeffneten Session folgt ihrem Besitzer.
+        var viewChosen by rememberSaveable { mutableStateOf(false) }
+        LaunchedEffect(cloudState.setupPending, cloudState.profile == null) {
+            if (!cloudState.setupPending && cloudState.profile == null && !viewChosen) viewLocal = true
+        }
+        LaunchedEffect(sessionId, cloudState.sessions, localState.sessions) {
+            if (sessionId != null) {
+                val inCloud = cloudState.sessions.any { it.sessionId == sessionId }
+                val inLocal = localState.sessions.any { it.sessionId == sessionId }
+                if (inLocal && !inCloud) viewLocal = true else if (inCloud && !inLocal) viewLocal = false
+            }
+        }
+        LaunchedEffect(cloudState.online, connectingFromSetup) {
+            if (cloudState.online && connectingFromSetup) {
                 openSettings(null)
                 connectingFromSetup = false
             }
         }
-        DisposableEffect(sessionId, selectedProfileKey) {
+        DisposableEffect(sessionId, selectedProfileKey, viewLocal) {
             if (sessionId != null) connection.retainSession(sessionId)
             onDispose { if (sessionId != null) connection.releaseSession(sessionId) }
         }
@@ -274,7 +294,7 @@ internal open class MainActivity : ComponentActivity() {
                 onBack = { openSettings(SettingsRoute.Hub) },
                 onOpenModels = { openSettings(SettingsRoute.Models) },
             )
-        } else if (showSetup && settingsRoute == null && state.profile == null && !firstRunDone) {
+        } else if (showSetup && settingsRoute == null && cloudState.profile == null && !firstRunDone) {
             FirstRunScreen(
                 onConnect = { finishFirstRun(); openSettings(SettingsRoute.Connection) },
                 onProviders = { finishFirstRun(); openSettings(SettingsRoute.Providers) },
@@ -283,16 +303,16 @@ internal open class MainActivity : ComponentActivity() {
             )
         } else if (showSetup) {
             ConnectionScreen(
-                state = state,
+                state = cloudState,
                 notificationDenied = notificationDenied,
                 canGoBack = settingsRoute == SettingsRoute.Connection &&
-                    (state.online || state.sessions.isNotEmpty() || sessionId != null),
+                    (cloudState.online || cloudState.sessions.isNotEmpty() || sessionId != null),
                 onBack = { openSettings(SettingsRoute.Hub) },
                 onImport = {
                     profilePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream"))
                 },
                 onExport = { enrollmentPicker.launch("harw-device-enrollment.json") },
-                onShowEnrollmentQr = { connection.showEnrollmentQr { enrollmentQr = it } },
+                onShowEnrollmentQr = { cloud.showEnrollmentQr { enrollmentQr = it } },
                 scanning = scannerOpen,
                 onScanProfile = {
                     if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -313,17 +333,17 @@ internal open class MainActivity : ComponentActivity() {
                 },
                 onConnectLocal = {
                     connectingFromSetup = true
-                    connection.connectLocal()
+                    onDevice.connectLocal()
                 },
-                onDisconnect = connection::disconnect,
-                onSelectRoute = { connection.selectRoute(it) },
-                onForgetSetup = connection::forgetSetup,
-                onRetryCleanup = connection::retryCleanup,
-                onCheckChatgpt = connection::refreshChatgptAccount,
-                onChatgptSignIn = connection::startChatgptSignIn,
-                onChatgptUnlink = connection::unlinkChatgptAccount,
-                onChatgptCancel = connection::cancelChatgptBrowser,
-                onDismissPlanNotice = connection::dismissChatgptPlanNotice,
+                onDisconnect = { cloud.disconnect(); onDevice.disconnect() },
+                onSelectRoute = { cloud.selectRoute(it) },
+                onForgetSetup = cloud::forgetSetup,
+                onRetryCleanup = cloud::retryCleanup,
+                onCheckChatgpt = cloud::refreshChatgptAccount,
+                onChatgptSignIn = cloud::startChatgptSignIn,
+                onChatgptUnlink = cloud::unlinkChatgptAccount,
+                onChatgptCancel = cloud::cancelChatgptBrowser,
+                onDismissPlanNotice = cloud::dismissChatgptPlanNotice,
                 onManageChatgpt = ::openChatgptUsage,
             )
         } else if (projectKey == null && sessionId == null && !state.local) {
@@ -336,7 +356,7 @@ internal open class MainActivity : ComponentActivity() {
                         Icon(Icons.Outlined.Settings, "Einstellungen")
                     }
                 }
-                BackendSwitch(local = false, enabled = !state.stopping, onSelect = connection::switchBackend)
+                BackendSwitch(local = false, enabled = !state.stopping, onSelect = { viewChosen = true; viewLocal = it })
                 ProjectsScreen(
                     onNewProject = { newProjectOpen = true },
                     projects = state.projects,
@@ -351,7 +371,7 @@ internal open class MainActivity : ComponentActivity() {
             }
             NewChatFab(
                 enabled = state.online && state.canCreate && !state.creating,
-                onClick = { newChatOpen = true },
+                onClick = { sheetLocal = viewLocal; newChatOpen = true },
                 modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
             )
             }
@@ -367,7 +387,7 @@ internal open class MainActivity : ComponentActivity() {
             }
             Box(Modifier.fillMaxSize()) {
             WorkspaceScreen(
-                onSwitchBackend = connection::switchBackend,
+                onSwitchBackend = { viewChosen = true; viewLocal = it },
                 state = state,
                 window = window,
                 connection = connection,
@@ -381,27 +401,31 @@ internal open class MainActivity : ComponentActivity() {
             if (sessionId == null) {
                 NewChatFab(
                     enabled = state.online && state.canCreate && !state.creating,
-                    onClick = { newChatOpen = true },
+                    onClick = { sheetLocal = viewLocal; newChatOpen = true },
                     modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
                 )
             }
             }
         }
         if (newChatOpen) {
+            val target = if (sheetLocal) onDevice else cloud
+            val targetState = if (sheetLocal) localState else cloudState
             NewChatSheet(
-                local = state.local,
-                projects = state.projects,
+                local = sheetLocal,
+                projects = targetState.projects,
                 initialProjectKey = projectKey?.takeIf { it.isNotEmpty() },
-                canStart = state.online && state.canCreate && !state.creating,
-                busy = state.creating,
-                onSwitch = connection::switchBackend,
+                canStart = targetState.online && targetState.canCreate && !targetState.creating,
+                busy = targetState.creating,
+                onSwitch = { sheetLocal = it },
                 onDismiss = { newChatOpen = false },
                 onStart = { key, message ->
-                    connection.startChat(
+                    target.startChat(
                         projectKey = key,
                         firstMessage = message,
                         opened = { id, assigned ->
                             newChatOpen = false
+                            viewChosen = true
+                            viewLocal = sheetLocal
                             if (message.isNotBlank()) window.queueFirstMessage(id, message)
                             window.openLink(DeepLink(assigned, id))
                         },
@@ -449,7 +473,7 @@ internal open class MainActivity : ComponentActivity() {
         try {
             HarwConnectionService.startFrom(this)
         } catch (error: Exception) {
-            connection.reportServiceError(error)
+            cloud.reportServiceError(error)
         }
     }
 
@@ -457,7 +481,7 @@ internal open class MainActivity : ComponentActivity() {
         startActivity(
             Intent(this, SessionWindowActivity::class.java)
                 .putExtra(InitialSessionKey, sessionId)
-                .putExtra(WindowProfileKey, connection.state.value.profile?.windowKey())
+                .putExtra(WindowProfileKey, cloud.state.value.profile?.windowKey())
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT),
         )
     }

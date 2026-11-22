@@ -4,6 +4,7 @@ import android.app.Application
 
 internal class HarwApplication : Application() {
     val connection by lazy { HarwConnection(applicationContext) }
+    val localConnection by lazy { HarwConnection(applicationContext, localBackend = true) }
 
     override fun onCreate() {
         super.onCreate()
