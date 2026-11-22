@@ -29,3 +29,6 @@ with open(tmp, "w") as f: json.dump(m, f, ensure_ascii=False)
 os.replace(tmp, os.path.join(root, "latest.json"))
 print(json.dumps(m, ensure_ascii=False, indent=1))
 PY
+# Push-Hinweis (FCM), falls ein Dienstkonto-Schluessel hinterlegt ist
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+python3 -I "$HERE/../update-service/fcm_send.py" "$CODE" "$NAME" || true

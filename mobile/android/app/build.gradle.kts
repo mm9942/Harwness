@@ -5,6 +5,9 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Firebase (FCM-Push fuer Updates): nur aktiv, wenn die lokale, nicht eingecheckte google-services.json vorhanden ist.
+if (file("google-services.json").isFile) apply(plugin = "com.google.gms.google-services")
+
 val uniffiSources = layout.buildDirectory.dir("generated/uniffi")
 val mobileLibraries = layout.buildDirectory.dir("generated/jniLibs")
 
@@ -111,6 +114,8 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("com.google.code.gson:gson:2.11.0")
+    implementation(platform("com.google.firebase:firebase-bom:35.2.0"))
+    implementation("com.google.firebase:firebase-messaging")
     implementation("com.google.zxing:core:3.5.4")
     implementation("androidx.camera:camera-core:1.7.0")
     implementation("androidx.camera:camera-camera2:1.7.0")

@@ -89,3 +89,5 @@ harw.env
 
 # Generated website output (build with: make site)
 /site/dist/
+
+mobile/android/app/google-services.json

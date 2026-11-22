@@ -81,6 +81,13 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
         <service
+            android:name=".HarwPushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+        <service
             android:name=".UpdateCheckJob"
             android:exported="false"
             android:permission="android.permission.BIND_JOB_SERVICE" />
