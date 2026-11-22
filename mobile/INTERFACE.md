@@ -14,6 +14,7 @@ class MobileCore(privateKey: ByteArray, label: String) {
     fun connect(profile: ServerProfile)
     fun disconnect()
     fun reconnect()
+    fun networkAvailable()
     fun status(): ConnectionStatus
     fun listSessions(): List<MobileSession>
     fun createSession(title: String?): MobileSession
@@ -35,6 +36,10 @@ class MobileCore(privateKey: ByteArray, label: String) {
 `openSession` shares an attachment across windows showing the same session. It can return before the replay is complete. While waiting, the snapshot is read-only and `detail` describes the state. Each other session has its own replay and snapshot. `detachSession` releases a process attachment when the last window stops using it. It leaves the hosted session running.
 
 `connect` completes the pinned handshake and `session.hello`. `disconnect` cancels the connection and marks retained snapshots read-only. `reconnect` reuses the selected profile and restarts open attachments. A transport failure after connecting also triggers bounded background reconnect. The connection identity consists of the normalized endpoint, node ID and pinned key. Editing the label preserves cached sessions and submission IDs. Changing the connection identity clears these caches. The Rust client never replays a mutating RPC after disconnect.
+
+`networkAvailable()` signals that the platform reports a usable network again. The app calls it from a `ConnectivityManager.NetworkCallback` on a platform thread, never from the Tokio runtime thread. It first applies a pending revocation. While `CONNECTING` or `RECONNECTING` with an active background run, it ends the current backoff pause, resets the attempt counter and dials at once. In `FAILED` after exhausted or transient retryable dial failures, it restarts the connection like `reconnect`. It does nothing in `REVOKED`, `DISCONNECTED` or `CONNECTED`, in `CONNECTING`/`RECONNECTING` without an active run, or in `FAILED` after a final error such as a pin, handshake or route-plan failure or HTTP 403. It never lifts a revocation, never overrides a user-chosen `disconnect` and never resends a mutating RPC.
+
+`status().attempt` counts reconnect attempts since the last successful connection and is 0 while connected or idle. `status().nextRetryAtMs` is the Unix time in milliseconds of the next scheduled dial while waiting in backoff, and `null` otherwise.
 
 A refused upgrade such as HTTP 403 sets the connection to `FAILED` and preserves the enrollment and read-only view. An explicit revocation RPC error, session frame or revoked WebSocket close code sets `REVOKED`, clears session content and stops automatic reconnect. The host can use this signal after invalidating connection policy. Keep the enrolled identity, profile and submission ID protection. Clear visible session content and drafts, then let the user reconnect explicitly after the operator restores access.
 
@@ -63,7 +68,7 @@ Provider status, import and unlink use `GET`, `POST` and `DELETE`. A `204` respo
 | `IdentityMaterial` | `privateKey: ByteArray`, `enrollment: DeviceEnrollment` |
 | `DeviceEnrollment` | `version: UInt`, `nodeId: String`, `publicKeyHex: String`, `label: String` |
 | `ServerProfile` | `version: UInt`, `label: String`, `endpoint: String`, `serverNodeId: String`, `serverPublicKeyHex: String`, `onion: String?` |
-| `ConnectionStatus` | `phase: ConnectionPhase`, `nodeId: String?`, `endpoint: String?`, `label: String?`, `detail: String?`, `canCreate: Boolean`, `canSubmit: Boolean`, `canApprove: Boolean`, `route: ConnectionRoute?`, `routePreference: RoutePreference`, `availableRoutes: List<ConnectionRoute>`, `tor: TorBootstrap?` |
+| `ConnectionStatus` | `phase: ConnectionPhase`, `nodeId: String?`, `endpoint: String?`, `label: String?`, `detail: String?`, `canCreate: Boolean`, `canSubmit: Boolean`, `canApprove: Boolean`, `route: ConnectionRoute?`, `routePreference: RoutePreference`, `availableRoutes: List<ConnectionRoute>`, `tor: TorBootstrap?`, `attempt: UInt`, `nextRetryAtMs: ULong?` |
 | `TorBootstrap` | `percent: UInt`, `ready: Boolean`, `blocked: String?`, `summary: String` |
 | `MobileSession` | `sessionId: String`, `title: String?`, `state: MobileSessionState`, `attached: UInt`, `updatedAt: String`, `model: String?` |
 | `SessionCursor` | `generation: UInt`, `durable: ULong`, `live: UInt` |

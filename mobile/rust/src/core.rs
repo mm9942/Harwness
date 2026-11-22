@@ -51,6 +51,31 @@ pub struct MobileCore {
 struct Shared {
     state: Mutex<CoreState>,
     dialer: Dialer,
+    /// Ends a running backoff pause early when the network returns.
+    wake: tokio::sync::Notify,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkAction {
+    Ignore,
+    WakeBackoff,
+    Restart,
+}
+
+fn network_action(phase: ConnectionPhase, run_active: bool, retryable_failure: bool) -> NetworkAction {
+    match phase {
+        ConnectionPhase::Connecting | ConnectionPhase::Reconnecting if run_active => {
+            NetworkAction::WakeBackoff
+        }
+        ConnectionPhase::Failed if retryable_failure => NetworkAction::Restart,
+        _ => NetworkAction::Ignore,
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 impl Shared {
@@ -71,6 +96,9 @@ struct CoreState {
     submissions: HashMap<(SessionId, String), Submission>,
     route_preference: RoutePreference,
     route: Option<ConnectionRoute>,
+    attempt: u32,
+    next_retry_at_ms: Option<u64>,
+    retryable_failure: bool,
 }
 
 impl Default for CoreState {
@@ -87,6 +115,9 @@ impl Default for CoreState {
             submissions: HashMap::new(),
             route_preference: RoutePreference::Auto,
             route: None,
+            attempt: 0,
+            next_retry_at_ms: None,
+            retryable_failure: false,
         }
     }
 }
@@ -139,6 +170,8 @@ impl CoreState {
     fn revoke(&mut self, detail: String) {
         self.stop(&detail);
         self.phase = ConnectionPhase::Revoked;
+        self.next_retry_at_ms = None;
+        self.retryable_failure = false;
         self.detail = Some(detail);
         self.sessions.clear();
     }
@@ -323,6 +356,35 @@ impl MobileCore {
         state.stop("Disconnected. This view is read-only");
         state.phase = ConnectionPhase::Disconnected;
         state.detail = None;
+        state.next_retry_at_ms = None;
+        state.retryable_failure = false;
+    }
+
+    /// Signals that the platform reports a usable network again.
+    /// Never resends mutating calls; never lifts a revocation.
+    pub fn network_available(&self) -> Result<(), MobileError> {
+        let action = {
+            let mut state = self.shared.state();
+            state.apply_pending_revocation();
+            let action = network_action(
+                state.phase,
+                state.run.as_ref().is_some_and(|run| !run.is_cancelled()),
+                state.retryable_failure,
+            );
+            if action == NetworkAction::WakeBackoff {
+                state.attempt = 0;
+                state.next_retry_at_ms = None;
+            }
+            action
+        };
+        match action {
+            NetworkAction::Ignore => Ok(()),
+            NetworkAction::WakeBackoff => {
+                self.shared.wake.notify_one();
+                Ok(())
+            }
+            NetworkAction::Restart => self.start_connection(None),
+        }
     }
 
     /// Sets the absolute Tor state and cache directories (before the first onion dial).
@@ -382,6 +444,8 @@ impl MobileCore {
                 .map(available_routes)
                 .unwrap_or_default(),
             tor,
+            attempt: state.attempt,
+            next_retry_at_ms: state.next_retry_at_ms,
         }
     }
 
@@ -672,6 +736,9 @@ impl MobileCore {
                     ConnectionPhase::Connecting
                 };
                 state.detail = None;
+                state.attempt = 0;
+                state.next_retry_at_ms = None;
+                state.retryable_failure = false;
                 (run, profile)
             };
             let (first_tx, first_rx) = oneshot::channel();
@@ -723,11 +790,32 @@ async fn drive_connection(
     let _ = aws_lc_rs::rand::fill(&mut entropy);
     let entropy = u64::from_ne_bytes(entropy);
     loop {
-        if run
-            .run_until_cancelled(tokio::time::sleep(delay))
-            .await
-            .is_none()
-        {
+        if !delay.is_zero() {
+            {
+                let mut state = shared.state();
+                if run.is_cancelled() {
+                    break;
+                }
+                state.attempt = retry;
+                state.next_retry_at_ms =
+                    Some(now_ms().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64));
+            }
+            let woken = tokio::select! {
+                () = run.cancelled() => break,
+                () = tokio::time::sleep(delay) => false,
+                () = shared.wake.notified() => true,
+            };
+            if woken {
+                retry = 0;
+            }
+            delay = Duration::ZERO;
+            let mut state = shared.state();
+            if run.is_cancelled() {
+                break;
+            }
+            state.attempt = retry;
+            state.next_retry_at_ms = None;
+        } else if run.is_cancelled() {
             break;
         }
         let mut options = ConnectOptions::new(&label);
@@ -750,6 +838,8 @@ async fn drive_connection(
                 }
                 state.detail = Some(detail.clone());
                 state.phase = ConnectionPhase::Failed;
+                state.retryable_failure = false;
+                state.next_retry_at_ms = None;
                 if let Some(first) = first.take() {
                     let _ = first.send(Err(MobileError::Connect { detail }));
                 }
@@ -803,6 +893,8 @@ async fn drive_connection(
                 if first.is_some() || kind != DialFailure::Retry || retry >= MAX_RECONNECT_ATTEMPTS
                 {
                     state.phase = ConnectionPhase::Failed;
+                    state.retryable_failure = kind == DialFailure::Retry;
+                    state.next_retry_at_ms = None;
                     if let Some(first) = first.take() {
                         let _ = first.send(Err(MobileError::Connect { detail }));
                     }
@@ -827,6 +919,9 @@ async fn drive_connection(
                 break;
             }
             state.phase = ConnectionPhase::Connected;
+            state.attempt = 0;
+            state.next_retry_at_ms = None;
+            state.retryable_failure = false;
             state.detail = fallback_note(&failures, state.route);
             state.link = Some(Arc::clone(&link));
             for (id, session) in &mut state.sessions {
@@ -853,6 +948,8 @@ async fn drive_connection(
             state.detail = Some(issue.detail);
             if issue.disposition == LinkDisposition::Final {
                 state.phase = ConnectionPhase::Failed;
+                state.retryable_failure = false;
+                state.next_retry_at_ms = None;
                 return;
             }
             state.phase = ConnectionPhase::Reconnecting;
@@ -1420,5 +1517,71 @@ mod route_failure_tests {
         assert!(text.contains("Tor storage is not configured"));
         assert_eq!(fallback_note(&[], Some(ConnectionRoute::Direct)), None);
         assert_eq!(fallback_note(&failures, None), None);
+    }
+
+    #[test]
+    fn network_action_ignores_revoked() {
+        for run in [false, true] {
+            for retryable in [false, true] {
+                assert_eq!(
+                    network_action(ConnectionPhase::Revoked, run, retryable),
+                    NetworkAction::Ignore
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn network_action_ignores_disconnected_and_connected() {
+        for phase in [ConnectionPhase::Disconnected, ConnectionPhase::Connected] {
+            for run in [false, true] {
+                for retryable in [false, true] {
+                    assert_eq!(network_action(phase, run, retryable), NetworkAction::Ignore);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn network_action_wakes_backoff_while_dialing() {
+        for phase in [ConnectionPhase::Connecting, ConnectionPhase::Reconnecting] {
+            for retryable in [false, true] {
+                assert_eq!(network_action(phase, true, retryable), NetworkAction::WakeBackoff);
+            }
+        }
+    }
+
+    #[test]
+    fn network_action_ignores_dialing_without_run() {
+        for phase in [ConnectionPhase::Connecting, ConnectionPhase::Reconnecting] {
+            for retryable in [false, true] {
+                assert_eq!(network_action(phase, false, retryable), NetworkAction::Ignore);
+            }
+        }
+    }
+
+    #[test]
+    fn network_action_restarts_retryable_failure() {
+        for run in [false, true] {
+            assert_eq!(
+                network_action(ConnectionPhase::Failed, run, true),
+                NetworkAction::Restart
+            );
+        }
+    }
+
+    #[test]
+    fn network_action_ignores_final_failure() {
+        for run in [false, true] {
+            assert_eq!(
+                network_action(ConnectionPhase::Failed, run, false),
+                NetworkAction::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn max_reconnect_attempts_unchanged() {
+        assert_eq!(MAX_RECONNECT_ATTEMPTS, 8);
     }
 }

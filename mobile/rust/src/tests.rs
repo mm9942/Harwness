@@ -607,6 +607,84 @@ async fn policy_invalidation_clears_session_content_and_allows_explicit_reconnec
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_available_never_lifts_revocation() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    let core = &fixture.core;
+    core.connect(fixture.profile.clone())?;
+    let id = core.create_session(None)?.session_id;
+    core.open_session(id.clone())?;
+    wait_for(core, &id, |view| view.online).await?;
+    let enrollment = core.enrollment();
+    fixture
+        .host
+        .invalidate_device_policy(&DeviceId::try_from_str("phone-device")?);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if core.status().phase == ConnectionPhase::Revoked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    // Outcome is irrelevant here; the invariant is that the revocation stays.
+    let _ = core.network_available();
+    let status = core.status();
+    assert_eq!(status.phase, ConnectionPhase::Revoked);
+    assert!(!status.can_submit);
+    assert_eq!(status.next_retry_at_ms, None);
+    assert!(matches!(core.list_sessions(), Err(MobileError::Revoked)));
+    assert!(core.snapshot(id).is_err());
+    assert_eq!(core.enrollment(), enrollment);
+    assert_eq!(fixture.driver.calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_available_is_noop_when_disconnected() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    let core = &fixture.core;
+    core.connect(fixture.profile.clone())?;
+    core.disconnect();
+    assert_eq!(core.status().phase, ConnectionPhase::Disconnected);
+    core.network_available()?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = core.status();
+    assert_eq!(status.phase, ConnectionPhase::Disconnected);
+    assert_eq!(status.next_retry_at_ms, None);
+    assert!(matches!(
+        core.list_sessions(),
+        Err(MobileError::Disconnected)
+    ));
+    assert_eq!(fixture.driver.calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_available_is_noop_when_connected() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    let core = &fixture.core;
+    core.connect(fixture.profile.clone())?;
+    let id = core.create_session(None)?.session_id;
+    core.open_session(id.clone())?;
+    wait_for(core, &id, |view| view.online).await?;
+    let enrollment = core.enrollment();
+    core.network_available()?;
+    let status = core.status();
+    assert_eq!(status.phase, ConnectionPhase::Connected);
+    assert_eq!(status.attempt, 0);
+    assert_eq!(status.next_retry_at_ms, None);
+    assert_eq!(
+        status.endpoint.as_deref(),
+        Some(fixture.profile.endpoint.as_str())
+    );
+    assert_eq!(core.enrollment(), enrollment);
+    assert!(core.snapshot(id).is_ok_and(|view| view.online));
+    assert_eq!(fixture.driver.calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
 const ONION_VECTOR: &str = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443";
 
 fn host_profile(onion: Option<&str>) -> Result<ServerProfile, MobileError> {
