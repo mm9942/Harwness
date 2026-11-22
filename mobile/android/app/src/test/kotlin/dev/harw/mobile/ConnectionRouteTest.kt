@@ -82,4 +82,14 @@ class ConnectionRouteTest {
     fun shortOnionKeepsPrefixAndPort() {
         assertEquals("2gzyxa….onion:443", shortOnion(vector))
     }
+
+    @Test
+    fun onionPreferenceResetsToAutoWithoutOnionProfile() {
+        for (choice in RoutePreference.values()) {
+            assertEquals(choice, normalizedPreference(choice, hasOnion = true))
+        }
+        assertEquals(RoutePreference.AUTO, normalizedPreference(RoutePreference.ONION, hasOnion = false))
+        assertEquals(RoutePreference.AUTO, normalizedPreference(RoutePreference.AUTO, hasOnion = false))
+        assertEquals(RoutePreference.DIRECT, normalizedPreference(RoutePreference.DIRECT, hasOnion = false))
+    }
 }

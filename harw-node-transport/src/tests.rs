@@ -1342,6 +1342,8 @@ mod uplink_loopback {
 mod generic_stream {
     use super::*;
     use crate::ClientOptions;
+    use crate::upgrade::UpgradeError;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
     async fn test_node_handshake_and_requests_work_over_in_memory_duplex() -> TestResult {
@@ -1388,9 +1390,10 @@ mod generic_stream {
     }
 
     #[tokio::test]
-    async fn test_wrong_pin_over_duplex_is_rejected() -> TestResult {
+    async fn test_wrong_pinned_server_key_over_duplex_is_rejected_by_client() -> TestResult {
         let a = test_node("node-a", 1)?;
         let b = test_node("node-b", 2)?;
+        let impostor_key = test_node("node-a", 9)?; // same name, other key
         let server = NodeTransportServer::new(
             a.local.clone(),
             Arc::new(pinned(&[&b.identity])?),
@@ -1403,20 +1406,79 @@ mod generic_stream {
                 .await
         });
 
-        // The client pins b's key for node a: the server's signature must not verify.
         let verdict = NodeTransportClient::connect_over(
             client_io,
             &b.local,
             &a.id,
-            &pinned(&[&b.identity])?,
+            &pinned(&[&impostor_key.identity])?,
             &ClientOptions::default(),
         )
         .await;
         ensure(
-            verdict.is_err(),
-            "connect_over accepted a server with the wrong pinned key",
+            matches!(
+                &verdict,
+                Err(TransportError::Handshake(HandshakeError::Verify(VerifyError::BadSignature(id)))) if *id == a.id
+            ),
+            format!("{:?}", verdict.map(|c| c.peer().clone())),
         )?;
         task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unpinned_client_over_duplex_is_rejected_by_server() -> TestResult {
+        let a = test_node("node-a", 1)?;
+        let b = test_node("node-b", 2)?;
+        let other = test_node("node-c", 3)?;
+        let server = NodeTransportServer::new(
+            a.local.clone(),
+            Arc::new(pinned(&[&other.identity])?),
+            ServerOptions::default(),
+        )?;
+        let reached = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&reached);
+        let service = TestService::new(move |_request: Request<hyper::body::Incoming>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.store(true, Ordering::SeqCst);
+                text_response(StatusCode::OK, "reached")
+            }
+        });
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            server
+                .serve_upgradable_io(server_io, service, Duration::from_secs(10))
+                .await
+        });
+
+        let verdict = NodeTransportClient::connect_over(
+            client_io,
+            &b.local,
+            &a.id,
+            &pinned(&[&a.identity])?,
+            &ClientOptions::default(),
+        )
+        .await;
+        match verdict {
+            Err(err) => ensure(is_rejection(&err), format!("unexpected error {err}"))?,
+            Ok(_) => {
+                return Err(TestError::Unexpected(
+                    "server accepted a client it has not pinned".into(),
+                ));
+            }
+        }
+        let served = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .map_err(ctx("server did not return promptly"))?
+            .map_err(ctx("join"))?;
+        ensure(
+            matches!(served, Err(UpgradeError::Transport(_))),
+            format!("expected Err(UpgradeError::Transport(_)), got {served:?}"),
+        )?;
+        ensure(
+            !reached.load(Ordering::SeqCst),
+            "the service was reached by an unauthenticated client",
+        )?;
         Ok(())
     }
 
@@ -1424,8 +1486,10 @@ mod generic_stream {
     async fn test_duplex_stream_respects_the_connection_limit() -> TestResult {
         let a = test_node("node-a", 1)?;
         let b = test_node("node-b", 2)?;
-        let mut options = ServerOptions::default();
-        options.max_connections = 0;
+        let options = ServerOptions {
+            max_connections: 0,
+            ..ServerOptions::default()
+        };
         let server =
             NodeTransportServer::new(a.local.clone(), Arc::new(pinned(&[&b.identity])?), options)?;
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);

@@ -13,9 +13,13 @@
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use harw_onion::{OnionClient, OnionClientConfig, OnionServer, OnionServerConfig, OnionStream};
+use harw_onion::{
+    OnionClient, OnionClientConfig, OnionLocator, OnionServer, OnionServerConfig, OnionStream,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -41,9 +45,23 @@ async fn echo(mut stream: OnionStream) {
     }
 }
 
-async fn launch_server(state: &Path, cache: &Path) -> Result<OnionServer, harw_onion::OnionError> {
+/// Launches the echo service; `accepted` counts the streams that reach the handler.
+async fn launch_server(
+    state: &Path,
+    cache: &Path,
+    accepted: &Arc<AtomicUsize>,
+) -> Result<OnionServer, harw_onion::OnionError> {
     let config = OnionServerConfig::new(state, cache);
-    OnionServer::launch(config, |p| eprintln!("server tor {}%", p.percent), echo).await
+    let accepted = Arc::clone(accepted);
+    OnionServer::launch(
+        config,
+        |p| eprintln!("server tor {}%", p.percent),
+        move |stream| {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            echo(stream)
+        },
+    )
+    .await
 }
 
 #[ignore = "needs the live Tor network"]
@@ -55,7 +73,8 @@ async fn launches_an_onion_service_and_dials_it() -> TestResult {
     let client_state = private_dir(&dir.path().join("client/state"))?;
     let client_cache = private_dir(&dir.path().join("client/cache"))?;
 
-    let server = launch_server(&server_state, &server_cache).await?;
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server = launch_server(&server_state, &server_cache, &accepted).await?;
     let locator = server.locator().clone();
     eprintln!("onion service {}", locator.redacted());
     assert!(
@@ -71,10 +90,26 @@ async fn launches_an_onion_service_and_dials_it() -> TestResult {
     stream.read_exact(&mut echoed).await?;
     assert_eq!(echoed, PING);
     drop(stream);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    // Only the virtual port may be served: a BEGIN to any other port must be
+    // refused by the service and never reach the handler.
+    let wrong_port = OnionLocator::new(locator.host(), 80)?;
+    let refused = client.dial(&wrong_port, Duration::from_secs(90)).await;
+    assert!(
+        refused.is_err(),
+        "a dial to a non-virtual port must not yield a stream"
+    );
+    drop(refused);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "the handler must not see streams to other ports"
+    );
     drop(client);
 
     server.shutdown();
-    let relaunched = launch_server(&server_state, &server_cache).await?;
+    let relaunched = launch_server(&server_state, &server_cache, &accepted).await?;
     assert_eq!(
         relaunched.locator(),
         &locator,

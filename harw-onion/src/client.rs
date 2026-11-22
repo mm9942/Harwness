@@ -181,7 +181,7 @@ pub(crate) fn create_client(
     TorClient::with_runtime(runtime)
         .config(config)
         .create_unbootstrapped()
-        .map_err(|e| map_arti_error(&e, OnionError::Config))
+        .map_err(|e| map_arti_error(&e, OnionError::Runtime))
 }
 
 /// Maps an arti bootstrap status to harw's progress snapshot.

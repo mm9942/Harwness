@@ -43,7 +43,7 @@
 //! and global-only), never a silent fallback.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "onion")]
 use std::time::Duration;
@@ -252,12 +252,6 @@ pub fn plan(section: &SessionListenerSection) -> Result<ListenerPlan, String> {
                 .map_err(|error| format!("[session_listener] approval_device: {error}"))
         })
         .transpose()?;
-    if section.onion && !cfg!(feature = "onion") {
-        return Err(
-            "[session_listener] onion = true needs a harw build with the `onion` cargo feature"
-                .to_owned(),
-        );
-    }
     let onion_dir = match section.onion_dir.as_deref() {
         None => None,
         Some(_) if !section.onion => {
@@ -268,9 +262,24 @@ pub fn plan(section: &SessionListenerSection) -> Result<ListenerPlan, String> {
             if !dir.is_absolute() {
                 return Err("[session_listener] onion_dir must be an absolute path".to_owned());
             }
+            if dir
+                .components()
+                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+            {
+                return Err(
+                    "[session_listener] onion_dir must not contain `.` or `..` components"
+                        .to_owned(),
+                );
+            }
             Some(dir)
         }
     };
+    if section.onion && !cfg!(feature = "onion") {
+        return Err(
+            "[session_listener] onion = true needs a harw build with the `onion` cargo feature"
+                .to_owned(),
+        );
+    }
     Ok(ListenerPlan {
         addr,
         node,
@@ -429,9 +438,15 @@ fn write_locator(path: &Path, locator: &harw_onion::OnionLocator) -> Result<(), 
 
     let tmp = path.with_extension("tmp");
     let fail = |error: std::io::Error| format!("[session_listener] onion locator file: {error}");
+    // A stale tmp (maybe with loose permissions) is removed; `create_new`
+    // (O_EXCL) never follows a symlink and guarantees the 0600 mode applies.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(fail(error)),
+    }
     let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&tmp)
@@ -499,12 +514,21 @@ mod tests {
         let mut dir_only = section();
         dir_only.onion_dir = Some("/var/onion".to_owned());
         assert!(plan(&dir_only).is_err(), "onion_dir without onion");
-        #[cfg(feature = "onion")]
-        {
-            let mut relative = section();
-            relative.onion = true;
-            relative.onion_dir = Some("onion".to_owned());
-            assert!(plan(&relative).is_err(), "relative onion_dir");
+        let mut relative = section();
+        relative.onion = true;
+        relative.onion_dir = Some("onion".to_owned());
+        assert!(
+            plan(&relative).is_err_and(|e| e.contains("absolute")),
+            "relative onion_dir"
+        );
+        for raw in ["/var/onion/../x", "/var/./onion"] {
+            let mut dotted = section();
+            dotted.onion = true;
+            dotted.onion_dir = Some(raw.to_owned());
+            assert!(
+                plan(&dotted).is_err_and(|e| e.contains("components")),
+                "{raw}"
+            );
         }
     }
 
@@ -545,6 +569,30 @@ mod tests {
             text,
             "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443\n"
         );
+        let mode = std::fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[cfg(feature = "onion")]
+    #[test]
+    fn write_locator_replaces_a_loose_stale_tmp() -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let locator: harw_onion::OnionLocator =
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443"
+                .parse()
+                .map_err(|e: harw_onion::OnionError| e.to_string())?;
+        let path = temp.path().join(ONION_LOCATOR_FILE);
+        let stale = path.with_extension("tmp");
+        std::fs::write(&stale, "old").map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| e.to_string())?;
+        write_locator(&path, &locator)?;
         let mode = std::fs::metadata(&path)
             .map_err(|e| e.to_string())?
             .permissions()

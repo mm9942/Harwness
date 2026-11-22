@@ -218,6 +218,15 @@ impl OnionServer {
     }
 }
 
+impl Drop for OnionServer {
+    fn drop(&mut self) {
+        // Aborting the accept loop drops its `JoinSet`s, which aborts every
+        // circuit task and every handler task; the service and the client are
+        // dropped right after this, in field order.
+        self.tasks.abort_all();
+    }
+}
+
 /// Builds the arti onion-service configuration: nickname and per-circuit
 /// stream limit only (no proof-of-work, no restricted discovery).
 pub(crate) fn service_config(config: &OnionServerConfig) -> Result<OnionServiceConfig, OnionError> {
@@ -238,13 +247,17 @@ impl TaskGuard {
     fn push(&mut self, task: JoinHandle<()>) {
         self.0.push(task);
     }
+
+    fn abort_all(&self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        for task in &self.0 {
-            task.abort();
-        }
+        self.abort_all();
     }
 }
 

@@ -368,6 +368,7 @@ async fn serve(args: Serve) -> Result<()> {
         "session socket : {}",
         args.state.join("session.sock").display()
     );
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
     let observe_gateway = async {
         let mut ready = false;
         let mut lines = BufReader::new(stderr).lines();
@@ -398,6 +399,7 @@ async fn serve(args: Serve) -> Result<()> {
                     eprintln!("Public server profile: {}", profile_path.display());
                 }
                 ready = true;
+                ready_tx.send_replace(true);
             }
         }
         let status = gateway.wait().await?;
@@ -406,14 +408,7 @@ async fn serve(args: Serve) -> Result<()> {
 
     let ready_deadline = async {
         if onion_dir.is_some() {
-            tokio::time::sleep(ONION_READY_TIMEOUT).await;
-            Err::<(), Box<dyn std::error::Error>>(
-                format!(
-                    "test gateway did not become ready within {} s",
-                    ONION_READY_TIMEOUT.as_secs()
-                )
-                .into(),
-            )
+            readiness_deadline(ready_rx, ONION_READY_TIMEOUT).await
         } else {
             std::future::pending().await
         }
@@ -423,6 +418,27 @@ async fn serve(args: Serve) -> Result<()> {
         result = ready_deadline => result,
         status = hub.wait() => Err(format!("test AuthHub exited ({})", status?).into()),
         status = wait_fixture(&mut fixture) => Err(format!("model fixture exited ({})", status?).into()),
+    }
+}
+
+/// Bounds only the wait for readiness: errors when `ready` does not become
+/// true within `limit`, and stays pending forever once it has, so a ready
+/// gateway keeps running until it exits or the user stops it.
+async fn readiness_deadline(
+    mut ready: tokio::sync::watch::Receiver<bool>,
+    limit: Duration,
+) -> Result<()> {
+    let reached = tokio::time::timeout(limit, ready.wait_for(|ready| *ready))
+        .await
+        .is_ok();
+    if reached {
+        std::future::pending().await
+    } else {
+        Err(format!(
+            "test gateway did not become ready within {} s",
+            limit.as_secs()
+        )
+        .into())
     }
 }
 
@@ -1259,6 +1275,27 @@ mod tests {
         status.backend_state = "Running".into();
         status.ips.truncate(1);
         assert!(tailnet_address(&status).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_deadline_errors_when_never_ready() -> TestResult {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let outcome = readiness_deadline(rx, Duration::from_millis(20)).await;
+        assert!(outcome.is_err_and(|error| error.to_string().contains("did not become ready")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_deadline_never_fires_after_readiness() -> TestResult {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send_replace(true);
+        let fired = tokio::time::timeout(
+            Duration::from_millis(200),
+            readiness_deadline(rx, Duration::from_millis(20)),
+        )
+        .await;
+        assert!(fired.is_err(), "deadline fired after the gateway was ready");
         Ok(())
     }
 

@@ -342,6 +342,9 @@ impl MobileCore {
     }
 
     pub fn status(&self) -> ConnectionStatus {
+        // Read Tor progress before the state lock: the Tor client lock can be
+        // held while Tor starts, which must never stall state operations.
+        let tor = self.shared.dialer.tor_status();
         let mut state = self.shared.state();
         state.apply_pending_revocation();
         let profile = state.profile.as_ref().map(|profile| &profile.profile);
@@ -378,7 +381,7 @@ impl MobileCore {
                 .as_ref()
                 .map(available_routes)
                 .unwrap_or_default(),
-            tor: self.shared.dialer.tor_status(),
+            tor,
         }
     }
 
@@ -790,16 +793,8 @@ async fn drive_connection(
         let connection = match connected {
             Some(connection) => connection,
             None => {
-                let detail = failures
-                    .iter()
-                    .map(|(route, error)| {
-                        format!("{}: {}", route_label(*route), dial_detail(error))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let kind = failures
-                    .last()
-                    .map_or(DialFailure::Final, |(_, error)| dial_failure(error));
+                let detail = failure_detail(&failures);
+                let kind = attempt_failure(&failures);
                 let mut state = shared.state();
                 if run.is_cancelled() {
                     break;
@@ -832,7 +827,7 @@ async fn drive_connection(
                 break;
             }
             state.phase = ConnectionPhase::Connected;
-            state.detail = None;
+            state.detail = fallback_note(&failures, state.route);
             state.link = Some(Arc::clone(&link));
             for (id, session) in &mut state.sessions {
                 start_attachment(&shared, session, id.clone(), Arc::clone(&link));
@@ -883,11 +878,78 @@ fn dial_detail(error: &RemoteError) -> String {
     }
 }
 
-#[derive(PartialEq, Eq)]
+/// Joins every route failure of one dial attempt into a user-facing detail.
+fn failure_detail(failures: &[(ConnectionRoute, RemoteError)]) -> String {
+    failures
+        .iter()
+        .map(|(route, error)| format!("{}: {}", route_label(*route), dial_detail(error)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Visible note for a link that only came up after earlier routes failed.
+fn fallback_note(
+    failures: &[(ConnectionRoute, RemoteError)],
+    route: Option<ConnectionRoute>,
+) -> Option<String> {
+    let route = route?;
+    if failures.is_empty() {
+        return None;
+    }
+    let via = match route {
+        ConnectionRoute::Direct => "directly".to_owned(),
+        ConnectionRoute::Onion => format!("via {}", route_label(route)),
+    };
+    Some(format!(
+        "{} unavailable, connected {via} ({})",
+        failures
+            .iter()
+            .map(|(failed, _)| route_label(*failed))
+            .collect::<Vec<_>>()
+            .join(", "),
+        failure_detail(failures)
+    ))
+}
+
+/// Whether a dial attempt whose every route failed is worth retrying later.
+fn attempt_failure(failures: &[(ConnectionRoute, RemoteError)]) -> DialFailure {
+    let mut retry = false;
+    for (_, error) in failures {
+        match dial_failure(error) {
+            DialFailure::Final => return DialFailure::Final,
+            DialFailure::Retry => retry = true,
+            DialFailure::Unavailable => {}
+        }
+    }
+    if retry {
+        DialFailure::Retry
+    } else {
+        DialFailure::Final
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum DialFailure {
+    /// Transient; a later attempt over this route may succeed.
     Retry,
+    /// This route cannot work in the current setup; try the next route but
+    /// do not schedule a retry for it.
+    Unavailable,
+    /// The server refused this device (node handshake, TLS configuration,
+    /// hello denied, HTTP 4xx); stop trying further routes. Tor setup errors
+    /// are never `Final` for a route: they are `Unavailable`, so Auto still
+    /// falls back to the direct route.
     Final,
 }
+
+/// Tor setup failures that no retry can fix without user or build changes.
+const TOR_SETUP_FAILURES: [&str; 5] = [
+    "tor: Tor storage is not configured",
+    "tor: tor configuration:",
+    "tor: no rustls crypto provider",
+    "tor: invalid onion locator:",
+    "tor: this build's Tor",
+];
 
 fn dial_failure(error: &RemoteError) -> DialFailure {
     // The transport authenticates the host before upgrade. Its current
@@ -895,6 +957,9 @@ fn dial_failure(error: &RemoteError) -> DialFailure {
     let RemoteError::Connect(detail) = error else {
         return DialFailure::Final;
     };
+    if TOR_SETUP_FAILURES.iter().any(|prefix| detail.starts_with(prefix)) {
+        return DialFailure::Unavailable;
+    }
     // An upgrade refusal is terminal for this dial. HTTP 403 can also
     // represent a missing/invalid registry; it is not a revocation signal.
     if detail.starts_with("node transport: node handshake:")
@@ -1295,5 +1360,59 @@ mod profile_tests {
                 .any(|feature| feature == "compact_reasoning")
         );
         assert!(requested.iter().any(|feature| feature == "job_frames"));
+    }
+}
+
+#[cfg(test)]
+mod route_failure_tests {
+    use super::*;
+
+    fn connect(detail: &str) -> RemoteError {
+        RemoteError::Connect(detail.into())
+    }
+
+    #[test]
+    fn tor_setup_errors_skip_to_the_next_route_without_retrying() {
+        for detail in [
+            "tor: Tor storage is not configured",
+            "tor: tor configuration: bad state dir",
+            "tor: this build's Tor (arti 0.48) is too old for the current Tor network; update harw",
+        ] {
+            assert_eq!(dial_failure(&connect(detail)), DialFailure::Unavailable);
+        }
+        assert_eq!(
+            dial_failure(&connect("tor: onion connect did not finish within 120s")),
+            DialFailure::Retry
+        );
+        let unconfigured = || connect("tor: Tor storage is not configured");
+        let onion_only = [(ConnectionRoute::Onion, unconfigured())];
+        assert_eq!(attempt_failure(&onion_only), DialFailure::Final);
+        let auto = [
+            (ConnectionRoute::Onion, unconfigured()),
+            (ConnectionRoute::Direct, connect("tcp connect: refused")),
+        ];
+        assert_eq!(attempt_failure(&auto), DialFailure::Retry);
+        let refused = [
+            (ConnectionRoute::Onion, connect("tor: tor bootstrap failed: x")),
+            (
+                ConnectionRoute::Direct,
+                connect("upgrade: peer did not switch protocols (status 403)"),
+            ),
+        ];
+        assert_eq!(attempt_failure(&refused), DialFailure::Final);
+        assert_eq!(attempt_failure(&[]), DialFailure::Final);
+    }
+
+    #[test]
+    fn direct_fallback_keeps_a_visible_note() {
+        let failures = [(
+            ConnectionRoute::Onion,
+            connect("tor: Tor storage is not configured"),
+        )];
+        let text = fallback_note(&failures, Some(ConnectionRoute::Direct)).unwrap_or_default();
+        assert!(text.starts_with("Tor (.onion) unavailable, connected directly (Tor (.onion): "));
+        assert!(text.contains("Tor storage is not configured"));
+        assert_eq!(fallback_note(&[], Some(ConnectionRoute::Direct)), None);
+        assert_eq!(fallback_note(&failures, None), None);
     }
 }

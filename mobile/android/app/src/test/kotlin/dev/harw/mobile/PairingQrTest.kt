@@ -97,10 +97,57 @@ class PairingQrTest {
     }
 
     @Test
-    fun profileQrV2RejectsAnOnionOfTheWrongLength() {
-        val qr = profileQrV2("abcdefg.onion", ByteArray(1952) { it.toByte() })
-        assertThrows(IllegalArgumentException::class.java) { decodeProfileQr(qr) }
-        val short = profileQrV2("abcdefghij", ByteArray(1952) { it.toByte() })
-        assertThrows(IllegalArgumentException::class.java) { decodeProfileQr(short) }
+    fun profileQrV2RejectsOnionLocatorsJustOutsideTheAcceptedLengths() {
+        for (length in listOf(61, 69)) {
+            val qr = profileQrV2("a".repeat(length), ByteArray(1952) { it.toByte() })
+            assertThrows("onion length $length", IllegalArgumentException::class.java) { decodeProfileQr(qr) }
+        }
+    }
+
+    @Test
+    fun profileQrV2AcceptsOnionLocatorsAtTheAcceptedLengthBoundaries() {
+        for (length in listOf(62, 68)) {
+            val onion = "a".repeat(length)
+            val qr = profileQrV2(onion, ByteArray(1952) { it.toByte() })
+            val profile = SiwcJson.fromJson(decodeProfileQr(qr), com.google.gson.JsonObject::class.java)
+            assertEquals(onion, profile.string("onion"))
+        }
+    }
+
+    @Test
+    fun profileQrV1RoundTripsAtTheMaximumFieldLengths() {
+        val label = "L".repeat(128)
+        val nodeId = "n".repeat(128)
+        val endpoint = "e".repeat(63)
+        val publicKey = ByteArray(1952) { it.toByte() }
+        val fields = listOf(label, nodeId, endpoint).map { it.encodeToByteArray() }
+        val binary = fields.map { it.size.toByte() }.toByteArray() + fields.reduce(ByteArray::plus) + publicKey
+        val qr = "HARW:PROFILE:1:" + encodeBase45(binary)
+        val profile = SiwcJson.fromJson(decodeProfileQr(qr), com.google.gson.JsonObject::class.java)
+        assertEquals(1L, profile.integer("version"))
+        assertEquals(label, profile.string("label"))
+        assertEquals(nodeId, profile.string("server_node_id"))
+        assertEquals(endpoint, profile.string("endpoint"))
+        assertEquals(publicKey.hex(), profile.string("server_public_key_hex"))
+        assertEquals(3411, qr.length - "HARW:PROFILE:1:".length)
+    }
+
+    @Test
+    fun profileQrV2RoundTripsAtTheMaximumFieldLengthsBelowTheTextLimit() {
+        val label = "L".repeat(128)
+        val nodeId = "n".repeat(128)
+        val endpoint = "e".repeat(63)
+        val onion = "o".repeat(68)
+        val publicKey = ByteArray(1952) { it.toByte() }
+        val fields = listOf(label, nodeId, endpoint, onion).map { it.encodeToByteArray() }
+        val binary = fields.map { it.size.toByte() }.toByteArray() + fields.reduce(ByteArray::plus) + publicKey
+        val qr = "HARW:PROFILE:2:" + encodeBase45(binary)
+        assertEquals(3515, qr.length - "HARW:PROFILE:2:".length)
+        val profile = SiwcJson.fromJson(decodeProfileQr(qr), com.google.gson.JsonObject::class.java)
+        assertEquals(label, profile.string("label"))
+        assertEquals(nodeId, profile.string("server_node_id"))
+        assertEquals(endpoint, profile.string("endpoint"))
+        assertEquals(onion, profile.string("onion"))
+        assertEquals(publicKey.hex(), profile.string("server_public_key_hex"))
     }
 }

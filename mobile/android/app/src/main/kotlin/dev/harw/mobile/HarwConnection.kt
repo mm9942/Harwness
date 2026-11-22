@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.util.Log
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -37,6 +38,10 @@ import uniffi.harw_mobile_ffi.SubmitOutcome
 import uniffi.harw_mobile_ffi.TorBootstrap
 import uniffi.harw_mobile_ffi.generateIdentity
 import uniffi.harw_mobile_ffi.parseServerProfile
+
+/** ONION needs an onion route; without one the preference falls back to AUTO. */
+internal fun normalizedPreference(preference: RoutePreference, hasOnion: Boolean): RoutePreference =
+    if (preference == RoutePreference.ONION && !hasOnion) RoutePreference.AUTO else preference
 
 internal data class WorkspaceState(
     val profile: ServerProfile? = null,
@@ -97,6 +102,7 @@ internal data class WorkspaceState(
         val cleared = if (forgetRequired) this else clearSessions()
         return cleared.copy(
             profile = null,
+            routePreference = RoutePreference.AUTO,
             deviceNodeId = null,
             phase = ConnectionPhase.DISCONNECTED,
             detail = "Removing saved phone setup.",
@@ -203,8 +209,9 @@ internal class HarwConnection(private val context: Context) {
                     val (saved, document) = storageLock.withLock { store.hasSavedSetup() to store.readProfile() }
                     saved to document?.let(::parseServerProfile)
                 }
+                val preference = normalizedPreference(loadRoutePreference(), profile?.onion != null)
                 change {
-                    it.copy(profile = profile, hasSavedSetup = hasSavedSetup, setupPending = false, cleanupError = null)
+                    it.copy(profile = profile, routePreference = preference, hasSavedSetup = hasSavedSetup, setupPending = false, cleanupError = null)
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
@@ -269,11 +276,7 @@ internal class HarwConnection(private val context: Context) {
             change {
                 it.copy(
                     profile = profile,
-                    routePreference = if (profile.onion == null && it.routePreference == RoutePreference.ONION) {
-                        RoutePreference.AUTO
-                    } else {
-                        it.routePreference
-                    },
+                    routePreference = normalizedPreference(it.routePreference, profile.onion != null),
                     hasSavedSetup = true,
                     setupNotice = "Profile imported.",
                     phase = ConnectionPhase.DISCONNECTED,
@@ -292,7 +295,25 @@ internal class HarwConnection(private val context: Context) {
         val current = state.value
         if (current.hasConnection || current.stopping) return
         if (preference == RoutePreference.ONION && current.profile?.onion == null) return
+        saveRoutePreference(preference)
         change { it.copy(routePreference = preference) }
+    }
+
+    private val routePrefs by lazy { context.getSharedPreferences(RoutePrefsName, Context.MODE_PRIVATE) }
+
+    private fun loadRoutePreference(): RoutePreference = try {
+        routePrefs.getString(RoutePrefKey, null)?.let { RoutePreference.valueOf(it) } ?: RoutePreference.AUTO
+    } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        RoutePreference.AUTO
+    }
+
+    private fun saveRoutePreference(preference: RoutePreference) {
+        try {
+            routePrefs.edit().putString(RoutePrefKey, preference.name).apply()
+        } catch (error: Exception) {
+            Log.w(LogTag, "Could not persist the route preference", error)
+        }
     }
 
     fun reportCameraUnavailable() {
@@ -800,7 +821,12 @@ internal class HarwConnection(private val context: Context) {
             // Setup erasure can only wait on local storage writes before erasing the
             // identity. Native RPCs and Android document providers can finish later.
             val storageFailed = try {
-                withContext(Dispatchers.IO) { storageLock.withLock { store.purgeSetup() } }
+                withContext(Dispatchers.IO) {
+                    storageLock.withLock {
+                        store.purgeSetup()
+                        if (!routePrefs.edit().clear().commit()) error("route preference not cleared")
+                    }
+                }
                 false
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
@@ -855,7 +881,12 @@ internal class HarwConnection(private val context: Context) {
             }
             try {
                 val native = MobileCore(privateKey, DeviceLabel)
-                native.setTorDirectories(File(context.noBackupFilesDir, "tor/state").path, File(context.cacheDir, "tor").path)
+                try {
+                    native.setTorDirectories(File(context.noBackupFilesDir, "tor/state").path, File(context.cacheDir, "tor").path)
+                } catch (error: MobileException) {
+                    // Only the onion route needs Tor storage; direct connections must keep working.
+                    Log.w(LogTag, "Tor storage is unavailable; the onion route will fail", error)
+                }
                 native to native.enrollment().nodeId
             } finally {
                 privateKey.fill(0)
@@ -893,6 +924,9 @@ internal class HarwConnection(private val context: Context) {
     private companion object {
         // This fixed label is part of the persisted enrollment format.
         const val DeviceLabel = "Harw Android"
+        const val LogTag = "HarwConnection"
+        const val RoutePrefsName = "harw_connection"
+        const val RoutePrefKey = "route_preference"
         const val ChatgptUnlinkWarning = "The server removed its local ChatGPT link. Revocation at OpenAI was not confirmed. Review the agent in ChatGPT Settings."
     }
 }

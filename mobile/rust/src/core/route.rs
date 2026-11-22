@@ -223,17 +223,19 @@ impl Dialer {
     #[cfg(feature = "onion")]
     fn tor_client(&self) -> Result<Arc<harw_onion::OnionClient>, String> {
         let dirs = lock(&self.inner.dirs).clone();
-        let mut tor = lock(&self.inner.tor);
-        if let Some(client) = tor.as_ref() {
+        if let Some(client) = lock(&self.inner.tor).as_ref() {
             return Ok(Arc::clone(client));
         }
         let (state, cache) = dirs.ok_or_else(|| "Tor storage is not configured".to_owned())?;
-        let client =
+        // Launch without holding the lock: it opens Tor storage and can be slow,
+        // and `tor_status` (polled by the UI) must not block meanwhile.
+        let launched =
             harw_onion::OnionClient::launch(&harw_onion::OnionClientConfig::new(state, cache))
                 .map_err(|error| error.to_string())?;
-        let client = Arc::new(client);
-        *tor = Some(Arc::clone(&client));
-        Ok(client)
+        let mut tor = lock(&self.inner.tor);
+        // If another task won the race, keep its client; ours is dropped.
+        let client = tor.get_or_insert_with(|| Arc::new(launched));
+        Ok(Arc::clone(client))
     }
 }
 

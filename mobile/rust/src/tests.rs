@@ -763,3 +763,66 @@ async fn session_runs_end_to_end_over_a_non_tcp_stream() -> TestResult {
     serving.abort();
     Ok(())
 }
+
+/// Fixture profile that additionally advertises a (never reachable) onion route.
+fn with_onion(profile: &ServerProfile) -> ServerProfile {
+    let mut profile = profile.clone();
+    profile.onion = Some(ONION_VECTOR.to_owned());
+    profile
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onion_only_preference_fails_on_tor_setup_and_never_dials_direct() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    // The direct endpoint is a bare counting listener: any direct dial would show up here.
+    let counter = TcpListener::bind("127.0.0.1:0").await?;
+    let mut profile = with_onion(&fixture.profile);
+    profile.endpoint = counter.local_addr()?.to_string();
+    fixture.core.set_route_preference(RoutePreference::Onion);
+    assert!(matches!(
+        fixture.core.connect(profile),
+        Err(MobileError::Connect { detail }) if detail.contains("tor:")
+    ));
+    assert_eq!(fixture.core.status().phase, ConnectionPhase::Failed);
+    assert!(fixture.core.status().tor.is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), counter.accept())
+            .await
+            .is_err(),
+        "the onion-only route must never dial the direct endpoint"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_preference_falls_back_to_direct_and_says_so() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    fixture.core.set_route_preference(RoutePreference::Auto);
+    fixture.core.connect(with_onion(&fixture.profile))?;
+    let status = fixture.core.status();
+    assert_eq!(status.phase, ConnectionPhase::Connected);
+    assert_eq!(status.route, Some(ConnectionRoute::Direct));
+    assert_eq!(
+        status.available_routes,
+        vec![ConnectionRoute::Onion, ConnectionRoute::Direct]
+    );
+    assert!(status.tor.is_none(), "Tor storage was never configured");
+    assert!(
+        status.detail.is_some(),
+        "the fallback to direct must leave a visible note"
+    );
+    assert!(fixture.core.list_sessions()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_preference_never_touches_tor() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    fixture.core.set_route_preference(RoutePreference::Direct);
+    fixture.core.connect(with_onion(&fixture.profile))?;
+    let status = fixture.core.status();
+    assert_eq!(status.phase, ConnectionPhase::Connected);
+    assert_eq!(status.route, Some(ConnectionRoute::Direct));
+    assert!(status.tor.is_none());
+    Ok(())
+}
