@@ -1217,7 +1217,8 @@ async fn work_driver_enqueue(
     Ok(OpOutput {
         text: format!(
             "WorkDriver job {work_id} admitted for goal `{goal_id}` (max {} rounds, {} parallel \
-             workers). Observe it with work_driver.status.",
+             workers). Observe it with work_driver.status. It only runs while `harw serve` is \
+             active for this home and profile.",
             input.spec.max_iterations, input.spec.max_parallel_workers
         ),
         data: Some(serde_json::json!({
@@ -1431,7 +1432,17 @@ fn render_status(
             .or_else(|| mean_cache_hit_ratio(&state.workers))
     });
     match state {
-        None => lines.push("no driver round recorded yet".to_owned()),
+        None => {
+            lines.push("no driver round recorded yet".to_owned());
+            // Nur der Job-Worker von `harw serve` setzt einen WorkDriver-Job
+            // von Ready auf Running; TUI und Session-Daemon starten keinen.
+            lines.push(
+                "not claimed yet: WorkDriver jobs are only executed by a running `harw serve` \
+                 with the same home and profile as this session (and the workspace as its \
+                 working directory); other causes: lane full or not_before in the future"
+                    .to_owned(),
+            );
+        }
         Some(state) => {
             lines.push(format!("iteration {}", state.iteration));
             lines.push(format!("workers ({}):", state.workers.len()));

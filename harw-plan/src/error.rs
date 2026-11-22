@@ -222,7 +222,11 @@ pub enum PlanError {
     ///
     /// # Arguments
     /// - `id` (`TaskId`): betroffener Knoten.
-    #[msg("Knoten '{id}' benötigt eine frische Exploration vor Coding/Integration (Regel 12)")]
+    #[msg(
+        "Knoten '{id}' benötigt eine frische Exploration vor Coding/Integration (Regel 12): \
+         `explore` mit task='{id}' ausführen oder einen abgeschlossenen Explore-/Research-Knoten \
+         als Abhängigkeit eintragen"
+    )]
     ExplorationRequired { id: TaskId },
 
     /// Der `write_scope` eines Kind-Knotens verlässt den `write_scope` seines
@@ -656,6 +660,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("t1"), "msg={msg}");
         assert!(msg.contains("Regel 12"), "msg={msg}");
+        assert!(msg.contains("`explore` mit task='t1'"), "msg={msg}");
     }
 
     #[test]
