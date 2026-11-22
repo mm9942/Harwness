@@ -30,7 +30,7 @@ CARGO ?= $(if $(wildcard $(HOME)/.cargo/bin/cargo),$(HOME)/.cargo/bin/cargo,carg
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
-.PHONY: help clippy-tests clippy tests fmt check build install uninstall service gates \
+.PHONY: release-apk help clippy-tests clippy tests fmt check build install uninstall service gates \
 	dod-build dod-install dod-enable dod-uninstall release release-publish site site-check
 
 .DEFAULT_GOAL := help
@@ -100,6 +100,9 @@ HARW_HOST_TARGET = $(shell rustc -vV | sed -n 's/^host: //p')
 # `HARW_VERSION` embeds via `CARGO_PKG_VERSION`), so Make needs no cargo
 # subprocess to know it.
 HARW_VERSION = $(shell awk -F'"' '/^version = /{print $$2; exit}' Cargo.toml)
+
+release-apk: ## Build the Android app, bump the version (VERSION=x.y.z to pin) and push a changed APK to the update channel
+	mobile/scripts/release-apk $(if $(VERSION),--version $(VERSION)) $(if $(NOTES),--notes "$(NOTES)") $(RELEASE_ARGS)
 
 install: build ## Install harw, killer, harw-job-exec and the agent runner into BINDIR (default ~/.local/bin)
 	install -Dm755 target/release/harw $(BINDIR)/harw
