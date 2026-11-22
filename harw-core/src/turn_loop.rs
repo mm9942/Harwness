@@ -4943,6 +4943,7 @@ async fn drive_turn(
         // cancel-aware provider (e.g. `RetryingProvider::race_respond`)
         // abort its own retry loop early; this `select!` is the backstop
         // for every provider, cancel-aware or not.
+        let respond_session = session.id().clone();
         let response = tokio::select! {
             biased;
             _ = control.cancel_token().cancelled() => {
@@ -4954,7 +4955,7 @@ async fn drive_turn(
                 )
                 .await;
             }
-            result = model.respond(request) => result,
+            result = crate::model::with_current_session(respond_session, model.respond(request)) => result,
         };
         // `ModelError::Cancelled` can also surface from inside `respond()`
         // itself (a cancel-aware provider observed the token before this

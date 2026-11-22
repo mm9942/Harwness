@@ -1414,3 +1414,24 @@ mod tests {
         );
     }
 }
+
+
+tokio::task_local! {
+    /// Session, deren Turn gerade das Modell aufruft (gesetzt von der Turn-Schleife).
+    static CURRENT_SESSION: harw_types::SessionId;
+}
+
+/// Die Session, für die der aktuell laufende Modellaufruf gemacht wird; `None` außerhalb eines Turns.
+/// So kann ein Modell-Wrapper (z. B. der der Telefon-App) pro Session eine andere Persona einsetzen.
+#[must_use]
+pub fn current_session_id() -> Option<harw_types::SessionId> {
+    CURRENT_SESSION.try_with(Clone::clone).ok()
+}
+
+/// Führt `future` mit gesetzter aktueller Session aus (siehe [`current_session_id`]).
+pub(crate) async fn with_current_session<F: std::future::Future>(
+    session: harw_types::SessionId,
+    future: F,
+) -> F::Output {
+    CURRENT_SESSION.scope(session, future).await
+}

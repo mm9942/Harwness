@@ -126,6 +126,7 @@ pub use history_tail::{
 };
 pub use media::{ModelImage, install_media_source, resolve_media, resolve_media_with};
 pub use mode::InteractionMode;
+pub use model::current_session_id;
 pub use model::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,
     REPLAY_UNAVAILABLE_CODE, RequestIdentity,

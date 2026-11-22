@@ -144,11 +144,28 @@ impl harw_core::ModelProvider for SwitchingModel {
     fn respond<'a>(&'a self, mut request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
         Box::pin(async move {
             let provider = self.provider().await?;
+            // Pro Chat gewählte UIA: ihre Persona ersetzt die der aktiven UIA in der Systemanweisung.
+            if let Some(session) = harw_core::current_session_id()
+                && let Some((chosen, active)) = crate::uia::session_persona(&self.home, session.as_str())
+            {
+                request.system_prompt = swap_persona(&request.system_prompt, &chosen, active.as_deref());
+            }
             request.model_id = None;
             request.provider_id = None;
             provider.respond(request).await
         })
     }
+}
+
+/// Ersetzt die Persona der aktiven UIA in `prompt` durch die gewählte; fehlt sie dort, wird die gewählte angehängt.
+#[cfg(feature = "local-host")]
+fn swap_persona(prompt: &str, chosen: &str, active: Option<&str>) -> String {
+    if let Some(active) = active.map(str::trim).filter(|a| !a.is_empty())
+        && prompt.contains(active)
+    {
+        return prompt.replacen(active, chosen.trim(), 1);
+    }
+    format!("{prompt}\n\n## Rolle in diesem Chat\n\n{}", chosen.trim())
 }
 
 /// Stand-in while the next model loads; never answers.

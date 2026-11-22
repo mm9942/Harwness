@@ -8,6 +8,7 @@
 //! `system.md`. Die laufende Sitzung uebernimmt die neue UIA beim naechsten Start
 //! des lokalen Hosts.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -26,6 +27,8 @@ const MAX_PERSONALITY_CHARS: usize = 2000;
 const MAX_USER_NAME_CHARS: usize = 80;
 const MAX_CONTEXT_CHARS: usize = 2000;
 const MAX_DEFINITION_BYTES: u64 = 64 * 1024;
+const ASSIGN_FILE: &str = "chat-uias.json";
+const MAX_ASSIGNMENTS: usize = 5000;
 
 /// Standardtext der Persoenlichkeit (wie im alten Kit).
 const DEFAULT_PERSONALITY: &str = "Sei klar, respektvoll und transparent. Erkläre Unsicherheit und Risiken offen; behaupte keine ausgeführte Aktion ohne überprüfbare Evidenz. Frage nur nach, wenn die Antwort die Entscheidung wesentlich verändert.";
@@ -145,6 +148,56 @@ impl UiaStore {
         })
     }
 
+    /// Die UIA, mit der dieser Chat läuft; `None` = die aktive UIA des Profils.
+    pub fn uia_for_session(&self, session_id: String) -> Result<Option<UiaProfile>, MobileError> {
+        let assigned = read_assign(&self.home).sessions.get(&session_id).cloned();
+        Ok(assigned.and_then(|id| self.profile_by_id(&id)))
+    }
+
+    /// Legt die UIA eines Chats fest (`None` = aktive UIA). Gilt ab der nächsten Antwort in diesem Chat.
+    pub fn set_session_uia(&self, session_id: String, uia_id: Option<String>) -> Result<(), MobileError> {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        check_key(&session_id)?;
+        let mut assign = read_assign(&self.home);
+        match uia_id {
+            Some(id) => {
+                if self.profile_by_id(&id).is_none() {
+                    return Err(rejected("Dieses Agenten-Profil gibt es nicht."));
+                }
+                assign.sessions.insert(session_id, id);
+            }
+            None => {
+                assign.sessions.remove(&session_id);
+            }
+        }
+        write_assign(&self.home, &mut assign)
+    }
+
+    /// Standard-UIA eines Projekts; neue Chats in diesem Projekt starten damit. `None` = keine eigene.
+    pub fn project_default_uia(&self, project_key: String) -> Result<Option<UiaProfile>, MobileError> {
+        let assigned = read_assign(&self.home).projects.get(&project_key).cloned();
+        Ok(assigned.and_then(|id| self.profile_by_id(&id)))
+    }
+
+    /// Legt die Standard-UIA eines Projekts fest (`None` = entfernen).
+    pub fn set_project_default_uia(&self, project_key: String, uia_id: Option<String>) -> Result<(), MobileError> {
+        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        check_key(&project_key)?;
+        let mut assign = read_assign(&self.home);
+        match uia_id {
+            Some(id) => {
+                if self.profile_by_id(&id).is_none() {
+                    return Err(rejected("Dieses Agenten-Profil gibt es nicht."));
+                }
+                assign.projects.insert(project_key, id);
+            }
+            None => {
+                assign.projects.remove(&project_key);
+            }
+        }
+        write_assign(&self.home, &mut assign)
+    }
+
     /// Macht eine vorhandene UIA zur aktiven.
     pub fn activate_uia(&self, id: String) -> Result<(), MobileError> {
         let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -189,6 +242,14 @@ impl UiaStore {
 }
 
 impl UiaStore {
+    fn profile_by_id(&self, id: &str) -> Option<UiaProfile> {
+        let active = self.home.info().ok()?.active_uia;
+        self.scan()
+            .into_iter()
+            .find(|(_, existing, _)| existing == id)
+            .map(|(_, id, name)| UiaProfile { active: active.as_deref() == Some(id.as_str()), id, name })
+    }
+
     fn agents_dir(&self) -> PathBuf {
         self.home.profile_dir().join("agents")
     }
@@ -239,6 +300,63 @@ impl UiaStore {
         }
         found
     }
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Assignments {
+    #[serde(default)]
+    sessions: BTreeMap<String, String>,
+    #[serde(default)]
+    projects: BTreeMap<String, String>,
+}
+
+fn assign_path(home: &AppHome) -> PathBuf {
+    home.profile_dir().join(ASSIGN_FILE)
+}
+
+fn read_assign(home: &AppHome) -> Assignments {
+    std::fs::read(assign_path(home))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn write_assign(home: &AppHome, assign: &mut Assignments) -> Result<(), MobileError> {
+    while assign.sessions.len() > MAX_ASSIGNMENTS {
+        let Some(first) = assign.sessions.keys().next().cloned() else { break };
+        assign.sessions.remove(&first);
+    }
+    let bytes = serde_json::to_vec(assign).map_err(|_| rejected("Zuordnung konnte nicht gespeichert werden."))?;
+    write_private_atomic(&assign_path(home), &bytes)
+}
+
+fn check_key(key: &str) -> Result<(), MobileError> {
+    if key.is_empty() || key.len() > 160 || !key.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(rejected("Ungültige Chat- oder Projekt-Id."));
+    }
+    Ok(())
+}
+
+/// Persona-Wechsel für einen Chat: `(system.md der gewählten UIA, system.md der aktiven UIA)`.
+/// `None`, wenn der Chat keine eigene UIA hat oder sie der aktiven entspricht.
+pub(crate) fn session_persona(home: &AppHome, session_id: &str) -> Option<(String, Option<String>)> {
+    let chosen_id = read_assign(home).sessions.get(session_id).cloned()?;
+    let active = home.info().ok()?.active_uia;
+    if active.as_deref() == Some(chosen_id.as_str()) {
+        return None;
+    }
+    let store = UiaStore { home: home.clone(), lock: Mutex::new(()) };
+    let found = store.scan();
+    let read = |id: &str| -> Option<String> {
+        let dir = &found.iter().find(|(_, existing, _)| existing == id)?.0;
+        let meta = std::fs::metadata(dir.join("system.md")).ok()?;
+        if meta.len() > MAX_DEFINITION_BYTES {
+            return None;
+        }
+        std::fs::read_to_string(dir.join("system.md")).ok()
+    };
+    let chosen = read(&chosen_id)?;
+    Some((chosen, active.as_deref().and_then(read)))
 }
 
 fn rejected(detail: &str) -> MobileError {

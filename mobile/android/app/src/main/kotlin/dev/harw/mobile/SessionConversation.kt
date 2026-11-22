@@ -207,6 +207,8 @@ internal fun SessionConversation(
     val manageOn = manageSupport?.manage == true
     var commandsOpen by rememberSaveable(sessionId) { mutableStateOf(false) }
     var modelsOpen by rememberSaveable(sessionId) { mutableStateOf(false) }
+    var agentVersion by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    val ctx = androidx.compose.ui.platform.LocalContext.current
     val draftText = window.draft(sessionId).text
     LaunchedEffect(sessionId, state.online, state.generation) {
         connection.refreshManageSupport()
@@ -307,6 +309,7 @@ internal fun SessionConversation(
             if (state.local) {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 2.dp)) {
                     LocalModelChip(hasImages = window.draft(sessionId).images.isNotEmpty())
+                    ChatAgentChip(sessionId, window.projectKey, agentVersion) { agentVersion++ }
                 }
             } else if (manageSupport != null) {
                 val block = modelChipBlock(manageSupport, active)
@@ -392,14 +395,7 @@ internal fun SessionConversation(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 4.dp),
             )
         }
-            val context = androidx.compose.ui.platform.LocalContext.current
-            val agentName by produceState("Harw", state.local) {
-                value = if (!state.local) "Harw" else withContext(Dispatchers.IO) {
-                    runCatching {
-                        uniffi.harw_mobile_ffi.UiaStore(context.filesDir.path).listUias().firstOrNull { it.active }?.name?.takeIf { it.isNotBlank() }
-                    }.getOrNull() ?: "Harw"
-                }
-            }
+            val agentName = rememberChatAgentName(sessionId, state.local, agentVersion) ?: "Harw"
             ConversationFeed(
                 agentName = agentName,
                 entries = snapshot?.transcript.orEmpty(),
@@ -410,7 +406,7 @@ internal fun SessionConversation(
                     if (generation != null && currentHead != null) window.regenerate(connection, sessionId, generation, currentHead, entryId, text, images)
                 },
                 onFork = { text, images ->
-                    val open = { id: String -> window.prefillDraft(id, text, images); window.select(id) }
+                    val open = { id: String -> window.prefillDraft(id, text, images); window.projectKey?.let { applyProjectAgent(ctx, it, id) }; window.select(id) }
                     val project = window.projectKey
                     if (project != null) connection.createInProject(project, open) else connection.createSession(null, open)
                 },

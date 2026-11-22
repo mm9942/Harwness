@@ -500,7 +500,7 @@ internal open class MainActivity : ComponentActivity() {
                     canCreate = state.online && state.canCreate && !state.creating,
                     error = state.projectsError,
                     onSelect = window::selectProject,
-                    onNewSession = { key -> connection.createInProject(key) { id -> window.openLink(DeepLink(key, id)) } },
+                    onNewSession = { key -> connection.createInProject(key) { id -> applyProjectAgent(this@MainActivity, key, id); window.openLink(DeepLink(key, id)) } },
                     onRefresh = connection::refreshProjects,
                 )
             }
