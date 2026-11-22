@@ -7,6 +7,17 @@ import android.net.Uri
 import android.util.Base64
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.FlowRow
@@ -175,8 +186,10 @@ private fun RemoteThumbnail(ref: String, fetch: suspend (String) -> PromptImage?
     }
     val shown = bitmap
     val shape = RoundedCornerShape(10.dp)
+    var open by remember(ref) { mutableStateOf(false) }
+    if (open) ImageViewerDialog({ fetch(ref)?.let { decodeThumb(it, 1800) } ?: ThumbCache.cache.get(ref) }) { open = false }
     when {
-        shown != null -> Image(shown, contentDescription = "Gesendetes Bild", contentScale = ContentScale.Crop, modifier = Modifier.size(72.dp).clip(shape))
+        shown != null -> Image(shown, contentDescription = "Gesendetes Bild", contentScale = ContentScale.Crop, modifier = Modifier.size(72.dp).clip(shape).clickable { open = true })
         failed -> ImageChip()
         else -> Box(Modifier.size(72.dp).clip(shape).background(MaterialTheme.colorScheme.surfaceContainerHighest))
     }
@@ -189,10 +202,12 @@ internal fun DraftThumbnail(image: DraftImage, enabled: Boolean, onRemove: () ->
         value = withContext(Dispatchers.Default) { decodeThumb(image.image, 192)?.asImageBitmap() }
     }
     val shape = RoundedCornerShape(10.dp)
+    var open by remember(image.image.dataB64) { mutableStateOf(false) }
+    if (open) ImageViewerDialog({ decodeThumb(image.image, 1800) }) { open = false }
     Box(Modifier.size(72.dp)) {
         val shown = bitmap
         if (shown != null) {
-            Image(shown, contentDescription = image.label, contentScale = ContentScale.Crop, modifier = Modifier.matchParentSize().clip(shape))
+            Image(shown, contentDescription = image.label, contentScale = ContentScale.Crop, modifier = Modifier.matchParentSize().clip(shape).clickable { open = true })
         } else {
             Box(Modifier.matchParentSize().clip(shape).background(MaterialTheme.colorScheme.surfaceContainerHighest))
         }
@@ -242,9 +257,51 @@ private fun Thumbnail(image: PromptImage) {
     }
     val shape = RoundedCornerShape(10.dp)
     val shown = bitmap
+    var open by remember(image.dataB64) { mutableStateOf(false) }
+    if (open) ImageViewerDialog({ decodeThumb(image, 1800) }) { open = false }
     if (shown != null) {
-        Image(shown, contentDescription = "Gesendetes Bild", contentScale = ContentScale.Crop, modifier = Modifier.size(72.dp).clip(shape))
+        Image(shown, contentDescription = "Gesendetes Bild", contentScale = ContentScale.Crop, modifier = Modifier.size(72.dp).clip(shape).clickable { open = true })
     } else {
         Box(Modifier.size(72.dp).clip(shape).background(MaterialTheme.colorScheme.surfaceContainerHighest))
+    }
+}
+
+
+/** Vollbild-Ansicht eines Bildes: Doppeltippen/Kneifen zum Zoomen, X oben rechts schliesst. */
+@Composable
+internal fun ImageViewerDialog(load: suspend () -> Bitmap?, onClose: () -> Unit) {
+    val bitmap by produceState<ImageBitmap?>(null) { value = withContext(Dispatchers.IO) { load()?.asImageBitmap() } }
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.94f))) {
+            val shown = bitmap
+            if (shown == null) {
+                CircularProgressIndicator(Modifier.align(Alignment.Center))
+            } else {
+                Image(
+                    shown, contentDescription = "Bild", contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize()
+                        .pointerInput(Unit) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                scale = (scale * zoom).coerceIn(1f, 6f)
+                                offset = if (scale == 1f) Offset.Zero else offset + pan
+                            }
+                        }
+                        .graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y),
+                )
+            }
+            Surface(
+                onClick = onClose,
+                shape = RoundedCornerShape(50),
+                color = Color.Black.copy(alpha = 0.6f),
+                contentColor = Color.White,
+                modifier = Modifier.align(Alignment.TopEnd).padding(16.dp).size(44.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Outlined.Close, contentDescription = "Schließen", Modifier.size(26.dp))
+                }
+            }
+        }
     }
 }
