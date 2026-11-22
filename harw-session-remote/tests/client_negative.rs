@@ -215,6 +215,7 @@ fn submit_params(session: &SessionId, text: String, head: harw_protocol::Cursor)
         expect_head: head,
         client_msg_id: "m".into(),
         force: false,
+        images: Vec::new(),
     }
 }
 

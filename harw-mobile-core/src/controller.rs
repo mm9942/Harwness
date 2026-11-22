@@ -187,6 +187,7 @@ impl Controller {
                 expect_head,
                 client_msg_id: self.keys.next_key(),
                 force: false,
+                images: Vec::new(),
             })
             .await?;
         if let SubmitResult::Stale { head } = &result {

@@ -511,6 +511,7 @@ pub async fn start_remote(
     };
     let driver =
         CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), Arc::new(factory))
+            .and_then(|driver| driver.with_media_root(&config.home.join("media")))
             .map_err(|error| format!("remote session driver: {error}"))?;
     start_remote_composed(config, share, Arc::new(driver), local, verifier, listener).await
 }
@@ -1765,6 +1766,7 @@ mod tests {
                 expect_head: ack.head,
                 client_msg_id: "m1".to_owned(),
                 force: false,
+                images: Vec::new(),
             })
             .await?;
         assert!(

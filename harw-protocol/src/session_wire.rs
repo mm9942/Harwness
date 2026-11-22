@@ -115,6 +115,8 @@ pub mod features {
     /// `config.set`, `config.reset`, `secret.put`, `stepup.confirm`, `stepup.cancel` and the
     /// `stepup_request` frame. Minor >= 4, only together with `manage`.
     pub const STEPUP: &str = "stepup";
+    /// `turn.submit` honours [`super::SubmitParams::images`]. A client sends images only when the host granted this feature (an older host rejects the unknown field).
+    pub const IMAGES: &str = "images";
 }
 
 /// Position in a session stream.
@@ -913,6 +915,25 @@ pub struct SubmitParams {
     /// "I have seen the newer head": skip the stale check.
     #[serde(default)]
     pub force: bool,
+    /// Images attached to the prompt (feature `images`). Empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<SubmitImage>,
+}
+
+/// Most images one `turn.submit` may carry.
+pub const MAX_SUBMIT_IMAGES: usize = 4;
+/// Most base64 bytes over all images of one `turn.submit` (the transport message limit is 1 MiB).
+pub const MAX_SUBMIT_IMAGE_B64_BYTES: usize = 800 * 1024;
+
+/// One image of a `turn.submit`: the bytes travel inline (base64), the host
+/// checks, sanitizes and stores them; transcripts only carry a media reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitImage {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    /// Standard base64 (RFC 4648, with padding) of the image bytes.
+    pub data_b64: String,
 }
 
 /// Result of `turn.submit`.

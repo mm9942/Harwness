@@ -289,6 +289,15 @@ pub enum SubmitOutcome {
     InFlight,
 }
 
+/// Ein Bild am Prompt. `data_b64` ist Standard-Base64 (mit Padding) der Bytes; der Host prueft und
+/// bereinigt das Bild. Die App verkleinert vorher, damit alle Bilder zusammen in eine Nachricht passen.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct PromptImage {
+    /// `image/png`, `image/jpeg`, `image/gif` oder `image/webp`.
+    pub mime: String,
+    pub data_b64: String,
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct SubmitReceipt {
     pub outcome: SubmitOutcome,

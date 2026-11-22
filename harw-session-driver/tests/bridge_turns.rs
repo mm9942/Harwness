@@ -205,6 +205,7 @@ fn input(session: &SessionId, text: &str) -> TurnInput {
     TurnInput {
         session_id: session.clone(),
         text: text.to_owned(),
+        images: Vec::new(),
         client_msg_id: "msg-1".to_owned(),
         submitted_by: "tester".to_owned(),
         actor: ApprovalActor::Operator {

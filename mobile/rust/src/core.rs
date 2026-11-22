@@ -8,8 +8,8 @@ use harw_node_transport::{LocalNode, NodeBody, empty_body};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams,
     Cursor, DEFAULT_TAIL_ITEMS, HolderInfo, InterruptParams, PageParams, ProjectsParams,
-    RenameParams, RespondResult, SessionFrame, SetProjectParams, StreamProfile, SubmitParams,
-    SubmitResult, features,
+    RenameParams, RespondResult, SessionFrame, SetProjectParams, StreamProfile, SubmitImage,
+    SubmitParams, SubmitResult, features,
 };
 use harw_protocol::{PortError, PortFuture, SessionPort};
 use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError};
@@ -32,7 +32,7 @@ use crate::{
     HostKind, HostRef, ManageSupport, MobileError, MobileHolder, MobileProject, MobileProjectPage,
     MobileRowOrigin, MobileSession, MobileSessionPage, MobileSessionRow, MobileShareInfo,
     MobileShareMode, MobileTier, PlatformKeystore, RoutePreference, ServerProfile, SessionCursor,
-    SessionSnapshot, SubmitOutcome, SubmitReceipt,
+    PromptImage, SessionSnapshot, SubmitOutcome, SubmitReceipt,
 };
 
 pub(crate) mod route;
@@ -798,12 +798,46 @@ impl MobileCore {
         expected_head: SessionCursor,
         client_message_id: String,
     ) -> Result<SubmitReceipt, MobileError> {
+        self.submit_with_images(session_id, text, expected_head, client_message_id, Vec::new())
+    }
+
+    /// Wie `submit`, mit Bildern am Prompt. Ohne Host-Feature `images` wird das ohne Anfrage abgelehnt.
+    pub fn submit_with_images(
+        &self,
+        session_id: String,
+        text: String,
+        expected_head: SessionCursor,
+        client_message_id: String,
+        images: Vec<PromptImage>,
+    ) -> Result<SubmitReceipt, MobileError> {
         let id = parse_session_id(session_id)?;
         validate_submission(&text, &client_message_id)?;
+        let images = validate_images(images)?;
+        if !images.is_empty() && !self.supports_images() {
+            return Err(MobileError::Denied {
+                detail: NO_IMAGES_DETAIL.into(),
+            });
+        }
         let shared = Arc::clone(&self.shared);
-        self.run(
-            async move { submit(shared, id, text, expected_head.into(), client_message_id).await },
-        )
+        self.run(async move {
+            submit(
+                shared,
+                id,
+                text,
+                images,
+                expected_head.into(),
+                client_message_id,
+            )
+            .await
+        })
+    }
+
+    /// Ob der aktive Host Bilder am Prompt annimmt (Feature `images`). Ohne Verbindung `false`.
+    pub fn supports_images(&self) -> bool {
+        self.shared
+            .state()
+            .active()
+            .is_ok_and(|link| link.backend.features().iter().any(|f| f == features::IMAGES))
     }
 
     pub fn interrupt(&self, session_id: String, turn_id: String) -> Result<(), MobileError> {
@@ -1604,6 +1638,7 @@ fn requested_features() -> Vec<String> {
         features::PROJECTS,
         features::MANAGE,
         features::STEPUP,
+        features::IMAGES,
     ]
     .iter()
     .map(|feature| (*feature).to_owned())
@@ -1878,11 +1913,22 @@ async fn submit(
     shared: Arc<Shared>,
     id: SessionId,
     text: String,
+    images: Vec<SubmitImage>,
     displayed: Cursor,
     client_message_id: String,
 ) -> Result<SubmitReceipt, MobileError> {
     let submission_id = (id.clone(), client_message_id.clone());
-    let fingerprint = blake3::hash(text.as_bytes());
+    let fingerprint = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(text.as_bytes());
+        for image in &images {
+            hasher.update(&[0]);
+            hasher.update(image.mime.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(image.data_b64.as_bytes());
+        }
+        hasher.finalize()
+    };
     let (link, head, profile_epoch) = {
         let mut state = shared.state();
         let link = state.active()?;
@@ -1923,6 +1969,7 @@ async fn submit(
             expect_head: head,
             client_msg_id: client_message_id.clone(),
             force: false,
+            images,
         }))
         .await;
     let result = match result {
@@ -1980,6 +2027,41 @@ fn stale(head: Cursor) -> SubmitReceipt {
         head: Some(head.into()),
         ..SubmitReceipt::new(SubmitOutcome::Stale)
     }
+}
+
+const NO_IMAGES_DETAIL: &str = "Dieser Host nimmt keine Bilder am Prompt an";
+
+/// Grenzen wie auf dem Draht (`MAX_SUBMIT_IMAGES`, `MAX_SUBMIT_IMAGE_B64_BYTES`), ohne Anfrage geprueft.
+fn validate_images(images: Vec<PromptImage>) -> Result<Vec<SubmitImage>, MobileError> {
+    use harw_protocol::session_wire::{MAX_SUBMIT_IMAGE_B64_BYTES, MAX_SUBMIT_IMAGES};
+    if images.len() > MAX_SUBMIT_IMAGES {
+        return Err(session_error("Zu viele Bilder an einer Nachricht"));
+    }
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(images.len());
+    for image in images {
+        let valid_mime = matches!(
+            image.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        );
+        let valid_data = !image.data_b64.is_empty()
+            && image
+                .data_b64
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+        if !valid_mime || !valid_data {
+            return Err(session_error("Ungueltiges Bild"));
+        }
+        total = total.saturating_add(image.data_b64.len());
+        out.push(SubmitImage {
+            mime: image.mime,
+            data_b64: image.data_b64,
+        });
+    }
+    if total > MAX_SUBMIT_IMAGE_B64_BYTES {
+        return Err(session_error("Bilder sind zusammen zu gross"));
+    }
+    Ok(out)
 }
 
 fn validate_submission(text: &str, id: &str) -> Result<(), MobileError> {

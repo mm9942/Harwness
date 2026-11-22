@@ -247,9 +247,9 @@ internal open class MainActivity : ComponentActivity() {
                 onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
             )
         } else if (settingsRoute == SettingsRoute.Agents) {
-            AgentsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) })
+            AgentsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) }, connection = connection)
         } else if (settingsRoute == SettingsRoute.Jobs) {
-            JobsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) })
+            JobsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) }, connection = connection)
         } else if (settingsRoute == SettingsRoute.LocalModels) {
             val modelManager = remember { ModelManager(ModelStore(applicationContext)) }
             ModelsScreen(modelManager, onBack = { openSettings(SettingsRoute.Hub) })
@@ -407,6 +407,7 @@ internal data class SessionDraft(
     val error: String? = null,
     val uncertain: Boolean = false,
     val sending: Boolean = false,
+    val images: List<DraftImage> = emptyList(),
 )
 
 internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewModel() {
@@ -461,7 +462,24 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
     fun edit(id: String, text: String) {
         val previous = draft(id)
         if (previous.uncertain || previous.sending) return
-        drafts = drafts + (id to SessionDraft(text))
+        drafts = drafts + (id to SessionDraft(text, images = previous.images))
+    }
+
+    fun attachImage(id: String, image: DraftImage) {
+        val previous = draft(id)
+        if (previous.uncertain || previous.sending || previous.images.size >= MaxPromptImages) return
+        drafts = drafts + (id to previous.copy(images = previous.images + image, error = null))
+    }
+
+    fun detachImage(id: String, index: Int) {
+        val previous = draft(id)
+        if (previous.uncertain || previous.sending || index !in previous.images.indices) return
+        drafts = drafts + (id to previous.copy(images = previous.images.filterIndexed { i, _ -> i != index }))
+    }
+
+    fun failImage(id: String, message: String) {
+        val previous = draft(id)
+        drafts = drafts + (id to previous.copy(error = message))
     }
 
     fun discardUncertainDraft(id: String) {
@@ -471,8 +489,13 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
 
     fun submit(connection: HarwConnection, id: String, generation: Long, head: SessionCursor) {
         val current = draft(id)
-        if (current.text.isBlank() || current.sending || current.uncertain) return
-        val attempt = current.attempt ?: DraftAttempt(current.text, head, UUID.randomUUID().toString())
+        if ((current.text.isBlank() && current.images.isEmpty()) || current.sending || current.uncertain) return
+        val attempt = current.attempt ?: DraftAttempt(
+            current.text.ifBlank { "(Bild)" },
+            head,
+            UUID.randomUUID().toString(),
+            current.images.map { it.image },
+        )
         drafts = drafts + (id to current.copy(attempt = attempt, sending = true, error = null))
         val admitted = connection.submit(id, generation, attempt) { result ->
             val latest = draft(id)

@@ -204,6 +204,7 @@ mod tests {
         Ok(TurnInput {
             session_id: SessionId::try_from_str("s1")?,
             text: "hello".into(),
+            images: Vec::new(),
             client_msg_id: id.into(),
             submitted_by: "test".into(),
             actor: ApprovalActor::Operator { id: "uid:1".into() },

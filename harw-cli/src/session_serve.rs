@@ -405,6 +405,7 @@ pub async fn start(
         .with_tier(config.tier),
     );
     let driver = CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), factory)
+        .and_then(|driver| driver.with_media_root(&config.home.join("media")))
         .map_err(|error| format!("session driver: {error}"))?;
     start_with_driver(config, Arc::new(driver)).await
 }
@@ -717,6 +718,7 @@ mod tests {
                 expect_head: ack.head,
                 client_msg_id: "m1".to_owned(),
                 force: false,
+                images: Vec::new(),
             })
             .await?;
         assert!(

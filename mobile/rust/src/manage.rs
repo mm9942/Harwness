@@ -101,6 +101,29 @@ impl MobileCore {
         run_result(result, jiff::Timestamp::now())
     }
 
+    /// Stoppt einen Kind-Agenten der Sitzung: `command.run "/agent stop <id>"` (Remote-Allowlist, Feature manage,
+    /// Cap steer). Das Ergebnis traegt den Text des Hosts; `ok = false` mit Grund, wenn der Host ablehnt.
+    pub fn stop_agent(
+        &self,
+        session_id: String,
+        agent_id: String,
+        client_msg_id: String,
+    ) -> Result<ManageRunResult, MobileError> {
+        check_target_id(&agent_id)?;
+        self.command(Some(session_id), format!("/agent stop {agent_id}"), client_msg_id)
+    }
+
+    /// Bricht einen Hintergrund-Job der Sitzung ab: `command.run "/jobs stop <id>"` (Feature manage, Cap steer).
+    pub fn cancel_job(
+        &self,
+        session_id: String,
+        work_id: String,
+        client_msg_id: String,
+    ) -> Result<ManageRunResult, MobileError> {
+        check_target_id(&work_id)?;
+        self.command(Some(session_id), format!("/jobs stop {work_id}"), client_msg_id)
+    }
+
     /// `catalog.get` (Feature manage). `session_id` fuer das Live-Modell.
     pub fn catalog(&self, session_id: Option<String>) -> Result<CloudCatalog, MobileError> {
         let params = CatalogGetParams {
@@ -239,6 +262,19 @@ pub(crate) fn check_line(line: &str) -> Result<(), MobileError> {
         Ok(())
     } else {
         Err(denied(LINE_INVALID_DETAIL))
+    }
+}
+
+/// Agent-/Job-ID als ein Token der Befehlszeile: 1..=128 Bytes, nur ASCII alphanumerisch, `-`, `_`, `.`, `:`.
+pub(crate) fn check_target_id(id: &str) -> Result<(), MobileError> {
+    if (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    {
+        Ok(())
+    } else {
+        Err(denied("Ungültige Agent- oder Job-ID"))
     }
 }
 

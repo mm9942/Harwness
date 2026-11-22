@@ -132,6 +132,7 @@ const HOST_FEATURES: &[&str] = &[
     features::PROJECTS,
     features::MANAGE,
     features::STEPUP,
+    features::IMAGES,
 ];
 
 /// Features that exist only from [`TOOL_GATEWAY_WIRE_MINOR`] on.
@@ -2100,6 +2101,9 @@ impl HostConnection {
                 None,
             ));
         }
+        if let Some(reason) = refuse_images(&params.images) {
+            return Ok((SubmitResult::Denied { reason }, None));
+        }
         let mut state = slot.lock()?;
         match state.record.state {
             HostedState::Closed => {
@@ -2145,6 +2149,7 @@ impl HostConnection {
         let input = TurnInput {
             session_id: params.session_id.clone(),
             text: params.text,
+            images: params.images,
             client_msg_id: params.client_msg_id,
             submitted_by: self.identity.label.clone(),
             actor: self.identity.actor.clone(),
@@ -3144,6 +3149,31 @@ const NEED_CONTROL_APPROVE: &[Need] = &[Need::Control, Need::Approve];
 /// Caps of the read-only manage methods and `stepup.cancel`.
 const NEED_OBSERVE: &[Need] = &[Need::Observe];
 
+/// Why the attached images of a `turn.submit` are refused, `None` when fine.
+fn refuse_images(images: &[harw_protocol::session_wire::SubmitImage]) -> Option<String> {
+    use harw_protocol::session_wire::{MAX_SUBMIT_IMAGE_B64_BYTES, MAX_SUBMIT_IMAGES};
+    if images.is_empty() {
+        return None;
+    }
+    if images.len() > MAX_SUBMIT_IMAGES {
+        return Some(format!("at most {MAX_SUBMIT_IMAGES} images per message"));
+    }
+    let mut total = 0usize;
+    for image in images {
+        if !matches!(
+            image.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            return Some("unsupported image type".into());
+        }
+        if image.data_b64.is_empty() {
+            return Some("empty image".into());
+        }
+        total = total.saturating_add(image.data_b64.len());
+    }
+    (total > MAX_SUBMIT_IMAGE_B64_BYTES).then(|| "images too large".to_owned())
+}
+
 /// A refused `command.run` answer with a gateway refusal code.
 fn refused_run(code: &str, text: &str) -> CommandRunResult {
     CommandRunResult {
@@ -3928,6 +3958,7 @@ mod share_tests {
             },
             client_msg_id: "msg-1".into(),
             force: true,
+            images: Vec::new(),
         }
     }
 

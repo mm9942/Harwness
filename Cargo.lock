@@ -5350,8 +5350,10 @@ dependencies = [
 name = "harw-session-driver"
 version = "0.10.0"
 dependencies = [
+ "base64 0.23.1",
  "harw-core",
  "harw-extension-api",
+ "harw-media",
  "harw-protocol",
  "harw-session-host",
  "harw-session-store",

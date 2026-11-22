@@ -244,6 +244,8 @@ pub struct CoreTurnDriver {
     controls: Mutex<HashMap<SessionId, TurnControl>>,
     /// Request id each parked session waits on (set when a leg parks).
     parked: Mutex<HashMap<SessionId, ItemId>>,
+    /// Where prompt images are checked and stored; `None` = images refused.
+    media: Option<Arc<harw_media::MediaStore>>,
 }
 
 impl std::fmt::Debug for CoreTurnDriver {
@@ -284,7 +286,55 @@ impl CoreTurnDriver {
             approvals: ApprovalStore::new(&config.sessions_root),
             controls: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
+            media: None,
         })
+    }
+
+    /// Store prompt images (`turn.submit` `images`) in `store`. The caller
+    /// installs the same store as the process media source so the provider
+    /// can read the images back.
+    #[must_use]
+    pub fn with_media_store(mut self, store: Arc<harw_media::MediaStore>) -> Self {
+        self.media = Some(store);
+        self
+    }
+
+    /// Open (creating) the media store at `root` (`<home>/media`), install it
+    /// as the process media source and use it for prompt images.
+    ///
+    /// # Errors
+    /// [`DriverBridgeError::Runtime`] when the store cannot be opened.
+    pub fn with_media_root(self, root: &std::path::Path) -> Result<Self, DriverBridgeError> {
+        let store = Arc::new(harw_media::MediaStore::open(root).map_err(|error| {
+            DriverBridgeError::Runtime(format!("media store {}: {error}", root.display()))
+        })?);
+        harw_core::install_media_source(Arc::clone(&store) as _);
+        Ok(self.with_media_store(store))
+    }
+
+    /// Decode, check and store the images of a submission.
+    fn ingest_images(
+        &self,
+        images: &[harw_protocol::session_wire::SubmitImage],
+    ) -> Result<Vec<harw_protocol::MediaRef>, DriverBridgeError> {
+        use base64::Engine as _;
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.media.as_ref().ok_or_else(|| {
+            DriverBridgeError::Runtime("this host has no media store for prompt images".into())
+        })?;
+        images
+            .iter()
+            .map(|image| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(image.data_b64.as_bytes())
+                    .map_err(|_| DriverBridgeError::Runtime("image is not valid base64".into()))?;
+                store
+                    .put(&bytes)
+                    .map_err(|error| DriverBridgeError::Runtime(format!("image refused: {error}")))
+            })
+            .collect()
     }
 
     /// Build the production driver: [`HarwCoreRuntime`] over `factory`.
@@ -681,7 +731,10 @@ impl TurnDriver for CoreTurnDriver {
             let token = control.cancel_token().clone();
             self.remember_control(&input.session_id, control.clone())?;
             let (tx, rx) = mpsc::unbounded_channel();
-            let core_input = CoreTurnInput::user(input.text).with_control(control);
+            let media = self.ingest_images(&input.images).map_err(HostError::from)?;
+            let core_input = CoreTurnInput::user(input.text)
+                .with_images(media)
+                .with_control(control);
             self.runtime
                 .bind_live_sink(&input.session_id, Arc::clone(&sink));
             let leg = self.runtime.run_turn(&input.session_id, core_input, tx);
@@ -1704,6 +1757,7 @@ mod live_events {
         let input = TurnInput {
             session_id: session.clone(),
             text: "hello".to_owned(),
+            images: Vec::new(),
             client_msg_id: "msg-1".to_owned(),
             submitted_by: "tester".to_owned(),
             actor: ApprovalActor::Operator {

@@ -64,6 +64,9 @@ pub trait EventSink: Send + Sync {
 pub struct TurnInput {
     pub session_id: SessionId,
     pub text: String,
+    /// Images attached to the prompt (base64, size-checked by the host; the
+    /// driver decodes and stores them).
+    pub images: Vec<harw_protocol::session_wire::SubmitImage>,
     pub client_msg_id: String,
     /// Presence label of the submitting client (audit/log only).
     pub submitted_by: String,

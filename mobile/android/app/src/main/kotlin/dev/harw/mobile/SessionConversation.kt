@@ -1,6 +1,14 @@
 package dev.harw.mobile
 
 import android.content.res.Configuration
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.outlined.AddPhotoAlternate
+import androidx.compose.material3.InputChip
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -325,8 +333,14 @@ internal fun SessionConversation(
             )
             val head = snapshot?.head
             val composerEnabled = access == ConversationAccess.Writable && head != null && !sendPending
+            val imagesSupported by produceState(false, state.online, state.generation) {
+                value = state.online && connection.supportsImages()
+            }
             PromptComposer(
                 draft = window.draft(sessionId),
+                onAttachImage = if (imagesSupported) ({ image -> window.attachImage(sessionId, image) }) else null,
+                onDetachImage = { index -> window.detachImage(sessionId, index) },
+                onImageError = { message -> window.failImage(sessionId, message) },
                 enabled = composerEnabled,
                 busy = sendPending,
                 onEdit = { window.edit(sessionId, it) },
@@ -518,7 +532,23 @@ private fun PromptComposer(
     onSend: () -> Unit,
     onDiscard: () -> Unit,
     onCommands: (() -> Unit)? = null,
+    onAttachImage: ((DraftImage) -> Unit)? = null,
+    onDetachImage: (Int) -> Unit = {},
+    onImageError: (String) -> Unit = {},
 ) {
+    val context = LocalContext.current
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
+        if (uri != null && onAttachImage != null) {
+            val label = "Bild ${draft.images.size + 1}"
+            // Dekodieren und Verkleinern gehoert nicht auf den Hauptthread.
+            Thread {
+                val image = prepareImage(context, uri, label)
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    if (image != null) onAttachImage(image) else onImageError("Das Bild konnte nicht gelesen oder nicht klein genug gemacht werden.")
+                }
+            }.start()
+        }
+    }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         draft.error?.let { StatusMessage(it, error = true) }
@@ -529,9 +559,27 @@ private fun PromptComposer(
                 TextButton(enabled = !draft.sending, onClick = onDiscard) { Text("Discard draft") }
             }
         }
+        if (draft.images.isNotEmpty()) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                draft.images.forEachIndexed { index, image ->
+                    InputChip(
+                        selected = false,
+                        enabled = enabled && !draft.uncertain,
+                        onClick = { onDetachImage(index) },
+                        label = { Text("${image.label} (${image.bytes / 1024} KB) entfernen") },
+                    )
+                }
+            }
+        }
         Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (onCommands != null) {
                 IconButton(onClick = onCommands) { Icon(Icons.Outlined.Terminal, "Befehle") }
+            }
+            if (onAttachImage != null) {
+                IconButton(
+                    enabled = enabled && !draft.uncertain && draft.images.size < MaxPromptImages,
+                    onClick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                ) { Icon(Icons.Outlined.AddPhotoAlternate, "Bild anhängen") }
             }
             OutlinedTextField(
                 value = draft.text,
@@ -542,7 +590,7 @@ private fun PromptComposer(
                 shape = RoundedCornerShape(17.dp),
                 maxLines = 4,
             )
-            FilledIconButton(onClick = onSend, enabled = enabled && draft.text.isNotBlank() && !draft.uncertain) {
+            FilledIconButton(onClick = onSend, enabled = enabled && (draft.text.isNotBlank() || draft.images.isNotEmpty()) && !draft.uncertain) {
                 if (busy) {
                     CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp)
                 } else {

@@ -271,7 +271,12 @@ internal fun ProjectSessionsState.applyChange(change: ProjectChange): ProjectSes
 /** Maps a submit receipt to the draft outcome; BUSY keeps the draft so the user can retry later. */
 internal fun busyDraftMessage(detail: String?): String = detail?.takeUnless { it.isBlank() } ?: "Die Session ist gerade belegt."
 
-internal data class DraftAttempt(val text: String, val head: SessionCursor, val id: String)
+internal data class DraftAttempt(
+    val text: String,
+    val head: SessionCursor,
+    val id: String,
+    val images: List<uniffi.harw_mobile_ffi.PromptImage> = emptyList(),
+)
 
 internal data class ChatgptTarget(
     val version: UInt,
@@ -1314,7 +1319,13 @@ internal class HarwConnection(private val context: Context) {
         runAction(sessionId, generation, SessionActionKind.Send, failure = { error ->
             result(DraftResult.Rejected(error.displayMessage(), error is MobileException.Ambiguous))
         }) {
-            val receipt = withContext(Dispatchers.IO) { it.submit(sessionId, attempt.text, attempt.head, attempt.id) }
+            val receipt = withContext(Dispatchers.IO) {
+                if (attempt.images.isEmpty()) {
+                    it.submit(sessionId, attempt.text, attempt.head, attempt.id)
+                } else {
+                    it.submitWithImages(sessionId, attempt.text, attempt.head, attempt.id, attempt.images)
+                }
+            }
             val outcome = when (receipt.outcome) {
                 SubmitOutcome.ACCEPTED -> DraftResult.Accepted
                 SubmitOutcome.STALE -> DraftResult.Rejected("The session changed. Review the latest messages before sending again.")
@@ -1325,6 +1336,42 @@ internal class HarwConnection(private val context: Context) {
             }
             result(outcome)
         }
+
+    /** Nimmt der aktive Host Bilder am Prompt an (Feature `images`)? */
+    suspend fun supportsImages(): Boolean {
+        val native = core ?: return false
+        return withContext(Dispatchers.IO) { native.supportsImages() }
+    }
+
+    /** Stoppt einen Kind-Agenten (`/agent stop <id>`); `onDone(null)` bei Erfolg, sonst ein deutscher Fehlertext. */
+    fun stopAgent(sessionId: String, agentId: String, onDone: (String?) -> Unit) =
+        stopTarget(onDone) { it.stopAgent(sessionId, agentId, newMsgId()) }
+
+    /** Bricht einen Hintergrund-Job ab (`/jobs stop <id>`); `onDone(null)` bei Erfolg, sonst ein deutscher Fehlertext. */
+    fun cancelJob(sessionId: String, workId: String, onDone: (String?) -> Unit) =
+        stopTarget(onDone) { it.cancelJob(sessionId, workId, newMsgId()) }
+
+    private fun stopTarget(onDone: (String?) -> Unit, call: (MobileCore) -> ManageRunResult) {
+        val generation = gate.generation
+        val native = core
+        if (generation == null || native == null) {
+            onDone("Nicht verbunden.")
+            return
+        }
+        scope.launch {
+            val failure = try {
+                val result = withContext(Dispatchers.IO) { call(native) }
+                when {
+                    result.ok && result.effect != ManageEffect.REFUSED -> null
+                    else -> result.text.ifBlank { "Der Host hat die Anfrage abgelehnt." }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                error.displayMessage()
+            }
+            if (generation == gate.generation) onDone(failure)
+        }
+    }
 
     fun interrupt(sessionId: String, generation: Long, turnId: String) {
         if (state.value.windows[sessionId]?.snapshot?.runningTurnId != turnId) return

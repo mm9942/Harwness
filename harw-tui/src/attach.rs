@@ -442,6 +442,7 @@ impl View<'_> {
             expect_head: self.head,
             client_msg_id: self.next_msg_id(),
             force: false,
+            images: Vec::new(),
         };
         match self.port.submit(params).await {
             Ok(SubmitResult::Accepted { position }) if position > 0 => {

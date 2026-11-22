@@ -263,6 +263,7 @@ fn submit(session: &SessionId, text: &str, msg: &str, head: Cursor) -> SubmitPar
         expect_head: head,
         client_msg_id: msg.into(),
         force: false,
+        images: Vec::new(),
     }
 }
 
@@ -421,7 +422,8 @@ async fn stale_head_is_reported() -> TestResult {
     let forced = client
         .submit(SubmitParams {
             force: true,
-            ..submit(&session, "two", "m3", Cursor::default())
+            ..submit(&session, "two", "m3", Cursor::default()),
+            images: Vec::new(),
         })
         .await?;
     assert!(matches!(forced, SubmitResult::Accepted { .. }));
@@ -446,7 +448,8 @@ async fn two_clients_share_one_writer_and_both_see_frames() -> TestResult {
     let b = phone
         .submit(SubmitParams {
             force: true,
-            ..submit(&session, "from phone", "p1", Cursor::default())
+            ..submit(&session, "from phone", "p1", Cursor::default()),
+            images: Vec::new(),
         })
         .await?;
     assert_eq!(a, SubmitResult::Accepted { position: 0 });

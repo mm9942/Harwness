@@ -463,6 +463,7 @@ impl RemoteSession {
                     expect_head: self.tracker.expect_head(),
                     client_msg_id: key.clone(),
                     force: false,
+                    images: Vec::new(),
                 })
                 .await
                 .map_err(|error| SdkError::Turn {

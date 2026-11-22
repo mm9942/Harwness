@@ -297,6 +297,7 @@ impl Rig {
         TurnInput {
             session_id: self.session.clone(),
             text: "do it".to_owned(),
+            images: Vec::new(),
             client_msg_id: "msg-1".to_owned(),
             submitted_by: "tester".to_owned(),
             actor: operator(),
