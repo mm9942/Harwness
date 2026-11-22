@@ -86,6 +86,9 @@ internal fun parseUpdate(json: String): UpdateInfo? = try {
 internal object AppUpdates {
     val pending = MutableStateFlow<UpdateInfo?>(null)
 
+    /** Neueste bekannte Version, die neuer ist als die installierte (auch nach "Später"); für die Einstellungen. */
+    val available = MutableStateFlow<UpdateInfo?>(null)
+
     fun installedCode(context: Context): Int =
         @Suppress("DEPRECATION") context.packageManager.getPackageInfo(context.packageName, 0).versionCode
 
@@ -104,7 +107,8 @@ internal object AppUpdates {
 
     /** Setzt das Angebot, wenn es neuer ist und nicht innerhalb der letzten 24 h auf "Später" gestellt wurde. */
     fun consider(context: Context, info: UpdateInfo, force: Boolean = false) {
-        if (info.versionCode <= installedCode(context)) { pending.value = null; return }
+        if (info.versionCode <= installedCode(context)) { pending.value = null; available.value = null; return }
+        available.value = info
         val p = prefs(context)
         val snoozed = p.getInt("snooze_code", 0) == info.versionCode &&
             System.currentTimeMillis() - p.getLong("snooze_at", 0) < 24 * 3600_000L

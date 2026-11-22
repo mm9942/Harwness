@@ -753,7 +753,7 @@ fn route_plan_orders_routes_by_preference_and_profile() -> TestResult {
     let without = crate::identity::ValidatedProfile::new(host_profile(None)?)?;
     assert_eq!(
         route_plan(RoutePreference::Auto, &with)?,
-        vec![ConnectionRoute::Direct, ConnectionRoute::Onion]
+        vec![ConnectionRoute::Onion, ConnectionRoute::Direct]
     );
     assert_eq!(
         route_plan(RoutePreference::Auto, &without)?,

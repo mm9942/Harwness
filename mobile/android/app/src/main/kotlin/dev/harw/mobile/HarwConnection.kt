@@ -543,7 +543,7 @@ internal class HarwConnection(private val context: Context, private val localBac
     private val routePrefs by lazy { context.getSharedPreferences(RoutePrefsName, Context.MODE_PRIVATE) }
 
     private fun loadRoutePreference(): RoutePreference = try {
-        routePrefs.getString(RoutePrefKey, null)?.let { RoutePreference.valueOf(it) } ?: RoutePreference.AUTO
+        routePrefs.getString(RoutePrefKey, null)?.let { RoutePreference.valueOf(it) } ?: RoutePreference.ONION
     } catch (error: Exception) {
         if (error is CancellationException) throw error
         RoutePreference.AUTO

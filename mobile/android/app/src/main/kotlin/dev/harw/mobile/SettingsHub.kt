@@ -23,7 +23,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -205,6 +207,34 @@ internal fun SettingsHub(
             HubRow("Ordner für lokale Modelle", modelsFolderLabel(context, modelsFolderRevision), null) { modelsFolderOpen = true }
             HubRow("Dateien", "Ordner dieses Geräts freigeben und durchsuchen", null) { onOpen(SettingsRoute.Files) }
             HubRow("Termux", "Befehle in Termux ausführen", null) { onOpen(SettingsRoute.Termux) }
+            run {
+                val availableUpdate by AppUpdates.available.collectAsState()
+                var updateStatus by remember { mutableStateOf<String?>(null) }
+                val updateScope = androidx.compose.runtime.rememberCoroutineScope()
+                val subtitle = availableUpdate?.let { "Version ${it.versionName} ist verfügbar. Tippen zum Installieren." }
+                    ?: updateStatus
+                    ?: "Installiert: ${AppUpdates.installedName(context)}. Tippen, um nach Updates zu suchen."
+                HubRow("App-Update", subtitle, null) {
+                    val known = availableUpdate
+                    if (known != null) {
+                        AppUpdates.consider(context, known, force = true)
+                    } else {
+                        updateStatus = "Suche nach Updates …"
+                        updateScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                            val latest = AppUpdates.fetchLatest()
+                            if (latest == null) {
+                                updateStatus = "Keine Verbindung zum Update-Dienst."
+                            } else if (latest.versionCode > AppUpdates.installedCode(context)) {
+                                AppUpdates.consider(context, latest, force = true)
+                                updateStatus = null
+                            } else {
+                                AppUpdates.consider(context, latest)
+                                updateStatus = "Du hast die neueste Version (${AppUpdates.installedName(context)})."
+                            }
+                        }
+                    }
+                }
+            }
 
             if (support?.manage == true) {
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)

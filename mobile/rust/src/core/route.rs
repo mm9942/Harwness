@@ -27,7 +27,8 @@ pub(crate) fn route_plan(
 ) -> Result<Vec<ConnectionRoute>, MobileError> {
     match preference {
         RoutePreference::Auto if profile.onion.is_some() => {
-            Ok(vec![ConnectionRoute::Direct, ConnectionRoute::Onion])
+            // Tor bevorzugt (stabile, dauerhafte .onion-Identität); direkt nur als Rückfall.
+            Ok(vec![ConnectionRoute::Onion, ConnectionRoute::Direct])
         }
         RoutePreference::Auto | RoutePreference::Direct => Ok(vec![ConnectionRoute::Direct]),
         RoutePreference::Onion if profile.onion.is_some() => Ok(vec![ConnectionRoute::Onion]),
