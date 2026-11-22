@@ -15542,7 +15542,7 @@ max_depth = 0
 
     /// Die Vorgabe des Spawners ist 85 % / 95 %; der Builder überschreibt sie.
     #[test]
-    fn the_spawner_default_graceful_policy_is_85_95_and_can_be_overridden() {
+    fn the_spawner_default_graceful_policy_is_85_95_and_can_be_overridden() -> TestResult {
         let (events, _receiver) = mpsc::unbounded_channel();
         let manager = Arc::new(Mutex::new(SessionManager::new(events)));
         let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
@@ -15556,6 +15556,7 @@ max_depth = 0
         let policy = spawner.graceful_shutdown_policy();
         assert_eq!(policy.graceful_percent(), 70);
         assert_eq!(policy.hard_percent(), 90);
+        Ok(())
     }
 
     // --- Runde 7, Teil A7: Start überlebt einen geerbten Turn-Abbruch ---
