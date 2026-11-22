@@ -1724,6 +1724,11 @@ impl AgentSession {
 
     /// Versucht einen Turn zu starten. Nur aus `Idle` möglich.
     pub fn try_start_turn(&mut self) -> Result<TurnHandle, TurnRejection> {
+        // Eine gescheiterte Session blockiert die Unterhaltung nicht dauerhaft: Eine neue Nachricht
+        // stellt sie wieder her (offene Tool-Calls werden repariert) und startet normal.
+        if matches!(self.state, SessionState::Failed(_)) {
+            let _ = self.recover();
+        }
         match &self.state {
             SessionState::Idle => {
                 let turn_id = TurnId::new();
