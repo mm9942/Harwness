@@ -9,6 +9,7 @@ import unittest
 
 
 HELPER = Path(__file__).resolve().parents[1] / "phone-adb"
+VALID_ONION = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443"
 PUBLIC_PROFILE = {
     "version": 1,
     "label": "Local test gateway",
@@ -84,6 +85,36 @@ else:
         ]:
             with self.subTest(content_length=len(content)):
                 self.profile.write_text(content)
+                result = self.run_helper("push-profile", self.profile)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.recording.exists())
+
+    def test_push_accepts_a_valid_onion_route(self):
+        profile = PUBLIC_PROFILE | {"onion": VALID_ONION}
+        self.profile.write_text(json.dumps(profile))
+        result = self.run_helper("push-profile", self.profile)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.recording.read_text()), profile)
+
+    def test_push_rejects_bad_onion_routes(self):
+        # Flip one middle character: the v3 checksum over the public key no longer matches.
+        middle = len(VALID_ONION) // 2
+        replacement = "a" if VALID_ONION[middle] != "a" else "b"
+        wrong_checksum = VALID_ONION[:middle] + replacement + VALID_ONION[middle + 1 :]
+        for onion in [
+            VALID_ONION.upper(),
+            wrong_checksum,
+            VALID_ONION.replace(":443", ":0"),
+            "x.onion:443",
+        ]:
+            with self.subTest(onion=onion):
+                self.profile.write_text(json.dumps(PUBLIC_PROFILE | {"onion": onion}))
+                result = self.run_helper("push-profile", self.profile)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.recording.exists())
+        for onion in [443, VALID_ONION.removesuffix(":443")]:
+            with self.subTest(onion=onion):
+                self.profile.write_text(json.dumps(PUBLIC_PROFILE | {"onion": onion}))
                 result = self.run_helper("push-profile", self.profile)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.recording.exists())

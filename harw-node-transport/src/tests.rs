@@ -1336,3 +1336,122 @@ mod uplink_loopback {
         Ok(())
     }
 }
+
+// --- generic (non-TCP) stream --------------------------------------------------
+
+mod generic_stream {
+    use super::*;
+    use crate::ClientOptions;
+
+    #[tokio::test]
+    async fn test_node_handshake_and_requests_work_over_in_memory_duplex() -> TestResult {
+        let a = test_node("node-a", 1)?;
+        let b = test_node("node-b", 2)?;
+        let server = NodeTransportServer::new(
+            a.local.clone(),
+            Arc::new(pinned(&[&b.identity])?),
+            ServerOptions::default(),
+        )?;
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            server
+                .serve_upgradable_io(server_io, whoami_service(), Duration::from_secs(10))
+                .await
+        });
+
+        let mut client = NodeTransportClient::connect_over(
+            client_io,
+            &b.local,
+            &a.id,
+            &pinned(&[&a.identity])?,
+            &ClientOptions::default(),
+        )
+        .await?;
+        assert_eq!(client.peer().node_id, a.id);
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/whoami")
+            .body(empty_body())
+            .map_err(ctx("request"))?;
+        let response = client.send_request(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(ctx("body"))?
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"node-b");
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_wrong_pin_over_duplex_is_rejected() -> TestResult {
+        let a = test_node("node-a", 1)?;
+        let b = test_node("node-b", 2)?;
+        let server = NodeTransportServer::new(
+            a.local.clone(),
+            Arc::new(pinned(&[&b.identity])?),
+            ServerOptions::default(),
+        )?;
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            server
+                .serve_upgradable_io(server_io, whoami_service(), Duration::from_secs(10))
+                .await
+        });
+
+        // The client pins b's key for node a: the server's signature must not verify.
+        let verdict = NodeTransportClient::connect_over(
+            client_io,
+            &b.local,
+            &a.id,
+            &pinned(&[&b.identity])?,
+            &ClientOptions::default(),
+        )
+        .await;
+        ensure(
+            verdict.is_err(),
+            "connect_over accepted a server with the wrong pinned key",
+        )?;
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_duplex_stream_respects_the_connection_limit() -> TestResult {
+        let a = test_node("node-a", 1)?;
+        let b = test_node("node-b", 2)?;
+        let mut options = ServerOptions::default();
+        options.max_connections = 0;
+        let server =
+            NodeTransportServer::new(a.local.clone(), Arc::new(pinned(&[&b.identity])?), options)?;
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            server
+                .serve_upgradable_io(server_io, whoami_service(), Duration::from_secs(10))
+                .await
+        });
+
+        let verdict = NodeTransportClient::connect_over(
+            client_io,
+            &b.local,
+            &a.id,
+            &pinned(&[&a.identity])?,
+            &ClientOptions::default(),
+        )
+        .await;
+        ensure(
+            verdict.is_err(),
+            "connect_over succeeded although the server has no free slot",
+        )?;
+        let served = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .map_err(ctx("server did not return promptly"))?
+            .map_err(ctx("join"))?;
+        ensure(served.is_ok(), "a full server must drop the stream with Ok(())")?;
+        Ok(())
+    }
+}

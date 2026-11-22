@@ -35,6 +35,13 @@ ignore = [
     # (optionales Feature `proxy`). Ablösung durch einen YAML-Parser in
     # sicherem Rust ist eine eigene Änderung am Cloud-Stack.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml über serde_yaml (harw-cloud-gateway, pingora-core); kein Upgrade verfügbar, nur Operator-Konfiguration" },
+    # arti 0.48 (harw-onion, Feature onion von harw-cli bzw. Handy): dieselben Ausnahmen wie arti-v2.8.0 maint/cargo-audit.
+    # rsa (Marvin, timing) transitiv über arti/tor-llcrypto; Clients verifizieren nur RSA-Signaturen, kein privater RSA-Schlüssel.
+    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin, timing) transitiv über arti/tor-llcrypto; Clients verifizieren nur RSA-Signaturen, kein privater RSA-Schlüssel (arti maint/cargo-audit trägt dieselbe Ausnahme)" },
+    # bincode unmaintained, transitiv über arti (typed-index-collections, maybenot); kein Upgrade verfügbar.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained, transitiv über arti (typed-index-collections, maybenot); kein Upgrade verfügbar" },
+    # crypto-bigint 0.5 (nicht konstante Zeit) transitiv über arti; arti trägt die Ausnahme mit Begründung (arti#2831).
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (nicht konstante Zeit) transitiv über arti; arti trägt die Ausnahme mit Begründung (arti#2831)" },
 ]
 
 [licenses]
@@ -52,6 +59,8 @@ allow = [
     "CC0-1.0",
     # Mozillas Root-Zertifikatsdaten in `webpki-roots`/`webpki-root-certs`.
     "CDLA-Permissive-2.0",
+    # Boost (z. B. xxhash-rust) im arti-Baum; arti selbst erlaubt BSL-1.0 (maint/check-licenses).
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
 

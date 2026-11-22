@@ -340,6 +340,8 @@ pub struct RemoteIngress {
     task: JoinHandle<()>,
     watcher: JoinHandle<()>,
     addr: SocketAddr,
+    intake: harw_node_listener::StreamIntake,
+    guards: Vec<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for RemoteIngress {
@@ -357,16 +359,38 @@ impl RemoteIngress {
         self.addr
     }
 
+    /// A cloneable handle that feeds already-established byte streams
+    /// (for example from an onion service) into the same node listener.
+    #[must_use]
+    pub(crate) fn intake(&self) -> harw_node_listener::StreamIntake {
+        self.intake.clone()
+    }
+
+    /// Keeps `guard` alive until shutdown; dropping it stops that extra
+    /// ingress, for example the onion service.
+    pub(crate) fn attach(&mut self, guard: Box<dyn std::any::Any + Send + Sync>) {
+        self.guards.push(guard);
+    }
+
     /// Stops accepting, closes live connections and waits for the listener.
     pub async fn shutdown(self) {
-        let _ = self.shutdown.send(true);
-        if let Err(error) = self.watcher.await {
+        let Self {
+            shutdown,
+            task,
+            watcher,
+            addr,
+            guards,
+            ..
+        } = self;
+        drop(guards);
+        let _ = shutdown.send(true);
+        if let Err(error) = watcher.await {
             tracing::error!(%error, "remote revocation watcher failed");
         }
-        if let Err(error) = self.task.await {
+        if let Err(error) = task.await {
             tracing::error!(%error, "remote session ingress task failed");
         } else {
-            tracing::info!(addr = %self.addr, "remote session ingress stopped");
+            tracing::info!(addr = %addr, "remote session ingress stopped");
         }
     }
 }
@@ -463,6 +487,7 @@ pub async fn start_remote_with_driver(
         })),
         None => node_listener,
     };
+    let intake = node_listener.intake();
     let revoker = node_listener.revoker().with_registry(&remote_dir);
     let (shutdown, mut rx) = watch::channel(false);
     let watcher = tokio::spawn(watch_revocations(
@@ -486,6 +511,8 @@ pub async fn start_remote_with_driver(
         task,
         watcher,
         addr,
+        intake,
+        guards: Vec::new(),
     })
 }
 

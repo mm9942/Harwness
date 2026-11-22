@@ -3,30 +3,41 @@ package dev.harw.mobile
 import com.google.gson.JsonObject
 
 private const val ProfilePrefix = "HARW:PROFILE:1:"
+private const val ProfilePrefixV2 = "HARW:PROFILE:2:"
 private const val EnrollmentPrefix = "HARW:ENROLL:1:"
 private const val PublicKeySize = 1952
 private const val Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
 
 internal fun decodeProfileQr(text: String): String {
-    require(text.startsWith(ProfilePrefix)) { "This is not a Harw server profile QR code." }
-    val decoded = decodeBase45(text.removePrefix(ProfilePrefix))
-    require(decoded.size >= PublicKeySize + 3) { "The server profile code is incomplete." }
+    val withOnion = when {
+        text.startsWith(ProfilePrefix) -> false
+        text.startsWith(ProfilePrefixV2) -> true
+        else -> throw IllegalArgumentException("This is not a Harw server profile QR code.")
+    }
+    val decoded = decodeBase45(text.removePrefix(if (withOnion) ProfilePrefixV2 else ProfilePrefix))
+    val header = if (withOnion) 4 else 3
+    require(decoded.size >= PublicKeySize + header) { "The server profile code is incomplete." }
     val labelSize = decoded[0].unsigned()
     val nodeSize = decoded[1].unsigned()
     val endpointSize = decoded[2].unsigned()
+    val onionSize = if (withOnion) decoded[3].unsigned() else 0
     require(labelSize in 1..128 && nodeSize in 1..128 && endpointSize in 1..63) { "The profile QR has invalid fields." }
-    require(decoded.size == 3 + labelSize + nodeSize + endpointSize + PublicKeySize) { "The profile QR has an invalid length." }
-    val nodeStart = 3 + labelSize
+    require(!withOnion || onionSize in 62..68) { "The profile QR has invalid fields." }
+    require(decoded.size == header + labelSize + nodeSize + endpointSize + onionSize + PublicKeySize) { "The profile QR has an invalid length." }
+    val nodeStart = header + labelSize
     val endpointStart = nodeStart + nodeSize
-    val keyStart = endpointStart + endpointSize
-    val label = decoded.decodeToString(3, nodeStart, throwOnInvalidSequence = true)
+    val onionStart = endpointStart + endpointSize
+    val keyStart = onionStart + onionSize
+    val label = decoded.decodeToString(header, nodeStart, throwOnInvalidSequence = true)
     val nodeId = decoded.printableAscii(nodeStart, endpointStart)
-    val endpoint = decoded.printableAscii(endpointStart, keyStart)
+    val endpoint = decoded.printableAscii(endpointStart, onionStart)
+    val onion = if (withOnion) decoded.printableAscii(onionStart, keyStart) else null
     return SiwcJson.toJson(JsonObject().apply {
         addProperty("version", 1)
         addProperty("label", label)
         addProperty("server_node_id", nodeId)
         addProperty("endpoint", endpoint)
+        if (onion != null) addProperty("onion", onion)
         addProperty("server_public_key_hex", decoded.copyOfRange(keyStart, decoded.size).hex())
     })
 }
@@ -60,7 +71,7 @@ internal fun encodeBase45(bytes: ByteArray): String = buildString((bytes.size * 
 }
 
 internal fun decodeBase45(text: String): ByteArray {
-    require(text.length <= 3426 && text.length % 3 != 1) { "Invalid Harw QR encoding." }
+    require(text.length <= 3600 && text.length % 3 != 1) { "Invalid Harw QR encoding." }
     val bytes = ByteArray(text.length / 3 * 2 + if (text.length % 3 == 2) 1 else 0)
     var input = 0
     var output = 0

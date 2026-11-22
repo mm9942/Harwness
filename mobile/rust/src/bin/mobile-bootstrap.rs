@@ -33,10 +33,13 @@ const SMOKE_PROVIDER: &str = "mobile-smoke";
 const SMOKE_MODEL: &str = "mobile-smoke-text";
 const SMOKE_RESPONSE: &str = "HARW MOBILE SMOKE REPLY";
 const IDENTITY_MARKER: &str = "harw-mobile-bootstrap-sealed-v1\n";
+const ONION_DIR: &str = "onion";
+const ONION_LOCATOR_FILE: &str = "locator";
+const ONION_READY_TIMEOUT: Duration = Duration::from_secs(600);
 const PROVIDER_ENV: &str = "HARW_MOBILE_TEST_PROVIDER_TOKEN";
 
 #[derive(Parser)]
-#[command(about = "Start an isolated loopback gateway for the Harw phone test")]
+#[command(about = "Start an isolated gateway (loopback, tailnet or Tor onion) for the Harw phone test")]
 struct Cli {
     #[command(subcommand)]
     command: Action,
@@ -99,6 +102,12 @@ struct Serve {
     /// Existing 32-byte, owner-only raw KEK file outside the identity and state directories.
     #[arg(long, requires = "identity_dir")]
     kek_file: Option<PathBuf>,
+    /// Also publish the gateway as a Tor onion service (the harw executable must be built with --features onion).
+    #[arg(long)]
+    onion: bool,
+    /// Absolute, dedicated directory that keeps the onion identity (stable .onion address) across runs.
+    #[arg(long, requires = "onion")]
+    onion_dir: Option<PathBuf>,
     #[command(flatten)]
     binaries: Binaries,
 }
@@ -170,7 +179,23 @@ async fn serve(args: Serve) -> Result<()> {
     // Report an existing listener before creating test state. The gateway's
     // own bind and readiness message also cover races after this check.
     drop(TcpListener::bind(&listen)?);
+    let onion_dir = if args.onion {
+        Some(prepare_onion_dir(args.onion_dir.as_deref(), &args.state)?)
+    } else {
+        None
+    };
     create_workspace(&args.state)?;
+    let home = args.state.join("home");
+    let onion_dir = match onion_dir {
+        Some(Some(dir)) => Some(dir),
+        Some(None) => {
+            eprintln!(
+                "note: without --onion-dir the .onion address is stored in --state and changes with each fresh --state"
+            );
+            Some(home.join("profiles/default/session-host").join(ONION_DIR))
+        }
+        None => None,
+    };
     let persistent = args
         .identity_dir
         .as_ref()
@@ -178,7 +203,6 @@ async fn serve(args: Serve) -> Result<()> {
         .map(|(dir, kek)| PersistentIdentity::open(&args.state, dir, kek))
         .transpose()?;
 
-    let home = args.state.join("home");
     let private = args.state.join("private");
     let environment = Builder::new()
         .prefix("harw-phone-run-")
@@ -275,6 +299,9 @@ async fn serve(args: Serve) -> Result<()> {
     } else {
         String::new()
     };
+    let onion_config = onion_dir
+        .as_deref()
+        .map_or_else(String::new, onion_settings);
     write_new(
         &home.join("config.toml"),
         format!(
@@ -282,7 +309,7 @@ async fn serve(args: Serve) -> Result<()> {
              [dream]\nenabled = false\n\
              [infrastructure]\nauth_socket = {}\n\
              [session_listener]\nenabled = true\nlisten = {}\nallow_non_loopback = {}\n\
-             node_id = \"{SERVER_NODE}\"\ntier = \"observer\"\nshared_socket_tenant = {}\n{approval}{provider_owner}",
+             node_id = \"{SERVER_NODE}\"\ntier = \"observer\"\nshared_socket_tenant = {}\n{approval}{provider_owner}{onion_config}",
             toml_string(&provider.provider),
             toml_string(&provider.model),
             path_string(&socket),
@@ -292,7 +319,7 @@ async fn serve(args: Serve) -> Result<()> {
         ),
     )?;
 
-    let profile = ServerProfile {
+    let mut profile = ServerProfile {
         version: 1,
         label: if args.smoke {
             "Harw mobile smoke gateway"
@@ -303,9 +330,17 @@ async fn serve(args: Serve) -> Result<()> {
         endpoint: listen.clone(),
         server_node_id: SERVER_NODE.to_owned(),
         server_public_key_hex: hex::encode(public_key),
+        onion: None,
     };
-    let profile_json = serde_json::to_string_pretty(&profile)?;
-    parse_server_profile(profile_json.clone())?;
+    // With onion the profile can only be completed once the gateway has
+    // published its locator, so it is built at the readiness line instead.
+    let direct_profile_json = if onion_dir.is_none() {
+        let json = serde_json::to_string_pretty(&profile)?;
+        parse_server_profile(json.clone())?;
+        Some(json)
+    } else {
+        None
+    };
     let profile_path = args.state.join(PROFILE_FILE);
 
     let mut gateway_command = command(&harw);
@@ -337,10 +372,29 @@ async fn serve(args: Serve) -> Result<()> {
         while let Some(line) = lines.next_line().await? {
             eprintln!("{line}");
             if !ready && line.trim() == readiness {
+                let (profile_json, routes) = match (&direct_profile_json, &onion_dir) {
+                    (Some(json), _) => (json.clone(), "direct".to_owned()),
+                    (None, Some(dir)) => {
+                        let text = read_text(&dir.join(ONION_LOCATOR_FILE), 128)?;
+                        let locator: harw_onion::OnionLocator = text.trim().parse()?;
+                        profile.onion = Some(locator.to_string());
+                        let json = serde_json::to_string_pretty(&profile)?;
+                        parse_server_profile(json.clone())?;
+                        (json, format!("direct {listen}, onion"))
+                    }
+                    (None, None) => return Err("missing onion directory".into()),
+                };
                 let mut file = NamedTempFile::new_in(&args.state)?;
                 writeln!(file, "{profile_json}")?;
                 file.persist_noclobber(&profile_path)?;
-                eprintln!("Public server profile: {}", profile_path.display());
+                if onion_dir.is_some() {
+                    eprintln!(
+                        "Public server profile: {} (routes: {routes})",
+                        profile_path.display()
+                    );
+                } else {
+                    eprintln!("Public server profile: {}", profile_path.display());
+                }
                 ready = true;
             }
         }
@@ -348,8 +402,23 @@ async fn serve(args: Serve) -> Result<()> {
         Err(format!("test gateway exited ({status})").into())
     };
 
+    let ready_deadline = async {
+        if onion_dir.is_some() {
+            tokio::time::sleep(ONION_READY_TIMEOUT).await;
+            Err::<(), Box<dyn std::error::Error>>(
+                format!(
+                    "test gateway did not become ready within {} s",
+                    ONION_READY_TIMEOUT.as_secs()
+                )
+                .into(),
+            )
+        } else {
+            std::future::pending().await
+        }
+    };
     tokio::select! {
         result = observe_gateway => result,
+        result = ready_deadline => result,
         status = hub.wait() => Err(format!("test AuthHub exited ({})", status?).into()),
         status = wait_fixture(&mut fixture) => Err(format!("model fixture exited ({})", status?).into()),
     }
@@ -458,6 +527,41 @@ fn validate_state_path(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validates `--onion-dir` before any state exists. Returns the directory to
+/// use, or `None` when the default inside the state tree applies.
+fn prepare_onion_dir(dir: Option<&Path>, state: &Path) -> Result<Option<PathBuf>> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    if !dir.is_absolute()
+        || dir.to_str().is_none()
+        || dir
+            .as_os_str()
+            .as_bytes()
+            .split(|byte| *byte == b'/')
+            .any(|part| part == b"." || part == b"..")
+    {
+        return Err("--onion-dir must be an absolute UTF-8 path without traversal".into());
+    }
+    if dir.starts_with(state) || state.starts_with(dir) {
+        return Err("--onion-dir must not be inside --state (or contain it)".into());
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let metadata = fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() || metadata.uid() != geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+        return Err("--onion-dir must be a directory owned by you without group/other access".into());
+    }
+    Ok(Some(dir.to_owned()))
+}
+
+/// Renders the `[session_listener]` keys that enable the onion service.
+fn onion_settings(dir: &Path) -> String {
+    format!("onion = true\nonion_dir = {}\n", path_string(dir))
 }
 
 fn create_workspace(path: &Path) -> Result<()> {
@@ -928,6 +1032,41 @@ mod tests {
             "public_key_hex": key, "label": label,
         })
         .to_string()
+    }
+
+    #[test]
+    fn onion_dir_requires_onion() {
+        let base = ["mobile-bootstrap", "serve", "--state", "/tmp/s", "--enrollment", "/tmp/e", "--smoke"];
+        let with_dir = [base.as_slice(), &["--onion-dir", "/tmp/o"]].concat();
+        assert!(Cli::try_parse_from(with_dir).is_err());
+        let both = [base.as_slice(), &["--onion", "--onion-dir", "/tmp/o"]].concat();
+        assert!(Cli::try_parse_from(both).is_ok());
+    }
+
+    #[test]
+    fn onion_settings_renders_both_keys() -> TestResult {
+        let text = onion_settings(Path::new("/var/lib/harw onion"));
+        let table: toml::Table = text.parse()?;
+        assert_eq!(table.get("onion"), Some(&toml::Value::Boolean(true)));
+        assert_eq!(
+            table.get("onion_dir").and_then(toml::Value::as_str),
+            Some("/var/lib/harw onion")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn onion_dir_validation_rejects_relative_and_state_nested_paths() -> TestResult {
+        let parent = tempfile::tempdir_in("/tmp")?;
+        let state = parent.path().join("state");
+        assert!(prepare_onion_dir(Some(Path::new("relative/onion")), &state).is_err());
+        assert!(prepare_onion_dir(Some(&state.join("onion")), &state).is_err());
+        assert!(!state.exists());
+        let good = parent.path().join("keep/onion");
+        assert_eq!(prepare_onion_dir(Some(&good), &state)?, Some(good.clone()));
+        assert_eq!(good.metadata()?.mode() & 0o077, 0);
+        assert_eq!(prepare_onion_dir(None, &state)?, None);
+        Ok(())
     }
 
     #[test]

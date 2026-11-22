@@ -9,6 +9,7 @@
 //! declarative. Operator-written files next to the host state
 //! (`<profile>/session-host/remote/`): `node-devices.conf` (enrolled devices,
 //! tenant, tier, approval opt-in) and `node-peers.conf` (pinned node keys).
+//! The optional Tor onion service is only a transport and adds no authority.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,7 @@ pub const DEFAULT_SESSION_LISTENER_ADDR: &str = "127.0.0.1:7443";
 /// assert_eq!(section.listen, "127.0.0.1:7443");
 /// assert_eq!(section.tier, "observer");
 /// assert!(!SessionListenerSection::default().enabled);
+/// assert!(!section.onion);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +62,12 @@ pub struct SessionListenerSection {
     /// Bind the requested local session socket to this tenant on the remote host.
     #[serde(default)]
     pub shared_socket_tenant: Option<String>,
+    /// Also publish this listener as a Tor onion service (embedded arti, in-process; needs a harw build with the `onion` cargo feature). Tor is only a transport: the node handshake and node-devices.conf stay the only authority. Default `false`.
+    #[serde(default)]
+    pub onion: bool,
+    /// Absolute directory for the onion service's Tor state (the persistent onion identity, i.e. a stable .onion address), cache and the public `locator` file. `None`: `<profile>/session-host/onion`.
+    #[serde(default)]
+    pub onion_dir: Option<String>,
 }
 
 fn default_listen() -> String {
@@ -81,6 +89,8 @@ impl Default for SessionListenerSection {
             approval_device: None,
             provider_link_device: None,
             shared_socket_tenant: None,
+            onion: false,
+            onion_dir: None,
         }
     }
 }

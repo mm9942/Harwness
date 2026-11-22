@@ -24,6 +24,43 @@ pub struct ServerProfile {
     pub endpoint: String,
     pub server_node_id: String,
     pub server_public_key_hex: String,
+    /// Optional Tor onion route `<56>.onion:<port>`; absent in profiles without onion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
+    pub onion: Option<String>,
+}
+
+/// Which network route a connection preference allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum RoutePreference {
+    /// Onion first when the profile has one, else direct.
+    Auto,
+    /// Tor (.onion) only; fails when the profile has no onion route.
+    Onion,
+    /// Direct TCP only.
+    Direct,
+}
+
+/// The network route a connection uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ConnectionRoute {
+    /// Direct TCP to the profile endpoint.
+    Direct,
+    /// Tor onion service at the profile's `.onion` locator.
+    Onion,
+}
+
+/// Live Tor bootstrap progress shown while the onion route starts.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TorBootstrap {
+    /// Bootstrap completion, 0 to 100.
+    pub percent: u32,
+    /// True once Tor can carry traffic.
+    pub ready: bool,
+    /// Human-readable reason Tor is blocked, if it is.
+    pub blocked: Option<String>,
+    /// Short status summary from Tor.
+    pub summary: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -46,6 +83,14 @@ pub struct ConnectionStatus {
     pub can_create: bool,
     pub can_submit: bool,
     pub can_approve: bool,
+    /// Route being dialed while connecting, the link's route when connected, else None.
+    pub route: Option<ConnectionRoute>,
+    /// The route preference the user selected.
+    pub route_preference: RoutePreference,
+    /// Routes this profile can use, in preference order.
+    pub available_routes: Vec<ConnectionRoute>,
+    /// Tor bootstrap progress; None until Tor was started.
+    pub tor: Option<TorBootstrap>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

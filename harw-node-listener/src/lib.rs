@@ -11,7 +11,8 @@
 //! File
 //! ownership (see `W00-ws-integration-map.md`): `lib.rs` (the
 //! [`NodeListener`] service) is shared with `identity.rs`/`revoke.rs` under
-//! S08 alone.
+//! S08 alone. [`StreamIntake`] (also in `lib.rs`) feeds already-accepted
+//! byte streams (onion) into the same service.
 
 #![forbid(unsafe_code)]
 
@@ -320,6 +321,54 @@ impl NodeListener {
         };
         self.server
             .serve_upgradable(listener, service, shutdown)
+            .await
+            .map_err(|error| match error {
+                UpgradeError::NotImplemented(what) => ListenerError::NotImplemented(what),
+                other => ListenerError::Io(other.to_string()),
+            })
+    }
+
+    /// A handle that serves already-accepted byte streams (for example an
+    /// onion-service stream) through this listener's service.
+    #[must_use]
+    pub fn intake(&self) -> StreamIntake {
+        StreamIntake {
+            server: self.server.clone(),
+            service: ListenerService {
+                provider_link: self.provider_link.clone(),
+                handler: Arc::clone(&self.handler),
+            },
+        }
+    }
+}
+
+/// Serves already-accepted byte streams (onion) with the same node handshake,
+/// identity mapping and live-connection table as [`NodeListener::serve`].
+/// Revocation and the shutdown of `serve` close these connections too, and the
+/// `node` listener_enabled gate applies, so `NodeListener::serve` must be
+/// running (it registers the listener); otherwise requests get 503.
+#[derive(Clone)]
+pub struct StreamIntake {
+    server: NodeTransportServer,
+    service: ListenerService,
+}
+
+impl StreamIntake {
+    /// Serve one connection over `io` until it ends.
+    ///
+    /// # Errors
+    /// [`ListenerError::NotImplemented`] while the transport upgrade is a
+    /// stub; [`ListenerError::Io`] for other transport failures.
+    pub async fn serve<I>(
+        &self,
+        io: I,
+        handshake_timeout: std::time::Duration,
+    ) -> Result<(), ListenerError>
+    where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        self.server
+            .serve_upgradable_io(io, self.service.clone(), handshake_timeout)
             .await
             .map_err(|error| match error {
                 UpgradeError::NotImplemented(what) => ListenerError::NotImplemented(what),

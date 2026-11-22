@@ -375,6 +375,8 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "session_listener.approval_device", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.provider_link_device", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.shared_socket_tenant", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.onion", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.onion_dir", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     // 1.9 [mode] (1)
     FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.10 [research] (5)
@@ -602,7 +604,7 @@ mod merge_rule_tests {
         // [retention]: +50 für `retention.<klasse>.*` (10 Klassen x 5 Schlüssel).
         // [memory]: +2 für `memory.security_signals`, `memory.llm_extraction`.
         // [tools.container]: +4 (`enabled`, `engine`, `connection`, `images`), alle GlobalOnly.
-        // [session_listener]: +6, alle GlobalOnly.
+        // [session_listener]: +10, alle GlobalOnly.
         // h7/h9: +2 für `tui.status_expiry`, `tui.goal_mode`.
         // +1 for explicit trusted single-agent task topology.
         // +1 for `internal_models.image_understanding`.
@@ -615,7 +617,8 @@ mod merge_rule_tests {
         // PL-100 Phase 4: +1 für `sandbox.host_lease_ttl_secs`.
         // PL-100 WP0.12: +10 für `retention.dod_verdicts.*`, `retention.dod_labels.*`
         // (12 Klassen x 5 Schlüssel).
-        assert_eq!(FIELD_TABLE.len(), 218);
+        // Onion-Connector: +2 für `session_listener.onion`, `session_listener.onion_dir`.
+        assert_eq!(FIELD_TABLE.len(), 220);
     }
 
     #[test]

@@ -4,13 +4,14 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use harw_node_transport::{LocalNode, NodeBody, NodeTransportClient, full_body};
+use harw_node_transport::{LocalNode, NodeBody, full_body};
 use http::{Method, Request, StatusCode, header};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::MobileError;
+use crate::core::route::{Dialer, ONION_DIAL_TIMEOUT};
+use crate::{ConnectionRoute, MobileError};
 use crate::identity::ValidatedProfile;
 
 const LINK_PATH: &str = "/v1/provider-link/chatgpt";
@@ -108,6 +109,8 @@ fn valid_token(value: &str, limit: usize) -> bool {
 }
 
 pub(crate) async fn request_provider(
+    dialer: Dialer,
+    route: ConnectionRoute,
     local: LocalNode,
     profile: ValidatedProfile,
     stop: CancellationToken,
@@ -115,16 +118,7 @@ pub(crate) async fn request_provider(
     body: NodeBody,
 ) -> Result<ChatgptProviderStatus, MobileError> {
     let request = async {
-        let mut client = NodeTransportClient::connect(
-            profile.endpoint.addr,
-            &local,
-            &profile.endpoint.expected_node,
-            &profile.verifier,
-        )
-        .await
-        .map_err(|_| MobileError::Connect {
-            detail: "Could not authenticate the selected server for ChatGPT access".into(),
-        })?;
+        let mut client = dialer.connect_transport(route, &profile, &local).await?;
         let mut request = Request::builder()
             .method(method.clone())
             .uri(LINK_PATH)
@@ -178,10 +172,14 @@ pub(crate) async fn request_provider(
             }),
         }
     };
+    let timeout = match route {
+        ConnectionRoute::Direct => LINK_TIMEOUT,
+        ConnectionRoute::Onion => LINK_TIMEOUT + ONION_DIAL_TIMEOUT,
+    };
     tokio::select! {
         biased;
         () = stop.cancelled() => Err(provider_interrupted_for_stop(&method)),
-        result = tokio::time::timeout(LINK_TIMEOUT, request) => result.unwrap_or_else(|_| Err(provider_interrupted(&method))),
+        result = tokio::time::timeout(timeout, request) => result.unwrap_or_else(|_| Err(provider_interrupted(&method))),
     }
 }
 

@@ -28,6 +28,7 @@ fn profile_checks_version_endpoint_and_public_pin() -> Result<(), MobileError> {
         endpoint: "[::1]:7410".into(),
         server_node_id: enrollment.node_id,
         server_public_key_hex: enrollment.public_key_hex,
+        onion: None,
     };
     assert_eq!(parse_server_profile(profile_json(&profile))?, profile);
     profile.server_public_key_hex.pop();
@@ -76,6 +77,7 @@ fn provider_handoff_rejects_missing_plan_scope_and_oversized_tokens() {
     assert!(fixture().request_body().is_ok());
 }
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -85,7 +87,8 @@ use harw_node_transport::{
     NodeTransportServer, PinnedPeers, ServerOptions, TranscriptWrappedVerifier,
 };
 use harw_protocol::items::{AssistantMessageItem, ContentPart, TurnItem, UserMessageItem};
-use harw_protocol::{ApprovalKind, ApprovalRequest, TurnEvent};
+use harw_protocol::{ApprovalKind, ApprovalRequest, SessionPort, TurnEvent};
+use harw_session_remote::{ConnectOptions, RemotePort};
 use harw_session_host::approvals::{ApprovalBackend, MemoryApprovals};
 use harw_session_host::driver::{
     CancelSignal, DriverEvent, DriverFuture, EventSink, ExecutionAdmission, Setting, TurnDriver,
@@ -231,12 +234,15 @@ struct HostFixture {
     host: Arc<SessionHost>,
     listener: JoinHandle<()>,
     dir: tempfile::TempDir,
+    intake: harw_node_listener::StreamIntake,
+    phone_key: Vec<u8>,
 }
 
 impl HostFixture {
     async fn start() -> TestResult<Self> {
         let dir = tempfile::tempdir()?;
         let phone = generate_identity("Phone".into())?;
+        let phone_key = phone.private_key.clone();
         let (server, local) = crate::identity::restore_identity(&[11; 32], "Server".into())?;
         let phone_id = NodeId::try_from_str(phone.enrollment.node_id)?;
         let mut pins = PinnedPeers::new();
@@ -275,6 +281,7 @@ impl HostFixture {
             Arc::new(RegistryIdentityMapper::new(dir.path())),
             WsLimits::default(),
         );
+        let intake = node_listener.intake();
         let socket = TcpListener::bind("127.0.0.1:0").await?;
         let profile = ServerProfile {
             version: 1,
@@ -282,6 +289,7 @@ impl HostFixture {
             endpoint: socket.local_addr()?.to_string(),
             server_node_id: server.node_id,
             server_public_key_hex: server.public_key_hex,
+            onion: None,
         };
         let listener = tokio::spawn(async move {
             let _ = node_listener.serve(socket, std::future::pending()).await;
@@ -294,6 +302,8 @@ impl HostFixture {
             host,
             listener,
             dir,
+            intake,
+            phone_key,
         })
     }
 }
@@ -594,5 +604,155 @@ async fn policy_invalidation_clears_session_content_and_allows_explicit_reconnec
         .ok_or("resumed session head")?;
     assert_eq!(send(head)?.outcome, SubmitOutcome::Accepted);
     assert_eq!(fixture.driver.calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+const ONION_VECTOR: &str = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443";
+
+fn host_profile(onion: Option<&str>) -> Result<ServerProfile, MobileError> {
+    let enrollment = generate_identity("Host".into())?.enrollment;
+    Ok(ServerProfile {
+        version: 1,
+        label: enrollment.label,
+        endpoint: "[::1]:7410".into(),
+        server_node_id: enrollment.node_id,
+        server_public_key_hex: enrollment.public_key_hex,
+        onion: onion.map(str::to_owned),
+    })
+}
+
+#[test]
+fn onion_profile_round_trips_lowercased_and_none_is_omitted() -> TestResult {
+    let upper = format!("{}{}", ONION_VECTOR[..56].to_uppercase(), &ONION_VECTOR[56..]);
+    let profile = host_profile(Some(&upper))?;
+    let parsed = parse_server_profile(profile_json(&profile))?;
+    assert_eq!(parsed.onion.as_deref(), Some(ONION_VECTOR));
+    let plain = host_profile(None)?;
+    let json = profile_json(&plain);
+    assert!(!json.contains("onion"));
+    assert_eq!(parse_server_profile(json)?, plain);
+    Ok(())
+}
+
+#[test]
+fn invalid_onion_values_are_rejected_as_invalid_profile() -> TestResult {
+    let wrong_checksum = format!("3{}", &ONION_VECTOR[1..]);
+    for bad in [
+        "x.onion:443",
+        "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion",
+        "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:0",
+        wrong_checksum.as_str(),
+    ] {
+        let json = profile_json(&host_profile(Some(bad))?);
+        assert!(
+            matches!(
+                parse_server_profile(json),
+                Err(MobileError::InvalidProfile { .. })
+            ),
+            "{bad}"
+        );
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&profile_json(&host_profile(None)?))?;
+    value["onion2"] = ONION_VECTOR.into();
+    assert!(matches!(
+        parse_server_profile(value.to_string()),
+        Err(MobileError::InvalidProfile { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn route_plan_orders_routes_by_preference_and_profile() -> TestResult {
+    use crate::core::route::{available_routes, route_plan};
+    let with = crate::identity::ValidatedProfile::new(host_profile(Some(ONION_VECTOR))?)?;
+    let without = crate::identity::ValidatedProfile::new(host_profile(None)?)?;
+    assert_eq!(
+        route_plan(RoutePreference::Auto, &with)?,
+        vec![ConnectionRoute::Onion, ConnectionRoute::Direct]
+    );
+    assert_eq!(
+        route_plan(RoutePreference::Auto, &without)?,
+        vec![ConnectionRoute::Direct]
+    );
+    assert!(matches!(
+        route_plan(RoutePreference::Onion, &without),
+        Err(MobileError::InvalidProfile { .. })
+    ));
+    assert_eq!(
+        route_plan(RoutePreference::Onion, &with)?,
+        vec![ConnectionRoute::Onion]
+    );
+    assert_eq!(
+        route_plan(RoutePreference::Direct, &with)?,
+        vec![ConnectionRoute::Direct]
+    );
+    assert_eq!(
+        available_routes(&with),
+        vec![ConnectionRoute::Onion, ConnectionRoute::Direct]
+    );
+    assert_eq!(available_routes(&without), vec![ConnectionRoute::Direct]);
+    Ok(())
+}
+
+#[test]
+fn tor_storage_must_be_absolute_and_is_created_private() -> TestResult {
+    let core = MobileCore::new(generate_identity("Phone".into())?.private_key, "Phone".into())?;
+    assert!(matches!(
+        core.set_tor_directories("relative/state".into(), "relative/cache".into()),
+        Err(MobileError::Internal { .. })
+    ));
+    let dir = tempfile::tempdir()?;
+    let state = dir.path().join("tor/state");
+    let cache = dir.path().join("tor/cache");
+    let args = || {
+        (
+            state.to_string_lossy().into_owned(),
+            cache.to_string_lossy().into_owned(),
+        )
+    };
+    let (s, c) = args();
+    core.set_tor_directories(s, c)?;
+    for path in [&state, &cache] {
+        assert!(path.is_dir());
+        assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o700);
+    }
+    let (s, c) = args();
+    core.set_tor_directories(s, c)?;
+    let status = core.status();
+    assert!(status.tor.is_none());
+    assert_eq!(status.route_preference, RoutePreference::Auto);
+    core.set_route_preference(RoutePreference::Direct);
+    assert_eq!(core.status().route_preference, RoutePreference::Direct);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_runs_end_to_end_over_a_non_tcp_stream() -> TestResult {
+    let fixture = HostFixture::start().await?;
+    tokio::time::timeout(WAIT, async {
+        while fixture.host.listener_enabled("node") != Some(true) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let intake = fixture.intake.clone();
+    let serving = tokio::spawn(async move {
+        let _ = intake.serve(server_io, Duration::from_secs(10)).await;
+    });
+    let (_, local) = crate::identity::restore_identity(&fixture.phone_key, "Phone".into())?;
+    let validated = crate::identity::ValidatedProfile::new(fixture.profile.clone())?;
+    let connection = harw_session_remote::conn::connect_node_over(
+        client_io,
+        &validated.endpoint.expected_node,
+        &local,
+        &validated.verifier,
+        ConnectOptions::new("Phone"),
+        &harw_node_transport::ClientOptions::default(),
+    )
+    .await?;
+    let port = RemotePort::new(connection);
+    assert!(port.list().await?.is_empty());
+    serving.abort();
     Ok(())
 }

@@ -24,14 +24,17 @@ import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ApprovalOutcome
 import uniffi.harw_mobile_ffi.ChatgptProviderCredential
 import uniffi.harw_mobile_ffi.ConnectionPhase
+import uniffi.harw_mobile_ffi.ConnectionRoute
 import uniffi.harw_mobile_ffi.ConnectionStatus
 import uniffi.harw_mobile_ffi.MobileCore
 import uniffi.harw_mobile_ffi.MobileException
 import uniffi.harw_mobile_ffi.MobileSession
+import uniffi.harw_mobile_ffi.RoutePreference
 import uniffi.harw_mobile_ffi.ServerProfile
 import uniffi.harw_mobile_ffi.SessionCursor
 import uniffi.harw_mobile_ffi.SessionSnapshot
 import uniffi.harw_mobile_ffi.SubmitOutcome
+import uniffi.harw_mobile_ffi.TorBootstrap
 import uniffi.harw_mobile_ffi.generateIdentity
 import uniffi.harw_mobile_ffi.parseServerProfile
 
@@ -58,6 +61,9 @@ internal data class WorkspaceState(
     val forgetting: Boolean = false,
     val cleanupError: String? = null,
     val chatgpt: ChatgptAccountState = ChatgptAccountState(),
+    val routePreference: RoutePreference = RoutePreference.AUTO,
+    val activeRoute: ConnectionRoute? = null,
+    val tor: TorBootstrap? = null,
 ) {
     val online: Boolean get() = phase == ConnectionPhase.CONNECTED && !stopping
     val canSetUp: Boolean get() = !setupPending && !forgetRequired && cleanupError == null
@@ -75,6 +81,7 @@ internal data class WorkspaceState(
         listError = null,
         creating = false,
         generation = null,
+        activeRoute = null,
         windows = emptyMap(),
         pendingActions = emptySet(),
         chatgpt = ChatgptAccountState(),
@@ -104,6 +111,8 @@ internal data class WorkspaceState(
     fun connectionStatus(phase: ConnectionPhase, detail: String?, canCreate: Boolean, generation: Long?) =
         copy(phase = phase, detail = detail, canCreate = canCreate, generation = generation)
 
+    fun routeStatus(route: ConnectionRoute?, tor: TorBootstrap?) = copy(activeRoute = route, tor = tor)
+
     fun cleanupCheckFailed() = copy(
         setupPending = false,
         cleanupError = "Android could not check for a pending phone setup reset.",
@@ -124,13 +133,14 @@ internal data class ChatgptTarget(
     val endpoint: String,
     val serverNodeId: String,
     val serverPublicKeyHex: String,
+    val onion: String?,
     val generation: Long,
 ) {
     constructor(profile: ServerProfile, generation: Long) : this(
-        profile.version, profile.label, profile.endpoint, profile.serverNodeId, profile.serverPublicKeyHex, generation,
+        profile.version, profile.label, profile.endpoint, profile.serverNodeId, profile.serverPublicKeyHex, profile.onion, generation,
     )
 
-    val profile: ServerProfile get() = ServerProfile(version, label, endpoint, serverNodeId, serverPublicKeyHex)
+    val profile: ServerProfile get() = ServerProfile(version, label, endpoint, serverNodeId, serverPublicKeyHex, onion)
 }
 internal enum class ChatgptOperation { Checking, Browser, Validating, Linking, Unlinking }
 internal data class ChatgptAccountState(
@@ -259,6 +269,11 @@ internal class HarwConnection(private val context: Context) {
             change {
                 it.copy(
                     profile = profile,
+                    routePreference = if (profile.onion == null && it.routePreference == RoutePreference.ONION) {
+                        RoutePreference.AUTO
+                    } else {
+                        it.routePreference
+                    },
                     hasSavedSetup = true,
                     setupNotice = "Profile imported.",
                     phase = ConnectionPhase.DISCONNECTED,
@@ -271,6 +286,13 @@ internal class HarwConnection(private val context: Context) {
             }
         }
         return true
+    }
+
+    fun selectRoute(preference: RoutePreference) {
+        val current = state.value
+        if (current.hasConnection || current.stopping) return
+        if (preference == RoutePreference.ONION && current.profile?.onion == null) return
+        change { it.copy(routePreference = preference) }
     }
 
     fun reportCameraUnavailable() {
@@ -296,9 +318,21 @@ internal class HarwConnection(private val context: Context) {
             try {
                 val native = loadCore()
                 if (request != lifecycle) return@launch
-                val status = withContext(Dispatchers.IO) {
-                    native.connect(profile)
-                    native.status()
+                val routePoller = scope.launch {
+                    while (isActive && request == lifecycle) {
+                        delay(500)
+                        val live = withContext(Dispatchers.IO) { native.status() }
+                        if (request == lifecycle) change { it.routeStatus(live.route, live.tor) }
+                    }
+                }
+                val status = try {
+                    withContext(Dispatchers.IO) {
+                        native.setRoutePreference(start.routePreference)
+                        native.connect(profile)
+                        native.status()
+                    }
+                } finally {
+                    routePoller.cancel()
                 }
                 if (request != lifecycle) return@launch
                 applyStatus(status)
@@ -732,7 +766,10 @@ internal class HarwConnection(private val context: Context) {
         } else {
             closeGate()
         }
-        change { it.connectionStatus(status.phase, status.detail, status.canCreate, gate.generation) }
+        change {
+            it.connectionStatus(status.phase, status.detail, status.canCreate, gate.generation)
+                .routeStatus(status.route, status.tor)
+        }
     }
 
     private fun invalidate() {
@@ -818,6 +855,7 @@ internal class HarwConnection(private val context: Context) {
             }
             try {
                 val native = MobileCore(privateKey, DeviceLabel)
+                native.setTorDirectories(File(context.noBackupFilesDir, "tor/state").path, File(context.cacheDir, "tor").path)
                 native to native.enrollment().nodeId
             } finally {
                 privateKey.fill(0)

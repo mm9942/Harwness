@@ -55,6 +55,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import uniffi.harw_mobile_ffi.ConnectionPhase
+import uniffi.harw_mobile_ffi.ConnectionRoute
+import uniffi.harw_mobile_ffi.RoutePreference
+import uniffi.harw_mobile_ffi.ServerProfile
+import uniffi.harw_mobile_ffi.TorBootstrap
 
 @Composable
 internal fun ConnectionScreen(
@@ -69,6 +73,7 @@ internal fun ConnectionScreen(
     onScanProfile: () -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onSelectRoute: (RoutePreference) -> Unit,
     onForgetSetup: () -> Unit,
     onRetryCleanup: () -> Unit,
     onCheckChatgpt: () -> Unit,
@@ -139,12 +144,41 @@ internal fun ConnectionScreen(
                 val profile: @Composable () -> Unit = {
                     val saved = state.profile
                     SetupCard(Icons.Outlined.Dns, saved?.label ?: "Harw server") {
-                        Text(
-                            saved?.endpoint ?: "Import the server profile to set the address and verify its identity.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontFamily = if (saved != null) FontFamily.Monospace else FontFamily.Default,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        if (saved == null) {
+                            Text(
+                                "Import the server profile to set the address and verify its identity.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        } else {
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    "Direct  ${saved.endpoint}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                saved.onion?.let {
+                                    Text(
+                                        "Tor  ${shortOnion(it)}",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                for ((choice, name) in ROUTE_CHOICES) {
+                                    val enabled = routeChoiceEnabled(choice, saved) &&
+                                        state.canSetUp && !state.hasConnection && !state.stopping
+                                    if (state.routePreference == choice) {
+                                        Button(enabled = enabled, onClick = { onSelectRoute(choice) }) { Text(name) }
+                                    } else {
+                                        OutlinedButton(enabled = enabled, onClick = { onSelectRoute(choice) }) { Text(name) }
+                                    }
+                                }
+                            }
+                        }
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             OutlinedButton(
                                 enabled = state.canSetUp && !state.hasConnection && !state.stopping && !scanning,
@@ -194,6 +228,7 @@ internal fun ConnectionScreen(
                 }
                 state.setupNotice?.let { StatusMessage(it) }
                 state.setupError?.let { StatusMessage(it, error = true) }
+                torProgressText(state.tor, state.phase, state.activeRoute)?.let { StatusMessage(it) }
                 state.detail?.let {
                     StatusMessage(it, error = state.phase in setOf(ConnectionPhase.FAILED, ConnectionPhase.REVOKED))
                 }
@@ -381,14 +416,7 @@ internal fun HarwHeader(
 
 @Composable
 internal fun ConnectionBadge(state: WorkspaceState) {
-    val label = if (state.stopping) "Stopping" else when (state.phase) {
-        ConnectionPhase.DISCONNECTED -> "Offline"
-        ConnectionPhase.CONNECTING -> "Connecting"
-        ConnectionPhase.CONNECTED -> "Live"
-        ConnectionPhase.RECONNECTING -> "Reconnecting"
-        ConnectionPhase.FAILED -> "Failed"
-        ConnectionPhase.REVOKED -> "Access stopped"
-    }
+    val label = connectionBadgeText(state.phase, state.stopping, state.activeRoute)
     val colors = MaterialTheme.colorScheme
     val (background, foreground) = when {
         state.online -> colors.tertiaryContainer to colors.onTertiaryContainer
@@ -436,3 +464,56 @@ private fun SetupCard(icon: ImageVector, title: String, content: @Composable () 
         }
     }
 }
+
+private val ROUTE_CHOICES = listOf(
+    RoutePreference.AUTO to "Auto",
+    RoutePreference.ONION to "Tor (.onion)",
+    RoutePreference.DIRECT to "Direct",
+)
+
+/** Routes a saved profile offers, in display order; empty without a profile. */
+internal fun profileRoutes(profile: ServerProfile?): List<ConnectionRoute> = when {
+    profile == null -> emptyList()
+    profile.onion != null -> listOf(ConnectionRoute.ONION, ConnectionRoute.DIRECT)
+    else -> listOf(ConnectionRoute.DIRECT)
+}
+
+/** Whether a route preference can be selected for this profile. */
+internal fun routeChoiceEnabled(choice: RoutePreference, profile: ServerProfile?): Boolean = when {
+    profile == null -> false
+    choice == RoutePreference.ONION -> profile.onion != null
+    else -> true
+}
+
+/** Badge label for the connection phase, with the active route while a link is being made or live. */
+internal fun connectionBadgeText(phase: ConnectionPhase, stopping: Boolean, route: ConnectionRoute?): String {
+    if (stopping) return "Stopping"
+    val base = when (phase) {
+        ConnectionPhase.DISCONNECTED -> "Offline"
+        ConnectionPhase.CONNECTING -> "Connecting"
+        ConnectionPhase.CONNECTED -> "Live"
+        ConnectionPhase.RECONNECTING -> "Reconnecting"
+        ConnectionPhase.FAILED -> "Failed"
+        ConnectionPhase.REVOKED -> "Access stopped"
+    }
+    val routed = phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.CONNECTED ||
+        phase == ConnectionPhase.RECONNECTING
+    if (!routed || route == null) return base
+    return base + when (route) {
+        ConnectionRoute.ONION -> " · onion"
+        ConnectionRoute.DIRECT -> " · direct"
+    }
+}
+
+/** Tor bootstrap status line, or null when there is nothing to show. */
+internal fun torProgressText(tor: TorBootstrap?, phase: ConnectionPhase, route: ConnectionRoute?): String? {
+    if (tor == null) return null
+    tor.blocked?.let { return "Tor blocked: $it" }
+    if (!tor.ready) return "Tor bootstrap ${tor.percent}% · ${tor.summary}"
+    val dialing = phase == ConnectionPhase.CONNECTING || phase == ConnectionPhase.RECONNECTING
+    return if (route == ConnectionRoute.ONION && dialing) "Tor ready · reaching the .onion service" else null
+}
+
+/** Shortened display form of an onion locator: first 6 characters, then the port. */
+internal fun shortOnion(locator: String): String =
+    locator.take(6) + "….onion:" + locator.substringAfterLast(':')

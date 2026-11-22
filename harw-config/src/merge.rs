@@ -1309,7 +1309,7 @@ fn merge_tools_doc(
     }
 }
 
-// `[session_listener]` — alle sechs Felder `GlobalOnly` und
+// `[session_listener]` — alle zehn Felder `GlobalOnly` und
 // sicherheitskritisch: nur die Baseline (Home) setzt sie.
 fn merge_session_listener(
     trusted: &mut HarnessConfig,
@@ -1389,6 +1389,24 @@ fn merge_session_listener(
         present("shared_socket_tenant"),
         role,
         "session_listener.shared_socket_tenant",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.onion,
+        incoming.onion,
+        present("onion"),
+        role,
+        "session_listener.onion",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.onion_dir,
+        incoming.onion_dir,
+        present("onion_dir"),
+        role,
+        "session_listener.onion_dir",
         layer_path,
         out,
     );

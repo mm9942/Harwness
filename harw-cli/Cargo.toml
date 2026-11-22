@@ -24,6 +24,9 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Tor onion ingress of the session listener (embedded arti =0.48.0 via harw-onion/service).
+# Build the gateway with: cargo build -p harw-cli --features onion --bin harw
+onion = ["dep:harw-onion", "harw-onion/service"]
 # jemalloc als globaler Allokator nur auf ausdrücklichen Wunsch (G-067): auf
 # Kerneln mit 16K-Seiten (RPi 5, `PAGESIZE=16384`) kann ein auf 4K-Systemen
 # gebautes jemalloc abstürzen. Ohne Feature gilt der System-Allokator.
@@ -176,6 +179,8 @@ harw-session-host = { path = "../harw-session-host" }
 # + own-cloud listener on a TCP socket, separate host and tier.
 harw-node-listener = { path = "../harw-node-listener" }
 harw-node-transport = { path = "../harw-node-transport" }
+# Tor onion ingress (optional; enabled by the `onion` feature).
+harw-onion = { path = "../harw-onion", optional = true }
 harw-session-ws = { path = "../harw-session-ws" }
 
 # `harw kill` (src/main.rs::run_kill): reicht alle Argumente an killer durch.
