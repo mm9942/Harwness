@@ -3221,7 +3221,7 @@ mod tests {
             .spawn_contract()
             .budget()
             .ok_or(TestError::Missing("[spawn.budget] muss gesetzt sein"))?;
-        assert_eq!(budget.max_tokens(), Some(60_000));
+        assert_eq!(budget.max_tokens(), None);
         assert_eq!(budget.max_tool_calls(), Some(40));
         assert_eq!(budget.max_wall_secs(), Some(180));
         assert_eq!(

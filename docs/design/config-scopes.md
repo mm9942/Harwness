@@ -259,6 +259,8 @@ remote_ocr = "ask"   # "off" (default) | "ask" | "on"
 |---|---|---|---|---|
 | `compaction.absolute_ceiling_tokens` | `Option<u64>` | `None` | `harness_config.rs:116` | RESET |
 | `compaction.max_history_bytes` | `Option<usize>` | `None` | `harness_config.rs:130` | RESET |
+| `compaction.graceful_shutdown_percent` | `Option<u64>` | `None` (→ `85`, `DEFAULT_GRACEFUL_SHUTDOWN_PERCENT`) | `harness_config.rs` | RESET |
+| `compaction.hard_limit_percent` | `Option<u64>` | `None` (→ `95`, `DEFAULT_HARD_CONTEXT_LIMIT_PERCENT`) | `harness_config.rs` | RESET |
 
 ### 1.15 `[reasoning]` (`harness_config.rs:119-148`)
 
@@ -530,6 +532,8 @@ This table now matches `FIELD_TABLE` in `harw-config/src/scope.rs`.
 | `sandbox.execution` | **PROFILE** (PL-97 E2) | `ProfileReplaces` | Chooses how `shell.exec`, `job.start` and child agents start their processes: `chain` (the job runtime's sandbox chain, the default) or `legacy` (the previous host-job path). Home and profile set it; the untrusted project layer cannot set it (`merge_sandbox`), so a cloned repository can never switch a session to the weaker path. | 🔒 |
 | `internal_models.*` (all 12 fields, including `auto_classifier`) | PROFILE | last explicitly set value wins (already correctly implemented) | Model routing for auxiliary tasks is user preference/cost control, not an access restriction. | |
 | `compaction.absolute_ceiling_tokens` | **GLOBAL as an upper bound (minimum)** (decided 2026-09-21) | `MinBound` | An admin enforces a cost ceiling; the profile may only lower it, never exceed the global limit. | |
+| `compaction.graceful_shutdown_percent` | **GLOBAL as an upper bound (minimum)** | `MinBound` | Percent of the agent's own usable context (window minus output reserve) at which a child gets its closing round (graceful shutdown). A profile may only lower it, never raise it above the global value. | |
+| `compaction.hard_limit_percent` | **GLOBAL as an upper bound (minimum)** | `MinBound` | Percent of the agent's own usable context (window minus output reserve) at which a child is aborted. A profile may only lower it, never raise it above the global value. | |
 | `reasoning.*` (all 6 fields) | PROFILE | last explicitly set value wins | Reasoning effort is a cost/speed trade-off, not an access restriction. | |
 | `guards.enabled` | GLOBAL (baseline) + profile may only tighten | **OR** (`true` wins) | Safety/stability guard; turning it off would be a relaxation, analogous to `tools.plan.validate_*`. | |
 | `guards.repeated_failure_warn` | GLOBAL (baseline) + profile may only narrow | **Minimum** | A lower threshold is a more sensitive (stricter) guard. | |
@@ -934,8 +938,10 @@ project layer cannot set it).
 | `internal_models.auto_classifier` | Profile | `ProfileReplaces` |
 | `InternalModelChoice.provider`/`.model` (field of each slot) | — | `CompositeMember` (travels as part of the atomic `Option<InternalModelChoice>` of that slot, see above; never merged individually) |
 
-**1.14 `[compaction]`** (2): `compaction.absolute_ceiling_tokens` — Global /
-`MinBound`; `compaction.max_history_bytes` — Profile / `ProfileReplaces`.
+**1.14 `[compaction]`** (4): `compaction.absolute_ceiling_tokens` — Global /
+`MinBound`; `compaction.graceful_shutdown_percent` — Global / `MinBound`;
+`compaction.hard_limit_percent` — Global / `MinBound`;
+`compaction.max_history_bytes` — Profile / `ProfileReplaces`.
 
 **1.15 `[reasoning]`** (6): `reasoning.uia`, `.root_orchestrator`,
 `.root_orchestrator_with_subs`, `.sub_orchestrator`, `.worker_complex`,

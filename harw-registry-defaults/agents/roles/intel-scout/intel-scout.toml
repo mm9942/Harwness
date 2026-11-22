@@ -50,7 +50,6 @@ forbidden = ["fs.write", "fs.edit", "shell.exec", "web.fetch", "web.docs_rs", "w
 max_depth = 0
 
 [spawn.budget]
-max_tokens = 40000
 max_tool_calls = 20
 max_wall_secs = 120
 

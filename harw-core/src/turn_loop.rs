@@ -537,6 +537,16 @@ pub const HANDOFF_PREFIX: &str = "transfer_to_";
 /// greift.
 pub const TOKEN_BUDGET_STOP_PREFIX: &str = "Token-Budget erschöpft";
 
+/// Anfang des Endgrunds ([`TurnControl::stop_detail`]) eines Turns, der nach
+/// seiner Abschlussrunde ([`GRACEFUL_SHUTDOWN_INSTRUCTION`]) am nächsten
+/// Prüfpunkt endet; danach folgt `" (<Ursache>)"` mit
+/// [`crate::agent_budget::GracefulShutdownCause::as_str`].
+pub const GRACEFUL_SHUTDOWN_STOP_PREFIX: &str = "Abschlussrunde beendet";
+
+/// Anfang des Endgrunds eines Turns, dessen Kontextfüllung die harte Grenze
+/// des Kontext-Budgets ([`crate::agent_budget::TurnContextBudget`]) erreicht.
+pub const CONTEXT_HARD_LIMIT_STOP_PREFIX: &str = "Kontext-Budget erschöpft";
+
 /// Ergebnis-Slot für einen parallelen Tool-Call: (ID, Ergebnis, Wandzeit ms).
 // Vorletztes Feld: `true`, wenn dieser Call mit `ToolsError::Cancelled`
 // endete (siehe `try_execute_parallel_calls`s Ergebnis-Auslieferung).
@@ -639,6 +649,15 @@ struct TurnMeter {
     /// Werkzeugaufrufe, die wegen des Werkzeug-Budgets nicht ausgeführt,
     /// sondern mit [`TOOL_BUDGET_SKIP_PREFIX`] beantwortet wurden.
     tool_budget_skipped: u32,
+    /// Phase der Abschlussrunde (siehe [`TurnControl::request_closing_round`]).
+    closing: ClosingPhase,
+    /// Zuletzt beobachtete Kontextfüllung in Tokens (`0` = noch keine).
+    context_fill: u64,
+    /// Werkzeugaufrufe insgesamt (inklusive Vorverbrauch des
+    /// Werkzeug-Budgets), ab denen die Abschlussrunde angefordert wird.
+    tool_closing_at: Option<u32>,
+    /// Zeitpunkt, ab dem die Abschlussrunde angefordert wird.
+    closing_deadline: Option<Instant>,
 }
 
 /// Präfix des synthetischen Ergebnisses eines Werkzeugaufrufs, der wegen
@@ -660,6 +679,29 @@ pub const TOKEN_BUDGET_WRAP_UP_INSTRUCTION: &str = "Dein Token-Budget für diese
 fast aufgebraucht. Beginne keine neuen Erkundungen und rufe nur noch Werkzeuge auf, wenn sie für \
 den Abschluss unverzichtbar sind. Fasse jetzt zusammen, was du herausgefunden hast, und liefere \
 dein Ergebnis im verlangten Format ab; offene Punkte nennst du ausdrücklich als offen.";
+
+/// Anweisung der Abschlussrunde (Graceful Shutdown), sobald Kontextfüllung,
+/// Werkzeug- oder Zeitbudget die Abschluss-Schwelle erreichen; enthält jede
+/// Überschrift aus [`crate::child_handoff::HANDOFF_SECTIONS`] wörtlich.
+pub const GRACEFUL_SHUTDOWN_INSTRUCTION: &str = "Abschlussrunde: Dein Budget für diesen \
+Auftrag ist fast aufgebraucht. Halte an einem konsistenten Punkt an. Beginne keine neuen \
+Änderungen und keine neuen Erkundungen und hinterlasse keine halb fertige Änderung: bringe eine \
+begonnene Änderung entweder sauber zu Ende oder lass sie ganz weg. Schreibe danach deine \
+Übergabe mit genau diesen Abschnitten in dieser Reihenfolge: \
+## Auftrag, ## Erledigt, ## Befunde mit Belegen, ## Offene Punkte, \
+## Empfohlene nächste Schritte, ## Stand beim Abbruch. \
+Offene Punkte nennst du ausdrücklich als offen.";
+
+// Phase der Abschlussrunde eines Turns (geteilt über den `TurnMeter`):
+// `Open` -> `Requested` (die nächste Anfrage trägt die Anweisung) -> `Sent`
+// (die Anfrage ist gesendet; der nächste Prüfpunkt beendet den Turn).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ClosingPhase {
+    #[default]
+    Open,
+    Requested(crate::agent_budget::GracefulShutdownCause),
+    Sent(crate::agent_budget::GracefulShutdownCause),
+}
 
 /// Token-Budget eines Turns, gemessen in **neuen** Tokens (Teil C).
 ///
@@ -758,6 +800,7 @@ pub struct TurnControl {
     clock: Arc<dyn Clock>,
     meter: Arc<Mutex<TurnMeter>>,
     token_budget: Option<TurnTokenBudget>,
+    context_budget: Option<crate::agent_budget::TurnContextBudget>,
     // Bucht jeden Werkzeugaufruf vor seiner Ausführung (siehe
     // `crate::tool_call_meter`); Klone teilen denselben Meter.
     tool_call_meter: Option<Arc<dyn ToolCallMeter>>,
@@ -772,6 +815,7 @@ impl std::fmt::Debug for TurnControl {
             .field("cancel", &self.cancel)
             .field("limits", &self.limits)
             .field("token_budget", &self.token_budget)
+            .field("context_budget", &self.context_budget)
             .field("tool_call_meter", &self.tool_call_meter.is_some())
             .field("dod_taint", &self.dod_taint)
             .finish_non_exhaustive()
@@ -797,6 +841,7 @@ impl TurnControl {
             clock: Arc::new(SystemClock),
             meter: Arc::new(Mutex::new(TurnMeter::default())),
             token_budget: None,
+            context_budget: None,
             tool_call_meter: None,
             dod_taint: crate::dod_taint::DodTaint::new(),
         }
@@ -895,6 +940,122 @@ impl TurnControl {
         true
     }
 
+    /// Setzt das Kontext-Budget des Turns ([`crate::agent_budget::TurnContextBudget`]),
+    /// gegen das vor jeder Modellrunde die geschätzte Request-Größe geprüft wird.
+    ///
+    /// # Beschreibung
+    /// Ab der Abschluss-Schwelle fordert der Turn einmal die Abschlussrunde
+    /// an ([`GRACEFUL_SHUTDOWN_INSTRUCTION`]); ab der harten Grenze endet er
+    /// mit `CancelReason::Budget` und [`CONTEXT_HARD_LIMIT_STOP_PREFIX`].
+    ///
+    /// # Arguments
+    /// - `budget` (`TurnContextBudget`): nutzbare Tokens und Schwellen.
+    #[must_use]
+    pub fn with_context_budget(mut self, budget: crate::agent_budget::TurnContextBudget) -> Self {
+        self.context_budget = Some(budget);
+        self
+    }
+
+    /// Das gesetzte Kontext-Budget, falls vorhanden.
+    #[must_use]
+    pub fn context_budget(&self) -> Option<crate::agent_budget::TurnContextBudget> {
+        self.context_budget
+    }
+
+    /// Fordert die Abschlussrunde an, sobald insgesamt `total_calls`
+    /// Werkzeugaufrufe erreicht sind (inklusive des Vorverbrauchs aus
+    /// [`Self::with_tool_call_budget`]). Liegt im geteilten Meter.
+    #[must_use]
+    pub fn with_tool_closing_at(self, total_calls: u32) -> Self {
+        self.meter().tool_closing_at = Some(total_calls);
+        self
+    }
+
+    /// Fordert die Abschlussrunde an, sobald `deadline` erreicht ist.
+    /// Liegt im geteilten Meter.
+    #[must_use]
+    pub fn with_closing_deadline(self, deadline: Instant) -> Self {
+        self.meter().closing_deadline = Some(deadline);
+        self
+    }
+
+    /// Fordert die Abschlussrunde mit Ursache `cause` an.
+    ///
+    /// # Returns
+    /// `true` nur beim Übergang aus der offenen Phase; eine bereits
+    /// angeforderte oder gesendete Abschlussrunde bleibt unverändert.
+    pub fn request_closing_round(&self, cause: crate::agent_budget::GracefulShutdownCause) -> bool {
+        let mut meter = self.meter();
+        Self::open_closing_round(&mut meter, cause)
+    }
+
+    /// `true`, solange eine angeforderte Abschlussrunde noch nicht gesendet ist.
+    #[must_use]
+    pub fn closing_round_due(&self) -> bool {
+        matches!(self.meter().closing, ClosingPhase::Requested(_))
+    }
+
+    /// Ursache der Abschlussrunde, sobald deren Anfrage gesendet wurde.
+    #[must_use]
+    pub fn graceful_shutdown(&self) -> Option<crate::agent_budget::GracefulShutdownCause> {
+        match self.meter().closing {
+            ClosingPhase::Sent(cause) => Some(cause),
+            ClosingPhase::Open | ClosingPhase::Requested(_) => None,
+        }
+    }
+
+    /// Zuletzt beobachtete Kontextfüllung in Tokens (`0` = noch keine).
+    #[must_use]
+    pub fn context_fill_tokens(&self) -> u64 {
+        self.meter().context_fill
+    }
+
+    // Übergang `Open -> Requested(cause)` auf einem bereits gesperrten Meter;
+    // `true` nur beim Übergang.
+    fn open_closing_round(
+        meter: &mut TurnMeter,
+        cause: crate::agent_budget::GracefulShutdownCause,
+    ) -> bool {
+        if meter.closing != ClosingPhase::Open {
+            return false;
+        }
+        meter.closing = ClosingPhase::Requested(cause);
+        tracing::info!(cause = cause.as_str(), "turn_loop.closing_round_requested");
+        true
+    }
+
+    // Vermerkt die geschätzte Kontextfüllung `fill_tokens` der nächsten
+    // Anfrage und bewertet sie gegen das Kontext-Budget: `Hard` in jeder
+    // Phase (Endgrund vermerkt), `Graceful` nur beim Übergang in die
+    // angeforderte Abschlussrunde, sonst `Below`.
+    fn observe_context_fill(&self, fill_tokens: u64) -> crate::agent_budget::ContextFillVerdict {
+        use crate::agent_budget::{ContextFillVerdict, GracefulShutdownCause};
+        let mut meter = self.meter();
+        meter.context_fill = fill_tokens;
+        let Some(budget) = self.context_budget else {
+            return ContextFillVerdict::Below;
+        };
+        match budget.verdict(fill_tokens) {
+            ContextFillVerdict::Hard => {
+                let usable = budget.usable_tokens;
+                let hard = budget.hard_limit_tokens();
+                meter.stop_detail.get_or_insert_with(|| {
+                    format!(
+                        "{CONTEXT_HARD_LIMIT_STOP_PREFIX} ({fill_tokens} von {usable} Tokens \
+                         Kontext; harte Grenze {hard})"
+                    )
+                });
+                ContextFillVerdict::Hard
+            }
+            ContextFillVerdict::Graceful
+                if Self::open_closing_round(&mut meter, GracefulShutdownCause::ContextFill) =>
+            {
+                ContextFillVerdict::Graceful
+            }
+            ContextFillVerdict::Graceful | ContextFillVerdict::Below => ContextFillVerdict::Below,
+        }
+    }
+
     /// Replaces the cancellation token (e.g. a child of the caller's token).
     ///
     /// # Arguments
@@ -986,6 +1147,10 @@ impl TurnControl {
     fn record_model_round(&self) {
         let mut meter = self.meter();
         meter.model_rounds = meter.model_rounds.saturating_add(1);
+        let closing = meter.closing;
+        if let ClosingPhase::Requested(cause) = closing {
+            meter.closing = ClosingPhase::Sent(cause);
+        }
     }
 
     /// Setzt ein sitzungsweites Werkzeug-Budget (Kind-`max_tool_calls`):
@@ -1059,6 +1224,37 @@ impl TurnControl {
             return Some(reason);
         }
         let mut meter = self.meter();
+        let closing = meter.closing;
+        match closing {
+            ClosingPhase::Sent(cause) => {
+                meter.stop_detail.get_or_insert_with(|| {
+                    format!("{GRACEFUL_SHUTDOWN_STOP_PREFIX} ({})", cause.as_str())
+                });
+                tracing::info!(cause = cause.as_str(), "turn_loop.graceful_shutdown_stop");
+                return Some(CancelReason::Budget);
+            }
+            ClosingPhase::Open => {
+                let used_before = meter.tool_call_budget.map_or(0, |(_, used)| used);
+                let tools_reached = meter
+                    .tool_closing_at
+                    .is_some_and(|at| used_before.saturating_add(meter.tool_calls) >= at);
+                let deadline_passed = meter
+                    .closing_deadline
+                    .is_some_and(|deadline| deadline <= Instant::now());
+                if tools_reached {
+                    Self::open_closing_round(
+                        &mut meter,
+                        crate::agent_budget::GracefulShutdownCause::ToolCalls,
+                    );
+                } else if deadline_passed {
+                    Self::open_closing_round(
+                        &mut meter,
+                        crate::agent_budget::GracefulShutdownCause::WallTime,
+                    );
+                }
+            }
+            ClosingPhase::Requested(_) => {}
+        }
         let fresh_used = self.token_budget.map(|budget| {
             budget
                 .used_before
@@ -4866,6 +5062,36 @@ async fn drive_turn(
                 session.token_calibration(),
             );
         }
+        // Kontext-Budget (Graceful Shutdown): ab der Abschluss-Schwelle wird
+        // der Request einmal mit der Abschluss-Anweisung neu gebaut; ab der
+        // harten Grenze endet der Turn mit `CancelReason::Budget`.
+        match control.observe_context_fill(estimated_tokens) {
+            crate::agent_budget::ContextFillVerdict::Graceful => {
+                request = assemble_round_request(
+                    session,
+                    ctx,
+                    &control,
+                    &handle.turn_id,
+                    &total_usage,
+                    continuation,
+                    max_output_override,
+                )
+                .await?;
+                estimated_tokens = crate::context_budget::estimate_request_tokens(
+                    &request,
+                    session.token_calibration(),
+                );
+            }
+            crate::agent_budget::ContextFillVerdict::Hard => {
+                tracing::warn!(
+                    fill = estimated_tokens,
+                    usable = control.context_budget().map_or(0, |b| b.usable_tokens),
+                    "turn_loop.context_hard_limit"
+                );
+                return cancel_turn(session, handle, total_usage, CancelReason::Budget).await;
+            }
+            crate::agent_budget::ContextFillVerdict::Below => {}
+        }
         // Nicht-Historien-Anteil dieses Requests (System, Fragmente,
         // Werkzeuge) — für jede weitere Notfall-Verdichtung dieser Runde.
         let request_overhead = request_overhead_tokens(&request, session.token_calibration());
@@ -6287,7 +6513,18 @@ async fn assemble_round_request(
     // Teil C: ab der Abschluss-Schwelle des Token-Budgets bekommt jede
     // weitere Anfrage die Anweisung, jetzt zusammenzufassen — damit beim
     // harten Limit eine verwertbare letzte Antwort als Teilergebnis vorliegt.
-    if control.token_budget_wrap_up_due() {
+    // Graceful Shutdown: eine angeforderte Abschlussrunde ersetzt für diese
+    // Anfrage die Abschluss-Anweisung des Token-Budgets.
+    if control.closing_round_due() {
+        match instruction_fragment(
+            "budget.graceful_shutdown",
+            "turn_loop.graceful_shutdown",
+            GRACEFUL_SHUTDOWN_INSTRUCTION,
+        ) {
+            Some(fragment) => fragments.push(fragment),
+            None => tracing::warn!("turn_loop.graceful_shutdown_fragment_unavailable"),
+        }
+    } else if control.token_budget_wrap_up_due() {
         match instruction_fragment(
             "budget.wrap_up",
             "turn_loop.token_budget",
@@ -16626,5 +16863,275 @@ mod tests {
         let expected: BTreeSet<String> = ["plan", "test"].iter().map(|t| (*t).to_owned()).collect();
         assert_eq!(tags, expected);
         assert!(wanted_tags("").is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Graceful Shutdown: Abschlussrunde über das Kontext-Budget
+    // ------------------------------------------------------------------
+
+    /// Skriptiertes Modell, das von jeder Anfrage die Debug-Darstellung
+    /// festhält (Kontext, Fragmente, Verlauf).
+    struct ContextRecordingModel {
+        responses: Mutex<std::collections::VecDeque<crate::model::ModelResponse>>,
+        requests: Mutex<Vec<String>>,
+    }
+
+    impl ContextRecordingModel {
+        fn new(responses: Vec<crate::model::ModelResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_requests(&self) -> Vec<String> {
+            std::mem::take(
+                &mut *self
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        }
+    }
+
+    impl ModelProvider for ContextRecordingModel {
+        fn respond<'a>(&'a self, request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(format!("{request:?}"));
+            let next = self
+                .responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front();
+            Box::pin(async move { next.ok_or(crate::model::ModelError::EmptyResponse) })
+        }
+    }
+
+    #[test]
+    fn graceful_instruction_contains_every_handoff_section() -> TestResult {
+        for section in crate::child_handoff::HANDOFF_SECTIONS {
+            if !GRACEFUL_SHUTDOWN_INSTRUCTION.contains(section) {
+                return Err(TestError::Unexpected(format!("fehlt: {section}")));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn observe_context_fill_requests_the_closing_round_once() -> TestResult {
+        use crate::agent_budget::{
+            ContextFillVerdict, GracefulShutdownCause, GracefulShutdownPolicy, TurnContextBudget,
+        };
+        let control = TurnControl::new().with_context_budget(TurnContextBudget::new(
+            1000,
+            GracefulShutdownPolicy::default(),
+        ));
+        assert_eq!(control.observe_context_fill(849), ContextFillVerdict::Below);
+        assert!(!control.closing_round_due());
+        assert_eq!(control.context_fill_tokens(), 849);
+        assert_eq!(control.observe_context_fill(850), ContextFillVerdict::Graceful);
+        assert!(control.closing_round_due());
+        assert_eq!(control.graceful_shutdown(), None);
+        assert_eq!(control.observe_context_fill(900), ContextFillVerdict::Below);
+        assert!(!control.request_closing_round(GracefulShutdownCause::ToolCalls));
+        assert_eq!(control.stop_detail(), None);
+        assert_eq!(control.observe_context_fill(950), ContextFillVerdict::Hard);
+        let detail = control.stop_detail().ok_or(TestError::Missing("stop_detail"))?;
+        assert!(detail.starts_with(CONTEXT_HARD_LIMIT_STOP_PREFIX), "{detail}");
+        assert_eq!(
+            detail,
+            "Kontext-Budget erschöpft (950 von 1000 Tokens Kontext; harte Grenze 950)"
+        );
+        assert_eq!(control.context_fill_tokens(), 950);
+        // Ohne Kontext-Budget bleibt alles `Below`, die Füllung wird vermerkt.
+        let plain = TurnControl::new();
+        assert_eq!(plain.observe_context_fill(u64::MAX), ContextFillVerdict::Below);
+        assert_eq!(plain.context_fill_tokens(), u64::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sent_closing_round_stops_at_the_next_checkpoint() -> TestResult {
+        use crate::agent_budget::GracefulShutdownCause;
+        let control = TurnControl::new();
+        assert!(control.request_closing_round(GracefulShutdownCause::ContextFill));
+        assert!(!control.request_closing_round(GracefulShutdownCause::WallTime));
+        // Angefordert, aber noch nicht gesendet: kein Abbruch.
+        assert_eq!(control.model_checkpoint(), None);
+        control.record_model_round();
+        assert!(!control.closing_round_due());
+        let clone = control.clone();
+        assert_eq!(
+            clone.graceful_shutdown(),
+            Some(GracefulShutdownCause::ContextFill)
+        );
+        assert_eq!(control.model_checkpoint(), Some(CancelReason::Budget));
+        assert_eq!(
+            control.stop_detail().as_deref(),
+            Some("Abschlussrunde beendet (context_fill)")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_closing_at_and_deadline_request_a_closing_round() -> TestResult {
+        use crate::agent_budget::GracefulShutdownCause;
+        // Vorverbrauch 3 + 2 eigene Aufrufe erreichen die Schwelle 5.
+        let tools = TurnControl::new()
+            .with_tool_call_budget(10, 3)
+            .with_tool_closing_at(5);
+        tools.record_tool_calls(1);
+        assert_eq!(tools.model_checkpoint(), None);
+        assert!(!tools.closing_round_due());
+        tools.record_tool_calls(1);
+        assert_eq!(tools.model_checkpoint(), None);
+        assert!(tools.closing_round_due());
+        tools.record_model_round();
+        assert_eq!(
+            tools.graceful_shutdown(),
+            Some(GracefulShutdownCause::ToolCalls)
+        );
+        assert_eq!(tools.model_checkpoint(), Some(CancelReason::Budget));
+        assert_eq!(
+            tools.stop_detail().as_deref(),
+            Some("Abschlussrunde beendet (tool_calls)")
+        );
+
+        let deadline = TurnControl::new().with_closing_deadline(Instant::now());
+        assert_eq!(deadline.model_checkpoint(), None);
+        assert!(deadline.closing_round_due());
+        deadline.record_model_round();
+        assert_eq!(
+            deadline.graceful_shutdown(),
+            Some(GracefulShutdownCause::WallTime)
+        );
+
+        let later_deadline = Instant::now()
+            .checked_add(Duration::from_secs(3600))
+            .ok_or(TestError::Missing("späterer Zeitpunkt"))?;
+        let later = TurnControl::new().with_closing_deadline(later_deadline);
+        assert_eq!(later.model_checkpoint(), None);
+        assert!(!later.closing_round_due());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn context_fill_triggers_one_closing_round_end_to_end() -> TestResult {
+        use crate::agent_budget::{GracefulShutdownCause, GracefulShutdownPolicy, TurnContextBudget};
+        // Kalibrierung: Füllung der ersten Anfrage einer gleich gebauten Sitzung.
+        let mut probe = guarded_session(
+            StubToolProvider::with_names(&["lookup"]),
+            Arc::new(CountingApproval::allow_everything()),
+        )?;
+        let probe_control = TurnControl::new();
+        run_turn(
+            &mut probe,
+            &ScriptedModel::new(vec![crate::model::ModelResponse::text("fertig")]),
+            &crate::state_store::InMemoryStateStore::new(),
+            TurnInput::user("arbeite").with_control(probe_control.clone()),
+        )
+        .await
+        .map_err(ctx("kalibrierender Turn"))?;
+        let first_fill = probe_control.context_fill_tokens();
+        assert!(first_fill > 0);
+
+        // Abschluss-Schwelle (1 %) knapp über der ersten Anfrage, harte
+        // Grenze (100 %) weit darüber: erst das Werkzeugergebnis der ersten
+        // Runde hebt die zweite Anfrage über die Schwelle.
+        let usable = first_fill.saturating_add(1).saturating_mul(100);
+        let budget = TurnContextBudget::new(usable, GracefulShutdownPolicy::new(1, 100));
+        assert_eq!(
+            budget.graceful_threshold_tokens(),
+            first_fill.saturating_add(1)
+        );
+        let control = TurnControl::new().with_context_budget(budget);
+        let mut session = guarded_session(
+            StubToolProvider::with_names(&["lookup"]),
+            Arc::new(CountingApproval::allow_everything()),
+        )?;
+        let model = ContextRecordingModel::new(vec![
+            response_with(vec![call(&ToolCallId::new(), "lookup")]),
+            response_with(vec![call(&ToolCallId::new(), "lookup")]),
+            crate::model::ModelResponse::text("darf nicht mehr angefragt werden"),
+        ]);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("arbeite").with_control(control.clone()),
+        )
+        .await
+        .map_err(ctx("Turn mit Abschlussrunde"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "{outcome:?}"
+        );
+        let requests = model.take_requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let carrying = requests
+            .iter()
+            .filter(|request| request.contains("## Stand beim Abbruch"))
+            .count();
+        assert_eq!(carrying, 1, "{requests:?}");
+        assert!(
+            requests
+                .get(1)
+                .is_some_and(|request| request.contains("budget.graceful_shutdown"))
+        );
+        assert_eq!(
+            control.graceful_shutdown(),
+            Some(GracefulShutdownCause::ContextFill)
+        );
+        assert_eq!(
+            control.stop_detail().as_deref(),
+            Some("Abschlussrunde beendet (context_fill)")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn many_small_rounds_without_token_budget_do_not_stop() -> TestResult {
+        use crate::agent_budget::{GracefulShutdownPolicy, TurnContextBudget};
+        let store = crate::state_store::InMemoryStateStore::new();
+        let mut session = guarded_session(
+            StubToolProvider::with_names(&["lookup"]),
+            Arc::new(CountingApproval::allow_everything()),
+        )?;
+        let heavy = |mut response: crate::model::ModelResponse| {
+            response.usage.input_tokens = 500_000;
+            response.usage.output_tokens = 10_000;
+            response
+        };
+        let mut script: Vec<crate::model::ModelResponse> = (0..8)
+            .map(|_| heavy(response_with(vec![call(&ToolCallId::new(), "lookup")])))
+            .collect();
+        script.push(heavy(crate::model::ModelResponse::text("fertig")));
+        let control = TurnControl::new().with_context_budget(TurnContextBudget::new(
+            10_000_000,
+            GracefulShutdownPolicy::default(),
+        ));
+        let outcome = run_turn(
+            &mut session,
+            &ScriptedModel::new(script),
+            &store,
+            TurnInput::user("viele Runden").with_control(control.clone()),
+        )
+        .await
+        .map_err(ctx("viele kleine Runden"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(control.graceful_shutdown(), None);
+        assert!(!control.closing_round_due());
+        assert_eq!(control.stop_detail(), None);
+        assert!(control.usage().input_tokens >= 4_000_000);
+        Ok(())
     }
 }

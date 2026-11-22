@@ -517,14 +517,22 @@ impl ChildEndCause {
     /// `uia-latex-writer` dreimal ohne Verdichtung). Ausgenommen ist das
     /// Token-Budget ([`crate::turn_loop::TOKEN_BUDGET_STOP_PREFIX`]): dort
     /// verdichtet der Budget-Pfad aus seiner Reserve — sonst doppelt.
+    /// Ebenfalls ausgenommen sind die harte Kontextgrenze
+    /// ([`crate::turn_loop::CONTEXT_HARD_LIMIT_STOP_PREFIX`]; der Budget-Pfad
+    /// verdichtet aus seiner Reserve) und die Abschlussrunde
+    /// ([`crate::turn_loop::GRACEFUL_SHUTDOWN_STOP_PREFIX`]; das Kind hat in
+    /// der Abschlussrunde bereits seine eigene Übergabe geschrieben).
     #[must_use]
     pub fn allows_compaction(&self) -> bool {
         match self {
             Self::WallTime { .. } | Self::ToolBudget { .. } => true,
             Self::TurnError(_) => !self.is_rate_limited(),
-            Self::TurnStopped(detail) => !detail
-                .trim_start()
-                .starts_with(crate::turn_loop::TOKEN_BUDGET_STOP_PREFIX),
+            Self::TurnStopped(detail) => {
+                let detail = detail.trim_start();
+                !(detail.starts_with(crate::turn_loop::TOKEN_BUDGET_STOP_PREFIX)
+                    || detail.starts_with(crate::turn_loop::CONTEXT_HARD_LIMIT_STOP_PREFIX)
+                    || detail.starts_with(crate::turn_loop::GRACEFUL_SHUTDOWN_STOP_PREFIX))
+            }
             _ => false,
         }
     }
@@ -2011,6 +2019,44 @@ mod tests {
             cause.predecessor_end(),
             crate::child_handoff::PredecessorEnd::Stopped { .. }
         ));
+    }
+
+    /// Harte Kontextgrenze und Abschlussrunde werden nicht doppelt verdichtet;
+    /// ein Turn-Wächter bleibt verdichtungsfähig.
+    #[test]
+    fn context_and_graceful_stops_are_not_compacted_twice() {
+        assert!(
+            !ChildEndCause::TurnStopped(format!(
+                "{} (190 von 200 Tokens Kontext; harte Grenze 190)",
+                crate::turn_loop::CONTEXT_HARD_LIMIT_STOP_PREFIX
+            ))
+            .allows_compaction()
+        );
+        assert!(
+            !ChildEndCause::TurnStopped(format!(
+                "{} (context_fill)",
+                crate::turn_loop::GRACEFUL_SHUTDOWN_STOP_PREFIX
+            ))
+            .allows_compaction()
+        );
+        assert!(
+            !ChildEndCause::TurnStopped(format!(
+                " {} (190 von 200 Tokens Kontext; harte Grenze 190)",
+                crate::turn_loop::CONTEXT_HARD_LIMIT_STOP_PREFIX
+            ))
+            .allows_compaction()
+        );
+        assert!(
+            !ChildEndCause::TurnStopped(format!(
+                " {} (context_fill)",
+                crate::turn_loop::GRACEFUL_SHUTDOWN_STOP_PREFIX
+            ))
+            .allows_compaction()
+        );
+        assert!(
+            ChildEndCause::TurnStopped("Turn-Wächter (no_progress_rounds): 4".into())
+                .allows_compaction()
+        );
     }
 
     /// Runde 9, E2: die Übergabe an eine Fortsetzung nennt Endgrund und

@@ -6141,6 +6141,7 @@ specialization = "bridge-contract-test"
             usage: harw_core::child_controller::ChildUsage::default(),
             budget_exhausted: true,
             budget_handoff: Some(harw_core::child_handoff::BudgetHandoff::LastAnswer),
+            graceful_shutdown: None,
         }
     }
 

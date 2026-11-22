@@ -70,10 +70,8 @@ forbidden = [
 [spawn]
 max_depth = 0
 
-# Textzug mit großzügigem Token-Budget; wenige lesende Aufrufe für die
-# Unterlagen.
+# Token-Budget = Kontextfenster des genutzten Modells (Teil 2); max_tokens nur noch als verengende Obergrenze.
 [spawn.budget]
-max_tokens = 60000
 max_tool_calls = 16
 max_wall_secs = 300
 

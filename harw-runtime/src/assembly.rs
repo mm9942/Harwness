@@ -6258,6 +6258,19 @@ fn configured_compaction_ceiling(config: &ResolvedConfig) -> u64 {
         .unwrap_or(harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS)
 }
 
+/// Die Richtlinie fuer das geordnete Beenden (graceful shutdown) der Kinder: `[compaction] graceful_shutdown_percent` und `hard_limit_percent` in Prozent des eigenen Kontextfensters, sonst Kern-Vorgaben (85 / 95). Gilt fuer alle Kinder.
+fn configured_graceful_shutdown(config: &ResolvedConfig) -> harw_core::GracefulShutdownPolicy {
+    let compaction = &config.harness.compaction;
+    harw_core::GracefulShutdownPolicy::new(
+        compaction
+            .graceful_shutdown_percent
+            .unwrap_or(harw_core::DEFAULT_GRACEFUL_SHUTDOWN_PERCENT),
+        compaction
+            .hard_limit_percent
+            .unwrap_or(harw_core::DEFAULT_HARD_CONTEXT_LIMIT_PERCENT),
+    )
+}
+
 /// Byte-Budget der Request-Montage aus dem Kontextfenster abgeleitet: der
 /// Verlauf darf ~3 Bytes je Token belegen (konservativ, Text ≈ 4 B/Token),
 /// damit Auto-Compaction (70 % des Fensters) greift, **bevor** die harte
@@ -6680,6 +6693,8 @@ fn build_spawner(
         // Welle 3: dieselbe feste Verdichtungs-Obergrenze wie die Wurzel
         // (`[compaction] absolute_ceiling_tokens`, sonst Kern-Vorgabe).
         .with_compaction_ceiling(Some(configured_compaction_ceiling(config)))
+        // Geordnetes Beenden: Richtlinie aus `[compaction]` für alle Kinder.
+        .with_graceful_shutdown(configured_graceful_shutdown(config))
         // Runde 5, Teil K: `[agents]` — Orchestrierungsgrenzen (geklemmt,
         // konsistent); die allgemeine Tiefe steckt in `child_limits`.
         .with_orchestration_limits(crate::agent_background_wiring::orchestration_limits(config))
@@ -8577,6 +8592,23 @@ mod tests {
         );
         config.harness.compaction.absolute_ceiling_tokens = Some(123_456);
         assert_eq!(configured_compaction_ceiling(&config), 123_456);
+    }
+
+    #[test]
+    fn graceful_shutdown_policy_defaults_and_overrides() {
+        let mut config = ResolvedConfig::default();
+        assert_eq!(
+            configured_graceful_shutdown(&config),
+            harw_core::GracefulShutdownPolicy::default()
+        );
+        let policy = configured_graceful_shutdown(&config);
+        assert_eq!(policy.graceful_percent(), 85);
+        assert_eq!(policy.hard_percent(), 95);
+        config.harness.compaction.graceful_shutdown_percent = Some(70);
+        config.harness.compaction.hard_limit_percent = Some(90);
+        let policy = configured_graceful_shutdown(&config);
+        assert_eq!(policy.graceful_percent(), 70);
+        assert_eq!(policy.hard_percent(), 90);
     }
 
     // ── split_root_and_uia_worker_models (Welle 3a, Teil A) ─────────────

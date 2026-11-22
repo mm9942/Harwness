@@ -60,7 +60,6 @@ forbidden = [
 max_depth = 0
 
 [spawn.budget]
-max_tokens = 120000
 max_tool_calls = 50
 max_wall_secs = 900
 

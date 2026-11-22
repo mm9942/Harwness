@@ -1267,6 +1267,13 @@ pub struct ChildRunResult {
     /// Assistant-Antwort (Modus `LastAnswer` oder Rückfall nach
     /// gescheiterter Verdichtung). `None`, wenn das Budget nicht griff.
     pub budget_handoff: Option<crate::child_handoff::BudgetHandoff>,
+    /// Agent-Budget = Kontextfenster: `Some(cause)`, wenn das Kind nach einer
+    /// Abschlussrunde (Graceful Shutdown) regulär beendet wurde — Kontextfüllung
+    /// über der Schwelle, Werkzeug- oder Zeitbudget kurz vor der harten Grenze.
+    /// Dann ist `outcome` `Completed`, `full_text` die letzte Assistant-Antwort
+    /// (die Übergabe mit den Abschnitten aus `child_handoff::HANDOFF_SECTIONS`),
+    /// `budget_exhausted` `false` und `budget_handoff` `None`. `None` sonst.
+    pub graceful_shutdown: Option<crate::agent_budget::GracefulShutdownCause>,
 }
 
 /// Hinweis, der ein budget-beendetes Teilergebnis für den Elternteil markiert
@@ -2514,6 +2521,9 @@ pub struct ManagedAgentSpawner {
     /// Runde 5, Teil J: was ein Kind am Ende seines Token-Budgets liefert
     /// (Vorgabe: Übergabe-Verdichtung mit Reserve).
     budget_handoff_mode: crate::child_handoff::BudgetHandoffMode,
+    /// Schwellen für Graceful Shutdown und harte Kontextgrenze
+    /// ([`Self::with_graceful_shutdown`]).
+    graceful_shutdown: crate::agent_budget::GracefulShutdownPolicy,
     /// Runde 5, Teil J: Budget-Übergaben und Fortsetzungsketten.
     handoff_ledger: Mutex<crate::child_handoff::HandoffLedger>,
     /// Runde 5, Teil K: Hintergrund-Läufe und Orchestrierungsgrenzen
@@ -3229,6 +3239,38 @@ impl ManagedAgentSpawner {
         self
     }
 
+    /// Setzt die Schwellen für Abschlussrunde (Graceful Shutdown) und harte
+    /// Kontextgrenze der Kind-Läufe.
+    ///
+    /// # Beschreibung
+    /// Bei bekanntem Kontextfenster bekommt ein Kind ab `graceful_percent` der
+    /// nutzbaren Tokens genau eine Abschlussrunde und endet ab `hard_percent`
+    /// hart mit Übergabe; Werkzeug- und Zeitbudget bekommen die Abschlussrunde
+    /// ab `graceful_percent` ihres Limits. Vorgabe: 85 % / 95 %.
+    ///
+    /// # Arguments
+    /// - `policy` (`GracefulShutdownPolicy`): die Schwellen.
+    ///
+    /// # Returns
+    /// Den Spawner mit gesetzter Policy (verbrauchender Builder).
+    #[must_use]
+    pub fn with_graceful_shutdown(
+        mut self,
+        policy: crate::agent_budget::GracefulShutdownPolicy,
+    ) -> Self {
+        self.graceful_shutdown = policy;
+        self
+    }
+
+    /// Die aktive Graceful-Shutdown-Policy der Kind-Läufe.
+    ///
+    /// # Returns
+    /// Die gesetzte Policy, sonst [`crate::agent_budget::GracefulShutdownPolicy::default`].
+    #[must_use]
+    pub fn graceful_shutdown_policy(&self) -> crate::agent_budget::GracefulShutdownPolicy {
+        self.graceful_shutdown
+    }
+
     /// Effektiver absoluter Auto-Compact-Deckel für Kind-Sessions:
     /// konfigurierter Wert, sonst
     /// [`crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS`].
@@ -3283,6 +3325,7 @@ impl ManagedAgentSpawner {
             external_root_plan_mode: std::sync::atomic::AtomicBool::new(false),
             child_results: Mutex::new(VecDeque::new()),
             budget_handoff_mode: crate::child_handoff::BudgetHandoffMode::default(),
+            graceful_shutdown: crate::agent_budget::GracefulShutdownPolicy::default(),
             handoff_ledger: Mutex::new(crate::child_handoff::HandoffLedger::default()),
             // Runde 5, Teil K.
             background: Arc::new(crate::background_children::BackgroundChildren::default()),
@@ -5494,6 +5537,24 @@ impl ManagedAgentSpawner {
     /// History des Kindes alle bisherigen Turns umfasst.
     ///
     /// ## Tokens
+    /// **Bekanntes Kontextfenster** ([`Self::with_model_known_probe`] kennt das
+    /// Kind-Modell und die Kind-Session trägt eine Auto-Compact-Policy mit
+    /// Fenster > 0): das Budget ist die aktuelle **Kontextfüllung** gegen
+    /// `min(Fenster, max_tokens)` abzüglich der Ausgabe-Reserve
+    /// ([`crate::agent_budget::resolve_context_budget`]). Ab der
+    /// Graceful-Schwelle ([`Self::with_graceful_shutdown`], Vorgabe 85 %)
+    /// bekommt das Kind genau eine Abschlussrunde
+    /// ([`crate::turn_loop::GRACEFUL_SHUTDOWN_INSTRUCTION`]) und endet danach
+    /// regulär mit seiner eigenen Übergabe
+    /// ([`ChildRunResult::graceful_shutdown`]); ab der harten Grenze
+    /// (Vorgabe 95 %) endet der Turn mit der Budget-Übergabe wie unten
+    /// (`budget_exhausted`). Kumulierte Tokens werden dann nicht geprüft.
+    ///
+    /// **Werkzeug- und Zeitbudget** bekommen in beiden Fällen eine
+    /// Abschlussrunde ab der Graceful-Schwelle ihres Limits und bleiben
+    /// harte Grenzen.
+    ///
+    /// **Unbekanntes Kontextfenster** — wie bisher:
     /// `max_tokens` zählt nur **neue** Tokens (Teil C):
     /// [`harw_types::TokenUsage::fresh_tokens`], also ungecachte Eingabe plus
     /// Ausgabe, über [`crate::session::AgentSession::total_usage`]. Wie bei
@@ -5533,8 +5594,10 @@ impl ManagedAgentSpawner {
     /// - `budget` (`AgentBudget`): die durchzusetzenden Obergrenzen.
     ///
     /// # Returns
-    /// `Ok(ChildRunResult)`, wenn der Turn im Budget blieb oder das
-    /// Token-Budget ein Teilergebnis erzwang (`budget_exhausted`).
+    /// `Ok(ChildRunResult)`, wenn der Turn im Budget blieb, das Token- bzw.
+    /// harte Kontext-Budget ein Teilergebnis erzwang (`budget_exhausted`) oder
+    /// das Kind nach einer Abschlussrunde regulär endete
+    /// ([`ChildRunResult::graceful_shutdown`] = `Some(cause)`).
     ///
     /// # Errors
     /// - [`ChildRunError::BudgetExhausted`] mit
@@ -5671,8 +5734,72 @@ impl ManagedAgentSpawner {
             .map(|record| budget_minus_usage(record.budget, record.consumed))
     }
 
+    /// Kontext-Budget eines Kindes mit bekanntem Kontextfenster.
+    ///
+    /// # Beschreibung
+    /// Bekannt ist das Fenster, wenn [`Self::with_model_known_probe`] das
+    /// Kind-Modell kennt und die Kind-Session eine Auto-Compact-Policy mit
+    /// Fenster > 0 trägt. Das Budget ist dann `min(Fenster, max_tokens)`
+    /// abzüglich der Ausgabe-Reserve
+    /// ([`crate::agent_budget::resolve_context_budget`]); ein deklarierter
+    /// Deckel über dem Fenster wird ignoriert und gewarnt.
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das admittierte Kind.
+    /// - `declared_max_tokens` (`Option<u64>`): `max_tokens` aus dem Budget.
+    ///
+    /// # Returns
+    /// `Some(AgentContextBudget)` bei bekanntem Fenster; `None` ohne Probe,
+    /// ohne Record, bei unbekanntem Modell, vergifteter Sperre, fehlender
+    /// (ausgecheckter) Session, fehlender Auto-Compact-Policy oder Fenster 0.
+    ///
+    /// # Concurrency
+    /// Nimmt erst kurz den `active`-Lock, danach kurz den Manager-Lock —
+    /// nie beide gleichzeitig.
+    fn child_context_budget(
+        &self,
+        child: &SessionId,
+        declared_max_tokens: Option<u64>,
+    ) -> Option<crate::agent_budget::AgentContextBudget> {
+        let probe = self.model_known_probe.as_ref()?;
+        let record = self.child_record(child)?;
+        if !probe(record.model.as_deref()) {
+            return None;
+        }
+        let (window, reserve) = {
+            let manager = self.manager.lock().ok()?;
+            let session = manager.get(child).ok()?;
+            let policy = session.auto_compact()?;
+            (policy.context_window_tokens(), policy.output_reserve_tokens())
+        };
+        if window == 0 {
+            return None;
+        }
+        let context =
+            crate::agent_budget::resolve_context_budget(window, reserve, declared_max_tokens);
+        if context.widening_ignored {
+            tracing::warn!(
+                child = %child,
+                window = context.window_tokens,
+                declared = ?declared_max_tokens,
+                "child_budget.widening_cap_ignored",
+            );
+        }
+        Some(context)
+    }
+
     /// Setzt `budget` für einen Lauf durch (Kern von
     /// [`Self::run_child_with_budget`], ohne Verbrauchsanrechnung).
+    ///
+    /// # Beschreibung
+    /// Bei bekanntem Kontextfenster ([`Self::child_context_budget`]) gilt die
+    /// Kontextfüllung gegen das nutzbare Budget: Abschlussrunde ab der
+    /// Graceful-Schwelle ([`Self::with_graceful_shutdown`], Vorgabe 85 %),
+    /// harter Stopp mit Übergabe ab der harten Grenze (Vorgabe 95 %).
+    /// Werkzeug- und Zeitbudget bekommen eine Abschlussrunde ab der
+    /// Graceful-Schwelle ihres Limits und bleiben harte Grenzen. Bei
+    /// unbekanntem Fenster zählt `max_tokens` wie bisher die kumulierten
+    /// neuen Tokens.
     async fn enforce_child_budget(
         &self,
         child: &SessionId,
@@ -5682,6 +5809,8 @@ impl ManagedAgentSpawner {
         budget: AgentBudget,
         started: std::time::Instant,
     ) -> Result<ChildRunResult, ChildRunError> {
+        let policy = self.graceful_shutdown;
+        let context = self.child_context_budget(child, budget.max_tokens);
         // Teil C: das Token-Budget wird je Modellrunde über den
         // `TurnControl` geprüft (Abschluss-Anweisung ab 80 %, Abbruch beim
         // Limit), nicht erst nach dem ganzen Turn.
@@ -5693,7 +5822,21 @@ impl ManagedAgentSpawner {
             }
             _ => 0,
         };
-        if let Some(limit) = budget.max_tokens {
+        if let Some(ctx) = context {
+            // Agent-Budget = Kontextfenster: geprüft wird die Kontextfüllung
+            // je Modellrunde, nicht der kumulierte Verbrauch.
+            input.control = input
+                .control
+                .clone()
+                .with_context_budget(ctx.turn_budget(policy));
+            tracing::info!(
+                child = %child,
+                window = ctx.window_tokens,
+                cap = ctx.cap_tokens,
+                usable = ctx.usable_tokens(),
+                "child_budget.context_window",
+            );
+        } else if let Some(limit) = budget.max_tokens {
             let used_before = self.child_token_usage(child).unwrap_or(0);
             input.control =
                 input
@@ -5712,6 +5855,23 @@ impl ManagedAgentSpawner {
                 .control
                 .clone()
                 .with_tool_call_budget(limit, used_before);
+            // Abschlussrunde kurz vor der harten Werkzeuggrenze.
+            let at = policy.graceful_threshold_of(u64::from(limit)).max(1);
+            if at < u64::from(limit) {
+                input.control = input
+                    .control
+                    .clone()
+                    .with_tool_closing_at(u32::try_from(at).unwrap_or(limit));
+            }
+        }
+        // Abschlussrunde kurz vor dem harten Zeitbudget.
+        if let Some(limit_ms) = budget.max_wall_time_ms {
+            let at = policy.graceful_threshold_of(limit_ms);
+            if at < limit_ms
+                && let Some(deadline) = started.checked_add(Duration::from_millis(at))
+            {
+                input.control = input.control.clone().with_closing_deadline(deadline);
+            }
         }
         // Klon mit geteiltem Zähler: Modellrunden und Werkzeugaufrufe dieses
         // Laufs für die Kopfzeile der Übergabe.
@@ -5796,13 +5956,13 @@ impl ManagedAgentSpawner {
             None => turn.await,
         };
         let outcome = outcome.map_err(ChildRunError::Spawn)?;
-
         if let Some(limit) = budget.max_tool_calls {
             // Nicht ausgeführte (budgetbedingt beantwortete) Aufrufe stehen im
-            // Verlauf, zählen aber nicht als verbraucht.
+            // Verlauf, zählen aber nicht als verbraucht. Nach einer
+            // Abschlussrunde übersprungene Aufrufe sind kein Fehler.
             let skipped = control.tool_budget_skipped();
             let used = self.child_tool_call_count(child)?.saturating_sub(skipped);
-            if used > limit || skipped > 0 {
+            if used > limit || (skipped > 0 && control.graceful_shutdown().is_none()) {
                 tracing::warn!(
                     child = %child,
                     dimension = BudgetDimension::ToolCalls.as_str(),
@@ -5828,6 +5988,87 @@ impl ManagedAgentSpawner {
                 return Err(error.into());
             }
         }
+        // Agent-Budget = Kontextfenster: nach einer gesendeten Abschlussrunde
+        // endet das Kind regulär mit seiner eigenen Übergabe.
+        let stop_detail = control.stop_detail();
+        let graceful_stop = matches!(
+            outcome.outcome,
+            TurnOutcome::Cancelled {
+                reason: CancelReason::Budget
+            }
+        ) && stop_detail.as_deref().is_some_and(|detail| {
+            detail
+                .trim_start()
+                .starts_with(crate::turn_loop::GRACEFUL_SHUTDOWN_STOP_PREFIX)
+        });
+        if let Some(cause) = control.graceful_shutdown()
+            && (graceful_stop || matches!(outcome.outcome, TurnOutcome::Completed))
+        {
+            let text = self.child_last_assistant_text(child);
+            tracing::info!(
+                child = %child,
+                cause = cause.as_str(),
+                text_bytes = text.as_deref().map_or(0, str::len),
+                "child_budget.graceful_shutdown",
+            );
+            if graceful_stop {
+                // Der Turn endete über den Abschluss-Stopp: der reguläre
+                // Abschluss fehlt noch (bei `Completed` lief er bereits).
+                self.set_status(child, ChildStatus::Completed);
+                self.comms.clear_end(child);
+                if let Some(last) = text.as_deref() {
+                    self.set_outcome_detail(child, last);
+                    self.comms.set_last_assistant(child, last);
+                }
+                self.archive_completed_child(child, text.as_deref());
+                self.record_completed_continuation(child, text.as_deref());
+            }
+            return Ok(ChildRunResult {
+                child: outcome.child,
+                outcome: TurnOutcome::Completed,
+                full_text: outcome.full_text.or(text),
+                usage: ChildUsage::default(),
+                budget_exhausted: false,
+                budget_handoff: None,
+                graceful_shutdown: Some(cause),
+            });
+        }
+        if let Some(ctx) = context {
+            // Harte Kontextgrenze: Übergabe wie beim Token-Budget, gemessen
+            // an der Kontextfüllung gegen den Deckel.
+            let hard_stop = matches!(
+                outcome.outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ) && stop_detail.as_deref().is_some_and(|detail| {
+                detail
+                    .trim_start()
+                    .starts_with(crate::turn_loop::CONTEXT_HARD_LIMIT_STOP_PREFIX)
+            });
+            if hard_stop {
+                let reserve = if matches!(
+                    self.budget_handoff_mode,
+                    crate::child_handoff::BudgetHandoffMode::Compact
+                ) {
+                    crate::child_handoff::handoff_reserve_tokens(ctx.cap_tokens)
+                } else {
+                    0
+                };
+                return Ok(self
+                    .finish_budget_exhausted(
+                        child,
+                        outcome.child,
+                        &control,
+                        ctx.cap_tokens,
+                        control.context_fill_tokens(),
+                        reserve,
+                    )
+                    .await);
+            }
+            // Bei bekanntem Fenster gibt es keine kumulierte Token-Nachprüfung.
+            return Ok(outcome);
+        }
         if let Some(limit) = budget.max_tokens {
             let used = self.child_token_usage(child)?;
             let stopped_by_budget = matches!(
@@ -5837,83 +6078,16 @@ impl ManagedAgentSpawner {
                 }
             );
             if stopped_by_budget && used >= limit.saturating_sub(handoff_reserve) {
-                // Teil C: kein harter Fehler — die letzte Assistant-Antwort
-                // ist das Teilergebnis, ausdrücklich als solches markiert.
-                let partial = self.child_last_assistant_text(child);
-                tracing::warn!(
-                    child = %child,
-                    dimension = BudgetDimension::Tokens.as_str(),
-                    limit = limit,
-                    used = used,
-                    reserve = handoff_reserve,
-                    partial_bytes = partial.as_deref().map_or(0, str::len),
-                    "child_budget.exhausted_partial_result",
-                );
-                self.set_status(child, ChildStatus::Completed);
-                // Runde 5, Teil M: das Token-Budget endet regulär mit
-                // Übergabe (Teil J) — kein Endbericht eines Abbruchs.
-                self.comms.clear_end(child);
-                // Runde 5, Teil H: auch das Teilergebnis ist über
-                // `agent.result` ungekürzt abrufbar — auch dann, wenn unten
-                // eine Verdichtung das Ergebnis an den Elternteil ersetzt.
-                self.archive_completed_child(child, partial.as_deref());
-                // Runde 5, Teil J: genau ein Verdichtungsaufruf aus der
-                // Reserve; scheitert er, bleibt die letzte Antwort.
-                let compacted = if handoff_reserve > 0 {
-                    self.compact_budget_handoff(
+                return Ok(self
+                    .finish_budget_exhausted(
                         child,
-                        handoff_reserve,
+                        outcome.child,
                         &control,
                         limit,
                         used,
-                        partial.is_some(),
+                        handoff_reserve,
                     )
-                    .await
-                } else {
-                    None
-                };
-                let (full_text, kind, handoff_tokens) = match compacted {
-                    Some((text, tokens)) => (
-                        Some(text),
-                        crate::child_handoff::BudgetHandoff::Compacted,
-                        tokens,
-                    ),
-                    None => (
-                        partial.clone(),
-                        crate::child_handoff::BudgetHandoff::LastAnswer,
-                        0,
-                    ),
-                };
-                let detail = match kind {
-                    crate::child_handoff::BudgetHandoff::Compacted => format!(
-                        "Token-Budget erreicht (limit={limit}, used={used}); \
-                         Übergabe-Zusammenfassung zurückgegeben"
-                    ),
-                    crate::child_handoff::BudgetHandoff::LastAnswer => format!(
-                        "Token-Budget erschöpft (limit={limit}, used={used}); Teilergebnis \
-                         zurückgegeben"
-                    ),
-                };
-                match (kind, partial.as_deref()) {
-                    (crate::child_handoff::BudgetHandoff::LastAnswer, Some(text)) => {
-                        self.set_outcome_detail(child, text);
-                    }
-                    _ => self.set_outcome_detail(child, &detail),
-                }
-                self.record_budget_handoff(child, kind, full_text.as_deref());
-                return Ok(ChildRunResult {
-                    child: outcome.child,
-                    outcome: TurnOutcome::Completed,
-                    full_text,
-                    // Nur die Verdichtung; `run_child_with_budget` addiert
-                    // den Verbrauch des Turns.
-                    usage: ChildUsage {
-                        tokens: handoff_tokens,
-                        ..ChildUsage::default()
-                    },
-                    budget_exhausted: true,
-                    budget_handoff: Some(kind),
-                });
+                    .await);
             }
             if used > limit {
                 // Der Turn schloss regulär ab; die letzte Runde hat das
@@ -5928,6 +6102,114 @@ impl ManagedAgentSpawner {
             }
         }
         Ok(outcome)
+    }
+
+    /// Beendet einen budget-gestoppten Lauf mit Teilergebnis bzw. Übergabe.
+    ///
+    /// # Beschreibung
+    /// Teil C / Runde 5, Teil J: kein harter Fehler — die letzte
+    /// Assistant-Antwort ist das Teilergebnis; im Modus `Compact` (Reserve
+    /// > 0) fasst genau ein Verdichtungsaufruf den Verlauf zur markierten
+    /// Übergabe zusammen. Genutzt vom kumulierten Token-Budget und von der
+    /// harten Kontextgrenze.
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das Kind.
+    /// - `run_child` (`SessionId`): die Session-ID aus dem Lauf-Ergebnis.
+    /// - `control` (`&TurnControl`): geteilter Meter des Laufs.
+    /// - `limit` (`u64`): das gegriffene Limit (Tokens).
+    /// - `used` (`u64`): der gemessene Verbrauch bzw. die Kontextfüllung.
+    /// - `handoff_reserve` (`u64`): Reserve der Verdichtung; `0` = keine.
+    ///
+    /// # Returns
+    /// Das `ChildRunResult` mit `budget_exhausted` = `true`.
+    async fn finish_budget_exhausted(
+        &self,
+        child: &SessionId,
+        run_child: SessionId,
+        control: &crate::turn_loop::TurnControl,
+        limit: u64,
+        used: u64,
+        handoff_reserve: u64,
+    ) -> ChildRunResult {
+        // Teil C: kein harter Fehler — die letzte Assistant-Antwort
+        // ist das Teilergebnis, ausdrücklich als solches markiert.
+        let partial = self.child_last_assistant_text(child);
+        tracing::warn!(
+            child = %child,
+            dimension = BudgetDimension::Tokens.as_str(),
+            limit = limit,
+            used = used,
+            reserve = handoff_reserve,
+            partial_bytes = partial.as_deref().map_or(0, str::len),
+            "child_budget.exhausted_partial_result",
+        );
+        self.set_status(child, ChildStatus::Completed);
+        // Runde 5, Teil M: das Token-Budget endet regulär mit
+        // Übergabe (Teil J) — kein Endbericht eines Abbruchs.
+        self.comms.clear_end(child);
+        // Runde 5, Teil H: auch das Teilergebnis ist über
+        // `agent.result` ungekürzt abrufbar — auch dann, wenn unten
+        // eine Verdichtung das Ergebnis an den Elternteil ersetzt.
+        self.archive_completed_child(child, partial.as_deref());
+        // Runde 5, Teil J: genau ein Verdichtungsaufruf aus der
+        // Reserve; scheitert er, bleibt die letzte Antwort.
+        let compacted = if handoff_reserve > 0 {
+            self.compact_budget_handoff(
+                child,
+                handoff_reserve,
+                control,
+                limit,
+                used,
+                partial.is_some(),
+            )
+            .await
+        } else {
+            None
+        };
+        let (full_text, kind, handoff_tokens) = match compacted {
+            Some((text, tokens)) => (
+                Some(text),
+                crate::child_handoff::BudgetHandoff::Compacted,
+                tokens,
+            ),
+            None => (
+                partial.clone(),
+                crate::child_handoff::BudgetHandoff::LastAnswer,
+                0,
+            ),
+        };
+        let detail = match kind {
+            crate::child_handoff::BudgetHandoff::Compacted => format!(
+                "Token-Budget erreicht (limit={limit}, used={used}); \
+                 Übergabe-Zusammenfassung zurückgegeben"
+            ),
+            crate::child_handoff::BudgetHandoff::LastAnswer => format!(
+                "Token-Budget erschöpft (limit={limit}, used={used}); Teilergebnis \
+                 zurückgegeben"
+            ),
+        };
+        match (kind, partial.as_deref()) {
+            (crate::child_handoff::BudgetHandoff::LastAnswer, Some(text)) => {
+                self.set_outcome_detail(child, text);
+            }
+            _ => self.set_outcome_detail(child, &detail),
+        }
+        self.record_budget_handoff(child, kind, full_text.as_deref());
+        ChildRunResult {
+            child: run_child,
+            outcome: TurnOutcome::Completed,
+            full_text,
+            // Nur die Verdichtung; `run_child_with_budget` addiert
+            // den Verbrauch des Turns.
+            usage: ChildUsage {
+                tokens: handoff_tokens,
+                ..ChildUsage::default()
+            },
+            budget_exhausted: true,
+            budget_handoff: Some(kind),
+            graceful_shutdown: None,
+        }
     }
 
     /// Deckelt einen bereits auf `max(1)` angehobenen Slot-Wunsch auf die
@@ -6453,6 +6735,7 @@ impl ManagedAgentSpawner {
                     usage: ChildUsage::default(),
                     budget_exhausted: false,
                     budget_handoff: None,
+                    graceful_shutdown: None,
                 })
             }
             None => {
@@ -6500,6 +6783,7 @@ impl ManagedAgentSpawner {
                     usage: ChildUsage::default(),
                     budget_exhausted: false,
                     budget_handoff: None,
+                    graceful_shutdown: None,
                 })
             }
         }
@@ -6773,6 +7057,7 @@ impl ManagedAgentSpawner {
                     usage,
                     budget_exhausted: false,
                     budget_handoff: None,
+                    graceful_shutdown: None,
                 })
             }
             ChildRunStatus::BudgetExhausted => {
@@ -6795,6 +7080,7 @@ impl ManagedAgentSpawner {
                     usage,
                     budget_exhausted: true,
                     budget_handoff: Some(crate::child_handoff::BudgetHandoff::LastAnswer),
+                    graceful_shutdown: None,
                 })
             }
             other => {
@@ -14893,6 +15179,385 @@ max_depth = 0
         Ok(())
     }
 
+    // --- Agent-Budget = Kontextfenster, Graceful Shutdown ---------------
+
+    /// Modell für die Abschlussrunde: liefert `tool_rounds` Runden lang einen
+    /// auf `message_bytes` aufgefüllten Zwischenstand plus Tool-Call und
+    /// merkt sich je Runde, ob die Anfrage die Abschluss-Anweisung enthielt.
+    /// Mit `stop_on_instruction` antwortet es auf die Anweisung mit einer
+    /// Übergabe aus allen Abschnitten von
+    /// [`crate::child_handoff::HANDOFF_SECTIONS`] und ohne Tool-Call.
+    struct ClosingProbeModel {
+        rounds: AtomicUsize,
+        seen: Mutex<Vec<bool>>,
+        message_bytes: usize,
+        tool_rounds: usize,
+        usage: TokenUsage,
+        stop_on_instruction: bool,
+    }
+
+    impl ClosingProbeModel {
+        /// Baut das Modell mit leerem Zähler.
+        fn new(
+            message_bytes: usize,
+            tool_rounds: usize,
+            usage: TokenUsage,
+            stop_on_instruction: bool,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                rounds: AtomicUsize::new(0),
+                seen: Mutex::new(Vec::new()),
+                message_bytes,
+                tool_rounds,
+                usage,
+                stop_on_instruction,
+            })
+        }
+
+        /// Die je Runde beobachteten Anweisungs-Treffer.
+        fn seen(&self) -> Vec<bool> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl ModelProvider for ClosingProbeModel {
+        fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+            Box::pin(async move {
+                let round = self.rounds.fetch_add(1, Ordering::SeqCst) + 1;
+                let marker = crate::turn_loop::GRACEFUL_SHUTDOWN_INSTRUCTION;
+                let seen = request.system_prompt.contains(marker)
+                    || request
+                        .instruction_fragments
+                        .iter()
+                        .any(|fragment| fragment.contains(marker))
+                    || format!("{:?}", request.context).contains(marker);
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(seen);
+                if (self.stop_on_instruction && seen) || round > self.tool_rounds {
+                    let message = if seen {
+                        format!(
+                            "fertig {round}\n{}",
+                            crate::child_handoff::HANDOFF_SECTIONS.join("\nnichts\n")
+                        )
+                    } else {
+                        format!("fertig {round}")
+                    };
+                    return Ok(ModelResponse {
+                        message: Some(message),
+                        usage: self.usage.clone(),
+                        ..Default::default()
+                    });
+                }
+                let mut message = format!("Zwischenstand {round} ");
+                while message.len() < self.message_bytes {
+                    message.push('x');
+                }
+                Ok(ModelResponse {
+                    message: Some(message),
+                    tool_calls: vec![ToolCall {
+                        id: ToolCallId::new(),
+                        name: ToolName::new("fs.read"),
+                        arguments: serde_json::json!({ "path": format!("/src/f{round}.rs") }),
+                    }],
+                    usage: self.usage.clone(),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    struct ClosingProbeRegistry {
+        model: Arc<ClosingProbeModel>,
+    }
+
+    impl ChildRegistryFactory for ClosingProbeRegistry {
+        fn build_registry(
+            &self,
+            _role: &str,
+            _input: &SpawnInput,
+            _suggestions: Option<&AgentSuggestions>,
+        ) -> Result<ExtensionRegistry, AgentSpawnError> {
+            Ok(ExtensionRegistryBuilder::default().build())
+        }
+
+        fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+            Ok(self.model.clone())
+        }
+    }
+
+    /// Gibt der Kind-Session ein bekanntes Kontextfenster (Auto-Compact-Policy
+    /// mit `window` Tokens und 16 384 Tokens Ausgabe-Reserve), wie es die
+    /// Admission täte.
+    fn give_known_window(
+        spawner: &ManagedAgentSpawner,
+        child: &SessionId,
+        window: u64,
+    ) -> TestResult {
+        let mut manager = spawner
+            .manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        manager
+            .get_mut(child)
+            .map_err(ctx("test child session exists"))?
+            .set_auto_compact(Some(
+                crate::auto_compact::AutoCompactPolicy::for_context_window(window)
+                    .with_output_reserve(16_384),
+            ));
+        Ok(())
+    }
+
+    /// Ein Kind mit bekanntem Fenster prüft die Kontextfüllung, nicht den
+    /// kumulierten Verbrauch: 168 000 neue Tokens bei `max_tokens` 60 000
+    /// beenden den Lauf nicht, solange der Kontext klein bleibt.
+    #[tokio::test]
+    async fn a_known_window_child_ignores_cumulative_tokens_below_the_threshold() -> TestResult {
+        let model = ClosingProbeModel::new(
+            64,
+            8,
+            TokenUsage {
+                input_tokens: 20_000,
+                output_tokens: 1_000,
+                cached_tokens: None,
+                ..TokenUsage::default()
+            },
+            true,
+        );
+        let (spawner, children) = runnable_children(
+            Arc::new(ClosingProbeRegistry {
+                model: model.clone(),
+            }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let spawner = spawner.with_model_known_probe(Arc::new(|_: Option<&str>| true));
+        let child = children[0].clone();
+        give_known_window(&spawner, &child, 200_000)?;
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("erkunde"),
+                AgentBudget {
+                    max_tokens: Some(60_000),
+                    ..AgentBudget::default()
+                },
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(format!("completion expected: {error}")))?;
+
+        assert!(
+            matches!(result.outcome, TurnOutcome::Completed),
+            "outcome {:?}",
+            result.outcome
+        );
+        assert_eq!(model.rounds.load(Ordering::SeqCst), 9);
+        assert_eq!(result.full_text.as_deref(), Some("fertig 9"));
+        assert!(!result.budget_exhausted);
+        assert_eq!(result.graceful_shutdown, None);
+        assert_eq!(result.budget_handoff, None);
+        assert!(model.seen().iter().all(|seen| !seen), "{:?}", model.seen());
+        Ok(())
+    }
+
+    /// Wächst der Kontext über die Graceful-Schwelle (85 % des nutzbaren
+    /// Budgets), bekommt das Kind genau eine Abschlussrunde und endet
+    /// regulär mit seiner eigenen Übergabe.
+    #[tokio::test]
+    async fn a_known_window_child_at_the_threshold_ends_gracefully() -> TestResult {
+        let model = ClosingProbeModel::new(
+            6_000,
+            60,
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..TokenUsage::default()
+            },
+            true,
+        );
+        let (spawner, children) = runnable_children(
+            Arc::new(ClosingProbeRegistry {
+                model: model.clone(),
+            }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let spawner = spawner.with_model_known_probe(Arc::new(|_: Option<&str>| true));
+        let child = children[0].clone();
+        give_known_window(&spawner, &child, 200_000)?;
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("erkunde"),
+                AgentBudget {
+                    max_tokens: Some(40_000),
+                    ..AgentBudget::default()
+                },
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(format!("graceful end expected: {error}")))?;
+
+        let seen = model.seen();
+        assert_eq!(
+            seen.iter().filter(|seen| **seen).count(),
+            1,
+            "genau eine Abschlussrunde: {seen:?}"
+        );
+        assert_eq!(seen.last(), Some(&true), "{seen:?}");
+        assert_eq!(seen.first(), Some(&false), "{seen:?}");
+        assert!(
+            matches!(result.outcome, TurnOutcome::Completed),
+            "outcome {:?}",
+            result.outcome
+        );
+        assert_eq!(
+            result.graceful_shutdown,
+            Some(crate::agent_budget::GracefulShutdownCause::ContextFill)
+        );
+        assert!(!result.budget_exhausted);
+        assert_eq!(result.budget_handoff, None);
+        assert!(
+            result
+                .full_text
+                .as_deref()
+                .is_some_and(|text| text.contains("## Auftrag")),
+            "{:?}",
+            result.full_text
+        );
+        assert_eq!(spawner.child_status(&child), Some(ChildStatus::Completed));
+        Ok(())
+    }
+
+    /// Kennt die Probe das Modell nicht, bleibt es beim kumulierten
+    /// Token-Budget — auch wenn die Session eine Auto-Compact-Policy trägt.
+    #[tokio::test]
+    async fn an_unknown_window_child_keeps_the_cumulative_token_budget() -> TestResult {
+        let model = Arc::new(BudgetProbeModel {
+            rounds: AtomicUsize::new(0),
+            wrap_up_seen: Mutex::new(Vec::new()),
+        });
+        let (spawner, children) = runnable_children(
+            Arc::new(BudgetProbeRegistry {
+                model: model.clone(),
+            }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let spawner = spawner
+            .with_budget_handoff(crate::child_handoff::BudgetHandoffMode::LastAnswer)
+            .with_model_known_probe(Arc::new(|_: Option<&str>| false));
+        let child = children[0].clone();
+        give_known_window(&spawner, &child, 200_000)?;
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("erkunde"),
+                AgentBudget {
+                    max_tokens: Some(1_000),
+                    ..AgentBudget::default()
+                },
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(format!("partial result expected: {error}")))?;
+
+        assert!(result.budget_exhausted, "outcome {:?}", result.outcome);
+        assert_eq!(model.rounds.load(Ordering::SeqCst), 5);
+        assert_eq!(result.graceful_shutdown, None);
+        Ok(())
+    }
+
+    /// Kurz vor der harten Werkzeuggrenze (85 % von 4 ⇒ ab 3 Aufrufen)
+    /// bekommt das Kind eine Abschlussrunde; danach endet es regulär statt
+    /// mit `budget_exceeded`.
+    #[tokio::test]
+    async fn a_child_near_its_tool_budget_gets_a_closing_round() -> TestResult {
+        let model = ClosingProbeModel::new(32, 100, TokenUsage::default(), false);
+        let (spawner, children) = runnable_children(
+            Arc::new(ClosingProbeRegistry {
+                model: model.clone(),
+            }),
+            true,
+            1,
+            empty_registry,
+        )?;
+        let child = children[0].clone();
+        let store = InMemoryStateStore::new();
+
+        let result = spawner
+            .run_child_with_budget(
+                &child,
+                &store,
+                None,
+                TurnInput::user("erkunde"),
+                AgentBudget {
+                    max_tool_calls: Some(4),
+                    ..AgentBudget::default()
+                },
+            )
+            .await
+            .map_err(|error| TestError::Unexpected(format!("graceful end expected: {error}")))?;
+
+        assert_eq!(model.rounds.load(Ordering::SeqCst), 4);
+        assert_eq!(model.seen(), vec![false, false, false, true]);
+        assert_eq!(
+            result.graceful_shutdown,
+            Some(crate::agent_budget::GracefulShutdownCause::ToolCalls)
+        );
+        assert!(
+            matches!(result.outcome, TurnOutcome::Completed),
+            "outcome {:?}",
+            result.outcome
+        );
+        assert!(!result.budget_exhausted);
+        assert!(
+            result
+                .full_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Zwischenstand 4")),
+            "{:?}",
+            result.full_text
+        );
+        assert_eq!(spawner.child_status(&child), Some(ChildStatus::Completed));
+        Ok(())
+    }
+
+    /// Die Vorgabe des Spawners ist 85 % / 95 %; der Builder überschreibt sie.
+    #[test]
+    fn the_spawner_default_graceful_policy_is_85_95_and_can_be_overridden() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
+        let policy = spawner.graceful_shutdown_policy();
+        assert_eq!(policy, crate::agent_budget::GracefulShutdownPolicy::default());
+        assert_eq!(policy.graceful_percent(), 85);
+        assert_eq!(policy.hard_percent(), 95);
+
+        let spawner = spawner
+            .with_graceful_shutdown(crate::agent_budget::GracefulShutdownPolicy::new(70, 90));
+        let policy = spawner.graceful_shutdown_policy();
+        assert_eq!(policy.graceful_percent(), 70);
+        assert_eq!(policy.hard_percent(), 90);
+    }
+
     // --- Runde 7, Teil A7: Start überlebt einen geerbten Turn-Abbruch ---
 
     #[test]
@@ -15014,6 +15679,7 @@ max_depth = 0
             usage: ChildUsage::default(),
             budget_exhausted: false,
             budget_handoff: None,
+            graceful_shutdown: None,
         };
         assert!(result.budget_exhausted_parent_text().is_none());
     }

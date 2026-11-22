@@ -128,7 +128,6 @@ forbidden = [
 max_depth = 0
 
 [spawn.budget]
-max_tokens = 20000
 # Kurze Online-Recherche (Suche, zwei, drei Abrufe, Crate-Metadaten) braucht
 # mehr als die frueheren 6 Aufrufe/90 s; weiterhin ein Schnellhelfer.
 max_tool_calls = 16

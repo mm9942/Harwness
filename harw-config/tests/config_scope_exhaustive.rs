@@ -711,7 +711,7 @@ fn test_field_table_exhaustive_internal_model_choice() {
 }
 
 // ---------------------------------------------------------------------
-// [compaction] (Abschnitt 1.14, 1 Feld)
+// [compaction] (Abschnitt 1.14, 4 Felder)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -719,10 +719,19 @@ fn test_field_table_exhaustive_compaction_toml() {
     let CompactionToml {
         absolute_ceiling_tokens,
         max_history_bytes,
+        graceful_shutdown_percent,
+        hard_limit_percent,
     } = CompactionToml::default();
-    let _ = (absolute_ceiling_tokens, max_history_bytes);
+    let _ = (
+        absolute_ceiling_tokens,
+        max_history_bytes,
+        graceful_shutdown_percent,
+        hard_limit_percent,
+    );
     assert_path_in_field_table_exactly_once("compaction.absolute_ceiling_tokens");
     assert_path_in_field_table_exactly_once("compaction.max_history_bytes");
+    assert_path_in_field_table_exactly_once("compaction.graceful_shutdown_percent");
+    assert_path_in_field_table_exactly_once("compaction.hard_limit_percent");
 }
 
 // ---------------------------------------------------------------------

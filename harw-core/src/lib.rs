@@ -12,6 +12,7 @@
 
 pub mod activation;
 pub mod admission;
+pub mod agent_budget;
 pub mod agent_events;
 pub mod auto_compact;
 mod context_ledger_hook;
@@ -70,6 +71,11 @@ pub use activation::{SessionActivation, ToolProfile};
 pub use admission::{
     AdmissionContext, JobAdmissionError, JobAdmissionPolicy, JobAdmissionService, JobIntent,
     ResolvedAdmission,
+};
+pub use agent_budget::{
+    AgentContextBudget, ContextFillVerdict, DEFAULT_GRACEFUL_SHUTDOWN_PERCENT,
+    DEFAULT_HARD_CONTEXT_LIMIT_PERCENT, GracefulShutdownCause, GracefulShutdownPolicy,
+    TurnContextBudget, resolve_context_budget,
 };
 pub use agent_events::{
     AgentEvent, AgentEventHub, AgentEventKind, HubOrchestrationObserver, UsageReportingProvider,

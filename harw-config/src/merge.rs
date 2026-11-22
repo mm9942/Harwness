@@ -467,7 +467,8 @@ const UNTRUSTED_BASELINE_ORCHESTRATOR_READ_WARN: u32 = 4;
 const UNTRUSTED_BASELINE_ORCHESTRATOR_READ_LIMIT: u32 = 5;
 
 // Wie `min_bound`, aber fuer `Option<T>`-Felder (`guards.*`,
-// `permissions.approval_timeout_secs`, `compaction.absolute_ceiling_tokens`).
+// `permissions.approval_timeout_secs`, `compaction.absolute_ceiling_tokens`,
+// `compaction.graceful_shutdown_percent`, `compaction.hard_limit_percent`).
 // Ist noch kein Wert gesetzt (`None`), uebernimmt ein vertrauter Layer den
 // ersten explizit gesetzten Wert ohne Vergleich. Der nicht vertraute
 // Projekt-Layer wird dann gegen `untrusted_baseline` verglichen: nur ein
@@ -1911,7 +1912,9 @@ fn merge_uia_worker_models(
     trusted.uia_worker_models = incoming;
 }
 
-// `[compaction]` (Abschnitt 1.14) — einziges Feld `MinBound` (Kostenobergrenze).
+// `[compaction]` (Abschnitt 1.14) — `MinBound` sind `absolute_ceiling_tokens`,
+// `graceful_shutdown_percent` und `hard_limit_percent` (Kosten-/Schwellen-
+// grenzen); `max_history_bytes` ist `ProfileReplaces`.
 fn merge_compaction(
     trusted: &mut HarnessConfig,
     incoming: CompactionToml,
@@ -1939,6 +1942,26 @@ fn merge_compaction(
         role,
         "compaction.max_history_bytes",
         layer_path,
+    );
+    merge_optional_min_bound(
+        &mut trusted.compaction.graceful_shutdown_percent,
+        incoming.graceful_shutdown_percent,
+        field_present(raw, &["compaction", "graceful_shutdown_percent"]),
+        role,
+        None,
+        "compaction.graceful_shutdown_percent",
+        layer_path,
+        out,
+    );
+    merge_optional_min_bound(
+        &mut trusted.compaction.hard_limit_percent,
+        incoming.hard_limit_percent,
+        field_present(raw, &["compaction", "hard_limit_percent"]),
+        role,
+        None,
+        "compaction.hard_limit_percent",
+        layer_path,
+        out,
     );
 }
 
@@ -4002,6 +4025,107 @@ mod tests {
                 .iter()
                 .any(|d| d.field == "guards.repeated_failure_warn")
         );
+        Ok(())
+    }
+
+    // [compaction] graceful_shutdown_percent / hard_limit_percent: MinBound.
+    fn merge_compaction_src(
+        trusted: &mut HarnessConfig,
+        src: &str,
+        role: LayerRole,
+    ) -> TestResult<Vec<ScopeDiagnostic>> {
+        Ok(merge_layer_into(
+            trusted,
+            toml::from_str(src).map_err(ctx("parse compaction layer"))?,
+            &raw_from(src)?,
+            role,
+            &layer_path(),
+        ))
+    }
+
+    #[test]
+    fn test_graceful_shutdown_percent_lower_value_narrows() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        merge_compaction_src(
+            &mut trusted,
+            "[compaction]\ngraceful_shutdown_percent = 85",
+            LayerRole::Baseline,
+        )?;
+        assert_eq!(trusted.compaction.graceful_shutdown_percent, Some(85));
+        let diagnostics = merge_compaction_src(
+            &mut trusted,
+            "[compaction]\ngraceful_shutdown_percent = 70",
+            LayerRole::Refinement,
+        )?;
+        assert_eq!(trusted.compaction.graceful_shutdown_percent, Some(70));
+        assert!(diagnostics.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_graceful_shutdown_percent_higher_value_is_ignored() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        merge_compaction_src(
+            &mut trusted,
+            "[compaction]\ngraceful_shutdown_percent = 85",
+            LayerRole::Baseline,
+        )?;
+        let diagnostics = merge_compaction_src(
+            &mut trusted,
+            "[compaction]\ngraceful_shutdown_percent = 90",
+            LayerRole::Refinement,
+        )?;
+        assert_eq!(trusted.compaction.graceful_shutdown_percent, Some(85));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.field == "compaction.graceful_shutdown_percent")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_hard_limit_percent_is_min_bound() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        merge_compaction_src(
+            &mut trusted,
+            "[compaction]\nhard_limit_percent = 95",
+            LayerRole::Baseline,
+        )?;
+        merge_compaction_src(
+            &mut trusted,
+            "[compaction]\nhard_limit_percent = 80",
+            LayerRole::Refinement,
+        )?;
+        assert_eq!(trusted.compaction.hard_limit_percent, Some(80));
+        let diagnostics = merge_compaction_src(
+            &mut trusted,
+            "[compaction]\nhard_limit_percent = 99",
+            LayerRole::Refinement,
+        )?;
+        assert_eq!(trusted.compaction.hard_limit_percent, Some(80));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.field == "compaction.hard_limit_percent")
+        );
+        Ok(())
+    }
+
+    // Noch kein Wert gesetzt: ein vertrauter Layer uebernimmt den ersten Wert
+    // ohne Vergleich (wie `merge_optional_min_bound` es fuer `None` vorsieht).
+    #[test]
+    fn test_compaction_percent_first_value_is_taken_when_unset() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.compaction.graceful_shutdown_percent, None);
+        let diagnostics = merge_compaction_src(
+            &mut trusted,
+            "[compaction]\ngraceful_shutdown_percent = 70\nhard_limit_percent = 90",
+            LayerRole::Refinement,
+        )?;
+        assert_eq!(trusted.compaction.graceful_shutdown_percent, Some(70));
+        assert_eq!(trusted.compaction.hard_limit_percent, Some(90));
+        assert!(diagnostics.is_empty());
         Ok(())
     }
 

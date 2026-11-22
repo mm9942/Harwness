@@ -674,13 +674,15 @@ fn uia_latex_writer_admits_exactly_files_pdf_and_latex_build() -> TestResult {
     );
     // Runde 7, Teil T5 / Plan R9: nur `latex-report` (Vorlage, Werkzeuge,
     // Übergabe) ist fest gebunden; Handwerk, Build und Pyramide lädt der
-    // Writer bei Bedarf über `skills.load`. Das Budget ist realistisch.
+    // Writer bei Bedarf über `skills.load`. Das Token-Budget folgt dem
+    // Kontextfenster (kein festes max_tokens); Wall-Time und Tool-Calls
+    // bleiben begrenzt.
     assert_eq!(ir.skills(), ["latex-report"], "{role}: skills");
     let budget = ir
         .spawn_contract()
         .budget()
         .ok_or(TestError::Unexpected(format!("{role} ohne [spawn.budget]")))?;
-    assert_eq!(budget.max_tokens(), Some(150_000), "{role}");
+    assert_eq!(budget.max_tokens(), None, "{role}");
     assert_eq!(budget.max_wall_secs(), Some(600), "{role}");
     assert_eq!(budget.max_tool_calls(), Some(60), "{role}");
     Ok(())

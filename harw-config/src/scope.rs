@@ -270,9 +270,9 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 223 Einträge (Kontrollsumme
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 225 Einträge (Kontrollsumme
 /// wie in `merge_rule_tests` geprüft: `ProfileReplaces` 114 · `GlobalOnly` 25 ·
-/// `MinBound` 58 · `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 ·
+/// `MinBound` 60 · `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 ·
 /// `Union` 2 · `AndBool` 2 · `StricterOf` 3 · `PerFileValidated` 1).
 /// Die Abschnitt-6.3-Tabelle der Spezifikation deckt nur die Felder bis zur
 /// ursprünglichen 111er-Zählung ab; spätere Blöcke (Retention, Memory, DoD …)
@@ -432,9 +432,11 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "internal_models.work_driver_judge", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "internal_models.image_understanding", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
-    // 1.14 [compaction] (2)
+    // 1.14 [compaction] (4)
     FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "compaction.max_history_bytes", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "compaction.graceful_shutdown_percent", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "compaction.hard_limit_percent", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
     // 1.15 [reasoning] (6)
     FieldScope { path: "reasoning.uia", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "reasoning.root_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -592,7 +594,7 @@ mod merge_rule_tests {
     use crate::test_support::{TestError, TestResult};
 
     #[test]
-    fn test_field_table_has_exactly_223_entries() {
+    fn test_field_table_has_exactly_225_entries() {
         // Runde 5, Teil B: +1 für `host.sudo_session_minutes`.
         // Runde 5, Teil E: +1 für `internal_models.auto_classifier`.
         // Runde 5, Teil G: +5 für `uia_worker_models.*`.
@@ -626,7 +628,8 @@ mod merge_rule_tests {
         // Cloud-Sessions fürs Handy: +2 für `session_listener.provider_link_device`,
         // `session_listener.shared_socket_tenant`.
         // Onion-Connector: +2 für `session_listener.onion`, `session_listener.onion_dir`.
-        assert_eq!(FIELD_TABLE.len(), 223);
+        // Teil 2 (Agenten-Budget): +2 fuer `compaction.graceful_shutdown_percent`, `compaction.hard_limit_percent`.
+        assert_eq!(FIELD_TABLE.len(), 225);
     }
 
     #[test]
@@ -670,7 +673,8 @@ mod merge_rule_tests {
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1
         // (`permissions.auto_classifier_timeout_secs`).
         // [jobs]: +1 (`jobs.max_running`).
-        assert_eq!(count(MergeRule::MinBound), 58);
+        // Teil 2 (Agenten-Budget): +2 (`compaction.graceful_shutdown_percent`, `compaction.hard_limit_percent`).
+        assert_eq!(count(MergeRule::MinBound), 60);
         assert_eq!(count(MergeRule::CompositeMember), 11);
         assert_eq!(count(MergeRule::Intersection), 4);
         assert_eq!(count(MergeRule::OrBool), 3);

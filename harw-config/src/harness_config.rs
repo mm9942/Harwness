@@ -201,6 +201,9 @@ pub struct AgentCompilerToml {
 /// `CONTRACT.md`). Überschreibt die absolute Obergrenze der
 /// UIA/Root-Sitzung, die sonst `harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS`
 /// verwendet.
+///
+/// `graceful_shutdown_percent` und `hard_limit_percent` steuern die
+/// Abschlussrunde und die harte Kontextgrenze der Kind-Agenten.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionToml {
@@ -214,6 +217,16 @@ pub struct CompactionToml {
     /// Auto-Compaction vor jeder stillen Byte-Kappung greift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_history_bytes: Option<usize>,
+    /// Schwelle der Abschlussrunde (Graceful Shutdown) eines Kind-Agenten in
+    /// Prozent des nutzbaren Kontexts (Fenster minus Ausgabe-Reserve).
+    /// `None` → `harw_core::DEFAULT_GRACEFUL_SHUTDOWN_PERCENT` (85).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graceful_shutdown_percent: Option<u64>,
+    /// Harte Kontextgrenze in Prozent des nutzbaren Kontexts. `None` →
+    /// `harw_core::DEFAULT_HARD_CONTEXT_LIMIT_PERCENT` (95); darüber wird
+    /// abgebrochen wie bisher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_limit_percent: Option<u64>,
 }
 
 /// Standard-Aufbewahrung von Diary-Tagesdateien in Tagen, wenn
