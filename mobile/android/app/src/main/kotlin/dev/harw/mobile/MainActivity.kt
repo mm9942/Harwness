@@ -246,6 +246,9 @@ internal open class MainActivity : ComponentActivity() {
                 onOpenConnection = { openSettings(SettingsRoute.Connection) },
                 onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
             )
+        } else if (settingsRoute == SettingsRoute.Uias) {
+            val uiaStore = remember { uniffi.harw_mobile_ffi.UiaStore(filesDir.path) }
+            UiaScreen(uiaStore, onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Agents) {
             AgentsScreen(state, sessionId ?: "", onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Jobs) {

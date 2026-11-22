@@ -1,6 +1,7 @@
 //! Native client for Harw's Android phone-test app.
 
 mod backend;
+mod chatgpt_local;
 mod core;
 mod device;
 mod home;
@@ -16,7 +17,9 @@ mod providers;
 mod qr;
 mod secrets;
 mod types;
+mod uia;
 
+pub use chatgpt_local::{ChatgptLocal, ChatgptLocalStatus};
 pub use core::MobileCore;
 pub use device::{
     DeviceError, DeviceLimits, FileAccess, SafEntry, SafRoot, ShellExecutor, ShellOutput,
@@ -34,6 +37,7 @@ pub use providers::ProviderStore;
 pub use qr::{ScannedProfile, decode_pairing_text, scan_pairing_frame};
 pub use secrets::{KeystoreError, KeystoreSecretResolver, PlatformKeystore};
 pub use types::*;
+pub use uia::{UiaProfile, UiaSetup, UiaStore};
 
 uniffi::setup_scaffolding!();
 

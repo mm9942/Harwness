@@ -158,7 +158,9 @@ internal fun ProvidersScreen(
                     FilterChip(selected = mode == m, onClick = { mode = m }, label = { Text(m.label) })
                 }
             }
-            if (mode != ProviderMode.Api) {
+            if (mode == ProviderMode.ChatGpt) {
+                ChatgptDirectCard(store)
+            } else if (mode != ProviderMode.Api) {
                 ModeInfo(mode, onOpenConnection, onOpenLocalModels)
             }
             if (mode == ProviderMode.Api) {
