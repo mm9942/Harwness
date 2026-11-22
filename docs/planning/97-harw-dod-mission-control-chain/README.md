@@ -690,23 +690,48 @@ codes) until it is.
 
 #### 3.3.1 Target screens (authoritative; cell-exact tests derive from these)
 
-Portrait (reference 46×78; also 48×65, 70×90):
+Portrait (owner decision 2026-11-22, see §7; reference 84×77, also 66×59,
+66×35 with keyboard, 46×78, 40×28, 30×40; applies at every zoom level):
 ```text
-┌ ACTIVE AGENTS ──────────┬ ACTIVE JOBS ───────────┐   CARDS_ROWS = 4 (title + 3)
-│ ● root · thinking 29%   │ ▸ build · 82% · 18m12s │
-│ ● worker · fs.read      │   tests · running 2m18s│
-├ FINISHED / FAILED · ⛨ DoD 0 ───────────────────────┤   1 row (collapsed) / 3–8 rows (expanded)
-│ Explorer ×8 ✓6 ✗2 NEW · Reviewer ×3 ✓3 · job ×5 ✗1  │
-├ LIVE · root-orchestrator ──────────────────────────┤   header + 0..4 body lines (chat_first)
-│ ∴ Checking Lens and internal tool contracts…        │
-│ ● fs.read · in progress · 1.2s                      │
-├ CHAT ──────────────────────────────────────────────┤   largest region, full width
-│ …                                                   │
-├─────────────────────────────────────────────────────┤
-│ status · goal · ⛨ · approvals                        │
-│ › composer                                          │
-└─────────────────────────────────────────────────────┘
+┌ Agents ─────┐┌ Jobs ───────┐   two visually SQUARE windows (height in px = width in px),
+│ agents only ││ jobs only   │   side by side, never combined; no reasoning/preview lines
+└─────────────┘└─────────────┘
+┌ Reasoning · 2 active ───────┐   boxed, full width, fixed 8 content rows (10 with border):
+│ root  ● delegate_wave · 1s  │   time-ordered stream of ALL agents (reasoning, tool
+│ dev   Ich baue zuerst …     │   start/end, finished), every line prefixed with the role
+└─────────────────────────────┘
+─ FINISHED / FAILED · ⛨ DoD 0    1 row (collapsed) / 3–8 rows (expanded), directly BELOW Reasoning
+CHAT                              largest region, full width, floor 8 rows
+status · goal · ⛨ · approvals
+› composer
 ```
+Rules of the portrait stack (`portrait_square_stack`, replaces `chat_first` there):
+- **Square windows:** Agents width = `cols/2`, Jobs = rest; both share one height
+  `square = round(agents_w · cell_aspect / 1000)` including borders. There is
+  **no `Combined` dock** in the stack at any width (the former `< 68` rule no
+  longer applies to the stack).
+- **Reasoning:** 8 content rows + 2 border rows = 10. Mixes all agents in time
+  order with a role prefix (fixed column up to 12 chars, `…`); a pinned agent
+  (`p`) limits it to that agent. Title ` Reasoning · N active ` (`locales/mission.json`).
+- **FINISHED/FAILED:** the existing one-row strip, below the Reasoning window.
+- **Allocation priority under pressure** (keyboard, zoom), most to least
+  important: 1 Chat 8 rows; 2 squares ≥ 5 rows; 3 Reasoning ≥ 3 rows (1 content
+  row); 4 FINISHED 1 row; 5 Reasoning up to 10; 6 squares up to the target
+  height; 7 FINISHED expansion. Only when even the minima do not fit, windows
+  drop in the order FINISHED → Reasoning → squares.
+- **Cell aspect** (`cell_aspect_permille` = cell width / cell height × 1000;
+  0 → 500), determined at start and on every resize: config `[tui] cell_aspect`
+  (0.2–1.5) > measured via `crossterm::terminal::window_size()` (pixels > 0) > 0.5.
+- **When the stack applies:** `cols < 100` and `rows ≥ 20` with `cols ≥ 30`
+  (was 40/28, lowered so zooming in does not fall into the compact summary), and
+  additionally for **physically** portrait terminals (`rows·1000 > cols·aspect`)
+  even at `cols ≥ 100`. Landscape is unchanged.
+- Examples (composer 3, status 1, aspect 500): 84×77 → squares 2×42 wide / 21
+  high, Reasoning 10, FINISHED 1, chat 41; 66×59 → 2×33 / 17, 10, 1, 27;
+  66×35 → 2×33 / 12, 10, 1, 8.
+- Agent lists (Agents window, combined list, F11) no longer show the `∴`
+  reasoning / `»` preview filler lines; the agent detail view keeps them.
+
 Landscape three columns (160×45, 200×50; dense profile from 120×42):
 ```text
 ┌ CHAT ───────────────────────────┬ FINISHED / FAILED ─────────┬ ACTIVE AGENTS ──────┐
@@ -734,6 +759,7 @@ pub enum Orientation { Portrait, Landscape, Balanced }        // rows>cols, cols
 pub fn orientation(cols: u16, rows: u16) -> Orientation;
 pub enum MissionPlacement { PortraitStack, LandscapeThreeColumns, ShallowLandscape, CompactSummary }
 pub struct MissionInput { pub cols: u16, pub rows: u16, pub status_rows: u16, pub composer_rows: u16,
+    pub cell_aspect_permille: u16 /*cell w/h × 1000; 0 → 500; 2026-11-22*/,
     pub live_body_lines_wanted: u16, pub finished_rows_wanted: u16 /*1 collapsed, 3..8 expanded*/,
     pub agents_visible: bool, pub workbench_visible: bool, pub explorer_visible: bool }
 pub struct MissionLayout { pub placement: MissionPlacement, pub orientation: Orientation,
@@ -744,7 +770,12 @@ pub fn classify_mission(input: MissionInput) -> MissionLayout;
 pub const LANDSCAPE_CHAT_MIN_COLS: u16 = 64;  pub const LANDSCAPE_CENTER_MIN_COLS: u16 = 38;
 pub const LANDSCAPE_RIGHT_MIN_COLS: u16 = 30;  // dense: 48 / 34 / 26
 pub const LANDSCAPE_MIN_ROWS_BODY: u16 = 5 + 5 + 3 + 7; // agents, jobs, finished, live
+pub const PORTRAIT_MIN_COLS: u16 = 30;  pub const PORTRAIT_MIN_ROWS: u16 = 20;  // 2026-11-22 (was 40/28)
 ```
+*Amended 2026-11-22:* in `PortraitStack` `live` is the framed Reasoning window
+(`live_content_rows() = height − 2`, 8 content rows when space allows),
+`agents` and `jobs` are square and never `None`, and `finished` sits directly
+below `live`. The split rule is "in the stack always split".
 Decision order (deterministic, saturating, never overlapping; property tests):
 1. `bottom = status_rows + composer_rows`; `body = rows - bottom` (saturating).
 2. If `orientation != Portrait` and `cols >= 64+38+30` (or dense `48+34+26` with
@@ -759,10 +790,12 @@ Decision order (deterministic, saturating, never overlapping; property tests):
    existing `split` geometry; in the chat column apply `chat_first` with
    `cards = None` semantics (finished strip 1 row + live header only); right
    column = agents above jobs (new `split_right_column_stacked`).
-4. Else if `PortraitDock` → `PortraitStack`: `chat_first` over the body (cards row
-   via `split_dock`, finished strip = `finished_rows_wanted` clamped so chat keeps
-   `MINI_LIVE_MIN_CHAT_ROWS`, live per `LiveMode`). Below 68 cols cards are
-   `Combined` (existing).
+4. Else if `PortraitDock` (cols < 100, `cols ≥ PORTRAIT_MIN_COLS`, `rows ≥
+   PORTRAIT_MIN_ROWS`, or physically portrait per `cell_aspect_permille`) →
+   `PortraitStack` via `portrait_square_stack` (§3.3.1: square Agents|Jobs,
+   boxed Reasoning, FINISHED below it, chat floor 8, allocation priority).
+   *Superseded 2026-11-22:* the former `chat_first` cards row with `Combined`
+   below 68 cols. `chat_first`/`CARDS_ROWS` stay for `ShallowLandscape`.
 5. Else → `CompactSummary` (today's Summary/Compact; all window rects `None`).
 Invariants (tests): rect union ⊆ area, pairwise disjoint, every `Some` rect has
 width≥3 && height≥3 except 1-row strips; 0×0 and 1×1 never panic; flipping
@@ -831,13 +864,22 @@ pub(crate) struct MissionUi { agents: WindowUi, jobs: WindowUi, finished: Window
   `sanitize_inline`; "no visible events yet" when empty. Portrait: header + ≤4
   body lines, **non-focusable, non-scrolling**; landscape centre: scrollable when
   focused (`ChatScroll`), `Alt+L` toggles an expanded detail (existing
-  `render_agent_detail`) inside the same rect. No model call, no new job, no
+  `render_agent_detail`) inside the same rect.
+  *Amended 2026-11-22 (portrait):* the portrait window is now the boxed
+  Reasoning window (new `mission/reasoning_feed.rs`: ring buffer, ≤ 2,000
+  entries / 256 KiB, entries `{seq, agent_id, role, kind: Reasoning | ToolStart |
+  ToolEnd{ok} | Finished{ok}, text}`, consecutive deltas of one agent merged;
+  fed from root reasoning/tools and child events), drawn with the framed
+  renderer of `live_window::render_window`. In portrait `presence.live = true`:
+  it is **focusable (F4/Alt+L) and scrollable** (mouse wheel via
+  `scroll_routing`); `Alt+L`/`Enter` open the **maximized agent detail**
+  (in-place expansion stays landscape-three-column only). F4 order unchanged. No model call, no new job, no
   timer beyond the existing frame requests.
 - `FrameRegions` gains `jobs`, `finished`, `live`; mouse wheel/click route by
   `Rect::contains(Position)`; modal dialogs keep precedence.
 - Portrait branch in `render_viewport`: replace `render_dock(split_dock_areas(dock))`
   + `portrait_live_strip` with `classify_mission` → per-window renderers. Keep
-  the legacy `Combined` dock renderer for < 68 cols. Keep every existing portrait
+  the legacy `Combined` dock renderer for < 68 cols (*superseded 2026-11-22 for the portrait stack, which never combines*). Keep every existing portrait
   test green (R19 regression contract: `narrow_tall_pane_shows_the_agent_dock`,
   `narrow_status_line_moves_marks_to_their_own_row`, `host_warning_stays_complete…`,
   `portrait_live_strip_follows_chat_first_at_46x78`, `ctrl_l_requests_a_full_redraw`).
@@ -1383,6 +1425,17 @@ Recommended execution order:
 Gate sequence §0.3. Additionally per area:
 - Layout matrix tests in `harw-tui-layout` (C1) and render-matrix tests in
   `harw-tui` (C2/C3) — the sizes listed in §3.3.2/§4 are mandatory test names.
+- Portrait redesign (2026-11-22) mandatory tests: geometry at 84×77, 66×59,
+  66×35, 46×78, 40×28, 30×40 and 120×200, each with aspect 500 and 480;
+  agents and jobs are never `None` while squares are placed (sweep: the stack
+  is never `Combined`); Reasoning is exactly 10 rows when space allows;
+  FINISHED sits directly below the Reasoning window; bottleneck order
+  (chat 8 → squares ≥ 5 → Reasoning ≥ 3 → FINISHED 1 → …); render at 84×77:
+  no `∴`/`»` in the Agents window and Reasoning lines of two agents in order
+  with role prefix; resize 84×77 → 66×37 → 66×59 uses the full height;
+  root-orchestrator live block with 40 entries shows all, without
+  "lines above"; `[tui] cell_aspect` parse/merge/scope-table tests
+  (`config_scope_exhaustive`).
 - `cargo test -p harw-macros` includes trybuild compile-fail (M2).
 - `make -C harw-dod test` + `harw-dod/scripts/stage-test.sh` (D1).
 - `cargo run -q -p xtask -- gates` must stay green after adding `harw-dod-client`
@@ -1496,6 +1549,20 @@ before starting B4** and scale B4 down to whatever is actually missing.
   (it declares `ExecuteProcess`; fail-closed, same as `process.list`), and the
   `cargo.*` registration in `Full` is deferred, so `cargo-tools` has no command
   or error-code triggers yet (§4 B4).
+- **Owner decision 2026-11-22 (portrait Mission Control, supersedes the
+  portrait parts of PL-94 W02 / PL-68 W00 and the `Combined` rule):** in portrait,
+  at every zoom level, Agents and Jobs are two visually square windows side by
+  side and never combined; below them a boxed Reasoning window (fixed 8 content
+  rows, all agents mixed in time order with a role prefix) and below that the
+  one-row FINISHED/FAILED strip; the chat keeps ≥ 8 rows. Agent lists show no
+  reasoning or preview lines. The portrait Reasoning window is focusable and
+  scrollable; `Alt+L` opens the maximized agent detail. Cell aspect comes from
+  `[tui] cell_aspect` > measured > 0.5; portrait minimum 30×20 and physical
+  portrait counts. Also: the `root-orchestrator` live block in the chat is
+  uncapped (no visible-entry/line/char limits, no "lines above"); only a
+  memory bound (≈ 5,000 entries / 256 KiB per block) remains, marked
+  "older entries: /agent detail". Other child agents keep compact caps.
+  TUI and the Android app (`dev.harw.mobile`) get the same grid in parallel.
 - W01 inline live cells (C5) are **in scope but last** with a go/no-go after
   C1–C4 land; the three windows + LIVE strip (W02) are the primary target.
 - Translation pass (#133) is **not** part of this PR beyond the DoD files D1
