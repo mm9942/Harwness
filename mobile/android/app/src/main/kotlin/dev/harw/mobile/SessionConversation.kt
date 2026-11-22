@@ -1,8 +1,10 @@
 package dev.harw.mobile
 
+import android.content.res.Configuration
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
@@ -44,6 +46,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -51,6 +54,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -58,6 +62,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -90,6 +95,13 @@ internal fun SessionConversation(
     var approvalId by rememberSaveable(sessionId) { mutableStateOf<String?>(null) }
     var confirmingInterrupt by rememberSaveable(sessionId) { mutableStateOf(false) }
     var transcriptJump by remember(sessionId) { mutableIntStateOf(0) }
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            nowMs = System.currentTimeMillis()
+        }
+    }
     val approval = approvals.firstOrNull { it.id == approvalId }
     val turnId = snapshot?.runningTurnId
     val approvalPending = SessionAction(sessionId, SessionActionKind.Decide) in state.pendingActions
@@ -129,83 +141,96 @@ internal fun SessionConversation(
         )
     }
 
-    Column(modifier.imePadding()) {
-        if (inlineActivity || turnId != null) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 5.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                if (inlineActivity) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text(
-                            sessionStatus(state, session, view),
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        val tool = snapshot?.transcript?.lastOrNull { it.kind == TranscriptKind.TOOL }
-                        if (tool != null) {
+    BoxWithConstraints(modifier.imePadding()) {
+        Column(Modifier.fillMaxSize()) {
+            if (inlineActivity || turnId != null) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (inlineActivity) {
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                             Text(
-                                toolSummary(tool), style = MaterialTheme.typography.bodySmall,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                sessionStatus(state, session, view),
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
+                            val tool = snapshot?.transcript?.lastOrNull { it.kind == TranscriptKind.TOOL }
+                            if (tool != null) {
+                                Text(
+                                    toolSummary(tool), style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                    if (turnId != null) {
+                        TextButton(
+                            onClick = { confirmingInterrupt = true },
+                            enabled = active && snapshot?.canInterrupt == true && !interruptPending,
+                        ) {
+                            Icon(Icons.Outlined.StopCircle, contentDescription = null, Modifier.size(18.dp))
+                            Text("Interrupt session", Modifier.padding(start = 5.dp))
                         }
                     }
                 }
-                if (turnId != null) {
-                    TextButton(
-                        onClick = { confirmingInterrupt = true },
-                        enabled = active && snapshot?.canInterrupt == true && !interruptPending,
-                    ) {
-                        Icon(Icons.Outlined.StopCircle, contentDescription = null, Modifier.size(18.dp))
-                        Text("Interrupt session", Modifier.padding(start = 5.dp))
-                    }
-                }
             }
-        }
-        if (approvals.isNotEmpty()) {
-            ApprovalStrip(
-                approvals.size,
-                canDecide = active && snapshot?.canApprove == true,
-                onClick = { approvalId = approvals.first().id },
-                modifier = Modifier.padding(horizontal = 15.dp, vertical = 5.dp),
+            if (approvals.isNotEmpty()) {
+                ApprovalStrip(
+                    approvals.size,
+                    canDecide = active && snapshot?.canApprove == true,
+                    onClick = { approvalId = approvals.first().id },
+                    modifier = Modifier.padding(horizontal = 15.dp, vertical = 5.dp),
+                )
+            }
+            view?.error?.let { StatusMessage(it, Modifier.padding(horizontal = 15.dp, vertical = 4.dp), error = true) }
+            (snapshot?.lastFailure ?: state.detail?.takeUnless { state.online } ?: snapshot?.detail?.takeUnless { it == view?.error })?.let {
+                StatusMessage(it, Modifier.padding(horizontal = 15.dp, vertical = 4.dp), error = snapshot?.lastFailure != null)
+            }
+        if (LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT && snapshot != null) {
+            MissionHeader(
+                agents = snapshot.agents,
+                jobs = snapshot.jobs,
+                reasoning = snapshot.reasoning,
+                finished = snapshot.finished,
+                nowMs = nowMs,
+                availableHeight = maxHeight,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 4.dp),
             )
         }
-        view?.error?.let { StatusMessage(it, Modifier.padding(horizontal = 15.dp, vertical = 4.dp), error = true) }
-        (snapshot?.lastFailure ?: state.detail?.takeUnless { state.online } ?: snapshot?.detail?.takeUnless { it == view?.error })?.let {
-            StatusMessage(it, Modifier.padding(horizontal = 15.dp, vertical = 4.dp), error = snapshot?.lastFailure != null)
+            ConversationFeed(
+                entries = snapshot?.transcript.orEmpty(),
+                liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
+                jumpToLatest = transcriptJump,
+                emptyMessage = when {
+                    snapshot == null && state.online -> "Opening session…"
+                    !active -> "Waiting for a live session."
+                    else -> "No messages yet."
+                },
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+            )
+            val head = snapshot?.head
+            val composerEnabled = active && head != null && snapshot?.canSubmit == true && !sendPending
+            PromptComposer(
+                draft = window.draft(sessionId),
+                enabled = composerEnabled,
+                busy = sendPending,
+                onEdit = { window.edit(sessionId, it) },
+                onReview = { transcriptJump++ },
+                onDiscard = { window.discardUncertainDraft(sessionId) },
+                onSend = {
+                    if (generation != null && head != null) window.submit(connection, sessionId, generation, head)
+                },
+                hint = when {
+                    !active -> "Read-only until the session reconnects"
+                    snapshot?.canSubmit != true -> "The server is not accepting prompts in this session"
+                    else -> "Message Harw"
+                },
+            )
         }
-        ConversationFeed(
-            entries = snapshot?.transcript.orEmpty(),
-            liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
-            jumpToLatest = transcriptJump,
-            emptyMessage = when {
-                snapshot == null && state.online -> "Opening session…"
-                !active -> "Waiting for a live session."
-                else -> "No messages yet."
-            },
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-        )
-        val head = snapshot?.head
-        val composerEnabled = active && head != null && snapshot?.canSubmit == true && !sendPending
-        PromptComposer(
-            draft = window.draft(sessionId),
-            enabled = composerEnabled,
-            busy = sendPending,
-            onEdit = { window.edit(sessionId, it) },
-            onReview = { transcriptJump++ },
-            onDiscard = { window.discardUncertainDraft(sessionId) },
-            onSend = {
-                if (generation != null && head != null) window.submit(connection, sessionId, generation, head)
-            },
-            hint = when {
-                !active -> "Read-only until the session reconnects"
-                snapshot?.canSubmit != true -> "The server is not accepting prompts in this session"
-                else -> "Message Harw"
-            },
-        )
     }
 }
 

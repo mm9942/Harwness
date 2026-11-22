@@ -112,6 +112,10 @@ pub struct SessionSnapshot {
     pub last_failure: Option<String>,
     pub last_sync_millis: Option<i64>,
     pub detail: Option<String>,
+    pub agents: Vec<MobileAgent>,
+    pub jobs: Vec<MobileJob>,
+    pub reasoning: Vec<ReasoningLine>,
+    pub finished: Vec<FinishedCategory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -135,6 +139,62 @@ pub struct TranscriptEntry {
     pub kind: TranscriptKind,
     pub text: String,
     pub tool_state: Option<MobileToolState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileAgentState {
+    Running,
+    Waiting,
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MobileAgent {
+    pub id: String,
+    pub parent: Option<String>,
+    pub role: String,
+    pub model: Option<String>,
+    pub state: MobileAgentState,
+    pub current_tool: Option<String>,
+    pub started_ms: u64,
+    pub tool_calls: u32,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MobileJob {
+    pub work_id: String,
+    pub kind: String,
+    pub state: String,
+    pub summary: Option<String>,
+    pub updated_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ReasoningKind {
+    Thinking,
+    ToolStart,
+    ToolEnd,
+    Finished,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ReasoningLine {
+    pub seq: u64,
+    pub agent: String,
+    pub role: String,
+    pub kind: ReasoningKind,
+    pub ok: Option<bool>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FinishedCategory {
+    pub label: String,
+    pub total: u32,
+    pub ok: u32,
+    pub failed: u32,
+    pub cancelled: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

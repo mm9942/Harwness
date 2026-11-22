@@ -2,6 +2,7 @@
 
 mod core;
 mod identity;
+mod mission;
 mod projection;
 mod provider;
 mod types;

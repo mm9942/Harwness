@@ -10,6 +10,7 @@ use harw_types::{ApprovalId, ItemId, ReviewDecision, RiskLevel, SessionId, TurnI
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::mission::Mission;
 use crate::{
     ApprovalDecision, ApprovalRisk, MobileApproval, MobileError, MobileSession, MobileSessionState,
     MobileToolState, SessionSnapshot, TranscriptEntry, TranscriptKind,
@@ -20,6 +21,7 @@ const MAX_LIVE_TEXT_BYTES: usize = 1024 * 1024;
 #[derive(Default)]
 pub(crate) struct SessionState {
     view: SessionView,
+    mission: Mission,
     pending: HashMap<ApprovalId, ApprovalRequest>,
     deciding: HashSet<ApprovalId>,
     partial: Option<PartialText>,
@@ -87,6 +89,7 @@ impl SessionState {
         self.replay_target = Some(ack.head);
         self.pending.clear();
         self.deciding.clear();
+        self.mission.root_waiting(false);
         self.partial = None;
         self.closed = ack.session.state == HostedState::Closed;
         self.readonly = ack.session.state == HostedState::Interrupted || self.closed;
@@ -116,6 +119,7 @@ impl SessionState {
 
     fn reset_view(&mut self) {
         self.view = SessionView::new();
+        self.mission.clear();
         self.head = None;
         self.pending.clear();
         self.deciding.clear();
@@ -156,6 +160,7 @@ impl SessionState {
             return FrameAction::Continue;
         }
         self.head = Some(cursor);
+        self.observe_mission(&envelope.frame);
         self.observe_transcript(envelope);
         self.last_sync_millis = Some(jiff::Timestamp::now().as_millisecond());
 
@@ -174,12 +179,14 @@ impl SessionState {
             }
             SessionFrame::ApprovalRequested(request) => {
                 self.pending.insert(request.id.clone(), request.clone());
+                self.mission.root_waiting(true);
                 if self.ready {
                     return self.refresh_transcript();
                 }
             }
             SessionFrame::ApprovalResolved { request_id, .. } => {
-                self.finish_decision(request_id, true)
+                self.finish_decision(request_id, true);
+                self.mission.root_waiting(!self.pending.is_empty());
             }
             SessionFrame::Snapshot {
                 turn_id,
@@ -238,6 +245,32 @@ impl SessionState {
     fn refresh_transcript(&mut self) -> FrameAction {
         self.begin_attach("Synchronizing the session transcript");
         FrameAction::RefreshTranscript
+    }
+
+    fn observe_mission(&mut self, frame: &SessionFrame) {
+        match frame {
+            SessionFrame::Turn(event) => self.mission.root_event(event),
+            SessionFrame::Child {
+                agent,
+                parent,
+                role,
+                event,
+            } => self.mission.child_event(
+                agent.as_str(),
+                parent.as_ref().map(SessionId::as_str),
+                role,
+                event,
+            ),
+            SessionFrame::Job {
+                work_id,
+                kind,
+                state,
+                summary,
+            } => self
+                .mission
+                .job(work_id, kind, state, summary.as_deref()),
+            _ => {}
+        }
     }
 
     fn observe_transcript(&mut self, envelope: &FrameEnvelope) {
@@ -443,6 +476,10 @@ impl SessionState {
                 .or_else(|| self.view.last_failure().map(str::to_owned)),
             last_sync_millis: self.last_sync_millis,
             detail: self.detail.clone(),
+            agents: self.mission.agents(),
+            jobs: self.mission.jobs(),
+            reasoning: self.mission.reasoning(),
+            finished: self.mission.finished(),
         }
     }
 }
