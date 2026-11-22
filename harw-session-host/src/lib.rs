@@ -14,8 +14,10 @@
 //!
 //! Module map:
 //! - [`identity`]: who is calling and what they may do (never from payloads).
+//! - [`index`]: profile index rows and share settings for hosted sessions.
 //! - [`record`]: durable `HostedSessionRecord` files.
 //! - [`replay`]: transcript records → durable frames.
+//! - [`stepup`]: step-up for remote global writes (nonce, hash, expiry, audit).
 //! - [`live_ring`]: bounded live buffer of the running turn.
 //! - [`fanout`]: per-attachment bounded queues with coalescing and `Lagged`.
 //! - [`arbiter`]: per-session FIFO, compare-and-swap on the head, idempotency.
@@ -42,9 +44,11 @@ pub mod error;
 pub mod fanout;
 pub mod host;
 pub mod identity;
+pub mod index;
 pub mod live_ring;
 pub mod record;
 pub mod replay;
+pub mod stepup;
 pub mod tool_host;
 
 pub use agents::{AgentCredential, AgentRegistry, Delegation, ResolvedAgent};
@@ -56,6 +60,8 @@ pub use identity::{
     AgentPrincipal, ClientIdentity, ConnectionId, ToolGrant, ToolGrantError, caps_for_tier,
     gateway_caps_for_tier,
 };
+pub use index::{ProfileIndex, ProfileRow, ProfileShare, ShareMode, ShareSettings};
+pub use record::CreateOutcome;
 pub use tool_host::{
     GatewaySandbox, NoGatewaySandbox, SessionScope, ToolApprovalIssuer, ToolHost, ToolHostBuilder,
     ToolRegistration, WorkspaceGatewaySandbox, WorkspaceSandboxConfig,

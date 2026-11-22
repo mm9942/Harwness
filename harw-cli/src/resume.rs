@@ -442,10 +442,43 @@ pub fn backfill_project_key(sessions_dir: &Path, session: &mut DiscoveredSession
         return;
     }
 
-    let Some(text) = read_transcript_prefix(&session.path) else {
+    let Some((project_root, key)) = detect_project(session) else {
         return;
     };
+    match meta::set_project(
+        sessions_dir,
+        &session.id,
+        None,
+        Some(&project_root),
+        Some(&key),
+    ) {
+        Ok(updated_meta) => {
+            tracing::debug!(
+                session = %session.id,
+                project = %key,
+                "resume.backfill_project"
+            );
+            session.meta = Some(updated_meta);
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %session.id,
+                %error,
+                "resume: Projekt-Backfill konnte nicht gespeichert werden"
+            );
+        }
+    }
+}
 
+/// Gemeinsame Projekterkennung (ohne Schreiben, ohne Prozess-Merker).
+///
+/// Gleiche Regeln wie [`backfill_project_key`]: Pfad-Kandidaten aus dem
+/// Transcript-Anfang, nach Häufigkeit, höchstens
+/// [`BACKFILL_MAX_CANDIDATES`] Versuche mit `discover_project`; Root `/` und
+/// das Home-Verzeichnis zählen nicht. Liefert `(project_root, project_key)`.
+#[must_use]
+pub fn detect_project(session: &DiscoveredSession) -> Option<(PathBuf, String)> {
+    let text = read_transcript_prefix(&session.path)?;
     let candidates = rank_directory_candidates(&text);
     let home_dir = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -455,9 +488,8 @@ pub fn backfill_project_key(sessions_dir: &Path, session: &mut DiscoveredSession
         let Some(existing_ancestor) = nearest_existing_ancestor(&candidate) else {
             continue;
         };
-        let project = match harw_home::project::discover_project(&existing_ancestor, &[]) {
-            Ok(project) => project,
-            Err(_) => continue,
+        let Ok(project) = harw_home::project::discover_project(&existing_ancestor, &[]) else {
+            continue;
         };
         if project.root == Path::new("/") {
             continue;
@@ -465,33 +497,164 @@ pub fn backfill_project_key(sessions_dir: &Path, session: &mut DiscoveredSession
         if home_dir.as_deref() == Some(project.root.as_path()) {
             continue;
         }
-
         let key = harw_home::project::project_key(&project.root);
+        return Some((project.root, key));
+    }
+    None
+}
+
+/// Zahlen eines Projekt-Backfills. Enthält nie Pfade oder Titel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BackfillReport {
+    /// Betrachtete Transcripts.
+    pub scanned: usize,
+    /// Schon mit Projekt-Schlüssel versehen.
+    pub already_tagged: usize,
+    /// Neu zugeordnet (bei `dry_run`: zuordenbar).
+    pub tagged: usize,
+    /// Kein Projekt erkennbar.
+    pub untagged: usize,
+    /// Übersprungen (zu alt für `since`, ungültige Id, unlesbar).
+    pub skipped: usize,
+}
+
+impl BackfillReport {
+    /// Nur Zahlen, nie Pfade oder Titel.
+    #[must_use]
+    pub fn text(&self, dry_run: bool) -> String {
+        let verb = if dry_run { "zuordenbar" } else { "zugeordnet" };
+        let prefix = if dry_run { "Trockenlauf: " } else { "" };
+        format!(
+            "{prefix}{} Sessions geprüft, {} schon mit Projekt, {} {verb}, {} ohne erkennbares Projekt, {} übersprungen",
+            self.scanned, self.already_tagged, self.tagged, self.untagged, self.skipped
+        )
+    }
+
+    /// Maschinenlesbare Fassung (nur Zahlen).
+    #[must_use]
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scanned": self.scanned,
+            "already_tagged": self.already_tagged,
+            "tagged": self.tagged,
+            "untagged": self.untagged,
+            "skipped": self.skipped,
+        })
+    }
+}
+
+/// `harw session backfill-projects`. `dry_run`: schreibt nichts (liest über
+/// `meta::peek`, legt keine Sidecars an). Nutzt [`detect_project`] und
+/// `meta::set_project`. `since`: nur Transcripts, deren Änderungszeit
+/// mindestens so neu ist.
+///
+/// # Errors
+/// [`ResumeError::Io`], wenn das Sessions-Verzeichnis nicht lesbar ist.
+/// Einzelne defekte Sessions zählen als `skipped`.
+pub fn backfill_projects(
+    sessions_dir: &Path,
+    since: Option<jiff::Timestamp>,
+    dry_run: bool,
+) -> ResumeResult<BackfillReport> {
+    let entries = fs::read_dir(sessions_dir).map_err(|source| ResumeError::Io {
+        action: "Sessions-Verzeichnis lesen",
+        source,
+    })?;
+    let mut report = BackfillReport::default();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            report.skipped += 1;
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            report.skipped += 1;
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        report.scanned += 1;
+        let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| SessionId::try_from(stem.to_owned()).ok())
+        else {
+            report.skipped += 1;
+            continue;
+        };
+        let Ok(modified_at) = metadata.modified() else {
+            report.skipped += 1;
+            continue;
+        };
+        if let Some(since) = since {
+            match jiff::Timestamp::try_from(modified_at) {
+                Ok(modified) if modified >= since => {}
+                _ => {
+                    report.skipped += 1;
+                    continue;
+                }
+            }
+        }
+        let Ok(meta) = meta::peek(sessions_dir, &id) else {
+            report.skipped += 1;
+            continue;
+        };
+        if meta.project_key.is_some() {
+            report.already_tagged += 1;
+            continue;
+        }
+        let session = DiscoveredSession {
+            id,
+            path,
+            modified_at,
+            meta: Some(meta),
+        };
+        let Some((project_root, key)) = detect_project(&session) else {
+            report.untagged += 1;
+            continue;
+        };
+        if dry_run {
+            report.tagged += 1;
+            continue;
+        }
         match meta::set_project(
             sessions_dir,
             &session.id,
             None,
-            Some(&project.root),
+            Some(&project_root),
             Some(&key),
         ) {
-            Ok(updated_meta) => {
-                tracing::debug!(
-                    session = %session.id,
-                    project = %key,
-                    "resume.backfill_project"
-                );
-                session.meta = Some(updated_meta);
-            }
+            Ok(_) => report.tagged += 1,
             Err(error) => {
                 tracing::warn!(
                     session = %session.id,
                     %error,
                     "resume: Projekt-Backfill konnte nicht gespeichert werden"
                 );
+                report.skipped += 1;
             }
         }
-        return;
     }
+    Ok(report)
+}
+
+/// `YYYY-MM-DD` -> 00:00 UTC.
+///
+/// # Errors
+/// Textuelle Beschreibung, wenn `raw` kein gültiges Datum ist.
+pub fn parse_since_date(raw: &str) -> Result<jiff::Timestamp, String> {
+    let date: jiff::civil::Date = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("Ungültiges Datum '{raw}', erwartet JJJJ-MM-TT"))?;
+    date.at(0, 0, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .map(|zoned| zoned.timestamp())
+        .map_err(|_| format!("Datum '{raw}' liegt außerhalb des gültigen Bereichs"))
 }
 
 /// Liest bis zu [`BACKFILL_SCAN_CAP_BYTES`] am Anfang eines Transcripts als
@@ -657,6 +820,9 @@ mod tests {
             usage_rounds: 0,
             total_usage: harw_types::TokenUsage::default(),
             drift_events: std::collections::BTreeMap::new(),
+            archived: false,
+            last_origin: None,
+            last_activity_at: None,
         })
     }
 
@@ -1053,5 +1219,74 @@ mod tests {
             None
         );
         Ok(())
+    }
+
+    #[test]
+    fn dry_run_writes_nothing_and_reports_counts() -> TestResult {
+        let sessions_dir = tempfile::tempdir().map_err(ctx("temporary sessions directory"))?;
+        let project_dir = tempfile::Builder::new()
+            .prefix("harw-backfill-dry-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .map_err(ctx("temporary project directory outside /tmp"))?;
+        fs::create_dir(project_dir.path().join(".git")).map_err(ctx("fake git marker"))?;
+        let file_a = project_dir.path().join("a.rs");
+        let id = SessionId::try_from("dry-run-hit".to_owned()).map_err(ctx("valid session id"))?;
+        let store = harw_session_store::store::TranscriptStore::new(sessions_dir.path());
+        store
+            .append(&harw_session_store::record::TranscriptRecord::new(
+                id.clone(),
+                harw_types::ThreadRef::from_str("root"),
+                0,
+                jiff::Timestamp::now(),
+                harw_session_store::record::RecordKind::Item,
+                serde_json::json!({
+                    "type": "tool_call",
+                    "arguments": { "path": file_a.display().to_string() },
+                }),
+            ))
+            .map_err(ctx("append record"))?;
+
+        let snapshot = |dir: &Path| -> TestResult<Vec<(String, Vec<u8>, SystemTime)>> {
+            let mut files = Vec::new();
+            for entry in fs::read_dir(dir).map_err(ctx("read dir"))? {
+                let entry = entry.map_err(ctx("dir entry"))?;
+                let modified = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map_err(ctx("mtime"))?;
+                let bytes = fs::read(entry.path()).map_err(ctx("read file"))?;
+                files.push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    bytes,
+                    modified,
+                ));
+            }
+            files.sort();
+            Ok(files)
+        };
+        let before = snapshot(sessions_dir.path())?;
+
+        let report = backfill_projects(sessions_dir.path(), None, true).map_err(ctx("dry run"))?;
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.tagged, 1);
+        assert_eq!(report.already_tagged, 0);
+        assert_eq!(snapshot(sessions_dir.path())?, before);
+        assert!(!report.text(true).contains(&id.to_string()));
+
+        let real = backfill_projects(sessions_dir.path(), None, false).map_err(ctx("real run"))?;
+        assert_eq!(real.tagged, 1);
+        let again = backfill_projects(sessions_dir.path(), None, false).map_err(ctx("rerun"))?;
+        assert_eq!(again.already_tagged, 1);
+        assert_eq!(again.tagged, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_since_date_accepts_iso_date_and_rejects_garbage() {
+        assert_eq!(
+            parse_since_date("2026-01-02").map(|t| t.to_string()),
+            Ok("2026-01-02T00:00:00Z".to_owned())
+        );
+        assert!(parse_since_date("gestern").is_err());
     }
 }

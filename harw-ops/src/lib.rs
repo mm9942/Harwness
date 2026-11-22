@@ -207,6 +207,7 @@ pub mod attach;
 pub mod bug_report;
 pub mod cancel;
 pub mod compact;
+pub mod command_meta;
 pub(crate) mod config_util;
 pub mod context_proposal;
 pub mod deny;

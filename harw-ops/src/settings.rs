@@ -27,6 +27,7 @@ use harw_config::{
     ConfigError, ConfigWriter, DodWatchMode, ProviderToml, ResolvedConfig, UiLanguage,
 };
 use harw_macros::operation;
+use harw_operations::operation::{RemoteEffect, RemotePolicy, RemoteVerb};
 use harw_operations::{OpContext, OpError, OpOutput};
 use serde_json::json;
 
@@ -57,6 +58,9 @@ enum Setting {
     StatusExpiry,
     /// `[dod.watch] mode` (PL-100 WP 1.9).
     WatchMode,
+    /// `[mode] default`: only on the remote allow-list ([`Setting::REMOTE_ALL`]),
+    /// never part of `/settings show|set|reset` in the TUI.
+    DefaultMode,
 }
 
 impl Setting {
@@ -69,6 +73,27 @@ impl Setting {
         Self::WatchMode,
     ];
 
+    /// The remote allow-list in output order (`REMOTE_CONFIG_KEYS`).
+    const REMOTE_ALL: [Self; 7] = [
+        Self::Language,
+        Self::Theme,
+        Self::Reasoning,
+        Self::ChildStream,
+        Self::StatusExpiry,
+        Self::WatchMode,
+        Self::DefaultMode,
+    ];
+
+    fn parse_remote(key: &str) -> Result<Self, OpError> {
+        Self::REMOTE_ALL
+            .into_iter()
+            .find(|setting| setting.key() == key)
+            .ok_or_else(|| {
+                let shown: String = key.chars().take(64).collect();
+                OpError::InvalidArguments(format!("Unbekannter Schlüssel: {shown}"))
+            })
+    }
+
     fn key(self) -> &'static str {
         match self {
             Self::Language => "tui.language",
@@ -77,6 +102,7 @@ impl Setting {
             Self::ChildStream => "tui.child_stream",
             Self::StatusExpiry => "tui.status_expiry",
             Self::WatchMode => "dod.watch.mode",
+            Self::DefaultMode => "mode.default",
         }
     }
 
@@ -101,13 +127,14 @@ impl Setting {
                 .into_iter()
                 .map(DodWatchMode::as_str)
                 .collect(),
+            Self::DefaultMode => harw_core::InteractionMode::names().collect(),
         }
     }
 
     // Whether the key's parent tables must already be real tables (or
     // absent) before `set_value`/`remove_value` touch them.
     fn requires_table_parents(self) -> bool {
-        matches!(self, Self::WatchMode)
+        matches!(self, Self::WatchMode | Self::DefaultMode)
     }
 
     fn value(self, config: &ResolvedConfig) -> &str {
@@ -127,6 +154,7 @@ impl Setting {
                 harw_config::StatusExpiryMode::Hide => "hide",
             },
             Self::WatchMode => config.dod.watch.mode.as_str(),
+            Self::DefaultMode => config.harness.mode.default.as_str(),
         }
     }
 
@@ -139,6 +167,11 @@ impl Setting {
             Self::ChildStream => to.child_stream = from.child_stream,
             Self::StatusExpiry => to.status_expiry = from.status_expiry,
             Self::WatchMode => target.dod.watch.mode = source.dod.watch.mode,
+            Self::DefaultMode => target
+                .harness
+                .mode
+                .default
+                .clone_from(&source.harness.mode.default),
         }
     }
 }
@@ -154,6 +187,8 @@ const INLINE_PARENT: &str = "dod or dod.watch is not a plain table in the profil
 // Whether every parent of `key` in `document` is absent or a real (header or
 // dotted) table, so `set_value`/`remove_value` edit in place instead of
 // replacing an inline table.
+const INLINE_MODE_PARENT: &str = "mode is not a plain table in the profile config; change mode.default there by hand";
+
 fn table_parents_are_plain(document: &str, key: &str) -> bool {
     let Ok(document) = document.parse::<toml_edit::DocumentMut>() else {
         return false;
@@ -356,6 +391,21 @@ fn handle_settings_with_save(
         "reset" if args.value.is_none() => {}
         _ => return Err(usage()),
     }
+    commit(ctx, setting, args.value.as_deref(), None, save)
+}
+
+const STALE_CHANGE: &str = "Wert hat sich seit der Bestätigung geändert; neu anfragen";
+
+// Shared write path of `/settings set|reset` and `apply_config_change`: lock,
+// optional stale check against the fresh value, edit, candidate validation,
+// save, live publication. `expect_old` is the value the change was planned on.
+fn commit(
+    ctx: &OpContext,
+    setting: Setting,
+    value: Option<&str>,
+    expect_old: Option<&str>,
+    save: impl FnOnce(&ConfigWriter) -> harw_config::ConfigResult<harw_config::ConfigSaveOutcome>,
+) -> Result<OpOutput, OpError> {
     // The path is derived exclusively from the immutable bound active profile.
     let home = crate::config_util::bound_home(ctx)?;
     let path = home.profile_dir.join("config.toml");
@@ -363,9 +413,28 @@ fn handle_settings_with_save(
     if setting.requires_table_parents()
         && !table_parents_are_plain(&writer.document(), setting.key())
     {
-        return Err(OpError::Execution(INLINE_PARENT.to_owned()));
+        let message = if matches!(setting, Setting::DefaultMode) {
+            INLINE_MODE_PARENT
+        } else {
+            INLINE_PARENT
+        };
+        return Err(OpError::Execution(message.to_owned()));
     }
-    match args.value.as_deref() {
+    if let Some(old) = expect_old {
+        let layers = settings_layers(home)?;
+        let fresh = harw_config::discover_config_with_override(
+            &layers.trusted,
+            layers.restricted_repo.as_deref(),
+            layers.project_settings.as_deref(),
+            &path,
+            &writer.document(),
+        )
+        .map_err(config_error)?;
+        if setting.value(&fresh) != old {
+            return Err(OpError::Execution(STALE_CHANGE.to_owned()));
+        }
+    }
+    match value {
         Some(value) => writer
             .set_value(setting.key(), toml_edit::value(value))
             .map_err(config_error)?,
@@ -416,6 +485,163 @@ fn handle_settings_with_save(
 )]
 async fn settings(ctx: &OpContext, args: SettingsArgs) -> Result<OpOutput, OpError> {
     handle_settings(ctx, args)
+}
+
+/// Remote allow-list of `/settings` (contract K-W3a, section 8): `show` reads,
+/// `set`/`reset` are global writes that need a step-up. The key allow-list is
+/// [`REMOTE_CONFIG_KEYS`]; `plan_config_change` enforces it.
+pub const REMOTE: RemotePolicy = RemotePolicy {
+    path: "/settings",
+    verbs: &[
+        RemoteVerb::read(&["-"]),
+        RemoteVerb::read(&["show", "-"]),
+        RemoteVerb::global(&["set", "*"], RemoteEffect::Applied),
+        RemoteVerb::global(&["reset", "*"], RemoteEffect::Applied),
+    ],
+    denied_tokens: &[],
+};
+
+/// Fixed allow-list for `config.get|set|reset`; order is the output order.
+pub const REMOTE_CONFIG_KEYS: &[&str] = &[
+    "tui.language",
+    "tui.theme",
+    "tui.reasoning",
+    "tui.child_stream",
+    "tui.status_expiry",
+    "dod.watch.mode",
+    "mode.default",
+];
+
+/// One `config.get` row. Never carries anything outside the allow-list.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ConfigRow {
+    pub key: &'static str,
+    pub value: String,
+    pub choices: Vec<&'static str>,
+    /// Always `"profile"`.
+    pub scope: &'static str,
+    /// `"now"` for `tui.*` and `dod.watch.mode`, `"next_session"` for `mode.default`.
+    pub apply: &'static str,
+}
+
+/// `config.get`: `keys = None` lists all allow-listed keys in order. An unknown
+/// key is `InvalidArguments` naming only that key.
+///
+/// # Errors
+/// `OpError::InvalidArguments` for a key outside [`REMOTE_CONFIG_KEYS`].
+pub fn config_view(
+    config: &ResolvedConfig,
+    keys: Option<&[String]>,
+) -> Result<Vec<ConfigRow>, OpError> {
+    let settings: Vec<Setting> = match keys {
+        None => Setting::REMOTE_ALL.to_vec(),
+        Some(keys) => keys
+            .iter()
+            .map(|key| Setting::parse_remote(key))
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(settings
+        .into_iter()
+        .map(|setting| ConfigRow {
+            key: setting.key(),
+            value: setting.value(config).to_owned(),
+            choices: setting.choices(),
+            scope: "profile",
+            apply: if matches!(setting, Setting::DefaultMode) {
+                "next_session"
+            } else {
+                "now"
+            },
+        })
+        .collect())
+}
+
+/// Ceiling for keys that widen rights (built by the caller from listener and
+/// device tier). Empty means `mode.default` is not remotely writable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteConfigCeiling {
+    pub allowed_modes: Vec<String>,
+}
+
+/// A planned change, the basis for the step-up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigChange {
+    pub key: &'static str,
+    pub old: String,
+    /// `None` resets to the default.
+    pub new: Option<String>,
+    /// `"config.set {key}: {old} -> {new}"` or `"config.reset {key}: {old} -> (default)"`.
+    pub canonical: String,
+}
+
+/// Phase 1, writes nothing: key on the allow-list, value among the choices,
+/// and for `mode.default` the value within `ceiling.allowed_modes`.
+///
+/// # Errors
+/// `OpError::InvalidArguments` (texts never contain config content).
+pub fn plan_config_change(
+    ctx: &OpContext,
+    key: &str,
+    value: Option<&str>,
+    ceiling: &RemoteConfigCeiling,
+) -> Result<ConfigChange, OpError> {
+    let setting = Setting::parse_remote(key)?;
+    if let Some(value) = value {
+        if !setting.choices().contains(&value) {
+            return Err(OpError::InvalidArguments(format!(
+                "Ungültiger Wert für {}",
+                setting.key()
+            )));
+        }
+        if matches!(setting, Setting::DefaultMode)
+            && !ceiling.allowed_modes.iter().any(|mode| mode == value)
+        {
+            return Err(OpError::InvalidArguments(
+                "mode.default ist für dieses Gerät gedeckelt".to_owned(),
+            ));
+        }
+    }
+    let old = setting.value(current(ctx)?.as_ref()).to_owned();
+    let canonical = match value {
+        Some(new) => format!("config.set {}: {old} -> {new}", setting.key()),
+        None => format!("config.reset {}: {old} -> (default)", setting.key()),
+    };
+    Ok(ConfigChange {
+        key: setting.key(),
+        old,
+        new: value.map(str::to_owned),
+        canonical,
+    })
+}
+
+/// Phase 2 after a confirmed step-up: locked write on the profile config; a
+/// value that changed since the plan is refused. Output as `/settings set`,
+/// with `data.change = {key, old, new}`.
+///
+/// # Errors
+/// `OpError::Execution` for a stale change or a failed write,
+/// `OpError::InvalidArguments` for a key or value outside the allow-list.
+pub fn apply_config_change(ctx: &OpContext, change: &ConfigChange) -> Result<OpOutput, OpError> {
+    let setting = Setting::parse_remote(change.key)?;
+    if let Some(new) = change.new.as_deref()
+        && !setting.choices().contains(&new)
+    {
+        return Err(OpError::InvalidArguments(format!(
+            "Ungültiger Wert für {}",
+            setting.key()
+        )));
+    }
+    let mut result = commit(
+        ctx,
+        setting,
+        change.new.as_deref(),
+        Some(&change.old),
+        ConfigWriter::save_with_outcome,
+    )?;
+    if let Some(data) = result.data.as_mut() {
+        data["change"] = json!({"key": change.key, "old": change.old, "new": change.new});
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1008,5 +1234,208 @@ mod tests {
             "dod.watch.mode"
         ));
         Ok(())
+    }
+
+    fn seeded() -> TestResult<(
+        tempfile::TempDir,
+        harw_home::ResolvedHomeContext,
+        OpContext,
+        SharedLiveConfig,
+    )> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        let (context, live) = fixture(&home)?;
+        Ok((dir, home, context, live))
+    }
+
+    fn ceiling(modes: &[&str]) -> RemoteConfigCeiling {
+        RemoteConfigCeiling {
+            allowed_modes: modes.iter().map(|mode| (*mode).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn config_keys_match_remote_settings() {
+        let keys: Vec<_> = Setting::REMOTE_ALL.iter().map(|s| s.key()).collect();
+        assert_eq!(keys, REMOTE_CONFIG_KEYS);
+        // The TUI list stays the six keys without `mode.default`.
+        assert_eq!(Setting::ALL.len(), 6);
+    }
+
+    #[test]
+    fn config_view_lists_allowlist_in_order() -> TestResult {
+        let (_dir, _home, _context, live) = seeded()?;
+        let rows = config_view(live.current().as_ref(), None).map_err(ctx("view"))?;
+        let keys: Vec<_> = rows.iter().map(|row| row.key).collect();
+        assert_eq!(keys, REMOTE_CONFIG_KEYS);
+        assert_eq!(rows.len(), 7);
+        for row in &rows {
+            assert_eq!(row.scope, "profile");
+            assert!(!row.choices.is_empty());
+        }
+        assert_eq!(rows[6].apply, "next_session");
+        assert_eq!(rows[0].apply, "now");
+        assert_eq!(rows[6].choices, ["chat", "plan", "explore", "work", "shell"]);
+        let only = config_view(live.current().as_ref(), Some(["tui.theme".to_owned()].as_slice()))
+            .map_err(ctx("subset"))?;
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].value, "dark");
+        Ok(())
+    }
+
+    #[test]
+    fn config_view_rejects_unknown_key() -> TestResult {
+        let (_dir, _home, _context, live) = seeded()?;
+        live.update(|config| {
+            config.harness.default_model = Some("private-model".to_owned());
+        });
+        let Err(error) = config_view(
+            live.current().as_ref(),
+            Some(["harness.secret".to_owned()].as_slice()),
+        ) else {
+            return Err(crate::test_support::TestError::Missing("error").into());
+        };
+        assert!(matches!(error, OpError::InvalidArguments(_)));
+        let text = error.to_string();
+        assert!(text.contains("harness.secret"));
+        assert!(!text.contains("private-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn config_view_has_no_secrets() -> TestResult {
+        let (_dir, _home, _context, live) = seeded()?;
+        live.update(|config| {
+            config
+                .env_layer
+                .insert("API_KEY".to_owned(), "sk-fake-SECRET-marker".to_owned());
+            config.harness.default_model = Some("private-model".to_owned());
+        });
+        let rows = config_view(live.current().as_ref(), None).map_err(ctx("view"))?;
+        let text = serde_json::to_string(&rows).map_err(ctx("json"))?;
+        assert!(!text.contains("fake-SECRET-marker"));
+        assert!(!text.contains("private-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_config_change_is_pure_and_canonical() -> TestResult {
+        let (_dir, home, context, _live) = seeded()?;
+        command(&context, "set tui.language en").map_err(ctx("seed"))?;
+        let path = home.profile_dir.join("config.toml");
+        let before = std::fs::read(&path).map_err(ctx("before"))?;
+        let change = plan_config_change(&context, "tui.theme", Some("light"), &ceiling(&[]))
+            .map_err(ctx("plan"))?;
+        assert_eq!(change.canonical, "config.set tui.theme: dark -> light");
+        assert_eq!(change.new.as_deref(), Some("light"));
+        let reset = plan_config_change(&context, "tui.theme", None, &ceiling(&[]))
+            .map_err(ctx("plan reset"))?;
+        assert_eq!(reset.canonical, "config.reset tui.theme: dark -> (default)");
+        assert_eq!(std::fs::read(&path).map_err(ctx("after"))?, before);
+        for (key, value) in [
+            ("tui.theme", Some("custom")),
+            ("default_model", Some("x")),
+            ("permissions.default_mode", Some("full")),
+        ] {
+            assert!(matches!(
+                plan_config_change(&context, key, value, &ceiling(&["chat"])),
+                Err(OpError::InvalidArguments(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mode_default_is_capped() -> TestResult {
+        let (_dir, _home, context, _live) = seeded()?;
+        let capped = plan_config_change(&context, "mode.default", Some("chat"), &ceiling(&[]));
+        let Err(OpError::InvalidArguments(text)) = capped else {
+            return Err(crate::test_support::TestError::Missing("cap error").into());
+        };
+        assert!(text.contains("gedeckelt"));
+        assert!(
+            plan_config_change(&context, "mode.default", Some("work"), &ceiling(&["chat"]))
+                .is_err()
+        );
+        let ok = plan_config_change(&context, "mode.default", Some("chat"), &ceiling(&["chat"]))
+            .map_err(ctx("allowed"))?;
+        assert_eq!(ok.key, "mode.default");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_detects_stale_change() -> TestResult {
+        let (_dir, home, context, live) = seeded()?;
+        let change = plan_config_change(&context, "tui.theme", Some("light"), &ceiling(&[]))
+            .map_err(ctx("plan"))?;
+        command(&context, "set tui.theme light").map_err(ctx("manual"))?;
+        let path = home.profile_dir.join("config.toml");
+        let before = std::fs::read(&path).map_err(ctx("before"))?;
+        let Err(error) = apply_config_change(&context, &change) else {
+            return Err(crate::test_support::TestError::Missing("stale error").into());
+        };
+        assert!(matches!(error, OpError::Execution(_)));
+        assert_eq!(std::fs::read(&path).map_err(ctx("after"))?, before);
+        assert_eq!(live.current().harness.tui.theme, "light");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_roundtrip() -> TestResult {
+        let (_dir, home, context, live) = seeded()?;
+        let change = plan_config_change(&context, "tui.theme", Some("light"), &ceiling(&[]))
+            .map_err(ctx("plan"))?;
+        let output = apply_config_change(&context, &change).map_err(ctx("apply"))?;
+        assert_eq!(live.current().harness.tui.theme, "light");
+        let data = output
+            .data
+            .ok_or(crate::test_support::TestError::Missing("data"))?;
+        assert_eq!(data["change"]["key"], "tui.theme");
+        assert_eq!(data["change"]["old"], "dark");
+        assert_eq!(data["change"]["new"], "light");
+        assert_eq!(data["rows"].as_array().map(Vec::len), Some(6));
+        let reset = plan_config_change(&context, "tui.theme", None, &ceiling(&[]))
+            .map_err(ctx("plan reset"))?;
+        assert_eq!(reset.canonical, "config.reset tui.theme: light -> (default)");
+        apply_config_change(&context, &reset).map_err(ctx("apply reset"))?;
+        assert_eq!(live.current().harness.tui.theme, "dark");
+        let profile = std::fs::read_to_string(home.profile_dir.join("config.toml"))
+            .map_err(ctx("profile"))?;
+        assert!(!profile.contains("theme"));
+        // mode.default writes `[mode] default` and publishes it live.
+        let mode = plan_config_change(&context, "mode.default", Some("work"), &ceiling(&["work"]))
+            .map_err(ctx("plan mode"))?;
+        apply_config_change(&context, &mode).map_err(ctx("apply mode"))?;
+        assert_eq!(live.current().harness.mode.default, "work");
+        let profile = std::fs::read_to_string(home.profile_dir.join("config.toml"))
+            .map_err(ctx("profile"))?;
+        assert!(profile.contains("[mode]") && profile.contains("work"));
+        // The TUI command still refuses the remote-only key.
+        assert!(command(&context, "set mode.default chat").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn settings_remote_policy_shape() {
+        use harw_operations::operation::{RemoteCap, RemoteSlice};
+        let toks = |items: &[&str]| -> Vec<String> {
+            items.iter().map(|item| (*item).to_owned()).collect()
+        };
+        assert_eq!(REMOTE.path, "/settings");
+        let show = REMOTE.find_verb(&toks(&["show"]));
+        assert_eq!(show.map(|v| v.cap), Some(RemoteCap::Observe));
+        assert_eq!(show.map(|v| v.stepup), Some(false));
+        assert_eq!(
+            REMOTE.find_verb(&[]).map(|v| v.cap),
+            Some(RemoteCap::Observe)
+        );
+        let set = REMOTE.find_verb(&toks(&["set", "tui.theme", "light"]));
+        assert_eq!(set.map(|v| v.cap), Some(RemoteCap::Control));
+        assert_eq!(set.map(|v| v.slice), Some(RemoteSlice::Global));
+        assert_eq!(set.map(|v| v.stepup), Some(true));
+        let reset = REMOTE.find_verb(&toks(&["reset", "tui.theme"]));
+        assert_eq!(reset.map(|v| v.stepup), Some(true));
+        assert!(REMOTE.find_verb(&toks(&["show", "x"])).is_none());
+        assert!(REMOTE.find_verb(&toks(&["bogus"])).is_none());
     }
 }

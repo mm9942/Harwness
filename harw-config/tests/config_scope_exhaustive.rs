@@ -352,7 +352,7 @@ fn test_field_table_exhaustive_tools_section() {
 }
 
 // [tools.doc] (Abschnitt 1.8a, 1 Feld)
-// [session_listener] (10 Felder, alle global-only)
+// [session_listener] (15 Felder, alle global-only)
 #[test]
 fn test_field_table_exhaustive_session_listener_section() {
     let harw_config::SessionListenerSection {
@@ -366,6 +366,11 @@ fn test_field_table_exhaustive_session_listener_section() {
         shared_socket_tenant,
         onion,
         onion_dir,
+        share_profile_sessions,
+        share_tenant,
+        share_legacy_rows,
+        share_since,
+        share_roots,
     } = harw_config::SessionListenerSection::default();
     let _ = (
         enabled,
@@ -378,6 +383,11 @@ fn test_field_table_exhaustive_session_listener_section() {
         shared_socket_tenant,
         onion,
         onion_dir,
+        share_profile_sessions,
+        share_tenant,
+        share_legacy_rows,
+        share_since,
+        share_roots,
     );
     for field in [
         "enabled",
@@ -390,6 +400,11 @@ fn test_field_table_exhaustive_session_listener_section() {
         "shared_socket_tenant",
         "onion",
         "onion_dir",
+        "share_profile_sessions",
+        "share_tenant",
+        "share_legacy_rows",
+        "share_since",
+        "share_roots",
     ] {
         assert_path_in_field_table_exactly_once(&format!("session_listener.{field}"));
     }

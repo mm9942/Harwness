@@ -61,6 +61,7 @@ mod onboarding;
 mod op_bridge;
 mod output;
 mod pr_review;
+mod profile_index;
 mod project_trust;
 mod provider_cmd;
 mod resume;

@@ -94,6 +94,56 @@ pub struct SessionEntry {
     pub project_label: Option<String>,
     /// Optionale Anzahl Gesprächsrunden.
     pub turns: Option<u64>,
+    /// Optionale Marke (zuletzt vom Handy bedient / läuft auf dem Gateway).
+    pub badge: Option<SessionBadge>,
+}
+
+/// Marke einer Sitzung im Picker.
+///
+/// `RunningOnGateway` hat Vorrang vor `LastPhone` (siehe [`badge_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionBadge {
+    /// "zuletzt: Handy" (`last_origin == Gateway`).
+    LastPhone,
+    /// "läuft auf Gateway" (Lease-Halter `Gateway`).
+    RunningOnGateway,
+}
+
+impl SessionBadge {
+    /// Anzeigetext der Marke (übersetzbar, Fallback Englisch).
+    fn label(self) -> &'static str {
+        match self {
+            Self::LastPhone => tr("pickers.badge_last_phone", "last: phone"),
+            Self::RunningOnGateway => tr("pickers.badge_on_gateway", "running on gateway"),
+        }
+    }
+}
+
+/// Reine Entscheidungslogik hinter [`badge_for`].
+fn badge_from_parts(
+    last_origin: Option<harw_session_store::LastOrigin>,
+    holder: Option<harw_session_store::HolderKind>,
+) -> Option<SessionBadge> {
+    if holder == Some(harw_session_store::HolderKind::Gateway) {
+        return Some(SessionBadge::RunningOnGateway);
+    }
+    if last_origin == Some(harw_session_store::LastOrigin::Gateway) {
+        return Some(SessionBadge::LastPhone);
+    }
+    None
+}
+
+/// Leitet die Picker-Marke aus Sitzungs-Meta und Lease-Halter ab.
+///
+/// `RunningOnGateway` (Halter `Gateway`) hat Vorrang vor `LastPhone`
+/// (`meta.last_origin == Gateway`). Ohne bekannten Halter (`None`) zählt nur
+/// die Meta.
+#[must_use]
+pub fn badge_for(
+    meta: &harw_session_store::SessionMeta,
+    holder: Option<&harw_session_store::LeaseHolder>,
+) -> Option<SessionBadge> {
+    badge_from_parts(meta.last_origin, holder.map(|h| h.kind))
 }
 
 /// Aktionssignal, das `SessionPicker::handle_key` (crate-intern) zurückgibt.
@@ -441,6 +491,9 @@ impl SessionPicker {
         let remaining = width.saturating_sub(MARKER_WIDTH + time_width);
 
         let mut suffix_parts: Vec<String> = Vec::new();
+        if let Some(badge) = entry.badge {
+            suffix_parts.push(format!("[{}]", badge.label()));
+        }
         if let Some(turns) = entry.turns {
             suffix_parts.push(tr_args(
                 "pickers.turns",
@@ -612,6 +665,7 @@ mod tests {
             last_active: now - Duration::from_secs(secs_ago),
             project_label: None,
             turns: None,
+            badge: None,
         }
     }
 
@@ -803,6 +857,55 @@ mod tests {
         picker.handle_key(make_key(KeyCode::Char('a')));
         assert_eq!(picker.filter, "a");
         assert!(!picker.show_all());
+    }
+
+    #[test]
+    fn badge_gateway_holder_wins_over_last_phone() {
+        use harw_session_store::{HolderKind, LastOrigin};
+        assert_eq!(
+            badge_from_parts(Some(LastOrigin::Gateway), Some(HolderKind::Gateway)),
+            Some(SessionBadge::RunningOnGateway)
+        );
+        assert_eq!(
+            badge_from_parts(None, Some(HolderKind::Gateway)),
+            Some(SessionBadge::RunningOnGateway)
+        );
+    }
+
+    #[test]
+    fn badge_last_phone_without_holder() {
+        use harw_session_store::{HolderKind, LastOrigin};
+        assert_eq!(
+            badge_from_parts(Some(LastOrigin::Gateway), None),
+            Some(SessionBadge::LastPhone)
+        );
+        assert_eq!(
+            badge_from_parts(Some(LastOrigin::Gateway), Some(HolderKind::Tui)),
+            Some(SessionBadge::LastPhone)
+        );
+    }
+
+    #[test]
+    fn badge_none_for_tui_unknown_or_missing() {
+        use harw_session_store::{HolderKind, LastOrigin};
+        assert_eq!(badge_from_parts(None, None), None);
+        assert_eq!(badge_from_parts(Some(LastOrigin::Tui), None), None);
+        assert_eq!(badge_from_parts(Some(LastOrigin::Unknown), None), None);
+        assert_eq!(badge_from_parts(None, Some(HolderKind::Unknown)), None);
+        assert_eq!(badge_from_parts(None, Some(HolderKind::Job)), None);
+    }
+
+    #[test]
+    fn render_shows_badge_label() {
+        let now = SystemTime::now();
+        let mut entry = make_entry("s1", "Titel", 60, now);
+        entry.badge = Some(SessionBadge::RunningOnGateway);
+        let picker = SessionPicker::new(vec![entry], now);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf, &Theme::Dark);
+        let rendered = buffer_to_string(&buf);
+        assert!(rendered.contains("running on gateway"), "{rendered}");
     }
 
     /// Rendering in einen 80x12-Buffer enthält Titeltext und "5 min ago".

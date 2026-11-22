@@ -157,6 +157,15 @@ impl HostedSessionRecord {
     }
 }
 
+/// Outcome of [`RecordStore::create_if_absent`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// The record was written by this call.
+    Created,
+    /// Another caller was faster; this is its record, left unchanged.
+    Existing(Box<HostedSessionRecord>),
+}
+
 /// File-backed store of [`HostedSessionRecord`]s.
 #[derive(Clone, Debug)]
 pub struct RecordStore {
@@ -188,6 +197,35 @@ impl RecordStore {
         })?;
         harw_fsutil::write_atomic(&path, &bytes, harw_fsutil::AtomicWriteOptions::private())?;
         Ok(())
+    }
+
+    /// Write `record` only when no record of this session exists yet
+    /// (O_EXCL semantics via `persist_noclobber`: private temp file, no-replace
+    /// link into place, parent fsync). An existing record is loaded and
+    /// returned as [`CreateOutcome::Existing`]; other failures are errors as
+    /// in [`RecordStore::save`].
+    pub fn create_if_absent(
+        &self,
+        record: &HostedSessionRecord,
+    ) -> Result<CreateOutcome, HostError> {
+        let path = self.record_path(&record.session_id)?;
+        self.ensure_root()?;
+        let bytes = serde_json::to_vec_pretty(record).map_err(|error| {
+            HostError::Storage(format!("encode hosted session record: {error}"))
+        })?;
+        match harw_session_store::store::persist_noclobber(&path, &bytes) {
+            Ok(()) => Ok(CreateOutcome::Created),
+            Err(harw_session_store::SessionStoreError::PersistTargetExists { .. }) => {
+                match self.load(&record.session_id)? {
+                    Some(existing) => Ok(CreateOutcome::Existing(Box::new(existing))),
+                    None => Err(HostError::Storage(format!(
+                        "{}: record vanished during create",
+                        path.display()
+                    ))),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Remove an unpublished/failed creation record. A missing file is benign.
@@ -711,6 +749,78 @@ mod tests {
         assert_eq!(mode(&store.root().join("mode.json"))?, 0o600);
         assert_eq!(mode(&store.root().join(EPOCH_FILE))?, 0o600);
         assert_eq!(mode(store.root())?, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn create_if_absent_creates_once() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = RecordStore::new(dir.path());
+        let rec = record("c-1", HostedState::Idle, 10)?;
+        assert_eq!(store.create_if_absent(&rec)?, CreateOutcome::Created);
+        assert_eq!(store.load(&rec.session_id)?, Some(rec));
+        Ok(())
+    }
+
+    #[test]
+    fn second_create_returns_existing_unchanged() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = RecordStore::new(dir.path());
+        let first = record("c-2", HostedState::Idle, 10)?;
+        let mut second = record("c-2", HostedState::Queued { depth: 1 }, 20)?;
+        second.title = Some("other".into());
+        assert_eq!(store.create_if_absent(&first)?, CreateOutcome::Created);
+        assert_eq!(
+            store.create_if_absent(&second)?,
+            CreateOutcome::Existing(Box::new(first.clone()))
+        );
+        assert_eq!(store.load(&first.session_id)?, Some(first));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_create_has_one_winner() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let store = RecordStore::new(dir.path());
+        let mut handles = Vec::new();
+        for n in 0..8_i64 {
+            let store = store.clone();
+            let mut rec = record("c-3", HostedState::Idle, 10 + n)?;
+            rec.title = Some(format!("writer {n}"));
+            handles.push(std::thread::spawn(move || {
+                store
+                    .create_if_absent(&rec)
+                    .map(|outcome| (rec.title.clone(), outcome))
+            }));
+        }
+        let mut created = Vec::new();
+        let mut existing = Vec::new();
+        for handle in handles {
+            let (title, outcome) = handle.join().map_err(|_| "thread panicked")??;
+            match outcome {
+                CreateOutcome::Created => created.push(title),
+                CreateOutcome::Existing(rec) => existing.push(rec.title),
+            }
+        }
+        assert_eq!(created.len(), 1);
+        assert_eq!(existing.len(), 7);
+        assert!(existing.iter().all(|title| *title == created[0]));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_file_is_private() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let store = RecordStore::new(dir.path());
+        store.create_if_absent(&record("c-4", HostedState::Idle, 1)?)?;
+        let mode = std::fs::metadata(store.root().join("c-4.json"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
         Ok(())
     }
 }

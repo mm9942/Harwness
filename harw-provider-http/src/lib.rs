@@ -92,6 +92,7 @@ mod replay_bounds;
 mod responses_reasoning;
 pub mod retry;
 pub mod routing;
+pub mod url_guard;
 mod sse;
 mod text_tool_calls;
 mod thinking_profiles;
@@ -130,6 +131,7 @@ pub use retry::{
     rate_limit_decision, retry_decision,
 };
 pub use routing::{RoutingBackends, RoutingModelProvider};
+pub use chatgpt_plan::{API as CHATGPT_PLAN_API, BASE_URL as CHATGPT_PLAN_BASE_URL};
 
 mod chatgpt_plan;
 mod codex;

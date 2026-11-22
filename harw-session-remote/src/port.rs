@@ -6,7 +6,9 @@
 //! is [`PortError::Transport`].
 
 use harw_protocol::methods::{
-    METHOD_APPROVAL_RESP, METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_ATTACH,
+    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
+    METHOD_STEPUP_CONFIRM, METHOD_APPROVAL_RESP, METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_ATTACH,
     METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_DETACH,
     METHOD_SESSION_HISTORY, METHOD_SESSION_LIST, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS,
     METHOD_SESSION_RENAME, METHOD_SESSION_RESUME, METHOD_SESSION_SET_EFFORT,
@@ -14,7 +16,10 @@ use harw_protocol::methods::{
     METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT,
 };
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CreateInParams, CreateParams,
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
+    CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams,
+    ConfigGetResult, ConfigResetParams, ConfigSetParams, SecretPutParams, SecretPutResult,
+    StepUpCancelParams, StepUpConfirmParams, CreateInParams, CreateParams,
     FrameEnvelope, HelloAck, HelloParams, HistoryParams, HistoryResult, InterruptParams,
     ListResult, PageParams, PageResult, ProjectsParams, ProjectsResult, RenameParams,
     RespondResult, SessionRef, SessionRow, SessionSummary, SetEffortParams, SetModeParams,
@@ -255,10 +260,88 @@ impl SessionPort for RemotePort {
                 .await
         })
     }
+
+    fn commands_list(&self, params: CommandsListParams) -> PortFuture<'_, CommandsListResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_COMMANDS_LIST, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn command_run(&self, params: CommandRunParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_COMMAND_RUN, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn catalog_get(&self, params: CatalogGetParams) -> PortFuture<'_, CatalogResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_CATALOG_GET, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn config_get(&self, params: ConfigGetParams) -> PortFuture<'_, ConfigGetResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_CONFIG_GET, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn config_set(&self, params: ConfigSetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_CONFIG_SET, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn config_reset(&self, params: ConfigResetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_CONFIG_RESET, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn secret_put(&self, params: SecretPutParams) -> PortFuture<'_, SecretPutResult> {
+        // `params` is dropped after sending; never logged or cloned.
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_SECRET_PUT, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn stepup_confirm(&self, params: StepUpConfirmParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_STEPUP_CONFIRM, &params, Effect::None)
+                .await
+        })
+    }
+
+    fn stepup_cancel(&self, params: StepUpCancelParams) -> PortFuture<'_, ()> {
+        Box::pin(async move {
+            self.connection
+                .call(METHOD_STEPUP_CANCEL, &params, Effect::None)
+                .await
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use harw_protocol::methods::{
+        METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+        METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
+        METHOD_STEPUP_CONFIRM,
+    };
     use harw_protocol::PortError;
     use harw_protocol::session_wire::error_codes;
 
@@ -277,5 +360,23 @@ mod tests {
         let error = PortError::from_code(error_codes::BUSY, "synthetic reason".into());
         assert_eq!(error, PortError::Busy("synthetic reason".into()));
         assert!(!matches!(error, PortError::Transport(_)));
+    }
+
+    #[test]
+    fn manage_method_names_are_wired() {
+        let table = [
+            (METHOD_COMMANDS_LIST, "commands.list"),
+            (METHOD_COMMAND_RUN, "command.run"),
+            (METHOD_CATALOG_GET, "catalog.get"),
+            (METHOD_CONFIG_GET, "config.get"),
+            (METHOD_CONFIG_SET, "config.set"),
+            (METHOD_CONFIG_RESET, "config.reset"),
+            (METHOD_SECRET_PUT, "secret.put"),
+            (METHOD_STEPUP_CONFIRM, "stepup.confirm"),
+            (METHOD_STEPUP_CANCEL, "stepup.cancel"),
+        ];
+        for (constant, name) in table {
+            assert_eq!(constant, name);
+        }
     }
 }

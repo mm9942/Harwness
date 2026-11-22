@@ -75,6 +75,27 @@ derived from the UIA, with the `tool_call` cap and a tool grant; and gateway
 inspection/administration only through the closed `gateway.*` table. Both
 tables are explicit method lists, not a generic dispatcher.
 
+**Minor-4 amendment (feature `manage`/`stepup`): typed, allow-listed operation execution.** Wire minor 4 adds
+`command.run` as the only path to run an operation remotely. It is not a generic dispatcher:
+
+1. The server resolves the line against a closed, server-side allow-list (`harw_ops::command_meta::REMOTE_POLICIES`,
+   one `RemotePolicy` per command path with explicit verb forms). No policy, no form match, a denied token, a
+   missing cap, a too-low tier or a disabled delivery slice answers `effect = refused` with a stable `reason_code`;
+   nothing runs.
+2. Rights come only from the authenticated connection (granted caps, device/listener tier, tenant). Request params
+   use `deny_unknown_fields` and carry no tier, tenant, actor or principal.
+3. Session controls (`/stop`, `/cancel`, `/mode`, `/effort`, `/model switch`) run through the existing typed
+   session ways (`turn.interrupt`, `session.set_*`), never through the operation.
+4. Global writes (roles, default model, `/mode default`, `config.set|reset`, providers) run only after a step-up:
+   canonical change text, single-use nonce, 60 s, fresh biometric confirmation on the device, audit without
+   secrets (`stepup.confirm`, frame `stepup_request`).
+5. `secret.put` is write-only: the value never returns, is bound to one new provider of the same connection,
+   expires after 180 s and is sealed only by a confirmed step-up.
+6. Read views (`commands.list`, `catalog.get`, `config.get`) are allow-listed and redacted; no raw TOML, no
+   arbitrary key or path.
+
+The method tables stay explicit lists (`MANAGE_METHODS`, `STEPUP_METHODS`). `tool.*` and `gateway.*` are unchanged.
+
 ### D6 — one WS can multiplex many sessions
 
 The connection is an authenticated client channel. Session attachment is
@@ -621,6 +642,10 @@ Required semantics:
 | LOC-01 | local surface | no default loopback TCP listener |
 | ARC-01 | protocol deps | `harw-protocol` has no async/network transport dep |
 | ARC-02 | rings | Tungstenite unreachable from J/D/T/Warden |
+| MG-01 | allow-list | line without remote policy or form -> `refused`, no operation call |
+| MG-02 | caps | observer cannot steer/control; operator without `control` cannot write |
+| MG-03 | step-up | expired or reused nonce fails; write only after confirm |
+| MG-04 | secrets | `catalog.get`/`secret.put` results and logs never contain a secret value |
 
 ---
 

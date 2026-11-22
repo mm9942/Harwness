@@ -41,6 +41,7 @@ mod provider;
 mod sandbox;
 mod service;
 mod session;
+mod sessions_backfill;
 mod settings;
 mod skill;
 mod tool;
@@ -73,6 +74,7 @@ pub use provider::*;
 pub use sandbox::*;
 pub use service::*;
 pub use session::*;
+pub use sessions_backfill::*;
 pub use settings::*;
 pub use skill::*;
 pub use tool::*;
@@ -157,6 +159,7 @@ pub enum Command {
     /// Analysiert die Crate-Abhängigkeiten im Workspace und bearbeitet sie der Reihe nach.
     Analyze(AnalyzeArgs),
     /// Listet, zeigt oder setzt gespeicherte Sitzungen fort.
+    #[command(visible_alias = "sessions")]
     Session {
         /// Auszuführende Sitzungs-Aktion.
         #[command(subcommand)]

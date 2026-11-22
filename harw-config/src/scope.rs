@@ -382,6 +382,11 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "session_listener.shared_socket_tenant", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.onion", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "session_listener.onion_dir", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.share_profile_sessions", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.share_tenant", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.share_legacy_rows", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.share_since", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "session_listener.share_roots", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     // 1.9 [mode] (1)
     FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.10 [research] (5)
@@ -626,7 +631,8 @@ mod merge_rule_tests {
         // Cloud-Sessions fürs Handy: +2 für `session_listener.provider_link_device`,
         // `session_listener.shared_socket_tenant`.
         // Onion-Connector: +2 für `session_listener.onion`, `session_listener.onion_dir`.
-        assert_eq!(FIELD_TABLE.len(), 223);
+        // Sessions teilen (Plan §3.4): +5 für session_listener.share_*.
+        assert_eq!(FIELD_TABLE.len(), 228);
     }
 
     #[test]
@@ -665,7 +671,8 @@ mod merge_rule_tests {
         assert_eq!(count(MergeRule::ProfileReplaces), 114);
         // +2 (`session_listener.provider_link_device`, `session_listener.shared_socket_tenant`).
         // +2 (`session_listener.onion`, `session_listener.onion_dir`).
-        assert_eq!(count(MergeRule::GlobalOnly), 25);
+        // Sessions teilen (Plan §3.4): +5 für session_listener.share_*.
+        assert_eq!(count(MergeRule::GlobalOnly), 30);
         // Runde 5, Teil K: +4 (`agents.*`); Teil N: +1 (`shell.max_timeout_secs`).
         // Runde 7: Teil A2 +2 (`guards.orchestrator_read_*`), Teil L4 +1
         // (`permissions.auto_classifier_timeout_secs`).

@@ -18,24 +18,30 @@ use std::pin::Pin;
 use harw_types::SessionId;
 
 use crate::methods::{
-    METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE,
+    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_SESSION_ADOPT,
+    METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE,
     METHOD_SESSION_PROJECTS, METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT,
+    METHOD_STEPUP_CANCEL, METHOD_STEPUP_CONFIRM,
 };
 use crate::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CreateInParams, CreateParams,
-    FrameEnvelope, GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo,
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams,
+    CatalogResult, CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult,
+    ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams,
+    CreateParams, FrameEnvelope, GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo,
     GatewayListenerSetParams, GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult,
     GatewayStatus, GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck,
     HelloParams, HistoryParams, InterruptParams, PageParams, PageResult, ProjectsParams,
-    ProjectsResult, RenameParams, RespondResult, SessionRow, SessionSummary, SetEffortParams,
-    SetModeParams, SetModelParams, SetProjectParams, SubmitParams, SubmitResult, ToolCallParams,
+    ProjectsResult, RenameParams, RespondResult, SecretPutParams, SecretPutResult, SessionRow,
+    SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SetProjectParams,
+    StepUpCancelParams, StepUpConfirmParams, SubmitParams, SubmitResult, ToolCallParams,
     ToolCallResultFrame, ToolCancelParams, ToolListParams, ToolListResult,
 };
 
 /// Boxed future returned by every port method.
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
 
-/// Answer of a port implementation that does not serve a minor-3 method.
+/// Answer of a port implementation that does not serve a minor-3 or minor-4 method.
 fn unsupported<'a, T: Send + 'a>(method: &'static str) -> PortFuture<'a, T> {
     Box::pin(std::future::ready(Err(PortError::Protocol(format!(
         "{method} is not served by this port"
@@ -92,6 +98,42 @@ pub trait SessionPort: Send + Sync {
     /// `session.archive` (steer + continue); returns the updated row.
     fn archive(&self, _params: ArchiveParams) -> PortFuture<'_, SessionRow> {
         unsupported(METHOD_SESSION_ARCHIVE)
+    }
+    /// `commands.list` (observe, feature `manage`): every command like the TUI popup, with availability.
+    fn commands_list(&self, _params: CommandsListParams) -> PortFuture<'_, CommandsListResult> {
+        unsupported(METHOD_COMMANDS_LIST)
+    }
+    /// `command.run` (observe at the host; the allow-list decides per form, W00 D5 amendment).
+    fn command_run(&self, _params: CommandRunParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_COMMAND_RUN)
+    }
+    /// `catalog.get` (observe): redacted providers, models, roles, live model.
+    fn catalog_get(&self, _params: CatalogGetParams) -> PortFuture<'_, CatalogResult> {
+        unsupported(METHOD_CATALOG_GET)
+    }
+    /// `config.get` (observe): allow-listed keys only.
+    fn config_get(&self, _params: ConfigGetParams) -> PortFuture<'_, ConfigGetResult> {
+        unsupported(METHOD_CONFIG_GET)
+    }
+    /// `config.set` (control + approve, feature `stepup`): answers a step-up challenge, writes nothing.
+    fn config_set(&self, _params: ConfigSetParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_CONFIG_SET)
+    }
+    /// `config.reset` (control + approve, feature `stepup`).
+    fn config_reset(&self, _params: ConfigResetParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_CONFIG_RESET)
+    }
+    /// `secret.put` (control + approve, feature `stepup`): write-only staging, never returns the value.
+    fn secret_put(&self, _params: SecretPutParams) -> PortFuture<'_, SecretPutResult> {
+        unsupported(METHOD_SECRET_PUT)
+    }
+    /// `stepup.confirm` (control + approve): single use, owner bound, 60 s.
+    fn stepup_confirm(&self, _params: StepUpConfirmParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_STEPUP_CONFIRM)
+    }
+    /// `stepup.cancel` (own step-ups only; an unknown id answers `NotFound`, never `Ok(())`).
+    fn stepup_cancel(&self, _params: StepUpCancelParams) -> PortFuture<'_, ()> {
+        unsupported(METHOD_STEPUP_CANCEL)
     }
 }
 
@@ -431,6 +473,34 @@ mod tests {
         if let Some(session) = session {
             let err = ready(Bare.adopt(session)).err();
             assert!(matches!(err, Some(PortError::Protocol(m)) if m.contains("session.adopt")));
+        }
+    }
+
+    #[test]
+    fn minor4_default_bodies_answer_protocol_error() {
+        use super::SessionPort;
+        let run: Result<crate::session_wire::CommandRunParams, _> = serde_json::from_value(
+            serde_json::json!({"line": "/status", "client_msg_id": "m-1"}),
+        );
+        if let Ok(params) = run {
+            let err = ready(Bare.command_run(params)).err();
+            assert!(matches!(err, Some(PortError::Protocol(m)) if m.contains("command.run")));
+        } else {
+            panic!("command.run params must decode");
+        }
+        let secret: Result<crate::session_wire::SecretPutParams, _> = serde_json::from_value(
+            serde_json::json!({
+                "name": "key-1",
+                "for_provider": "provider-test",
+                "value": "sk-test-FAKE-0000000000000000"
+            }),
+        );
+        if let Ok(params) = secret {
+            let err = ready(Bare.secret_put(params)).err();
+            assert!(matches!(err, Some(PortError::Protocol(m)) if m.contains("secret.put")
+                && !m.contains("FAKE")));
+        } else {
+            panic!("secret.put params must decode");
         }
     }
 }
