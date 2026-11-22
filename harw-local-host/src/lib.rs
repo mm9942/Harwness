@@ -661,6 +661,7 @@ impl LocalHost {
             CoreDriverConfig::new(sessions_root),
             Arc::new(factory),
         )
+        .and_then(|driver| driver.with_media_root(&config.home.join("media")))
         .map_err(|error| LocalHostError::Setup(format!("session driver: {error}")))?;
         let host = match index {
             None => SessionHost::open(
