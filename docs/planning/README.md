@@ -1262,6 +1262,8 @@ harw-cli/Cargo.toml
 
 ## Registered planning references
 
+- [PL-98-ONION-EDGE-ADAPTER](98-onion-edge-adapter/README.md) — proposed Onion and mTLS edge adapter for Rust services.
+
 ```text
 docs/planning/10-ecosystem-workspace/HARW_ECOSYSTEM_WORKSPACE_ARCHITECTURE.md
 
