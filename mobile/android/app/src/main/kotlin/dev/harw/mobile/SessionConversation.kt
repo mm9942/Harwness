@@ -421,7 +421,7 @@ internal fun SessionConversation(
             )
             ConversationFeed(
                 agentName = agentName,
-                entries = snapshot?.transcript.orEmpty(),
+                entries = remember(snapshot?.transcript) { dedupeUserRuns(snapshot?.transcript.orEmpty()) },
                 sentImages = { text, count -> window.sentImages(sessionId, text, count) },
                 fetchMedia = { ref -> connection.mediaThumbnail(sessionId, ref) },
                 onRegenerate = resend,

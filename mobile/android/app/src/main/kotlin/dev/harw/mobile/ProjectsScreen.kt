@@ -16,9 +16,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Forum
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -165,9 +169,35 @@ internal fun ProjectsScreen(
     modifier: Modifier = Modifier,
     onNewProject: (() -> Unit)? = null,
     nowMillis: Long = System.currentTimeMillis(),
+    names: Map<String, String> = emptyMap(),
+    sort: ProjectSort = ProjectSort.Recent,
+    onSort: (ProjectSort) -> Unit = {},
+    onRename: (String, String?) -> Unit = { _, _ -> },
+    suggestion: ProjectSuggestion? = null,
+    onAcceptSuggestion: (ProjectSuggestion) -> Unit = {},
+    onDismissSuggestion: (ProjectSuggestion) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
-    val visible = remember(projects, query) { filterProjects(orderProjects(projects), query) }
+    var sortMenu by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf<MobileProject?>(null) }
+    val visible = remember(projects, query, sort, names) { filterProjects(orderProjects(projects, sort, names), query) }
+    renaming?.let { project ->
+        var text by remember(project.projectKey) { mutableStateOf(names[project.projectKey] ?: project.displayLabel()) }
+        AlertDialog(
+            onDismissRequest = { renaming = null },
+            title = { Text("Projekt umbenennen") },
+            text = {
+                OutlinedTextField(value = text, onValueChange = { text = it }, singleLine = true, label = { Text("Name") })
+            },
+            confirmButton = { TextButton(onClick = { onRename(project.projectKey, text); renaming = null }, enabled = text.isNotBlank()) { Text("Speichern") } },
+            dismissButton = {
+                Row {
+                    if (names.containsKey(project.projectKey)) TextButton(onClick = { onRename(project.projectKey, null); renaming = null }) { Text("Zurücksetzen") }
+                    TextButton(onClick = { renaming = null }) { Text("Abbrechen") }
+                }
+            },
+        )
+    }
     Column(modifier.fillMaxSize().padding(top = 9.dp)) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 12.dp),
@@ -182,6 +212,17 @@ internal fun ProjectsScreen(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            androidx.compose.foundation.layout.Box {
+                TextButton(onClick = { sortMenu = true }) { Text(sort.label) }
+                DropdownMenu(expanded = sortMenu, onDismissRequest = { sortMenu = false }) {
+                    ProjectSort.values().forEach { option ->
+                        DropdownMenuItem(
+                            text = { Text(if (option == sort) "✓ ${option.label}" else option.label) },
+                            onClick = { sortMenu = false; onSort(option) },
+                        )
+                    }
+                }
+            }
             if (onNewProject != null) {
                 TextButton(onClick = onNewProject, enabled = online) { Text("Neues Projekt") }
             }
@@ -230,8 +271,30 @@ internal fun ProjectsScreen(
                 if (online && !canCreate) {
                     item { StatusMessage("Dieses Gerät darf keine Sessions anlegen.") }
                 }
+                if (suggestion != null) {
+                    item(key = "suggestion") {
+                        Surface(
+                            shape = RoundedCornerShape(15.dp),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        ) {
+                            Column(Modifier.fillMaxWidth().padding(13.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("Diese Chats scheinen zusammenzugehören", style = MaterialTheme.typography.titleSmall)
+                                suggestion.titles.take(4).forEach {
+                                    Text("• $it", style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    TextButton(onClick = { onAcceptSuggestion(suggestion) }) { Text("Projekt „${suggestion.name}“ anlegen") }
+                                    TextButton(onClick = { onDismissSuggestion(suggestion) }) { Text("Nicht jetzt") }
+                                }
+                            }
+                        }
+                    }
+                }
                 items(visible, key = { it.projectKey }) { project ->
                     ProjectRow(
+                        label = names[project.projectKey] ?: project.displayLabel(),
+                        onRename = if (project.projectKey == NoProjectKey) null else ({ renaming = project }),
                         project = project,
                         nowMillis = nowMillis,
                         canCreate = online && canCreate,
@@ -246,6 +309,8 @@ internal fun ProjectsScreen(
 
 @Composable
 private fun ProjectRow(
+    label: String,
+    onRename: (() -> Unit)?,
     project: MobileProject,
     nowMillis: Long,
     canCreate: Boolean,
@@ -266,7 +331,7 @@ private fun ProjectRow(
             Icon(Icons.Outlined.Forum, contentDescription = null, Modifier.size(18.dp), tint = colors.primary)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text(
-                    project.displayLabel(), style = MaterialTheme.typography.titleSmall,
+                    label, style = MaterialTheme.typography.titleSmall,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
                 project.pathHint?.takeIf { it.isNotBlank() }?.let {
@@ -275,6 +340,9 @@ private fun ProjectRow(
                 val detail = sessionCountText(project.sessionCount, project.activeCount) +
                     " · " + lastActivityText(project.lastActivity, nowMillis)
                 Text(detail, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (onRename != null) {
+                IconButton(onClick = onRename) { Icon(Icons.Outlined.Edit, "Projekt umbenennen", Modifier.size(18.dp)) }
             }
             IconButton(onClick = onNewSession, enabled = canCreate) {
                 Icon(Icons.Outlined.Add, "Neue Session in ${project.displayLabel()}", Modifier.size(20.dp))

@@ -492,7 +492,28 @@ internal open class MainActivity : ComponentActivity() {
                     }
                 }
                 BackendSwitch(local = state.local, enabled = !state.stopping, onSelect = { viewChosen = true; viewLocal = it })
+                val backendName = if (state.local) "local" else "cloud"
+                var projectNames by remember(backendName) { mutableStateOf(readProjectNames(this@MainActivity, backendName)) }
+                var projectSort by remember { mutableStateOf(readProjectSort(this@MainActivity)) }
+                var suggestion by remember(backendName) { mutableStateOf<ProjectSuggestion?>(null) }
+                LaunchedEffect(state.online, state.projects, backendName) {
+                    suggestion = if (!state.online) null else suggestProject(
+                        connection.unassignedRows(), readDismissedSuggestions(this@MainActivity),
+                    )
+                }
                 ProjectsScreen(
+                    names = projectNames,
+                    sort = projectSort,
+                    onSort = { projectSort = it; writeProjectSort(this@MainActivity, it) },
+                    onRename = { key, name -> projectNames = writeProjectName(this@MainActivity, backendName, key, name) },
+                    suggestion = suggestion,
+                    onAcceptSuggestion = { s ->
+                        val key = slugify(s.name)
+                        connection.assignMany(s.sessionIds, key)
+                        projectNames = writeProjectName(this@MainActivity, backendName, key, s.name)
+                        suggestion = null
+                    },
+                    onDismissSuggestion = { s -> dismissSuggestion(this@MainActivity, s.name); suggestion = null },
                     onNewProject = { newProjectOpen = true },
                     projects = state.projects,
                     loaded = state.projectsLoaded,

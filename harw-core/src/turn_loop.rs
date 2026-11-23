@@ -3979,6 +3979,10 @@ async fn run_turn_with_approvals(
             }
         };
         *session.history_mut() = history;
+        // Versehentlich mehrfach gesendete, identische Nachrichten bleiben nur einmal.
+        if session.history_mut().dedupe_consecutive_user_messages() > 0 {
+            let _ = store.save_history(session.id(), session.history()).await;
+        }
         // PL-97 H7: wie `hydrate_from_store` auch den Skill-Injektor.
         session.restore_skill_injector_from_store(store).await;
     }
@@ -3993,7 +3997,16 @@ async fn run_turn_with_approvals(
                 .history_mut()
                 .push_user_message(text, input.user_images);
         }
-        if let Err(error) = persist_last(session, store).await {
+        let persisted = if session.history_mut().dedupe_consecutive_user_messages() > 0 {
+            // Doppelt gesendet: nur eine Fassung bleibt, der Verlauf wird ersetzt statt angehängt.
+            store
+                .save_history(session.id(), session.history())
+                .await
+                .map_err(|error| state_store_error(error, "history save"))
+        } else {
+            persist_last(session, store).await
+        };
+        if let Err(error) = persisted {
             transition_after_turn_failure(session, &ctx, &error);
             return Err(error);
         }

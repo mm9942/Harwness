@@ -124,6 +124,23 @@ impl ConversationHistory {
         id
     }
 
+    /// Entfernt aufeinanderfolgende identische User-Nachrichten (ohne Agentenantwort dazwischen), etwa nach
+    /// versehentlichem Mehrfach-Senden. Behält die erste; liefert die Zahl entfernter Nachrichten.
+    pub fn dedupe_consecutive_user_messages(&mut self) -> usize {
+        let before = self.items.len();
+        let mut kept: Vec<TurnItem> = Vec::with_capacity(before);
+        for item in self.items.drain(..) {
+            if let (TurnItem::UserMessage(new), Some(TurnItem::UserMessage(last))) = (&item, kept.last())
+                && serde_json::to_value(&new.content).ok() == serde_json::to_value(&last.content).ok()
+            {
+                continue;
+            }
+            kept.push(item);
+        }
+        self.items = kept;
+        before - self.items.len()
+    }
+
     /// Komfort: eine User-Nachricht mit Text und gespeicherten Bildern anhängen.
     /// Die Bilder gehen vor dem Text in die Nachricht (so bevorzugt es u. a.
     /// Anthropic). Ist der Text leer, trägt die Nachricht nur die Bilder.

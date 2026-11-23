@@ -730,23 +730,13 @@ internal class HarwConnection(private val context: Context, private val localBac
                             note = "Modell „$model“ konnte nicht gesetzt werden: ${error.displayMessage()}"
                         }
                     }
+                    // Kein automatisches Projekt mehr aus der ersten Nachricht: der Chat bleibt "Ohne Projekt",
+                    // trägt aber den Themen-Titel. Zusammengehörige Chats schlägt die Projektliste später vor.
                     if (existing == null && topic.isNotBlank()) {
-                        val slug = slugify(topic)
-                        if (!supported) {
-                            note = NoProjectsSupportText
-                        } else {
-                            try {
-                                native.setProject(created.sessionId, slug)
-                                assigned = slug
-                            } catch (error: Exception) {
-                                if (error is CancellationException) throw error
-                                note = "Projekt „$slug“ konnte nicht angelegt werden: ${error.displayMessage()}. " + ServerCreatesNoProjectsText
-                            }
-                            try {
-                                native.renameSession(created.sessionId, topic)
-                            } catch (error: Exception) {
-                                if (error is CancellationException) throw error
-                            }
+                        try {
+                            native.renameSession(created.sessionId, topic)
+                        } catch (error: Exception) {
+                            if (error is CancellationException) throw error
                         }
                     }
                     created
@@ -1509,6 +1499,35 @@ internal class HarwConnection(private val context: Context, private val localBac
         projectMutation("Projekt zuweisen") { native ->
             native.setProject(sessionId, projectKey)
             ProjectChange.Remove(sessionId)
+        }
+    }
+
+    /** Sessions ohne Projekt (für Vorschläge zusammengehöriger Chats). */
+    suspend fun unassignedRows(): List<uniffi.harw_mobile_ffi.MobileSessionRow> {
+        val native = core ?: return emptyList()
+        if (!state.value.projectsSupported) return emptyList()
+        return try {
+            withContext(Dispatchers.IO) { native.listSessionsPage("", null, false, null, ProjectPageSize).sessions }
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            emptyList()
+        }
+    }
+
+    /** Ordnet mehrere Sessions einem Projekt zu (legt es dabei an, falls es das noch nicht gibt). */
+    fun assignMany(sessionIds: List<String>, projectKey: String) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        commands.launch {
+            try {
+                withContext(Dispatchers.IO) { sessionIds.forEach { native.setProject(it, projectKey) } }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+            }
+            if (generation == gate.generation) {
+                refreshSessions()
+                refreshProjectsQuietly()
+            }
         }
     }
 

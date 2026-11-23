@@ -102,3 +102,17 @@ internal fun applyViewing(entries: List<TranscriptEntry>, ui: VersionsUi): Pair<
     }
     return entries to Int.MAX_VALUE
 }
+
+/** Versehentlich mehrfach gesendete, identische Nachrichten ohne Antwort dazwischen zeigt die Ansicht nur einmal. */
+internal fun dedupeUserRuns(entries: List<TranscriptEntry>): List<TranscriptEntry> {
+    if (entries.size < 2) return entries
+    val out = ArrayList<TranscriptEntry>(entries.size)
+    for (entry in entries) {
+        val last = out.lastOrNull()
+        if (entry.kind == TranscriptKind.USER && last != null && last.kind == TranscriptKind.USER &&
+            last.text == entry.text && last.images.size == entry.images.size
+        ) continue
+        out.add(entry)
+    }
+    return out
+}
