@@ -58,10 +58,12 @@ internal fun ModelListDialog(store: ProviderStore, route: ProviderRoute, onDone:
     var saving by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var filter by remember { mutableStateOf("") }
+    var contextWindow by remember { mutableStateOf("128000") }
 
     LaunchedEffect(route.id) {
         val stored = withContext(Dispatchers.IO) { runCatching { store.routeModels(route.id) }.getOrDefault(emptyList()) }
         models = stored.ifEmpty { listOf(route.defaultModel).filter { it.isNotEmpty() } }.ifEmpty { listOf("") }
+        withContext(Dispatchers.IO) { runCatching { store.routeContextWindow(route.id) }.getOrNull() }?.let { contextWindow = it.toString() }
     }
 
     AlertDialog(
@@ -99,6 +101,14 @@ internal fun ModelListDialog(store: ProviderStore, route: ProviderRoute, onDone:
                     Icon(Icons.Filled.Add, contentDescription = null)
                     Text("  Modell hinzufügen")
                 }
+                OutlinedTextField(
+                    value = contextWindow,
+                    onValueChange = { contextWindow = it.filter { c -> c.isDigit() }.take(8) },
+                    singleLine = true,
+                    label = { Text("Kontextfenster (Token) aller Modelle") },
+                    supportingText = { Text("Bestimmt, wann der Chat verdichtet wird. Ohne Angabe gilt nur 32k.") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 HorizontalDivider()
                 OutlinedButton(
                     enabled = !probing && route.hasSecret,
@@ -175,7 +185,10 @@ internal fun ModelListDialog(store: ProviderStore, route: ProviderRoute, onDone:
                     error = null
                     scope.launch {
                         try {
-                            withContext(Dispatchers.IO) { store.setRouteModels(route.id, models.map { it.trim() }.filter { it.isNotEmpty() }) }
+                            withContext(Dispatchers.IO) {
+                                store.setRouteModels(route.id, models.map { it.trim() }.filter { it.isNotEmpty() })
+                                contextWindow.toULongOrNull()?.takeIf { it >= 4096uL }?.let { store.setRouteContextWindow(route.id, it) }
+                            }
                             onDone(true)
                         } catch (e: Exception) {
                             error = e.message ?: "Speichern fehlgeschlagen"

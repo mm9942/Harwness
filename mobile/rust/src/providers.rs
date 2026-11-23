@@ -301,6 +301,31 @@ impl ProviderStore {
         toml::from_str::<ProviderToml>(&rendered)
             .map_err(|_| internal("the rendered provider route is invalid"))?;
         write_private_atomic(&path, rendered.as_bytes())?;
+        let stored = self.load_route(&route_id)?.map(|p| p.models.clone()).unwrap_or_default();
+        self.ensure_model_files(&route_id, &stored, None);
+        Ok(())
+    }
+
+    /// Kontextfenster (Token) der Modelle dieses Providers; `None`, wenn keines festgelegt ist.
+    pub fn route_context_window(&self, route_id: String) -> Result<Option<u64>, MobileError> {
+        check_id(&route_id).map_err(|_| unknown_route())?;
+        let provider = self.load_route(&route_id)?.ok_or_else(unknown_route)?;
+        Ok(provider.models.first().and_then(|model| {
+            let text = std::fs::read_to_string(self.model_file(&route_id, model)).ok()?;
+            toml::from_str::<toml::Table>(&text).ok()?.get("context_window")?.as_integer().map(|n| n as u64)
+        }))
+    }
+
+    /// Setzt das Kontextfenster für alle Modelle dieses Providers. Es bestimmt, wann der Chat verdichtet wird; ein
+    /// unbekanntes Modell gilt sonst nur als 32k groß und wird viel zu früh gekürzt.
+    pub fn set_route_context_window(&self, route_id: String, tokens: u64) -> Result<(), MobileError> {
+        check_id(&route_id).map_err(|_| unknown_route())?;
+        if !(4_096..=2_000_000).contains(&tokens) {
+            return Err(MobileError::Session { detail: "Kontextfenster muss zwischen 4096 und 2000000 Token liegen".into() });
+        }
+        let _guard = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let provider = self.load_route(&route_id)?.ok_or_else(unknown_route)?;
+        self.ensure_model_files(&route_id, &provider.models, Some(tokens));
         Ok(())
     }
 
@@ -1211,6 +1236,38 @@ mod tests {
             assert!(keystore.stored("route-local").is_none());
             assert!(store.home().active_route()?.is_none());
             Ok(())
+        }
+    }
+}
+
+impl ProviderStore {
+    fn model_file(&self, route_id: &str, model: &str) -> std::path::PathBuf {
+        let safe: String = format!("{route_id}--{model}")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+            .collect();
+        self.home.home().join("models").join(format!("{safe}.toml"))
+    }
+
+    /// Legt je Modell eine Modelldatei mit Kontextfenster an (Standard 128k) oder setzt das Fenster neu (`force`).
+    fn ensure_model_files(&self, route_id: &str, models: &[String], force: Option<u64>) {
+        let dir = self.home.home().join("models");
+        if crate::home::create_private_dir(&dir).is_err() {
+            return;
+        }
+        for model in models {
+            let path = self.model_file(route_id, model);
+            if force.is_none() && path.exists() {
+                continue;
+            }
+            let window = force.unwrap_or(128_000);
+            let mut table = toml::Table::new();
+            table.insert("id".into(), toml::Value::String(model.clone()));
+            table.insert("provider".into(), toml::Value::String(route_id.to_owned()));
+            table.insert("context_window".into(), toml::Value::Integer(window as i64));
+            if let Ok(rendered) = toml::to_string(&table) {
+                let _ = write_private_atomic(&path, rendered.as_bytes());
+            }
         }
     }
 }
