@@ -2175,10 +2175,13 @@ async fn submit(
                 .as_ref()
                 .is_ok_and(|receipt| receipt.outcome == SubmitOutcome::Accepted)
                 && state.same_link(&link)
-                && rewind_before.is_none()
                 && let Ok(session) = state.session_mut(&id)
             {
-                session.echo_prompt(&id, displayed, &client_message_id, text);
+                if rewind_before.is_none() {
+                    session.echo_prompt(&id, displayed, &client_message_id, text);
+                } else {
+                    session.expect_history_replace();
+                }
                 shared.notifier.session(id.as_str());
             }
             let keep = match &result {

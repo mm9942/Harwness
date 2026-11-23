@@ -30,6 +30,8 @@ pub(crate) struct SessionState {
     running_turn: Option<TurnId>,
     head: Option<Cursor>,
     replay_target: Option<Cursor>,
+    /// Nach einem "Neu senden" (rewind_before) erwartet: der nächste *live* gemeldete Verlaufsersatz lädt den Chat neu.
+    expect_history_replace: bool,
     host_epoch: Option<u64>,
     granted: ClientCaps,
     ready: bool,
@@ -264,7 +266,15 @@ impl SessionState {
             SessionFrame::HostDraining { retry_after_ms } => {
                 return FrameAction::Draining(*retry_after_ms);
             }
-            SessionFrame::Resync { .. } | SessionFrame::HistoryReplaced { .. } => {
+            SessionFrame::HistoryReplaced { .. } if self.expect_history_replace => {
+                // Nur der durch unser Neu-Senden ausgelöste, live gemeldete Ersatz lädt neu; beim Wiederholen alter
+                // Verlaufsersätze (Replay beim Anhängen, Verdichtung) wird er ignoriert, sonst entstünde eine Schleife.
+                self.expect_history_replace = false;
+                self.reset_view();
+                self.begin_attach("Refreshing transcript after your edit");
+                return FrameAction::Reattach(None);
+            }
+            SessionFrame::Resync { .. } => {
                 self.reset_view();
                 self.begin_attach("Refreshing transcript after a server history change");
                 return FrameAction::Reattach(None);
@@ -537,6 +547,11 @@ impl SessionState {
             cursor: envelope.cursor,
             frame: SessionFrame::Turn(projected),
         });
+    }
+
+    /// Merkt, dass ein Neu-Senden (rewind_before) lief und der Verlaufsersatz erwartet wird.
+    pub fn expect_history_replace(&mut self) {
+        self.expect_history_replace = true;
     }
 
     pub fn echo_prompt(
