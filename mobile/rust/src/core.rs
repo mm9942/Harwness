@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use harw_node_transport::{LocalNode, NodeBody, empty_body};
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams,
+    ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams, ForkFrom,
     Cursor, DEFAULT_TAIL_ITEMS, HolderInfo, InterruptParams, PageParams, ProjectsParams,
     MediaGetParams, RenameParams, RespondResult, SessionFrame, SetModelParams, SetProjectParams, StreamProfile, SubmitImage,
     SubmitParams, SubmitResult, HostedState, features,
@@ -744,6 +744,34 @@ impl MobileCore {
             let params = CreateParams {
                 workspace: None,
                 title,
+                fork_from: None,
+            };
+            let created = link.request(link.backend.port().create(params)).await?;
+            shared.notifier.sessions();
+            Ok(created.into())
+        })
+    }
+
+    /// Legt eine neue Session an, die den Verlauf der Quelle bis vor der User-Nachricht `before_item` übernimmt (Fork).
+    pub fn fork_session(
+        &self,
+        source_session_id: String,
+        before_item: String,
+        title: Option<String>,
+    ) -> Result<MobileSession, MobileError> {
+        let source = parse_session_id(source_session_id)?;
+        let link = self.shared.state().active()?;
+        if !link.backend.granted().steer {
+            return Err(MobileError::Denied {
+                detail: "This device cannot create sessions".into(),
+            });
+        }
+        let shared = Arc::clone(&self.shared);
+        self.run(async move {
+            let params = CreateParams {
+                workspace: None,
+                title,
+                fork_from: Some(ForkFrom { session_id: source, before_item }),
             };
             let created = link.request(link.backend.port().create(params)).await?;
             shared.notifier.sessions();

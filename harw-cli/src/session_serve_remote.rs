@@ -997,6 +997,7 @@ mod tests {
             .create(CreateParams {
                 title: Some("desktop".into()),
                 workspace: None,
+                fork_from: None,
             })
             .await?;
         assert_eq!(session.tenant.as_ref(), Some(&tenant));
@@ -1011,6 +1012,7 @@ mod tests {
             .create(CreateParams {
                 title: Some("phone".into()),
                 workspace: None,
+                fork_from: None,
             })
             .await?;
         assert!(

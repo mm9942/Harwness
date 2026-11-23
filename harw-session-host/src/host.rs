@@ -2761,6 +2761,21 @@ impl HostConnection {
         }
     }
 
+    /// Fork: the caller must be able to see the source session (same rule as steering it).
+    async fn fork_into(&self, new: &SessionId, fork: &harw_protocol::session_wire::ForkFrom) -> Result<(), HostError> {
+        if fork.before_item.is_empty()
+            || fork.before_item.len() > 128
+            || !fork.before_item.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(HostError::Denied("invalid fork target".into()));
+        }
+        self.profile_target(&fork.session_id)?;
+        self.host
+            .driver
+            .fork_history(new, &fork.session_id, &fork.before_item)
+            .await
+    }
+
     async fn create_in_inner(&self, params: CreateInParams) -> Result<SessionSummary, HostError> {
         let share = self.steering_share()?;
         let project = share
@@ -3620,6 +3635,9 @@ impl SessionPort for HostConnection {
                     .driver
                     .create_session(&record.session_id, record.title.as_deref())
                     .await?;
+                if let Some(fork) = &params.fork_from {
+                    self.fork_into(&record.session_id, fork).await?;
+                }
                 self.host.records.save(&record)?;
                 let slot = self.host.insert_slot(record)?;
                 let summary = self.host.summary(&*slot.lock()?);

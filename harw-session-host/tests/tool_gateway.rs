@@ -1013,6 +1013,7 @@ async fn tool_call_into_a_foreign_session_of_the_same_tenant_is_refused() -> Tes
         .create(CreateParams {
             workspace: Some("w".into()),
             title: None,
+            fork_from: None,
         })
         .await?
         .session_id;

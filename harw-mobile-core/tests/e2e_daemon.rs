@@ -201,6 +201,7 @@ async fn a_phone_resolves_a_parked_approval_over_the_real_daemon() -> TestResult
         .create(CreateParams {
             workspace: None,
             title: Some("phone e2e".to_owned()),
+            fork_from: None,
         })
         .await?
         .session_id;
@@ -278,6 +279,7 @@ async fn a_second_device_sees_the_approval_and_the_first_decision_wins() -> Test
         .create(CreateParams {
             workspace: None,
             title: None,
+            fork_from: None,
         })
         .await?
         .session_id;

@@ -272,6 +272,16 @@ pub trait TurnDriver: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Fill the freshly created session `new` with the history of `source` before its user message `before_item`.
+    fn fork_history(
+        &self,
+        _new: &SessionId,
+        _source: &SessionId,
+        _before_item: &str,
+    ) -> DriverFuture<'_, ()> {
+        Box::pin(async { Err(HostError::Driver("driver does not support fork".into())) })
+    }
+
     /// Prepare durable state for a new session (transcript, meta).
     fn create_session(&self, session_id: &SessionId, title: Option<&str>) -> DriverFuture<'_, ()>;
 

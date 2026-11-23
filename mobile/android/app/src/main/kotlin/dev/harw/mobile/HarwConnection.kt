@@ -1598,6 +1598,39 @@ internal class HarwConnection(private val context: Context, private val localBac
         }
     }
 
+    /** Fork: neue Session mit dem Verlauf der Quelle bis vor der Nachricht [beforeItem]; bleibt im selben Projekt. */
+    fun forkSession(sourceId: String, beforeItem: String, projectKey: String?, select: (String) -> Unit, failed: (String) -> Unit) {
+        val generation = gate.generation ?: return
+        val native = core ?: return
+        val current = state.value
+        if (!current.canCreate || current.creating) return
+        change { it.copy(creating = true, listError = null) }
+        commands.launch {
+            try {
+                val session = withContext(Dispatchers.IO) {
+                    val created = native.forkSession(sourceId, beforeItem, null)
+                    val key = projectKey?.takeIf { it.isNotEmpty() && it != NoProjectKey }
+                    if (key != null) {
+                        try { native.setProject(created.sessionId, key) } catch (error: Exception) {
+                            if (error is CancellationException) throw error
+                        }
+                    }
+                    created
+                }
+                if (generation == gate.generation) {
+                    change { it.copy(sessions = listOf(session) + it.sessions.filterNot { existing -> existing.sessionId == session.sessionId }) }
+                    select(session.sessionId)
+                    refreshSessions()
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (generation == gate.generation) failed("Fork: ${error.displayMessage()}")
+            } finally {
+                change { it.copy(creating = false) }
+            }
+        }
+    }
+
     fun submit(sessionId: String, generation: Long, attempt: DraftAttempt, result: (DraftResult) -> Unit): Boolean =
         runAction(sessionId, generation, SessionActionKind.Send, failure = { error ->
             result(DraftResult.Rejected(error.displayMessage(), error is MobileException.Ambiguous))

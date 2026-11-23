@@ -31,6 +31,7 @@ async fn session_id(port: &Arc<dyn SessionPort>, args: &Args) -> Result<SessionI
             .create(CreateParams {
                 workspace: None,
                 title: args.title.clone(),
+                fork_from: None,
             })
             .await
             .map_err(|e| format!("create: {e}"))?;

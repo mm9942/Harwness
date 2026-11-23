@@ -964,6 +964,7 @@ mod tests {
             .create(CreateParams {
                 workspace: None,
                 title: Some("t".into()),
+                fork_from: None,
             })
             .await?;
         drop(port);

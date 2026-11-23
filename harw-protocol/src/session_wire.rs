@@ -851,6 +851,19 @@ pub struct CreateParams {
     pub workspace: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Fork: the new session starts with the history of `fork_from.session_id` up to (excluding) the user message
+    /// `fork_from.before_item`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_from: Option<ForkFrom>,
+}
+
+/// Source of a forked session (`session.create` with `fork_from`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkFrom {
+    pub session_id: SessionId,
+    /// Item id of a user message of the source session; the fork keeps everything before it.
+    pub before_item: String,
 }
 
 /// Default number of durable items sent on an attach without a cursor.

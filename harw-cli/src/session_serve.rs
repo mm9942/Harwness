@@ -701,6 +701,7 @@ mod tests {
             .create(CreateParams {
                 workspace: None,
                 title: Some("e2e".to_owned()),
+                fork_from: None,
             })
             .await?;
         let session = created.session_id;

@@ -221,6 +221,7 @@ impl RemoteHarwness {
             .create(CreateParams {
                 workspace: None,
                 title: title.map(str::to_owned),
+                fork_from: None,
             })
             .await
             .map_err(session_error)?;

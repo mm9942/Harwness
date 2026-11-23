@@ -933,6 +933,7 @@ fn smoke_test(binaries: &Binaries) -> Result<()> {
             .create(CreateParams {
                 workspace: None,
                 title: Some("Desktop smoke B".into()),
+                fork_from: None,
             })
             .await?;
         Ok::<_, Box<dyn std::error::Error>>(session.session_id.as_str().to_owned())

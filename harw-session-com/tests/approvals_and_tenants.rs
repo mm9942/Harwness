@@ -195,6 +195,7 @@ async fn two_clients_race_for_one_approval_and_exactly_one_wins() -> TestResult 
         .create(CreateParams {
             workspace: None,
             title: Some("race".into()),
+            fork_from: None,
         })
         .await?
         .session_id;

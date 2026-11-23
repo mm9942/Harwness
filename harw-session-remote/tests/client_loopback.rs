@@ -189,6 +189,8 @@ fn titled(title: &str) -> CreateParams {
     CreateParams {
         workspace: None,
         title: Some(title.to_owned()),
+    fork_from: None,
+        fork_from: None,
     }
 }
 

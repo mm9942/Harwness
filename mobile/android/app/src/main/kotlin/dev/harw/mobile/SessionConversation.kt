@@ -426,10 +426,9 @@ internal fun SessionConversation(
                 fetchMedia = { ref -> connection.mediaThumbnail(sessionId, ref) },
                 onRegenerate = resend,
                 versionsUi = versionsUi,
-                onFork = { text, images ->
+                onFork = { entryId, text, images ->
                     val open = { id: String -> window.prefillDraft(id, text, images); window.projectKey?.let { applyProjectAgent(ctx, it, id) }; window.select(id) }
-                    val project = window.projectKey
-                    if (project != null) connection.createInProject(project, open) else connection.createSession(null, open)
+                    connection.forkSession(sessionId, entryId, window.projectKey, open) { message -> android.widget.Toast.makeText(ctx, message, android.widget.Toast.LENGTH_LONG).show() }
                 },
                 liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
                 jumpToLatest = transcriptJump,
@@ -483,7 +482,7 @@ private fun ConversationFeed(
     sentImages: (String, Int) -> List<uniffi.harw_mobile_ffi.PromptImage>?,
     fetchMedia: suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?,
     onRegenerate: ((String, String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
-    onFork: ((String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
+    onFork: ((String, String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
     versionsUi: VersionsUi? = null,
     liveText: String?,
     jumpToLatest: Int,
@@ -554,7 +553,7 @@ private fun ConversationFeed(
                     label, shownText, entry.kind, imageCount = count, thumbs = thumbs,
                     imageRefs = entry.images, fetchMedia = fetchMedia,
                     onRegenerate = if (canAct) onRegenerate?.let { cb -> { cb(entry.id, shownText, thumbs.orEmpty()) } } else null,
-                    onFork = onFork?.let { cb -> { cb(forkText(shown, entry, shownText), thumbs.orEmpty()) } },
+                    onFork = onFork?.let { cb -> { cb(entry.id, shownText, thumbs.orEmpty()) } },
                     onEdit = if (canAct && versionsUi != null) ({ newText -> versionsUi.onEdit(entry, anchor, newText, thumbs.orEmpty()) }) else null,
                     nav = nav,
                     oldVersion = viewingIdx != null && index >= 0 && !canAct,

@@ -137,6 +137,16 @@ pub trait CoreRuntime: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Copy the history of `source` before its user message `before_item` into the new session `new`.
+    fn fork_history<'a>(
+        &'a self,
+        _new: &'a SessionId,
+        _source: &'a SessionId,
+        _before_item: &'a str,
+    ) -> CoreFuture<'a, ()> {
+        Box::pin(async { Err(DriverBridgeError::Runtime("runtime does not support fork".into())) })
+    }
+
     /// Prepare the session (idempotent).
     fn open_session<'a>(
         &'a self,
@@ -714,6 +724,21 @@ impl TurnDriver for CoreTurnDriver {
             .map_err(HostError::from)
     }
 
+    fn fork_history(
+        &self,
+        new: &SessionId,
+        source: &SessionId,
+        before_item: &str,
+    ) -> DriverFuture<'_, ()> {
+        let (new, source, before) = (new.clone(), source.clone(), before_item.to_owned());
+        Box::pin(async move {
+            self.runtime
+                .fork_history(&new, &source, &before)
+                .await
+                .map_err(HostError::from)
+        })
+    }
+
     fn create_session(&self, session_id: &SessionId, title: Option<&str>) -> DriverFuture<'_, ()> {
         let session_id = session_id.clone();
         let title = title.map(str::to_owned);
@@ -1182,6 +1207,36 @@ impl CoreRuntime for HarwCoreRuntime {
         title: Option<&'a str>,
     ) -> CoreFuture<'a, ()> {
         Box::pin(async move { self.slot(session_id, title).await.map(|_| ()) })
+    }
+
+    fn fork_history<'a>(
+        &'a self,
+        new: &'a SessionId,
+        source: &'a SessionId,
+        before_item: &'a str,
+    ) -> CoreFuture<'a, ()> {
+        Box::pin(async move {
+            let source_slot = self.slot(source, None).await?;
+            let items: Vec<harw_protocol::items::TurnItem> =
+                source_slot.lock().await.core.session.history().items().to_vec();
+            let Some(index) = items.iter().position(|item| {
+                matches!(item, harw_protocol::items::TurnItem::UserMessage(m) if m.id.as_str() == before_item)
+            }) else {
+                return Err(DriverBridgeError::Runtime(
+                    "fork target is not a user message of the source session".into(),
+                ));
+            };
+            let target_slot = self.slot(new, None).await?;
+            let mut guard = target_slot.lock().await;
+            *guard.core.session.history_mut() =
+                harw_core::ConversationHistory::from_items(items[..index].to_vec());
+            guard
+                .core
+                .store
+                .save_history(new, guard.core.session.history())
+                .await
+                .map_err(|error| DriverBridgeError::Core(error.to_string()))
+        })
     }
 
     fn run_turn<'a>(
