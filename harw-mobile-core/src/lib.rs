@@ -70,6 +70,8 @@ pub enum EntryKind {
     User(String),
     /// What the agent answered.
     Assistant(String),
+    /// Provider-supplied display text, separate from the assistant answer.
+    Reasoning(String),
     /// A tool call.
     Tool {
         /// Tool name.
@@ -250,7 +252,18 @@ impl SessionView {
                 },
             ),
             TurnItem::Error(e) => (e.id.as_str(), EntryKind::Error(e.message.clone())),
-            TurnItem::ToolResult(_) | TurnItem::Reasoning(_) => return,
+            TurnItem::Reasoning(reasoning) => {
+                // This is the same display field as Harw TUI. Never expose raw_content.
+                let text = reasoning.summary_text.join("\n");
+                if text.trim().is_empty() {
+                    return;
+                }
+                let cut = text.floor_char_boundary(
+                    text.len().min(harw_protocol::session_wire::MAX_VISIBLE_REASONING_BYTES),
+                );
+                (reasoning.id.as_str(), EntryKind::Reasoning(text[..cut].to_owned()))
+            }
+            TurnItem::ToolResult(_) => return,
         };
         if self.transcript.iter().any(|entry| entry.key == key) {
             return;
@@ -610,6 +623,25 @@ mod tests {
     }
 
     #[test]
+    fn only_user_visible_reasoning_survives_durable_replay() -> TestResult {
+        let mut view = SessionView::new();
+        let item_with_reasoning = |id: &str, summary_text: Vec<String>| {
+            TurnItem::Reasoning(harw_protocol::items::ReasoningItem {
+                id: harw_types::ItemId::from_str(id),
+                summary_text,
+                raw_content: vec!["do not render this".to_owned()],
+            })
+        };
+        view.apply(&item(1, item_with_reasoning("public", vec!["Provider-visible reasoning".into()])));
+        view.apply(&item(2, item_with_reasoning("private", Vec::new())));
+        ensure(view.transcript().len() == 1, "ignore opaque-only reasoning")?;
+        ensure(
+            view.transcript()[0].kind == EntryKind::Reasoning("Provider-visible reasoning".to_owned()),
+            "show only the public display text",
+        )
+    }
+
+    #[test]
     fn partial_text_is_shown_until_the_full_message_or_the_turn_end() -> TestResult {
         let mut view = SessionView::new();
         let snapshot = |durable: u64, text: &str| {
@@ -619,6 +651,7 @@ mod tests {
                     turn_id: TurnId::from_str("t1"),
                     assistant_text: text.to_owned(),
                     reasoning_collapsed: true,
+                    reasoning_text: None,
                 },
             )
         };

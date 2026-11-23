@@ -375,12 +375,25 @@ impl AnthropicStreamAccumulator {
                 message: "Anthropic stream ended before message_start".into(),
             });
         }
-        for index in 0..self.blocks.len() {
-            if !self.partial_json[index].is_empty() {
-                self.finish_block(index)?;
+        let refused = self.message.get("stop_reason").and_then(Value::as_str) == Some("refusal");
+        if !refused {
+            for index in 0..self.blocks.len() {
+                if !self.partial_json[index].is_empty() {
+                    self.finish_block(index)?;
+                }
             }
         }
-        let blocks = self.blocks.into_iter().filter(|b| !b.is_null()).collect();
+        let blocks = self
+            .blocks
+            .into_iter()
+            .filter(|block| {
+                if refused {
+                    block.get("type").and_then(Value::as_str) == Some("text")
+                } else {
+                    !block.is_null()
+                }
+            })
+            .collect();
         self.message.insert("content".into(), Value::Array(blocks));
         self.message
             .insert("usage".into(), Value::Object(self.usage));
@@ -567,6 +580,13 @@ fn emit_live(sink: Option<&StreamSink>, outputs: Vec<LiveOut>) {
     }
 }
 
+/// The result of a native SSE reader. A clean HTTP EOF is not a provider
+/// finish reason and must never be inserted into the reconstructed JSON.
+pub(crate) enum NativeStreamOutcome {
+    Completed(Value),
+    InterruptedChat(harw_core::ModelResponse),
+}
+
 /// Baut aus `chat.completion.chunk`-Events einen `chat.completion`-Body.
 #[derive(Debug, Default)]
 pub(crate) struct ChatStreamAccumulator {
@@ -574,6 +594,7 @@ pub(crate) struct ChatStreamAccumulator {
     model: Option<Value>,
     content: String,
     reasoning: String,
+    refusal: String,
     has_content: bool,
     tool_calls: Vec<Map<String, Value>>,
     finish_reason: Option<Value>,
@@ -630,7 +651,11 @@ impl ChatStreamAccumulator {
         else {
             return Ok(false);
         };
-        let finished = choice.get("finish_reason").filter(|r| !r.is_null());
+        let finished = choice.get("finish_reason").filter(|reason| {
+            reason
+                .as_str()
+                .is_some_and(|reason| !reason.trim().is_empty())
+        });
         if let Some(reason) = finished {
             self.finish_reason = Some(reason.clone());
         }
@@ -647,6 +672,11 @@ impl ChatStreamAccumulator {
         }
         if finished.is_some() {
             emit_live(sink, self.live.flush());
+        }
+        if let Some(fragment) = delta.get("refusal").and_then(Value::as_str) {
+            let remaining =
+                crate::error::MAX_REFUSAL_DETAIL_CHARS.saturating_sub(self.refusal.chars().count());
+            self.refusal.extend(fragment.chars().take(remaining));
         }
         for key in ["reasoning_content", "reasoning"] {
             if let Some(text) = delta.get(key).and_then(Value::as_str) {
@@ -702,11 +732,27 @@ impl ChatStreamAccumulator {
         Ok(false)
     }
 
-    /// Der rekonstruierte `chat.completion`-Body.
-    pub(crate) fn finish(self) -> Result<Value, ModelError> {
-        if !self.done && self.finish_reason.is_none() && self.id.is_none() {
-            return Err(ModelError::Truncated {
-                message: "chat stream ended without any chunk".into(),
+    /// Reconstructs a completed body or keeps only the answer prefix after
+    /// EOF. Incomplete tool calls and reasoning must never become accepted
+    /// output or enter replay.
+    pub(crate) fn finish(self) -> NativeStreamOutcome {
+        if !self.done && self.finish_reason.is_none() {
+            let text: String = LiveTextFilter::default()
+                .push(&self.content)
+                .into_iter()
+                .filter_map(|output| match output {
+                    LiveOut::Text(text) => Some(text),
+                    LiveOut::Reasoning(_) => None,
+                })
+                .collect();
+            return NativeStreamOutcome::InterruptedChat(harw_core::ModelResponse {
+                message: (!text.is_empty()).then_some(text),
+                stop: harw_core::model::StopReason::StreamInterrupted,
+                usage: crate::extract_openai_usage(
+                    &serde_json::json!({ "usage": self.usage }),
+                    crate::Transport::Chat,
+                ),
+                ..Default::default()
             });
         }
         let mut message = Map::new();
@@ -722,6 +768,9 @@ impl ChatStreamAccumulator {
         if !self.reasoning.is_empty() {
             message.insert("reasoning_content".into(), Value::String(self.reasoning));
         }
+        if !self.refusal.trim().is_empty() {
+            message.insert("refusal".into(), Value::String(self.refusal));
+        }
         if !self.tool_calls.is_empty() {
             message.insert(
                 "tool_calls".into(),
@@ -734,7 +783,7 @@ impl ChatStreamAccumulator {
         choice.insert(
             "finish_reason".into(),
             self.finish_reason
-                .unwrap_or_else(|| Value::String(if self.done { "stop" } else { "length" }.into())),
+                .unwrap_or_else(|| Value::String("stop".into())),
         );
         let mut body = Map::new();
         body.insert("object".into(), Value::String("chat.completion".into()));
@@ -748,7 +797,7 @@ impl ChatStreamAccumulator {
         if let Some(usage) = self.usage {
             body.insert("usage".into(), usage);
         }
-        Ok(Value::Object(body))
+        NativeStreamOutcome::Completed(Value::Object(body))
     }
 }
 
@@ -856,6 +905,15 @@ mod tests {
             }
         });
         (sink, seen)
+    }
+
+    fn completed_chat_body(
+        acc: ChatStreamAccumulator,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        match acc.finish() {
+            NativeStreamOutcome::Completed(body) => Ok(body),
+            NativeStreamOutcome::InterruptedChat(_) => Err("unexpected stream interruption".into()),
+        }
     }
 
     fn decode_all(raw: &str) -> Result<Vec<SseFrame>, ModelError> {
@@ -991,7 +1049,7 @@ mod tests {
             stopped |= acc.push(&frame, Some(&sink))?;
         }
         assert!(stopped);
-        let body = acc.finish()?;
+        let body = completed_chat_body(acc)?;
         let message = &body["choices"][0]["message"];
         assert_eq!(message["content"], "Hi");
         assert_eq!(message["tool_calls"][0]["id"], "call_1");
@@ -1004,6 +1062,151 @@ mod tests {
         assert_eq!(body["usage"]["prompt_tokens"], 7);
         let events = seen.lock().map(|g| g.clone()).unwrap_or_default();
         assert!(events.contains(&ModelStreamEvent::TextDelta("Hi".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn chat_stream_keeps_explicit_finish_reason_without_done_sentinel() -> TestResult {
+        for (reason, expected) in [
+            ("length", harw_core::model::StopReason::MaxTokens),
+            (
+                "content_filter",
+                harw_core::model::StopReason::ContentFilter,
+            ),
+        ] {
+            let raw = format!(
+                r#"data: {{"id":"c1","choices":[{{"delta":{{"content":"partial"}},"finish_reason":"{reason}"}}]}}"#,
+            );
+            let mut acc = ChatStreamAccumulator::default();
+            for frame in decode_all(&format!("{raw}\n\n"))? {
+                assert!(!acc.push(&frame, None)?);
+            }
+            let body = completed_chat_body(acc)?;
+            assert_eq!(body["choices"][0]["finish_reason"], reason);
+            assert_eq!(
+                crate::interpret_chat(&body, "fixture", "m", &[])?.stop,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn chat_refusal_deltas_survive_partial_text_without_accepting_tools() -> TestResult {
+        use harw_core::model::StopReason;
+        for (reason, expected) in [
+            (
+                "stop",
+                StopReason::Refusal {
+                    detail: Some("Not available.".into()),
+                },
+            ),
+            ("length", StopReason::MaxTokens),
+            ("content_filter", StopReason::ContentFilter),
+        ] {
+            let events = [
+                serde_json::json!({"choices":[{"delta":{"content":"An initial sentence. "}}]}),
+                serde_json::json!({"choices":[{"delta":{
+                    "refusal":"Not ",
+                    "tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{"}}],
+                }}]}),
+                serde_json::json!({"choices":[{"delta":{"refusal":"available."},"finish_reason":reason}]}),
+            ];
+            let mut acc = ChatStreamAccumulator::default();
+            for event in events {
+                assert!(!acc.push(
+                    &SseFrame {
+                        event: None,
+                        data: event.to_string()
+                    },
+                    None
+                )?);
+            }
+            let body = completed_chat_body(acc)?;
+            let response = crate::interpret_chat(&body, "fixture", "m", &["lookup"])?;
+            assert_eq!(response.message.as_deref(), Some("An initial sentence. "));
+            assert_eq!(response.stop, expected);
+            assert!(response.tool_calls.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_stream_keeps_refusal_detail_with_partial_text() -> TestResult {
+        use harw_core::model::StopReason;
+        let events = [
+            serde_json::json!({"type":"message_start","message":{"content":[],"stop_reason":null}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"An initial sentence."}}),
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}}),
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{"}}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{
+                "type":"refusal","explanation":"Policy reason."
+            }}}),
+            serde_json::json!({"type":"message_stop"}),
+        ];
+        let mut acc = AnthropicStreamAccumulator::default();
+        for event in events {
+            acc.push(
+                &SseFrame {
+                    event: None,
+                    data: event.to_string(),
+                },
+                None,
+            )?;
+        }
+        let body = acc.finish()?;
+        assert_eq!(
+            crate::anthropic::extract_anthropic_stop_reason(&body),
+            StopReason::Refusal {
+                detail: Some("Policy reason.".into())
+            },
+        );
+        assert_eq!(body["content"][0]["text"], "An initial sentence.");
+        Ok(())
+    }
+
+    #[test]
+    fn chat_stream_distinguishes_bare_eof_from_done_without_reason() -> TestResult {
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let frames = decode_all(raw)?;
+        let mut acc = ChatStreamAccumulator::default();
+        for frame in &frames {
+            assert!(!acc.push(frame, None)?);
+        }
+        let NativeStreamOutcome::InterruptedChat(partial) = acc.finish() else {
+            return Err("missing terminal event is an interruption".into());
+        };
+        assert_eq!(
+            partial.stop,
+            harw_core::model::StopReason::StreamInterrupted
+        );
+        assert_eq!(partial.message.as_deref(), Some("partial"));
+
+        let mut acc = ChatStreamAccumulator::default();
+        for frame in &frames {
+            assert!(!acc.push(frame, None)?);
+        }
+        for frame in decode_all("data: [DONE]\n\n")? {
+            assert!(acc.push(&frame, None)?);
+        }
+        let body = completed_chat_body(acc)?;
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_chat_stream_has_an_interruption_without_fabricated_content() -> TestResult {
+        let NativeStreamOutcome::InterruptedChat(partial) =
+            ChatStreamAccumulator::default().finish()
+        else {
+            return Err("empty stream had no terminal event".into());
+        };
+        assert_eq!(
+            partial.stop,
+            harw_core::model::StopReason::StreamInterrupted
+        );
+        assert!(partial.message.is_none());
+        assert!(partial.tool_calls.is_empty());
         Ok(())
     }
 
@@ -1038,7 +1241,7 @@ mod tests {
         for frame in decode_all(&raw)? {
             acc.push(&frame, Some(&sink))?;
         }
-        let body = acc.finish()?;
+        let body = completed_chat_body(acc)?;
         let events = seen.lock().map(|g| g.clone()).unwrap_or_default();
         let text: String = events
             .iter()
@@ -1121,7 +1324,7 @@ mod tests {
             },
             Some(&sink),
         )?;
-        let body = acc.finish()?;
+        let body = completed_chat_body(acc)?;
         assert!(body["choices"][0]["message"]["content"].is_null());
         assert_eq!(
             body["choices"][0]["message"]["reasoning_content"],

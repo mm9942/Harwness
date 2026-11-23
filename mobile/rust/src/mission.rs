@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 
 use harw_protocol::TurnEvent;
 use harw_protocol::items::TurnItem;
+use harw_types::TurnId;
 
 use crate::{
     FinishedCategory, MobileAgent, MobileAgentState, MobileJob, ReasoningKind, ReasoningLine,
@@ -26,6 +27,7 @@ const OTHER_LABEL: &str = "other";
 
 struct AgentRec {
     agent: MobileAgent,
+    last_started_turn: Option<TurnId>,
     terminal: bool,
     outcome: Option<Outcome>,
 }
@@ -111,10 +113,14 @@ impl Mission {
         // The root agent exists from the first event on, and sorts first.
         self.agent_mut(ROOT_ID, None, ROOT_ROLE);
         match event {
-            TurnEvent::TurnStarted { .. } => {
+            TurnEvent::TurnStarted { turn_id, .. } => {
                 // A new run of a finished agent counts (and finishes) again.
                 let index = self.agent_index(id, parent, role);
                 let rec = &mut self.agents[index];
+                if rec.last_started_turn.as_ref() != Some(turn_id) {
+                    rec.last_started_turn = Some(turn_id.clone());
+                    rec.agent.started_ms = now_ms();
+                }
                 rec.terminal = false;
                 rec.outcome = None;
                 rec.agent.state = MobileAgentState::Running;
@@ -299,6 +305,7 @@ impl Mission {
                         started_ms: now_ms(),
                         tool_calls: 0,
                     },
+                    last_started_turn: None,
                     terminal: false,
                     outcome: None,
                 });
@@ -572,6 +579,30 @@ mod tests {
             .iter()
             .find(|category| category.label == label)
             .ok_or_else(|| format!("missing category {label}").into())
+    }
+
+    #[test]
+    fn new_turn_restarts_clock_but_replayed_start_does_not() -> TestResult {
+        let mut mission = Mission::default();
+        mission.set_root_state(MobileAgentState::Done);
+        mission.agents[0].agent.started_ms = 0;
+        let start = TurnEvent::TurnStarted {
+            turn_id: TurnId::try_from_str("first")?,
+            thread_id: ThreadId::try_from_str("thread")?,
+        };
+        mission.root_event(&start);
+        assert_ne!(mission.agents()[0].started_ms, 0);
+
+        mission.agents[0].agent.started_ms = 1;
+        mission.root_event(&start);
+        assert_eq!(mission.agents()[0].started_ms, 1);
+
+        mission.root_event(&TurnEvent::TurnStarted {
+            turn_id: TurnId::try_from_str("second")?,
+            thread_id: ThreadId::try_from_str("thread")?,
+        });
+        assert_ne!(mission.agents()[0].started_ms, 1);
+        Ok(())
     }
 
     #[test]

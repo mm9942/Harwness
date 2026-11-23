@@ -9,6 +9,7 @@ import org.junit.Test
 import uniffi.harw_mobile_ffi.MobileHolder
 import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.MobileHolderKind
+import uniffi.harw_mobile_ffi.TranscriptEntry
 import uniffi.harw_mobile_ffi.TranscriptKind
 
 class SessionConversationTest {
@@ -20,6 +21,43 @@ class SessionConversationTest {
         holder: MobileHolder? = null,
         turnRunning: Boolean = false,
     ) = conversationAccess(active, canSubmit, holder, turnRunning)
+
+    @Test
+    fun asyncReplyStatusNeverInventsThinkingOrStreaming() {
+        assertNull(chatReplyStatus(attached = true, running = false, hasReplyText = false, reloading = false, approval = false))
+        assertEquals("Antwort wird erstellt … Noch kein Antworttext empfangen.", chatReplyStatus(true, true, false, false, false))
+        assertEquals("Antwort wird gestreamt …", chatReplyStatus(true, true, true, false, false))
+        assertEquals("Wartet auf Freigabe.", chatReplyStatus(true, true, false, false, true))
+        assertEquals("Antwortstatus wird abgeglichen …", chatReplyStatus(false, true, true, false, false))
+        assertEquals("Antwort wird nachgeladen …", chatReplyStatus(false, false, false, true, false))
+    }
+
+    @Test
+    fun incompleteMarkerRecognizesOnlySpecificFailure() {
+        assertTrue(isIncompleteResponseNotice("Antwort unvollständig: Das Ausgabe- oder Kontextlimit wurde erreicht."))
+        assertTrue(isIncompleteResponseNotice("model output was truncated"))
+        assertFalse(isIncompleteResponseNotice("Die Verbindung wurde beendet."))
+    }
+
+    @Test
+    fun archivedFirstPromptForksAtCurrentBoundaryButLaterOldPromptsDoNot() {
+        fun user(id: String, text: String = id) = TranscriptEntry(id, TranscriptKind.USER, text, null, emptyList())
+        val current = listOf(user("prefix"), user("replacement"), user("current-later"))
+        val archived = listOf(user("old-id", "Old prompt"), user("old-later"))
+        val ui = VersionsUi(
+            versions = mapOf("prefix" to listOf(ChatVersion(archived))),
+            viewing = mapOf("prefix" to 0),
+            onView = { _, _ -> },
+            onEdit = { _, _, _, _ -> },
+        )
+        val (shown, firstArchived) = applyViewing(current, ui)
+        assertEquals("old-id", shown[1].id)
+        assertEquals("Old prompt", shown[1].text)
+        assertEquals("prefix", forkBoundaryId(current, shown, 0, firstArchived))
+        assertEquals("replacement", forkBoundaryId(current, shown, 1, firstArchived))
+        assertNull(forkBoundaryId(current, shown, 2, firstArchived))
+        assertEquals("current-later", forkBoundaryId(current, current, 2, Int.MAX_VALUE))
+    }
 
     @Test
     fun freeSessionIsWritable() {
@@ -66,6 +104,7 @@ class SessionConversationTest {
         assertFalse(rendersMarkdown(TranscriptKind.USER))
         assertFalse(rendersMarkdown(TranscriptKind.TOOL))
         assertFalse(rendersMarkdown(TranscriptKind.ERROR))
+        assertFalse(rendersMarkdown(TranscriptKind.REASONING))
     }
 
     private fun support(

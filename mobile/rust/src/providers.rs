@@ -298,11 +298,44 @@ impl ProviderStore {
         );
         let rendered = toml::to_string(&table)
             .map_err(|_| internal("could not render the provider route file"))?;
+        let stored = toml::from_str::<ProviderToml>(&rendered)
+            .map_err(|_| internal("the rendered provider route is invalid"))?;
+        write_private_atomic(&path, rendered.as_bytes())?;
+        self.ensure_model_files(&route_id, &stored, None);
+        Ok(())
+    }
+
+    /// Whether the owner explicitly opted out of streaming for this route.
+    pub fn route_synchronous(&self, route_id: String) -> Result<bool, MobileError> {
+        check_id(&route_id).map_err(|_| unknown_route())?;
+        let provider = self.load_route(&route_id)?.ok_or_else(unknown_route)?;
+        Ok(provider.stream == Some(false))
+    }
+
+    /// Changes a route's mode for new requests without touching the credential.
+    pub fn set_route_synchronous(
+        &self,
+        route_id: String,
+        synchronous: bool,
+    ) -> Result<(), MobileError> {
+        check_id(&route_id).map_err(|_| unknown_route())?;
+        let _guard = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.load_route(&route_id)?.ok_or_else(unknown_route)?;
+        let path = self.route_path(&route_id);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|_| internal("the provider route file could not be read"))?;
+        let mut table: toml::Table =
+            toml::from_str(&text).map_err(|_| internal("the provider route file is invalid"))?;
+        if synchronous {
+            table.insert("stream".into(), toml::Value::Boolean(false));
+        } else {
+            table.remove("stream");
+        }
+        let rendered = toml::to_string(&table)
+            .map_err(|_| internal("could not render the provider route file"))?;
         toml::from_str::<ProviderToml>(&rendered)
             .map_err(|_| internal("the rendered provider route is invalid"))?;
         write_private_atomic(&path, rendered.as_bytes())?;
-        let stored = self.load_route(&route_id)?.map(|p| p.models.clone()).unwrap_or_default();
-        self.ensure_model_files(&route_id, &stored, None);
         Ok(())
     }
 
@@ -325,7 +358,7 @@ impl ProviderStore {
         }
         let _guard = self.write_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let provider = self.load_route(&route_id)?.ok_or_else(unknown_route)?;
-        self.ensure_model_files(&route_id, &provider.models, Some(tokens));
+        self.ensure_model_files(&route_id, &provider, Some(tokens));
         Ok(())
     }
 
@@ -898,6 +931,30 @@ mod tests {
         Ok((dir, keystore, store))
     }
 
+    #[cfg(feature = "local-host")]
+    #[test]
+    fn new_foundry_files_use_verified_windows_and_preserve_existing_files() -> TestResult {
+        let (_dir, _keystore, store) = store()?;
+        let id = "azure-foundry-chat";
+        let legacy = "Kimi-K3.1-Pro";
+        let fresh = "DeepSeek-V4.1-Flash-1017";
+        store.import_route(
+            route(
+                id,
+                ProviderKind::OpenAiCompatible,
+                "https://fixture.services.ai.azure.com/openai/v1",
+                legacy,
+            ),
+            Vec::new(),
+        )?;
+        store.set_route_context_window(id.to_owned(), 128_000)?;
+        store.set_route_models(id.to_owned(), vec![fresh.to_owned(), legacy.to_owned()])?;
+        assert_eq!(store.route_context_window(id.to_owned())?, Some(1_000_000));
+        store.set_route_models(id.to_owned(), vec![legacy.to_owned(), fresh.to_owned()])?;
+        assert_eq!(store.route_context_window(id.to_owned())?, Some(128_000));
+        Ok(())
+    }
+
     #[test]
     fn id_validation() {
         for ok in ["a", "0", "my-route-1", &"a".repeat(32)] {
@@ -1249,18 +1306,31 @@ impl ProviderStore {
         self.home.home().join("models").join(format!("{safe}.toml"))
     }
 
-    /// Legt je Modell eine Modelldatei mit Kontextfenster an (Standard 128k) oder setzt das Fenster neu (`force`).
-    fn ensure_model_files(&self, route_id: &str, models: &[String], force: Option<u64>) {
+    /// Writes missing model files with their known context window (128k
+    /// fallback). Existing windows change only when explicitly overridden.
+    fn ensure_model_files(&self, route_id: &str, provider: &ProviderToml, force: Option<u64>) {
         let dir = self.home.home().join("models");
         if crate::home::create_private_dir(&dir).is_err() {
             return;
         }
-        for model in models {
+        for model in &provider.models {
             let path = self.model_file(route_id, model);
             if force.is_none() && path.exists() {
                 continue;
             }
-            let window = force.unwrap_or(128_000);
+            let window = force.unwrap_or_else(|| {
+                #[cfg(feature = "local-host")]
+                if provider.api == API_OPENAI_CHAT
+                    && let Some(limits) = harw_provider_http::azure_foundry_chat_token_limits(
+                        route_id,
+                        &provider.base_url,
+                        model,
+                    )
+                {
+                    return u64::from(limits.context_window);
+                }
+                128_000
+            });
             let mut table = toml::Table::new();
             table.insert("id".into(), toml::Value::String(model.clone()));
             table.insert("provider".into(), toml::Value::String(route_id.to_owned()));

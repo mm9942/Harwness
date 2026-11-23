@@ -990,6 +990,7 @@ mod tests {
                     turn_id: TurnId::from_str("t"),
                     assistant_text: "partial".to_owned(),
                     reasoning_collapsed: false,
+                    reasoning_text: None,
                 },
             ),
             at(0, 0, 1, done()),

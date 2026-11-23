@@ -21,6 +21,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -58,12 +59,17 @@ internal fun ModelListDialog(store: ProviderStore, route: ProviderRoute, onDone:
     var saving by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var filter by remember { mutableStateOf("") }
-    var contextWindow by remember { mutableStateOf("128000") }
+    var contextWindow by remember { mutableStateOf("") }
+    var synchronous by remember { mutableStateOf(false) }
+    var modeLoaded by remember { mutableStateOf(false) }
 
     LaunchedEffect(route.id) {
         val stored = withContext(Dispatchers.IO) { runCatching { store.routeModels(route.id) }.getOrDefault(emptyList()) }
         models = stored.ifEmpty { listOf(route.defaultModel).filter { it.isNotEmpty() } }.ifEmpty { listOf("") }
-        withContext(Dispatchers.IO) { runCatching { store.routeContextWindow(route.id) }.getOrNull() }?.let { contextWindow = it.toString() }
+        withContext(Dispatchers.IO) { runCatching { store.routeSynchronous(route.id) }.getOrNull() }?.let {
+            synchronous = it
+            modeLoaded = true
+        }
     }
 
     AlertDialog(
@@ -105,10 +111,17 @@ internal fun ModelListDialog(store: ProviderStore, route: ProviderRoute, onDone:
                     value = contextWindow,
                     onValueChange = { contextWindow = it.filter { c -> c.isDigit() }.take(8) },
                     singleLine = true,
-                    label = { Text("Kontextfenster (Token) aller Modelle") },
-                    supportingText = { Text("Bestimmt, wann der Chat verdichtet wird. Ohne Angabe gilt nur 32k.") },
+                    label = { Text("Kontextfenster manuell überschreiben") },
+                    supportingText = { Text("Leer lassen, um die vorhandenen Werte pro Modell beizubehalten.") },
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Antworten ohne Stream abrufen")
+                        Text("Nur für neue Anfragen dieses Providers. Standard ist Streaming.", style = MaterialTheme.typography.bodySmall)
+                    }
+                    Switch(checked = synchronous, onCheckedChange = { synchronous = it }, enabled = modeLoaded && !saving)
+                }
                 HorizontalDivider()
                 OutlinedButton(
                     enabled = !probing && route.hasSecret,
@@ -188,6 +201,7 @@ internal fun ModelListDialog(store: ProviderStore, route: ProviderRoute, onDone:
                             withContext(Dispatchers.IO) {
                                 store.setRouteModels(route.id, models.map { it.trim() }.filter { it.isNotEmpty() })
                                 contextWindow.toULongOrNull()?.takeIf { it >= 4096uL }?.let { store.setRouteContextWindow(route.id, it) }
+                                if (modeLoaded) store.setRouteSynchronous(route.id, synchronous)
                             }
                             onDone(true)
                         } catch (e: Exception) {

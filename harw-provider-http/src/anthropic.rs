@@ -855,7 +855,19 @@ pub fn extract_anthropic_stop_reason(body: &Value) -> StopReason {
         Some("max_tokens") => StopReason::MaxTokens,
         Some("stop_sequence") => StopReason::StopSequence,
         Some("pause_turn") => StopReason::PauseTurn,
-        Some("refusal") => StopReason::Refusal { detail: None },
+        Some("refusal") => StopReason::Refusal {
+            detail: body
+                .get("stop_details")
+                .and_then(Value::as_object)
+                .filter(|details| {
+                    details
+                        .get("type")
+                        .is_none_or(|kind| kind.as_str() == Some("refusal"))
+                })
+                .and_then(|details| details.get("explanation"))
+                .and_then(Value::as_str)
+                .and_then(crate::error::sanitize_refusal_detail),
+        },
         Some("model_context_window_exceeded") => StopReason::ContextWindowExceeded,
         Some(other) => StopReason::Other(other.to_owned()),
         None => StopReason::EndTurn,
@@ -1253,18 +1265,20 @@ impl AnthropicMessagesProvider {
             .await?;
             let value = accumulator.finish()?;
             let response = self.interpret_body(&request, model, &value)?;
-            crate::replay_bounds::remember_or_warn(
-                "anthropic",
-                model,
-                self.thinking_replay.remember(
-                    &self.provider_id,
-                    &messages_url,
+            if !matches!(response.stop, StopReason::Refusal { .. }) {
+                crate::replay_bounds::remember_or_warn(
+                    "anthropic",
                     model,
-                    &request,
-                    &response,
-                    &value,
-                ),
-            );
+                    self.thinking_replay.remember(
+                        &self.provider_id,
+                        &messages_url,
+                        model,
+                        &request,
+                        &response,
+                        &value,
+                    ),
+                );
+            }
             budget_permit.reconcile(&response.usage);
             return Ok(response);
         }
@@ -1334,18 +1348,20 @@ impl AnthropicMessagesProvider {
 
         let value: Value = serde_json::from_str(&body)?;
         let response = self.interpret_body(&request, model, &value)?;
-        crate::replay_bounds::remember_or_warn(
-            "anthropic",
-            model,
-            self.thinking_replay.remember(
-                &self.provider_id,
-                &messages_url,
+        if !matches!(response.stop, StopReason::Refusal { .. }) {
+            crate::replay_bounds::remember_or_warn(
+                "anthropic",
                 model,
-                &request,
-                &response,
-                &value,
-            ),
-        );
+                self.thinking_replay.remember(
+                    &self.provider_id,
+                    &messages_url,
+                    model,
+                    &request,
+                    &response,
+                    &value,
+                ),
+            );
+        }
         budget_permit.reconcile(&response.usage);
         Ok(response)
     }
@@ -1359,6 +1375,15 @@ impl AnthropicMessagesProvider {
         value: &Value,
     ) -> Result<ModelResponse, ModelError> {
         let text = extract_anthropic_text(value);
+        let stop = extract_anthropic_stop_reason(value);
+        if matches!(stop, StopReason::Refusal { .. }) {
+            return Ok(ModelResponse {
+                message: text,
+                usage: extract_anthropic_usage(value),
+                stop,
+                ..ModelResponse::default()
+            });
+        }
         let names = ToolNameCodec::for_request(request);
         let tool_calls = extract_anthropic_tool_calls(value)
             .map_err(|_| {
@@ -1380,7 +1405,7 @@ impl AnthropicMessagesProvider {
             message: text,
             tool_calls,
             usage: extract_anthropic_usage(value),
-            stop: extract_anthropic_stop_reason(value),
+            stop,
             reasoning: extract_anthropic_reasoning(value, model),
         })
     }
@@ -2499,6 +2524,50 @@ mod tests {
             );
         }
         assert_eq!(DEFAULT_MAX_TOKENS, 16_384);
+    }
+
+    #[test]
+    fn anthropic_refusal_surfaces_without_text_and_sanitizes_structured_detail() -> TestResult {
+        let body = serde_json::json!({
+            "content": [{"type":"tool_use","id":"partial","name":"lookup","input":"{"}],
+            "stop_reason":"refusal",
+            "stop_details":{
+                "type":"refusal",
+                "explanation":format!("Policy\nreason.\u{202e}{}", "é".repeat(300)),
+                "category":"not needed for the notice",
+            },
+        });
+        let provider = test_provider()?;
+        let response = provider
+            .interpret_body(&request_with_ids(None, None), "fixture", &body)
+            .map_err(ctx("a structured refusal may have no text"))?;
+        let StopReason::Refusal {
+            detail: Some(detail),
+        } = response.stop
+        else {
+            return Err(TestError::Unexpected(
+                "expected a structured refusal".into(),
+            ));
+        };
+        assert!(response.tool_calls.is_empty());
+        assert!(response.message.is_none());
+        assert!(detail.starts_with("Policy reason."));
+        assert!(!detail.contains('\u{202e}'));
+        assert!(detail.chars().count() <= 240);
+
+        let mut ordinary = body;
+        ordinary["stop_reason"] = Value::String("max_tokens".into());
+        assert_eq!(
+            extract_anthropic_stop_reason(&ordinary),
+            StopReason::MaxTokens
+        );
+        ordinary["stop_reason"] = Value::String("refusal".into());
+        ordinary["stop_details"]["type"] = Value::String("not-a-refusal".into());
+        assert_eq!(
+            extract_anthropic_stop_reason(&ordinary),
+            StopReason::Refusal { detail: None },
+        );
+        Ok(())
     }
 
     #[test]

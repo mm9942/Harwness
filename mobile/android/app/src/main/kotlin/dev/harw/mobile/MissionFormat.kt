@@ -22,6 +22,15 @@ internal fun missionCardHeightDp(sideDp: Float, availableHeightDp: Float, panelD
 
 internal fun missionHeaderMaxHeightDp(availableHeightDp: Float): Float = max(0f, availableHeightDp - 184f)
 
+/** Converts a monotonic tick into the wall-time domain of a freshly observed agent start. */
+internal data class MissionClockAnchor(val wallMs: Long, val elapsedMs: Long) {
+    fun wallAt(nowElapsedMs: Long): Long = wallMs + (nowElapsedMs - elapsedMs).coerceAtLeast(0)
+}
+
+/** The single-line live preview favors the newest reasoning, including after a line break. */
+internal fun reasoningPreview(reasoning: String): String =
+    reasoning.trimEnd().substringAfterLast('\n').trim()
+
 internal fun formatElapsed(startedMs: Long, nowMs: Long): String {
     val elapsedMs = nowMs - startedMs
     if (elapsedMs <= 0L) return "0s"

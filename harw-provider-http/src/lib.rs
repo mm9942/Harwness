@@ -81,6 +81,8 @@
 pub mod anthropic;
 mod anthropic_caps;
 mod anthropic_replay;
+mod azure_foundry;
+pub use azure_foundry::{AzureFoundryChatTokenLimits, azure_foundry_chat_token_limits};
 pub mod budget;
 pub mod cache_strategy;
 mod chat_reasoning;
@@ -2162,6 +2164,18 @@ impl OpenAiResponsesProvider {
         self.budgets = budgets;
     }
 
+    /// Limits the requested output after resolving the actual deployment, before
+    /// serializing the body or accounting for its output in quota admission.
+    fn apply_chat_output_limit(&self, request: &mut ModelRequest, base_url: &str, model: &str) {
+        if self.transport == Transport::Chat
+            && let Some(requested) = request.max_output_tokens
+            && let Some(limits) =
+                azure_foundry_chat_token_limits(&self.provider_id, base_url, model)
+        {
+            request.max_output_tokens = Some(requested.min(limits.max_output_tokens));
+        }
+    }
+
     /// Resolves the model for one request after checking its provider affinity.
     ///
     /// A request without a provider ID (or with an empty one) remains compatible
@@ -3186,7 +3200,8 @@ fn interpret_responses(
 /// `choices[0].finish_reason`: `length` → `MaxTokens`, `content_filter` →
 /// `ContentFilter` (beide: Tool-Calls verworfen, Teiltext bleibt);
 /// vorhandene Tool-Calls → `ToolUse` (auch bei `stop`, manche Gateways);
-/// nur `message.refusal` → `Refusal`; `stop`/`tool_calls`/fehlend → `EndTurn`;
+/// `message.refusal` (auch nach Teiltext) → `Refusal` ohne Tool-Calls;
+/// `stop`/`tool_calls`/fehlend → `EndTurn`;
 /// unbekannt → `Other`.
 ///
 /// `choices[0].message.reasoning_content` (DeepSeek/Kimi/GLM-Konvention):
@@ -3234,10 +3249,9 @@ fn interpret_chat(
     let refusal = choice
         .and_then(|choice| choice.pointer("/message/refusal"))
         .and_then(Value::as_str)
-        .filter(|refusal| !refusal.is_empty())
-        .map(str::to_owned);
-    let truncated = matches!(finish, Some("length" | "content_filter"));
-    let mut tool_calls = if truncated {
+        .filter(|refusal| !refusal.trim().is_empty());
+    let suppress_tools = refusal.is_some() || matches!(finish, Some("length" | "content_filter"));
+    let mut tool_calls = if suppress_tools {
         let dropped = choice
             .and_then(|choice| choice.pointer("/message/tool_calls"))
             .and_then(Value::as_array)
@@ -3245,7 +3259,7 @@ fn interpret_chat(
         if dropped > 0 {
             tracing::warn!(
                 dropped,
-                "dropping tool calls of a truncated chat completion"
+                "dropping tool calls of an incomplete or refused chat completion"
             );
         }
         Vec::new()
@@ -3275,7 +3289,7 @@ fn interpret_chat(
     // strukturierte Tool-Calls fehlen, der Request tatsächlich Tools
     // angeboten hat, und der (bereits think-bereinigte) Text einen
     // `<tool_call>`-Marker enthält — sonst bleibt die Antwort unverändert.
-    if !truncated
+    if !suppress_tools
         && tool_calls.is_empty()
         && !offered_tools.is_empty()
         && let Some(candidate) = text.as_deref()
@@ -3304,7 +3318,7 @@ fn interpret_chat(
     // `[TOOL_CALLS]`, Llama `<|python_tag|>` und eine Antwort, die nur aus
     // einem (ggf. umzäunten) JSON-Aufruf eines angebotenen Werkzeugs
     // besteht. Gleiche Fail-closed-Regeln wie oben.
-    if !truncated
+    if !suppress_tools
         && tool_calls.is_empty()
         && !offered_tools.is_empty()
         && let Some(candidate) = text.as_deref()
@@ -3334,15 +3348,23 @@ fn interpret_chat(
     let stop = match finish {
         Some("length") => StopReason::MaxTokens,
         Some("content_filter") => StopReason::ContentFilter,
-        _ if !tool_calls.is_empty() => StopReason::ToolUse,
-        _ if text.is_none() && refusal.is_some() => StopReason::Refusal {
-            detail: refusal.clone(),
+        _ if refusal.is_some() => StopReason::Refusal {
+            detail: refusal.and_then(error::sanitize_refusal_detail),
         },
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
         None | Some("stop" | "tool_calls" | "function_call") => StopReason::EndTurn,
         Some(other) => StopReason::Other(bounded_reason(other)),
     };
-    if !truncated && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
+    if !suppress_tools && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
         return Err(ModelError::EmptyResponse);
+    }
+    if matches!(stop, StopReason::Refusal { .. }) {
+        return Ok(ModelResponse {
+            message: text,
+            usage: extract_openai_usage(body, Transport::Chat),
+            stop,
+            ..ModelResponse::default()
+        });
     }
     // Runde 7, Teil L7: vLLM/LM Studio liefern Denktext je nach Version in
     // `reasoning_content` oder `reasoning` — beide werden gelesen.
@@ -3765,6 +3787,26 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
         }
     }
     body
+}
+
+/// Removes only optional compatibility fields for the one HTTP 400 retry.
+fn remove_optional_chat_fields(body: &mut Value) -> bool {
+    let Some(map) = body.as_object_mut() else {
+        return false;
+    };
+    let mut removed = false;
+    for key in [
+        "reasoning_effort",
+        "stream_options",
+        "parallel_tool_calls",
+        "temperature",
+        "top_p",
+        "thinking",
+        "reasoning",
+    ] {
+        removed |= map.remove(key).is_some();
+    }
+    removed
 }
 
 /// Hängt einen `tool_calls`-Eintrag an die laufende Assistant-Nachricht an oder
@@ -4205,6 +4247,7 @@ impl OpenAiResponsesProvider {
         let mut request = request;
         let model = self.selected_model(&request)?.to_owned();
         let model = model.as_str();
+        self.apply_chat_output_limit(&mut request, base_url, model);
         // Runde 7, Teil L7: Modelle ohne Werkzeugaufrufe bekommen keine
         // Werkzeuge angeboten (plus Hinweis in den Instruktionen).
         strip_tools_for_toolless_model(&mut request, model, &self.toolless_models);
@@ -4363,16 +4406,13 @@ impl OpenAiResponsesProvider {
                 && !degraded_after_400
                 && self.codex_route.is_none()
                 && self.chatgpt_plan.is_none()
-                && let Some(map) = wire.as_object_mut()
-                && ["reasoning_effort", "stream_options", "parallel_tool_calls", "temperature", "top_p", "thinking", "reasoning"]
-                    .iter()
-                    .any(|key| map.contains_key(*key))
+                && remove_optional_chat_fields(&mut wire)
             {
                 degraded_after_400 = true;
-                for key in ["reasoning_effort", "stream_options", "parallel_tool_calls", "temperature", "top_p", "thinking", "reasoning"] {
-                    map.remove(key);
-                }
-                tracing::warn!(model, "provider returned HTTP 400; retrying once without optional request fields");
+                tracing::warn!(
+                    model,
+                    "provider returned HTTP 400; retrying once without optional request fields"
+                );
                 continue;
             }
             if response.status() == reqwest::StatusCode::UNAUTHORIZED
@@ -4399,7 +4439,17 @@ impl OpenAiResponsesProvider {
         } else if status.is_success()
             && let Some(sink) = stream_sink
         {
-            read_native_stream(response, self.transport, sink, self.stream_idle_timeout).await?
+            match read_native_stream(response, self.transport, sink, self.stream_idle_timeout)
+                .await?
+            {
+                sse::NativeStreamOutcome::Completed(body) => body,
+                sse::NativeStreamOutcome::InterruptedChat(partial) => {
+                    budget_permit.reconcile(&partial.usage);
+                    // This is a partial answer, not an error eligible for
+                    // transport retry and not a complete round for replay.
+                    return Ok(partial);
+                }
+            }
         } else {
             let body = response
                 .text()
@@ -4501,6 +4551,7 @@ impl OpenAiResponsesProvider {
                 StopReason::MaxTokens
                     | StopReason::ContentFilter
                     | StopReason::ContextWindowExceeded
+                    | StopReason::Refusal { .. }
             )
         {
             replay_bounds::remember_or_warn(
@@ -4563,7 +4614,7 @@ async fn read_native_stream(
     transport: Transport,
     sink: &harw_core::StreamSink,
     idle_timeout: Duration,
-) -> Result<Value, ModelError> {
+) -> Result<sse::NativeStreamOutcome, ModelError> {
     match transport {
         Transport::Chat => {
             let mut accumulator = sse::ChatStreamAccumulator::default();
@@ -4571,7 +4622,7 @@ async fn read_native_stream(
                 accumulator.push(&frame, Some(sink))
             })
             .await?;
-            accumulator.finish()
+            Ok(accumulator.finish())
         }
         Transport::Responses => {
             let mut terminal = None;
@@ -4584,9 +4635,11 @@ async fn read_native_stream(
                 Ok(terminal.is_some())
             })
             .await?;
-            terminal.ok_or_else(|| ModelError::Truncated {
-                message: "response stream ended before its terminal event".into(),
-            })
+            terminal
+                .map(sse::NativeStreamOutcome::Completed)
+                .ok_or_else(|| ModelError::Truncated {
+                    message: "response stream ended before its terminal event".into(),
+                })
         }
     }
 }
@@ -4809,6 +4862,68 @@ mod tests {
             Ok(())
         });
         Ok((base_url, handle))
+    }
+
+    /// Returns a clean HTTP response whose SSE conversation has no terminal
+    /// event. This is different from the transport itself failing.
+    fn mock_interrupted_chat_sse() -> TestResult<(String, thread::JoinHandle<TestResult<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind SSE fixture"))?;
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().map_err(ctx("SSE fixture address"))?
+        );
+        let content = serde_json::json!({
+            "id":"fixture",
+            "choices":[{"delta":{
+                "content":"visible prefix<tool_call>lookup",
+                "reasoning_content":"partial reasoning",
+                "tool_calls":[{"index":0,"id":"call-1","function":{"name":"lookup","arguments":"{"}}]
+            }}],
+        });
+        let usage = serde_json::json!({
+            "id":"fixture",
+            "choices":[],
+            "usage":{"prompt_tokens":10,"completion_tokens":4},
+        });
+        let body = format!("data: {content}\n\ndata: {usage}\n\n");
+        let thread = thread::spawn(move || -> TestResult<()> {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept SSE request"))?;
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer).map_err(ctx("read SSE request"))?;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .map_err(ctx("write SSE response"))?;
+            Ok(())
+        });
+        Ok((base_url, thread))
+    }
+
+    #[tokio::test]
+    async fn chat_bare_eof_is_not_a_provider_token_limit() -> TestResult {
+        let (base_url, server) = mock_interrupted_chat_sse()?;
+        let provider = OpenAiResponsesProvider::with_transport(
+            base_url,
+            "gpt-test",
+            SecretString::new("fixture".into()),
+            Transport::Chat,
+        )
+        .map_err(ctx("construct SSE fixture provider"))?;
+        let mut request = request_with_ids(None, None);
+        request.stream = Some(harw_core::StreamSink::new(|_| {}));
+        let response = provider
+            .respond(request)
+            .await
+            .map_err(ctx("partial response"))?;
+        server.join().map_err(join_thread_error)??;
+        assert_eq!(response.stop, StopReason::StreamInterrupted);
+        assert_eq!(response.message.as_deref(), Some("visible prefix"));
+        assert!(response.tool_calls.is_empty());
+        assert!(response.reasoning.is_none());
+        assert_eq!(response.usage.output_tokens, 4);
+        Ok(())
     }
 
     #[tokio::test]
@@ -6763,6 +6878,73 @@ mod tests {
                 .map_err(ctx("selected_model succeeds"))?,
             "requested-model"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn foundry_default_model_preserves_the_output_cap_on_the_chat_retry() -> TestResult {
+        let provider_id = "azure-foundry-chat";
+        let base_url = "https://fixture.services.ai.azure.com/openai/v1";
+        let mut provider = OpenAiResponsesProvider::with_transport(
+            base_url,
+            "mistral-large-4-latest",
+            SecretString::new("fixture".into()),
+            Transport::Chat,
+        )
+        .map_err(ctx("configure fixture"))?;
+        provider.provider_id = provider_id.to_owned();
+
+        // The phone's SwitchingModel deliberately clears both request IDs.
+        let mut request = request_with_ids(None, None);
+        request.max_output_tokens = Some(20_000);
+        request.reasoning_effort = Some(harw_types::ReasoningEffort::High);
+        let model = provider
+            .selected_model(&request)
+            .map_err(ctx("select model"))?
+            .to_owned();
+        provider.apply_chat_output_limit(&mut request, base_url, &model);
+
+        assert_eq!(request.max_output_tokens, Some(4_096)); // Also used for quota admission.
+        let mut wire = build_chat_body(&request, &model);
+        assert_eq!(wire["max_completion_tokens"], 4_096);
+        assert_eq!(wire["reasoning_effort"], "high");
+        assert!(remove_optional_chat_fields(&mut wire));
+        assert_eq!(wire["max_completion_tokens"], 4_096);
+        assert!(wire.get("reasoning_effort").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn foundry_chat_budget_does_not_raise_small_budgets_or_cap_other_routes() -> TestResult {
+        let foundry_url = "https://fixture.services.ai.azure.com/openai/v1";
+        let mut provider = OpenAiResponsesProvider::with_transport(
+            foundry_url,
+            "grok-4.3",
+            SecretString::new("fixture".into()),
+            Transport::Chat,
+        )
+        .map_err(ctx("configure fixture"))?;
+        provider.provider_id = "azure-foundry-chat".to_owned();
+
+        let mut request = request_with_ids(None, None);
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3");
+        assert_eq!(request.max_output_tokens, None);
+        request.max_output_tokens = Some(2_000);
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3");
+        assert_eq!(request.max_output_tokens, Some(2_000));
+
+        request.max_output_tokens = Some(20_000);
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3-custom");
+        assert_eq!(request.max_output_tokens, Some(20_000));
+        provider.apply_chat_output_limit(&mut request, "https://api.x.ai/v1", "grok-4.3");
+        assert_eq!(request.max_output_tokens, Some(20_000));
+        provider.transport = Transport::Responses;
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3");
+        assert_eq!(request.max_output_tokens, Some(20_000));
+        provider.transport = Transport::Chat;
+        provider.provider_id = "azure-openai-chat".to_owned();
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3");
+        assert_eq!(request.max_output_tokens, Some(20_000));
         Ok(())
     }
 

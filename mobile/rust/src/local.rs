@@ -11,6 +11,25 @@ pub(crate) const LOCAL_CLIENT_LABEL: &str = "harw-android-local";
 /// Error detail of builds without the on-device host.
 pub(crate) const LOCAL_HOST_UNAVAILABLE: &str = "the on-device host is not available in this build";
 
+#[cfg(feature = "local-host")]
+static LOCAL_INFERENCE: std::sync::LazyLock<harw_llama::LocalInferenceControl> =
+    std::sync::LazyLock::new(harw_llama::LocalInferenceControl::default);
+
+/// Change the on-device cap for new inference calls without reloading a model.
+/// Invalid values or builds without a local host return false.
+#[uniffi::export]
+pub fn set_local_image_concurrency(count: u8) -> bool {
+    #[cfg(feature = "local-host")]
+    {
+        LOCAL_INFERENCE.set_image_concurrency(count)
+    }
+    #[cfg(not(feature = "local-host"))]
+    {
+        let _ = count;
+        false
+    }
+}
+
 /// Builds without the `local-host` feature have no on-device host.
 #[cfg(not(feature = "local-host"))]
 pub(crate) async fn open_local(
@@ -49,6 +68,7 @@ pub(crate) async fn open_local(
     let model_home = home.clone();
     let selection = home.active_route()?;
     let fingerprint = projector_fingerprint(&home);
+    let revision = provider_revision(&home, selection.as_ref());
     let resolver_for_build = resolver.clone();
     let built = tokio::task::spawn_blocking(move || {
         build_active_model(&model_home, &resolver_for_build)
@@ -57,10 +77,10 @@ pub(crate) async fn open_local(
     .map_err(|_| host_task_failed())??;
     // The host keeps this wrapper for its whole life: a later provider/model
     // activation is picked up by the next turn (see `SwitchingModel`).
-    let model: Arc<dyn harw_core::ModelProvider> = Arc::new(SwitchingModel {
+    let model = Arc::new(SwitchingModel {
         home: home.clone(),
         resolver,
-        current: tokio::sync::Mutex::new((selection, fingerprint, built)),
+        current: tokio::sync::Mutex::new((selection, fingerprint, revision, built)),
     });
     // The device tools follow the profile switch (off by default for the on-device model).
     let (shell, files) = device;
@@ -79,7 +99,10 @@ pub(crate) async fn open_local(
             allow: LEAN_TOOLS.iter().map(|name| (*name).to_owned()).collect(),
         }
     };
-    open_local_with_tools(home, model, features, contributors, Some(surface)).await
+    let host_provider: Arc<dyn harw_core::ModelProvider> = model.clone();
+    let mut backend = open_local_with_tools(home, host_provider, features, contributors, Some(surface)).await?;
+    backend.hybrid_model = Some(model);
+    Ok(backend)
 }
 
 /// Model provider of the on-device host that follows the active selection.
@@ -91,12 +114,13 @@ pub(crate) async fn open_local(
 /// per-session model ids of the request are cleared: the app-level selection
 /// is what the owner picked on the phone.
 #[cfg(feature = "local-host")]
-struct SwitchingModel {
+pub(crate) struct SwitchingModel {
     home: crate::home::AppHome,
     resolver: crate::secrets::KeystoreSecretResolver,
     current: tokio::sync::Mutex<(
         Option<(String, String)>,
         Option<ProjectorFingerprint>,
+        Option<blake3::Hash>,
         Arc<dyn harw_core::ModelProvider>,
     )>,
 }
@@ -116,26 +140,80 @@ fn projector_fingerprint(home: &crate::home::AppHome) -> Option<ProjectorFingerp
     Some((path, meta.len(), meta.modified().ok()))
 }
 
+/// The active provider's app-managed route file is atomically replaced on edit.
+#[cfg(feature = "local-host")]
+fn provider_revision(
+    home: &crate::home::AppHome,
+    selection: Option<&(String, String)>,
+) -> Option<blake3::Hash> {
+    use std::io::Read;
+    let (provider, _) = selection?;
+    if provider == crate::home::LOCAL_ROUTE_ID || !provider.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+    }) {
+        return None;
+    }
+    let path = home.providers_dir().join(format!("{provider}.toml"));
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= 64 * 1024).then(|| blake3::hash(&bytes))
+}
+
 #[cfg(feature = "local-host")]
 impl SwitchingModel {
+    pub(crate) fn home(&self) -> &crate::home::AppHome {
+        &self.home
+    }
+
+    pub(crate) fn resolver(&self) -> &crate::secrets::KeystoreSecretResolver {
+        &self.resolver
+    }
+
+    pub(crate) fn hybrid_qwen_id(&self) -> Result<Option<String>, MobileError> {
+        if !harw_llama::engine_available() {
+            return Ok(None);
+        }
+        Ok(self.home.active_local_model()?.filter(|id| {
+            id.starts_with("qwen3.5-") || id.starts_with("qwen3-")
+        }))
+    }
+
+    pub(crate) async fn pin_hybrid_qwen(
+        &self,
+        selected: &str,
+    ) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
+        let changed = || MobileError::Session { detail: "Das gewählte lokale Qwen ist nicht aktiv".into() };
+        if self.hybrid_qwen_id()?.as_deref() != Some(selected) {
+            return Err(changed());
+        }
+        let provider = self.provider().await.map_err(|_| changed())?;
+        if provider.pinned_provider_id().as_deref() != Some(harw_llama::LOCAL_PROVIDER_ID)
+            || provider.pinned_model_id().as_deref() != Some(selected)
+        {
+            return Err(changed());
+        }
+        Ok(provider)
+    }
+
     async fn provider(&self) -> Result<Arc<dyn harw_core::ModelProvider>, harw_core::ModelError> {
         let failed = |detail: String| harw_core::ModelError::RequestFailed(detail);
         let wanted = self.home.active_route().map_err(|e| failed(e.to_string()))?;
         let fingerprint = projector_fingerprint(&self.home);
+        let revision = provider_revision(&self.home, wanted.as_ref());
         let mut current = self.current.lock().await;
-        if current.0 != wanted || current.1 != fingerprint {
+        if current.0 != wanted || current.1 != fingerprint || current.2 != revision {
             // Release the old model first: two loaded GGUFs do not fit in memory.
             let placeholder: Arc<dyn harw_core::ModelProvider> = Arc::new(NoModel);
-            current.2 = placeholder;
+            current.3 = placeholder;
             let home = self.home.clone();
             let resolver = self.resolver.clone();
             let built = tokio::task::spawn_blocking(move || build_active_model(&home, &resolver))
                 .await
                 .map_err(|_| failed("on-device model switch failed".to_owned()))?
                 .map_err(|e| failed(e.to_string()))?;
-            *current = (wanted, fingerprint, built);
+            *current = (wanted, fingerprint, revision, built);
         }
-        Ok(Arc::clone(&current.2))
+        Ok(Arc::clone(&current.3))
     }
 }
 
@@ -225,7 +303,10 @@ fn build_active_model(
 /// prompt and tool specs (text-only by default).
 #[cfg(feature = "local-host")]
 fn local_gguf_config() -> harw_llama::LocalGgufConfig {
-    let mut config = harw_llama::LocalGgufConfig::default();
+    let mut config = harw_llama::LocalGgufConfig {
+        inference: (*LOCAL_INFERENCE).clone(),
+        ..harw_llama::LocalGgufConfig::default()
+    };
     if let Some(n) = std::env::var("HARW_LOCAL_N_CTX")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())

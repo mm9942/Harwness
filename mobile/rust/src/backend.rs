@@ -20,6 +20,8 @@ pub(crate) struct Backend {
     port: Arc<dyn SessionPort>,
     ack: HelloAck,
     kind: BackendKind,
+    #[cfg(feature = "local-host")]
+    pub(crate) hybrid_model: Option<Arc<crate::local::SwitchingModel>>,
     _guard: Option<Box<dyn Any + Send + Sync>>,
 }
 
@@ -31,6 +33,8 @@ impl Backend {
             port: Arc::new(RemotePort::new(connection)),
             ack,
             kind: BackendKind::Remote,
+            #[cfg(feature = "local-host")]
+            hybrid_model: None,
             _guard: None,
         }
     }
@@ -47,6 +51,8 @@ impl Backend {
             port,
             ack,
             kind: BackendKind::Local,
+            #[cfg(feature = "local-host")]
+            hybrid_model: None,
             _guard: Some(guard),
         }
     }

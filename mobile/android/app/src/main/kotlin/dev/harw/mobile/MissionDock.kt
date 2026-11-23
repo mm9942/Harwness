@@ -1,6 +1,8 @@
 package dev.harw.mobile
 
+import android.os.SystemClock
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -68,15 +70,17 @@ internal fun MissionHeader(
         MaterialTheme.typography.bodySmall.lineHeight.toDp() * REASONING_LINES
     } + PANEL_CHROME
     val imeVisible = WindowInsets.isImeVisible
-    val now = rememberTicker(activeAgents(agents) > 0)
     val agentCount = activeAgents(agents)
     val jobCount = activeJobs(jobs)
-    var expanded by rememberSaveable { mutableStateOf(agentCount > 0 || jobCount > 0) }
+    val now = rememberMissionTicker(agentCount > 0, agents.firstOrNull()?.startedMs)
+    // An idle first snapshot must not pin the panel closed for the whole session.
+    var expansionOverride by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    val expanded = expansionOverride ?: (agentCount > 0 || jobCount > 0 || reasoning.isNotEmpty())
     val summary = missionSummary(agentCount, jobCount)
     if (!expanded) {
         Text(
             "▸ $summary",
-            modifier = modifier.fillMaxWidth().clickable { expanded = true }.padding(vertical = 4.dp),
+            modifier = modifier.fillMaxWidth().clickable { expansionOverride = true }.padding(vertical = 4.dp),
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
@@ -93,7 +97,7 @@ internal fun MissionHeader(
     ) {
         Text(
             "▾ $summary",
-            modifier = Modifier.fillMaxWidth().clickable { expanded = false },
+            modifier = Modifier.fillMaxWidth().clickable { expansionOverride = false },
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
@@ -125,6 +129,22 @@ internal fun rememberTicker(running: Boolean): State<Long> {
     LaunchedEffect(running) {
         while (running) {
             now.longValue = System.currentTimeMillis()
+            delay(TICK_MS)
+        }
+    }
+    return now
+}
+
+/** Elapsed mission time is independent of snapshots and of subsequent wall-clock changes. */
+@Composable
+private fun rememberMissionTicker(running: Boolean, startedMs: ULong?): State<Long> {
+    val anchor = remember(startedMs) {
+        MissionClockAnchor(System.currentTimeMillis(), SystemClock.elapsedRealtime())
+    }
+    val now = remember(anchor) { mutableLongStateOf(anchor.wallMs) }
+    LaunchedEffect(running, anchor) {
+        while (running) {
+            now.longValue = anchor.wallAt(SystemClock.elapsedRealtime())
             delay(TICK_MS)
         }
     }
@@ -188,8 +208,10 @@ private fun AgentRow(agent: MobileAgent, now: State<Long>) {
                 )
             }
         }
+        val status = agentStatus(agent)
+        val running = agent.state == MobileAgentState.RUNNING || agent.state == MobileAgentState.WAITING
         Text(
-            agentStatus(agent) + " · " + formatElapsed(agent.startedMs.toLong(), now.value),
+            if (running) "$status · ${formatElapsed(agent.startedMs.toLong(), now.value)}" else status,
             style = MaterialTheme.typography.labelSmall,
             color = if (agent.state == MobileAgentState.FAILED) colors.error else dim,
             maxLines = 1,
@@ -250,16 +272,16 @@ private fun JobRow(job: MobileJob) {
 @Composable
 private fun ReasoningPanel(lines: List<ReasoningLine>, active: Int) {
     val state = rememberLazyListState()
+    val dragging by state.interactionSource.collectIsDraggedAsState()
     var follow by remember { mutableStateOf(true) }
-    LaunchedEffect(state) {
-        snapshotFlow {
-            val info = state.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
-            state.isScrollInProgress to (last >= info.totalItemsCount - 2)
-        }.collect { (scrolling, atBottom) -> if (scrolling) follow = atBottom }
-    }
-    LaunchedEffect(lines.lastOrNull()?.seq) {
-        if (follow && lines.isNotEmpty()) state.scrollToItem(lines.lastIndex)
+    LaunchedEffect(state, dragging) {
+        if (dragging) {
+            follow = false
+        } else {
+            snapshotFlow { !state.isScrollInProgress && !state.canScrollForward }.collect { atBottom ->
+                if (atBottom) follow = true
+            }
+        }
     }
     val bodyHeight = with(LocalDensity.current) {
         MaterialTheme.typography.bodySmall.lineHeight.toDp() * REASONING_LINES
@@ -267,6 +289,12 @@ private fun ReasoningPanel(lines: List<ReasoningLine>, active: Int) {
     val context = androidx.compose.ui.platform.LocalContext.current
     // Echter Denktext, einklappbar; Startzustand folgt der Einstellung "Denkzusammenfassungen anzeigen".
     var open by rememberSaveable { mutableStateOf(readShowReasoningPref(context)) }
+    val latest = lines.lastOrNull()
+    LaunchedEffect(open, follow, dragging, latest?.seq, latest?.text) {
+        if (open && follow && !dragging && latest != null) {
+            state.scrollToItem(lines.lastIndex)
+        }
+    }
     OutlinedCard(Modifier.fillMaxWidth(), shape = CARD_SHAPE) {
         Column(Modifier.padding(SPACING), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
@@ -296,7 +324,7 @@ private fun ReasoningRow(line: ReasoningLine) {
     val failed = line.ok == false
     val color = if (failed && line.kind != ReasoningKind.THINKING) colors.error else colors.onSurface
     val body = when (line.kind) {
-        ReasoningKind.THINKING -> "∴ " + line.text
+        ReasoningKind.THINKING -> reasoningPreview(line.text)
         ReasoningKind.TOOL_START -> "● " + line.text
         ReasoningKind.TOOL_END -> (if (failed) "✗ " else "✓ ") + line.text
         ReasoningKind.FINISHED -> if (failed) "✗ failed" else "✓ done"
@@ -316,7 +344,8 @@ private fun ReasoningRow(line: ReasoningLine) {
             fontStyle = if (line.kind == ReasoningKind.THINKING) FontStyle.Italic else null,
             color = if (line.kind == ReasoningKind.THINKING) colors.onSurfaceVariant else color,
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+            softWrap = false,
+            overflow = if (line.kind == ReasoningKind.THINKING) TextOverflow.StartEllipsis else TextOverflow.Ellipsis,
         )
     }
 }

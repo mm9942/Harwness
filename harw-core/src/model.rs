@@ -556,6 +556,9 @@ pub enum StopReason {
     ToolUse,
     /// Der Provider hat die Ausgabe wegen einer Token-Obergrenze abgeschnitten.
     MaxTokens,
+    /// A response stream ended without a terminal event or finish reason.
+    /// A visible answer prefix may be retained, but no tools may be accepted.
+    StreamInterrupted,
     /// Eine konfigurierte Stop-Sequenz wurde erreicht.
     StopSequence,
     /// Der Provider hat den Turn pausiert (z. B. Anthropic `pause_turn` bei
@@ -1250,6 +1253,7 @@ mod tests {
             StopReason::EndTurn,
             StopReason::ToolUse,
             StopReason::MaxTokens,
+            StopReason::StreamInterrupted,
             StopReason::StopSequence,
             StopReason::PauseTurn,
             StopReason::Refusal {
@@ -1414,7 +1418,6 @@ mod tests {
         );
     }
 }
-
 
 tokio::task_local! {
     /// Session, deren Turn gerade das Modell aufruft (gesetzt von der Turn-Schleife).

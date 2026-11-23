@@ -60,7 +60,12 @@ private val EdgeSteps = intArrayOf(1280, 1024, 800, 640, 512)
 private val QualitySteps = intArrayOf(80, 65, 50)
 
 /** Ein vorbereitetes Bild fuer die Anzeige im Entwurf. */
-internal data class DraftImage(val label: String, val image: PromptImage, val bytes: Int)
+internal data class DraftImage(
+    val label: String,
+    val image: PromptImage,
+    val bytes: Int,
+    val freshlyPicked: Boolean = false,
+)
 
 /**
  * Liest ein Bild aus dem Foto-Picker, verkleinert es und kodiert es als JPEG-Base64.
@@ -96,7 +101,7 @@ internal fun prepareImage(context: Context, uri: Uri, label: String): DraftImage
                 if (bytes.size <= MaxImageBytes) {
                     if (scaled !== decoded) scaled.recycle()
                     val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    return DraftImage(label, PromptImage("image/jpeg", b64), bytes.size)
+                    return DraftImage(label, PromptImage("image/jpeg", b64), bytes.size, freshlyPicked = true)
                 }
             }
             if (scaled !== decoded) scaled.recycle()

@@ -56,7 +56,7 @@ use harw_protocol::session_wire::{
 };
 use harw_protocol::{
     ApprovalRequest, ClientCaps, Cursor, FrameEnvelope, FrameSource, GatewayPort, HostedState,
-    PortError, PortFuture, PresenceEntry, SessionEvent, SessionFrame, SessionPort, ToolPort,
+    PortError, PortFuture, PresenceEntry, SessionEvent, SessionFrame, SessionPort, StreamProfile, ToolPort,
     ToolRefusal, TurnEvent,
 };
 use harw_session_store::{
@@ -85,7 +85,7 @@ use crate::index::{
 use crate::live_ring::LiveRing;
 use crate::ops::{OpsCaller, OpsPort, OpsRun, OpsSession, SessionAction, tier_for_caps};
 use crate::record::{CreateOutcome, HostedSessionRecord, RecordStore};
-use crate::replay::{TranscriptSource, history_before, replay, tail_start};
+use crate::replay::{TranscriptSource, history_before, replay_page, tail_start};
 use crate::tool_host::{SessionScope, ToolEvents, ToolHost};
 
 /// Host configuration.
@@ -1178,29 +1178,26 @@ impl HostInner {
             return;
         }
         let budget = (self.config.queue.max_frames / 2).max(1);
-        let frames = match replay(
+        let page = match replay_page(
             self.transcripts.as_ref(),
             id,
             generation,
             state.durable_head,
             budget,
         ) {
-            Ok(frames) => frames,
+            Ok(page) => page,
             Err(error) => {
                 tracing::debug!(%error, session = %id.as_str(), "session host: head replay failed");
                 return;
             }
         };
-        let reached = frames
-            .last()
-            .map_or(head, |frame| frame.cursor.durable.max(state.durable_head));
         state.attachments.retain(|entry| !entry.queue.is_closed());
-        for frame in frames {
+        for frame in page.frames {
             for entry in &state.attachments {
                 entry.queue.push(frame.clone());
             }
         }
-        state.durable_head = reached.min(head);
+        state.durable_head = page.next_sequence.min(head);
     }
 
     /// Projects with a running or parked host turn, by project key
@@ -1905,34 +1902,43 @@ impl HostConnection {
                 },
             });
         }
-        let frames = replay(
+        let page = replay_page(
             self.host.transcripts.as_ref(),
             &slot.id,
             generation,
             start,
             budget,
         )?;
-        let replayed_to = frames.last().map_or(start, |frame| frame.cursor.durable);
-        for frame in frames {
+        let last_visible = page
+            .frames
+            .last()
+            .map_or(start, |frame| frame.cursor.durable);
+        for frame in page.frames {
             queue.push(frame);
         }
-        if replayed_to < head {
-            // More durable history than fits: let the client page on.
-            queue.push(FrameEnvelope {
+        if page.next_sequence < head {
+            let resume_from = Cursor {
+                generation,
+                durable: page.next_sequence,
+                live: 0,
+            };
+            if page.next_sequence > last_visible {
+                // A cursor is acknowledged by applying a frame, not by
+                // reading Lagged. Checkpoint hidden records on the wire so
+                // conservative clients can advance without skipping a visible item.
+                queue.push(FrameEnvelope {
+                    session_id: slot.id.clone(),
+                    cursor: resume_from,
+                    frame: SessionFrame::Heartbeat,
+                });
+            }
+            // Finish this replay page. A later Presence push must not evict
+            // the checkpoint (or an item) before the client receives it.
+            queue.close(Some(FrameEnvelope {
                 session_id: slot.id.clone(),
-                cursor: Cursor {
-                    generation,
-                    durable: replayed_to,
-                    live: 0,
-                },
-                frame: SessionFrame::Lagged {
-                    resume_from: Cursor {
-                        generation,
-                        durable: replayed_to,
-                        live: 0,
-                    },
-                },
-            });
+                cursor: resume_from,
+                frame: SessionFrame::Lagged { resume_from },
+            }));
         } else {
             // Pending approvals come from the approval store, never from the
             // transcript (PL-65 §3.4 step 3).
@@ -1964,11 +1970,17 @@ impl HostConnection {
                         }
                     }
                     None => {
-                        let frame = state.ring.snapshot().unwrap_or(SessionFrame::Snapshot {
+                        let mut frame = state.ring.snapshot().unwrap_or(SessionFrame::Snapshot {
                             turn_id,
                             assistant_text: String::new(),
                             reasoning_collapsed: false,
+                            reasoning_text: None,
                         });
+                        if params.profile == StreamProfile::Compact
+                            && let SessionFrame::Snapshot { reasoning_text, .. } = &mut frame
+                        {
+                            *reasoning_text = None;
+                        }
                         queue.push(FrameEnvelope {
                             session_id: slot.id.clone(),
                             cursor: state.head_cursor(),

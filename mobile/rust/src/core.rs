@@ -868,6 +868,51 @@ impl MobileCore {
         )
     }
 
+    /// Sichtbare exakte Cloud-Modellrouten für ein einmaliges Opt-in, nur lokal.
+    pub fn hybrid_vision_choices(&self) -> Result<Vec<crate::HybridVisionChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            if let Some(model) = &link.backend.hybrid_model {
+                return crate::hybrid::choices(model);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// One-shot: the named cloud route only sees the approved images. The
+    /// question and final generation remain on the pinned local Qwen.
+    pub async fn hybrid_vision_reply(
+        &self,
+        choice: crate::HybridVisionChoice,
+        images: Vec<PromptImage>,
+        question: String,
+        progress: Arc<dyn crate::HybridVisionProgress>,
+    ) -> Result<String, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            let model = link.backend.hybrid_model.clone()
+                .ok_or_else(|| session_error("Cloud-Bildanalyse ist nur im lokalen Chat verfügbar"))?;
+            let stop = link.stop.clone();
+            let runtime = self.runtime.as_ref().ok_or_else(|| internal("Runtime stopped"))?;
+            let work = runtime.spawn(async move {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => Err(MobileError::Disconnected),
+                    result = crate::hybrid::reply(model, choice, images, question, progress) => result,
+                }
+            });
+            tokio_util::task::AbortOnDropHandle::new(work).await
+                .map_err(|_| internal("Vision task stopped"))?
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, images, question, progress);
+            Err(session_error("Cloud-Bildanalyse ist in diesem Build nicht verfügbar"))
+        }
+    }
+
     /// Wie `submit`, mit Bildern am Prompt. Ohne Host-Feature `images` wird das ohne Anfrage abgelehnt.
     pub fn submit_with_images(
         &self,
@@ -1948,6 +1993,23 @@ fn start_attachment(
     session.worker = Some(SessionWorker { stop, task });
 }
 
+#[derive(Default)]
+struct AttachmentRecovery {
+    attempts: usize,
+}
+
+impl AttachmentRecovery {
+    fn after_eof(&mut self) -> Option<Duration> {
+        let ms = [250, 500, 1_000].get(self.attempts).copied()?;
+        self.attempts += 1;
+        Some(Duration::from_millis(ms))
+    }
+
+    fn made_progress(&mut self) {
+        self.attempts = 0;
+    }
+}
+
 async fn drive_attachment(
     shared: Arc<Shared>,
     id: SessionId,
@@ -1956,7 +2018,8 @@ async fn drive_attachment(
     mut from: Option<Cursor>,
 ) {
     let mut stalled = 0_u8;
-    while !stop.is_cancelled() {
+    let mut recovery = AttachmentRecovery::default();
+    'attach: while !stop.is_cancelled() {
         let Some(Ok(permit)) = stop.run_until_cancelled(link.attaching.acquire()).await else {
             return;
         };
@@ -2020,11 +2083,46 @@ async fn drive_attachment(
                     return;
                 }
                 Some(Ok(None)) => {
-                    end_attachment(&shared, &id, &link, "The server ended this attachment");
-                    return;
+                    // A frame source can end while the base connection is healthy.
+                    // Kotlin still considers the window open, so its snapshot polls
+                    // cannot restart a dead worker. Recover here, where the cursor
+                    // and attachment cancellation are both available.
+                    let Some(delay) = recovery
+                        .after_eof()
+                        .filter(|_| ack.session.state != HostedState::Closed)
+                    else {
+                        end_attachment(&shared, &id, &link, "The server ended this attachment");
+                        return;
+                    };
+                    let Some(resume) = with_session(&shared, &id, &link, SessionState::recover_stream)
+                    else {
+                        return;
+                    };
+                    drop(source);
+                    match stop
+                        .run_until_cancelled(link.request(link.backend.port().detach(id.clone())))
+                        .await
+                    {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            end_attachment(&shared, &id, &link, &error.to_string());
+                            return;
+                        }
+                        None => return,
+                    }
+                    if stop.run_until_cancelled(tokio::time::sleep(delay)).await.is_none() {
+                        return;
+                    }
+                    from = resume;
+                    continue 'attach;
                 }
                 None => return,
             };
+            // Merely seeing replay or handshake frames is not evidence that a
+            // broken stream recovered; let three rapid replay-only EOFs stop.
+            if envelope.cursor > ack.head && !matches!(&envelope.frame, SessionFrame::Presence { .. }) {
+                recovery.made_progress();
+            }
             if let SessionFrame::Holder { session_id, holder } = &envelope.frame {
                 let mut state = shared.state();
                 if state.same_link(&link) {
@@ -2319,6 +2417,86 @@ fn ambiguous() -> MobileError {
 #[cfg(test)]
 mod profile_tests {
     use super::*;
+
+    #[test]
+    fn clean_session_stream_eof_retries_with_a_bounded_backoff() {
+        let mut recovery = AttachmentRecovery::default();
+        assert_eq!(recovery.after_eof(), Some(Duration::from_millis(250)));
+        assert_eq!(recovery.after_eof(), Some(Duration::from_millis(500)));
+        assert_eq!(recovery.after_eof(), Some(Duration::from_secs(1)));
+        assert_eq!(recovery.after_eof(), None);
+        recovery.made_progress();
+        assert_eq!(recovery.after_eof(), Some(Duration::from_millis(250)));
+    }
+
+    #[cfg(feature = "local-host")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retained_session_reattaches_after_its_source_ends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let backend = crate::local::open_local_with_model(
+            crate::home::AppHome::open(dir.path())?,
+            Arc::new(harw_core::EchoModelProvider::new("fixture")),
+            requested_features(),
+        )
+        .await?;
+        let shared = Arc::new(Shared::default());
+        let link = Arc::new(Link {
+            backend,
+            stop: CancellationToken::new(),
+            failure: watch::channel(None).0,
+            attaching: Semaphore::new(1),
+        });
+        let id = link
+            .backend
+            .port()
+            .create(CreateParams {
+                workspace: None,
+                title: Some("attachment fixture".into()),
+                fork_from: None,
+            })
+            .await?
+            .session_id;
+        {
+            let mut state = shared.state();
+            state.link = Some(Arc::clone(&link));
+            let session = state.sessions.entry(id.clone()).or_default();
+            start_attachment(&shared, session, id.clone(), Arc::clone(&link));
+        }
+        let wait_until_online = |online| {
+            let shared = Arc::clone(&shared);
+            let id = id.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if shared
+                            .state()
+                            .session(&id)
+                            .is_ok_and(|state| state.snapshot(&id, true).online == online)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+            }
+        };
+        wait_until_online(true).await?;
+
+        // Inject source EOF without stopping the session, the connection, or
+        // the retained Rust worker. Hold reattach until we observe unready.
+        let permit = link.attaching.acquire().await?;
+        link.backend.port().detach(id.clone()).await?;
+        wait_until_online(false).await?;
+        drop(permit);
+
+        // The same subscription recovers; no second open_session call.
+        let recovered = wait_until_online(true).await;
+        link.stop.cancel();
+        recovered?;
+        Ok(())
+    }
 
     #[test]
     fn attach_profile_follows_the_granted_features() {

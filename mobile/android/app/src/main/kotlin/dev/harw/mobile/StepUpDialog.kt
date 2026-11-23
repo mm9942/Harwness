@@ -1,5 +1,6 @@
 package dev.harw.mobile
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.KeyguardManager
 import android.hardware.biometrics.BiometricManager
@@ -47,6 +48,8 @@ internal class StepUpAuthorization(private val activity: ComponentActivity) {
     private var awaitingCredential by mutableStateOf(false)
     val busy: Boolean get() = pending != null || awaitingCredential
 
+    // MainActivity is a ComponentActivity, not a legacy FragmentActivity.
+    @SuppressLint("InvalidFragmentVersionForActivityResult")
     private val credential = activity.registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (!awaitingCredential) return@registerForActivityResult
         awaitingCredential = false

@@ -8,6 +8,7 @@ mod core;
 mod device;
 mod device_tools;
 mod home;
+mod hybrid;
 mod identity;
 mod listener;
 mod local;
@@ -32,10 +33,12 @@ pub use device::{
     ShellRequest, check_shell_request, device_limits, normalize_device_path,
 };
 pub use device_tools::{device_tools_enabled, set_device_tools_enabled};
+pub use hybrid::{HybridVisionChoice, HybridVisionProgress};
 pub use identity::{
     generate_identity, parse_device_enrollment, parse_server_profile, sign_admin_enrollment,
 };
 pub use listener::CoreListener;
+pub use local::set_local_image_concurrency;
 pub use models::{
     CatalogModel, ImportCheck, ImportVerdict, LocalModel, ModelFileState, ModelOrigin,
     ModelProgress, ModelVerification, commit_import, delete_model, discard_import, finalize_model,

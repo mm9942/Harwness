@@ -616,6 +616,9 @@ pub struct PresenceEntry {
     pub since: jiff::Timestamp,
 }
 
+/// Limit for the user-visible reasoning preview in a live snapshot.
+pub const MAX_VISIBLE_REASONING_BYTES: usize = 16 * 1024;
+
 /// One frame of a session stream.
 ///
 /// The derive uses `remote = "Self"` so the generated (strict) serde code
@@ -663,6 +666,9 @@ pub enum SessionFrame {
         turn_id: TurnId,
         assistant_text: String,
         reasoning_collapsed: bool,
+        /// Provider-facing UI text, never encrypted or opaque reasoning payloads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_text: Option<String>,
     },
     /// The durable history was replaced (compaction marker).
     HistoryReplaced { item_count: u32 },

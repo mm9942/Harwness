@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.dp
 import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
+import uniffi.harw_mobile_ffi.setLocalImageConcurrency
 
 internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias, Knowledge }
 
@@ -51,28 +52,36 @@ internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route)
 internal const val UI_PREFS = "harw_ui"
 internal const val PREF_THEME = "theme" // "system" | "light" | "dark"
 internal const val PREF_SHOW_REASONING = "show_reasoning"
-internal const val PREF_IMAGE_PARALLEL = "image_parallel"
+private const val PREF_LEGACY_IMAGE_PARALLEL = "image_parallel"
+private const val PREF_LOCAL_IMAGE_CONCURRENCY = "image_concurrency"
 
-/** Lokale Bildbeschreibung: bis zu drei Bilder gleichzeitig (Standard aus). Wirkt ab der naechsten Nachricht. */
-internal fun readImageParallelPref(context: Context): Boolean = try {
-    context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).getBoolean(PREF_IMAGE_PARALLEL, false)
+internal fun restoredImageConcurrency(value: Any?, legacyParallel: Boolean?): Int = when {
+    value == null -> if (legacyParallel == true) 3 else 1
+    value is Int && value in 1..3 -> value
+    else -> 1
+}
+
+internal fun readLocalImageConcurrency(context: Context): Int = try {
+    val prefs = context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).all
+    restoredImageConcurrency(
+        prefs[PREF_LOCAL_IMAGE_CONCURRENCY],
+        prefs[PREF_LEGACY_IMAGE_PARALLEL] as? Boolean,
+    )
+} catch (_: RuntimeException) {
+    1
+}
+
+internal fun applyLocalImageConcurrency(value: Int): Boolean =
+    value in 1..3 && runCatching { setLocalImageConcurrency(value.toUByte()) }.getOrDefault(false)
+
+private fun writeLocalImageConcurrency(context: Context, value: Int): Boolean = try {
+    context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).edit()
+        .putInt(PREF_LOCAL_IMAGE_CONCURRENCY, value)
+        .remove(PREF_LEGACY_IMAGE_PARALLEL)
+        .apply()
+    true
 } catch (_: RuntimeException) {
     false
-}
-
-internal fun applyImageParallelEnv(value: Boolean) {
-    try {
-        android.system.Os.setenv("HARW_LOCAL_IMAGE_PARALLEL", if (value) "3" else "1", true)
-    } catch (_: Exception) {
-    }
-}
-
-private fun writeImageParallelPref(context: Context, value: Boolean) {
-    try {
-        context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).edit().putBoolean(PREF_IMAGE_PARALLEL, value).apply()
-    } catch (_: RuntimeException) {
-    }
-    applyImageParallelEnv(value)
 }
 
 private val THEME_CHOICES = listOf("system" to "Wie System", "light" to "Hell", "dark" to "Dunkel")
@@ -185,7 +194,7 @@ internal fun SettingsHub(
     }
     var theme by remember { mutableStateOf(readThemePref(context)) }
     var showReasoning by remember { mutableStateOf(readShowReasoningPref(context)) }
-    var imageParallel by remember { mutableStateOf(readImageParallelPref(context)) }
+    var imageConcurrency by remember { mutableStateOf(readLocalImageConcurrency(context)) }
     var editing by remember { mutableStateOf<ManageConfigEntry?>(null) }
     val block = manageOpenBlock(state)
     var modelsFolderOpen by remember { mutableStateOf(false) }
@@ -287,25 +296,46 @@ internal fun SettingsHub(
                     },
                 )
             }
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            SectionTitle("Bilder auf diesem Gerät")
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text("Bilder parallel verarbeiten", style = MaterialTheme.typography.bodyLarge)
-                    Text(
-                        "Lokal: bis zu drei Bilder gleichzeitig beschreiben. Schneller, braucht aber mehr Speicher und Akku.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                Switch(
-                    checked = imageParallel,
-                    onCheckedChange = {
-                        imageParallel = it
-                        writeImageParallelPref(context, it)
-                    },
+                Text("Gleichzeitige Bildbeschreibungen", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    "Gilt ab der nächsten lokalen Verarbeitung. Mehr parallele Bilder brauchen mehr Speicher und Akku.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    (1..3).forEach { count ->
+                        FilterChip(
+                            selected = imageConcurrency == count,
+                            onClick = {
+                                if (count != imageConcurrency) {
+                                    if (applyLocalImageConcurrency(count)) {
+                                        imageConcurrency = count
+                                        if (!writeLocalImageConcurrency(context, count)) {
+                                            Toast.makeText(
+                                                context,
+                                                "Bildeinstellung konnte nicht gespeichert werden",
+                                                Toast.LENGTH_SHORT,
+                                            ).show()
+                                        }
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            "Lokale Bildeinstellung nicht verfügbar",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                }
+                            },
+                            label = { Text(if (count == 1) "1 Bild" else "$count Bilder") },
+                        )
+                    }
+                }
             }
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)

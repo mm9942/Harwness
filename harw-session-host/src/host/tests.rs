@@ -636,6 +636,74 @@ async fn reattach_replays_the_exact_durable_suffix() -> TestResult {
 }
 
 #[tokio::test]
+async fn attach_replays_across_hidden_durable_pages_without_stalling() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let transcripts = Arc::new(MemoryTranscripts::new());
+    let approvals = Arc::new(MemoryApprovals::new());
+    let driver = Arc::new(FakeDriver::new(
+        Arc::clone(&transcripts),
+        Arc::clone(&approvals),
+    ));
+    let mut config = HostConfig::new(dir.path().to_path_buf());
+    config.queue.max_frames = 4; // 2 transcript records per attach page
+    let host = SessionHost::open(config, driver.clone(), transcripts.clone(), approvals)?;
+    let phone = connect(&host, local(1, PermissionTier::Operator)).await?;
+    let session = phone.create(CreateParams::default()).await?.session_id;
+    driver.append_item(&session, "before");
+    for sequence in 1..=4 {
+        transcripts.append(TranscriptRecord::new(
+            session.clone(),
+            ThreadRef::from_str("root"),
+            sequence,
+            jiff::Timestamp::now(),
+            RecordKind::Turn,
+            serde_json::Value::Null,
+        ));
+    }
+    driver.append_item(&session, "after");
+
+    let mut projected = Cursor::default();
+    let mut items = Vec::new();
+    for (start, next) in [(0, 2), (2, 4), (4, 6)] {
+        let (ack, mut frames) = phone
+            .attach(AttachParams {
+                profile: StreamProfile::CompactReasoning,
+                ..attach(&session, Some(projected))
+            })
+            .await?;
+        assert_eq!(ack.replay_from.durable, start);
+        assert_eq!(ack.head.durable, 6);
+        loop {
+            let envelope = next_frame(&mut frames).await?;
+            match envelope.frame {
+                SessionFrame::Lagged { resume_from } => {
+                    // Android conservatively takes the older of its last
+                    // applied frame and the advertised re-attachment cursor.
+                    projected = projected.min(resume_from);
+                    assert_eq!(projected.durable, next, "page {start} stalled");
+                    assert!(next < ack.head.durable, "caught-up page must not lag");
+                    break;
+                }
+                SessionFrame::Presence { .. } => {
+                    projected = envelope.cursor;
+                    assert_eq!(next, ack.head.durable, "premature ready frame");
+                    assert_eq!(projected.durable, next);
+                    break;
+                }
+                SessionFrame::Turn(TurnEvent::ItemAdded { .. }) => {
+                    projected = envelope.cursor;
+                    items.push(projected.durable);
+                }
+                SessionFrame::Heartbeat => projected = envelope.cursor,
+                other => return Err(format!("unexpected attach frame: {other:?}").into()),
+            }
+        }
+    }
+    assert_eq!(items, [1, 6], "no missing or duplicate visible items");
+    Ok(())
+}
+
+#[tokio::test]
 async fn old_generation_forces_resync() -> TestResult {
     // RP-02
     let fx = fixture()?;

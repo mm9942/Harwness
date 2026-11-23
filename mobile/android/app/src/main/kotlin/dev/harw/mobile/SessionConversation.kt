@@ -2,6 +2,7 @@ package dev.harw.mobile
 
 import android.content.res.Configuration
 import android.net.Uri
+import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -12,11 +13,17 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -43,6 +50,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.CallSplit
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
@@ -83,6 +91,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -193,6 +202,21 @@ internal fun SessionConversation(
     var transcriptJump by remember(sessionId) { mutableIntStateOf(0) }
     val approval = approvals.firstOrNull { it.id == approvalId }
     val turnId = snapshot?.runningTurnId
+    val replyRunning = turnId != null || session?.state in setOf(
+        MobileSessionState.QUEUED, MobileSessionState.RUNNING,
+        MobileSessionState.WAITING_FOR_APPROVAL, MobileSessionState.WAITING_FOR_CHILD,
+    )
+    val preservingReply = view?.preserveAnswerWhileReloading == true
+    val attachDetail = snapshot?.detail
+    val replayPending = attachDetail == null || attachDetail in setOf(
+        "Attaching to session", "Reconnecting to the session stream", "Catching up with the server",
+        "Synchronizing the session transcript",
+    )
+    val reloading = view?.answerReloadPending == true || preservingReply && replayPending
+    val replyStatus = chatReplyStatus(
+        attached = active, running = replyRunning, hasReplyText = !snapshot?.liveText.isNullOrBlank(),
+        reloading = reloading, approval = approvals.isNotEmpty() || session?.state == MobileSessionState.WAITING_FOR_APPROVAL,
+    )
     val approvalPending = SessionAction(sessionId, SessionActionKind.Decide) in state.pendingActions
     val interruptPending = SessionAction(sessionId, SessionActionKind.Interrupt) in state.pendingActions
     val sendPending = SessionAction(sessionId, SessionActionKind.Send) in state.pendingActions
@@ -306,7 +330,6 @@ internal fun SessionConversation(
                         state.detail?.takeIf { it.isNotBlank() },
                     ).joinToString(" · "),
                     Modifier.padding(horizontal = 15.dp, vertical = 4.dp),
-                    error = true,
                 )
             }
             if (state.local) {
@@ -336,7 +359,7 @@ internal fun SessionConversation(
                     }
                 }
             }
-            if (inlineActivity || turnId != null) {
+            if (inlineActivity || turnId != null || state.online && snapshot != null) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -358,6 +381,14 @@ internal fun SessionConversation(
                                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 )
                             }
+                        }
+                    }
+                    if (state.online && snapshot != null) {
+                        TextButton(
+                            onClick = { connection.reloadAnswer(sessionId) },
+                            enabled = view?.answerReloadPending != true,
+                        ) {
+                            Text(if (view?.answerReloadPending == true) "Wird nachgeladen …" else "Antwort nachladen")
                         }
                     }
                     if (turnId != null) {
@@ -384,9 +415,16 @@ internal fun SessionConversation(
                     modifier = Modifier.padding(horizontal = 15.dp, vertical = 5.dp),
                 )
             }
-            view?.error?.let { StatusMessage(it, Modifier.padding(horizontal = 15.dp, vertical = 4.dp), error = true) }
-            (snapshot?.lastFailure ?: state.detail?.takeUnless { state.online } ?: snapshot?.detail?.takeUnless { it == view?.error })?.let {
-                StatusMessage(it, Modifier.padding(horizontal = 15.dp, vertical = 4.dp), error = snapshot?.lastFailure != null)
+            val savedIncomplete = snapshot?.transcript.orEmpty().any {
+                it.kind == TranscriptKind.ERROR && isIncompleteResponseNotice(it.text)
+            }
+            val failure = view?.error ?: snapshot?.lastFailure
+                ?: attachDetail?.takeIf { preservingReply && !reloading }
+            failure?.takeUnless { savedIncomplete && isIncompleteResponseNotice(it) }?.let {
+                ChatErrorNotice(sessionId, it)
+            }
+            snapshot?.detail?.takeUnless { it == failure || reloading }?.let {
+                StatusMessage(it, Modifier.padding(horizontal = 15.dp, vertical = 4.dp))
             }
         if (LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT && snapshot != null) {
             MissionHeader(
@@ -401,6 +439,10 @@ internal fun SessionConversation(
             val agentName = rememberChatAgentName(sessionId, state.local, agentVersion) ?: "Harw"
             var versions by remember(sessionId) { mutableStateOf(ChatVersions.load(ctx, sessionId)) }
             var viewing by remember(sessionId) { mutableStateOf(emptyMap<String, Int>()) }
+            var forkPreparing by remember(sessionId) { mutableStateOf(false) }
+            val forkError: (String) -> Unit = { message ->
+                android.widget.Toast.makeText(ctx, message, android.widget.Toast.LENGTH_LONG).show()
+            }
             val resend = { entryId: String, text: String, images: List<uniffi.harw_mobile_ffi.PromptImage> ->
                 val all = snapshot?.transcript.orEmpty()
                 val at = all.indexOfFirst { it.id == entryId }
@@ -426,11 +468,43 @@ internal fun SessionConversation(
                 fetchMedia = { ref -> connection.mediaThumbnail(sessionId, ref) },
                 onRegenerate = resend,
                 versionsUi = versionsUi,
-                onFork = { entryId, text, images ->
-                    val open = { id: String -> window.prefillDraft(id, text, images); window.projectKey?.let { applyProjectAgent(ctx, it, id) }; window.select(id) }
-                    connection.forkSession(sessionId, entryId, window.projectKey, open) { message -> android.widget.Toast.makeText(ctx, message, android.widget.Toast.LENGTH_LONG).show() }
+                onFork = { fork ->
+                    val expectedGeneration = connection.state.value.generation
+                    if (expectedGeneration == null) {
+                        forkError("Zum Abzweigen muss die Verbindung zum Chat aktiv sein.")
+                    } else if (!forkPreparing) {
+                        val projectKey = window.projectKey
+                        forkPreparing = true
+                        scope.launch {
+                            try {
+                                // Stored refs recover the actual bytes rather than
+                                // guessing by prompt text (which older revisions can share).
+                                val images = if (fork.imageRefs.isEmpty()) fork.cachedImages else {
+                                    fork.imageRefs.mapNotNull { ref -> connection.mediaThumbnail(sessionId, ref) }
+                                }
+                                if (window.sessionId != sessionId || connection.state.value.generation != expectedGeneration) return@launch
+                                if (images.size != fork.imageCount) {
+                                    forkError("Abzweigen nicht möglich: Die Bilder dieser Fassung konnten nicht vollständig übernommen werden.")
+                                    return@launch
+                                }
+                                connection.forkSession(sessionId, fork.beforeItem, projectKey, { id ->
+                                    window.prefillDraft(id, fork.text, images)
+                                    projectKey?.let { applyProjectAgent(ctx, it, id) }
+                                    if (window.sessionId == sessionId) window.select(id)
+                                }, forkError)
+                            } finally {
+                                forkPreparing = false
+                            }
+                        }
+                    }
+                },
+                onUnsupportedFork = {
+                    forkError("Diese Nachricht liegt nur in der älteren Fassung. Wähle zum Abzweigen die erste bearbeitete Nachricht.")
                 },
                 liveText = snapshot?.liveText?.takeUnless { it.isEmpty() },
+                liveReasoning = snapshot?.liveReasoning?.takeIf { !it.isBlank() },
+                showReasoning = readShowReasoningPref(ctx),
+                replyStatus = replyStatus,
                 jumpToLatest = transcriptJump,
                 emptyMessage = when {
                     snapshot == null && state.online -> "Session wird geöffnet …"
@@ -454,8 +528,23 @@ internal fun SessionConversation(
             val imagesSupported by produceState(false, state.online, state.generation) {
                 value = state.online && connection.supportsImages()
             }
+            val draft = window.draft(sessionId)
+            var visionDraft by remember(sessionId, generation) { mutableStateOf<SessionDraft?>(null) }
+            if (state.local && sendEnabled && !draft.uncertain && draft.rewindBefore == null &&
+                draft.images.any { it.freshlyPicked }
+            ) {
+                TextButton(onClick = { visionDraft = draft }) { Text("Cloud-Bildanalyse mit lokalem Qwen") }
+            }
+            visionDraft?.let { approvedDraft ->
+                HybridVisionDialog(
+                    connection = connection,
+                    images = approvedDraft.images.filter { it.freshlyPicked },
+                    question = approvedDraft.text,
+                    onClose = { visionDraft = null },
+                )
+            }
             PromptComposer(
-                draft = window.draft(sessionId),
+                draft = draft,
                 onAttachImage = if (imagesSupported) ({ image -> window.attachImage(sessionId, image) }) else null,
                 onDetachImage = { index -> window.detachImage(sessionId, index) },
                 onImageError = { message -> window.failImage(sessionId, message) },
@@ -475,6 +564,53 @@ internal fun SessionConversation(
     }
 }
 
+/** Only report observable turn/transport status; never infer or copy reasoning text. */
+internal fun chatReplyStatus(
+    attached: Boolean,
+    running: Boolean,
+    hasReplyText: Boolean,
+    reloading: Boolean,
+    approval: Boolean,
+): String? = when {
+    reloading -> "Antwort wird nachgeladen …"
+    !running -> null
+    !attached -> "Antwortstatus wird abgeglichen …"
+    approval -> "Wartet auf Freigabe."
+    hasReplyText -> "Antwort wird gestreamt …"
+    else -> "Antwort wird erstellt … Noch kein Antworttext empfangen."
+}
+
+internal fun isIncompleteResponseNotice(text: String): Boolean =
+    text.startsWith("Antwort unvollständig:") || text.equals("model output was truncated", ignoreCase = true)
+
+@Composable
+private fun ChatErrorNotice(sessionId: String, message: String) {
+    var dismissed by rememberSaveable(sessionId, message) { mutableStateOf(false) }
+    val deadline = rememberSaveable(sessionId, message) { SystemClock.elapsedRealtime() + 60_000 }
+    LaunchedEffect(sessionId, message, deadline) {
+        delay((deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0))
+        dismissed = true
+    }
+    if (dismissed) return
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        StatusMessage(message, Modifier.weight(1f), error = true)
+        IconButton(onClick = { dismissed = true }) {
+            Icon(Icons.Outlined.Close, contentDescription = "Fehlermeldung schließen", Modifier.size(18.dp))
+        }
+    }
+}
+
+private data class ForkDraft(
+    val beforeItem: String,
+    val text: String,
+    val imageCount: Int,
+    val imageRefs: List<String>,
+    val cachedImages: List<uniffi.harw_mobile_ffi.PromptImage>,
+)
+
 @Composable
 private fun ConversationFeed(
     agentName: String,
@@ -482,14 +618,21 @@ private fun ConversationFeed(
     sentImages: (String, Int) -> List<uniffi.harw_mobile_ffi.PromptImage>?,
     fetchMedia: suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?,
     onRegenerate: ((String, String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
-    onFork: ((String, String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
+    onFork: ((ForkDraft) -> Unit)? = null,
+    onUnsupportedFork: (() -> Unit)? = null,
     versionsUi: VersionsUi? = null,
     liveText: String?,
+    liveReasoning: String?,
+    showReasoning: Boolean,
+    replyStatus: String?,
     jumpToLatest: Int,
     emptyMessage: String,
     modifier: Modifier,
 ) {
-    if (entries.isEmpty() && liveText == null) {
+    val visibleReasoning = liveReasoning.takeIf { showReasoning }
+    if (entries.none { showReasoning || it.kind != TranscriptKind.REASONING } &&
+        liveText == null && replyStatus == null && visibleReasoning == null
+    ) {
         Box(modifier, contentAlignment = Alignment.Center) { DirectoryEmpty(emptyMessage) }
         return
     }
@@ -499,7 +642,9 @@ private fun ConversationFeed(
     }
     val shown = viewed.first
     val readOnlyFrom = viewed.second
-    val reversed = remember(shown) { shown.asReversed() }
+    val reversed = remember(shown, showReasoning) {
+        (if (showReasoning) shown else shown.filterNot { it.kind == TranscriptKind.REASONING }).asReversed()
+    }
     val listState = rememberLazyListState()
     var followLatest by rememberSaveable { mutableStateOf(true) }
     LaunchedEffect(listState) {
@@ -507,7 +652,7 @@ private fun ConversationFeed(
             if (scrolling || !awayFromLatest) followLatest = !awayFromLatest
         }
     }
-    LaunchedEffect(liveText != null, entries.lastOrNull()?.id) {
+    LaunchedEffect(liveText != null, visibleReasoning != null, replyStatus != null, entries.lastOrNull()?.id) {
         if (followLatest) listState.requestScrollToItem(0)
     }
     LaunchedEffect(jumpToLatest) {
@@ -524,12 +669,29 @@ private fun ConversationFeed(
         if (liveText != null) {
             item(key = "live-reply") { MessageBlock("$agentName · Streaming", liveText, TranscriptKind.ASSISTANT) }
         }
+        if (replyStatus != null) {
+            item(key = "live-reply-status") { InlineReplyMetadata(replyStatus) }
+        }
+        if (visibleReasoning != null) {
+            item(key = "live-reasoning") { InlineReasoning(visibleReasoning, live = true) }
+        }
         items(reversed, key = { "entry-${it.id}" }) { entry ->
+            if (entry.kind == TranscriptKind.REASONING) {
+                InlineReasoning(entry.text, live = false)
+                return@items
+            }
+            if (entry.kind == TranscriptKind.ERROR && isIncompleteResponseNotice(entry.text)) {
+                InlineReplyMetadata(
+                    if (entry.text.startsWith("Antwort unvollständig:")) entry.text else "Antwort unvollständig.",
+                )
+                return@items
+            }
             val label = when (entry.kind) {
                 TranscriptKind.USER -> "Du"
                 TranscriptKind.ASSISTANT -> agentName
                 TranscriptKind.TOOL -> entry.toolState?.let { "Werkzeug · ${it.displayName()}" } ?: "Werkzeug"
                 TranscriptKind.ERROR -> "Fehler"
+                TranscriptKind.REASONING -> "Denkprozess"
             }
             if (entry.kind == TranscriptKind.USER) {
                 val index = shown.indexOfFirst { it.id == entry.id }
@@ -549,11 +711,24 @@ private fun ConversationFeed(
                 val (clean, count) = splitImagePlaceholders(entry.text)
                 val thumbs = if (count > 0) sentImages(clean, count) else null
                 val shownText = if (count > 0) clean else entry.text
+                val boundary = forkBoundaryId(entries, shown, index, readOnlyFrom)
                 MessageBlock(
                     label, shownText, entry.kind, imageCount = count, thumbs = thumbs,
                     imageRefs = entry.images, fetchMedia = fetchMedia,
                     onRegenerate = if (canAct) onRegenerate?.let { cb -> { cb(entry.id, shownText, thumbs.orEmpty()) } } else null,
-                    onFork = onFork?.let { cb -> { cb(entry.id, shownText, thumbs.orEmpty()) } },
+                    onFork = onFork?.let { cb ->
+                        if (boundary == null) onUnsupportedFork else {
+                            {
+                                cb(ForkDraft(
+                                    beforeItem = boundary,
+                                    text = shownText,
+                                    imageCount = maxOf(count, entry.images.size),
+                                    imageRefs = entry.images,
+                                    cachedImages = if (canAct) thumbs.orEmpty() else emptyList(),
+                                ))
+                            }
+                        }
+                    },
                     onEdit = if (canAct && versionsUi != null) ({ newText -> versionsUi.onEdit(entry, anchor, newText, thumbs.orEmpty()) }) else null,
                     nav = nav,
                     oldVersion = viewingIdx != null && index >= 0 && !canAct,
@@ -563,6 +738,29 @@ private fun ConversationFeed(
             MessageBlock(label, entry.text, entry.kind)
         }
     }
+}
+
+/** Show only the provider-facing display text, never treat it as Markdown or a command. */
+@Composable
+private fun InlineReasoning(text: String, live: Boolean) {
+    val preview = if (live && text.length > 1_200) "…" + text.takeLast(1_200) else text
+    SelectionContainer {
+        Text(
+            preview, Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.bodySmall,
+            fontStyle = FontStyle.Italic,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun InlineReplyMetadata(text: String) {
+    Text(
+        text, Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable
@@ -585,7 +783,7 @@ private fun MessageBlock(
     val (background, foreground) = when (kind) {
         TranscriptKind.USER -> colors.primaryContainer to colors.onPrimaryContainer
         TranscriptKind.ASSISTANT -> colors.surfaceContainerLowest to colors.onSurface
-        TranscriptKind.TOOL -> colors.surfaceContainer to colors.onSurfaceVariant
+        TranscriptKind.TOOL, TranscriptKind.REASONING -> colors.surfaceContainer to colors.onSurfaceVariant
         TranscriptKind.ERROR -> colors.errorContainer to colors.onErrorContainer
     }
     Box(Modifier.fillMaxWidth(), contentAlignment = if (user) Alignment.CenterEnd else Alignment.CenterStart) {
@@ -788,18 +986,41 @@ internal fun PromptComposer(
     onImageError: (String) -> Unit = {},
 ) {
     val context = LocalContext.current
+    val preparationScope = rememberCoroutineScope()
+    var preparingImages by remember { mutableIntStateOf(0) }
+    var preparedImages by remember { mutableIntStateOf(0) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris: List<Uri> ->
-        val free = (MaxPromptImages - draft.images.size).coerceAtLeast(0)
-        if (uris.isNotEmpty() && onAttachImage != null) {
-            uris.take(free).forEachIndexed { index, uri ->
-                val label = "Bild ${draft.images.size + index + 1}"
-                // Dekodieren und Verkleinern gehoert nicht auf den Hauptthread.
-                Thread {
-                    val image = prepareImage(context, uri, label)
-                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        if (image != null) onAttachImage(image) else onImageError("Ein Bild konnte nicht gelesen oder nicht klein genug gemacht werden.")
+        val attach = onAttachImage
+        val existing = draft.images.size
+        val selected = uris.take((MaxPromptImages - existing).coerceAtLeast(0))
+        if (selected.isNotEmpty() && attach != null && preparingImages == 0) {
+            preparingImages = selected.size
+            preparedImages = 0
+            preparationScope.launch {
+                try {
+                    // Cap decoders independently of native inference and preserve picker order.
+                    for ((batchIndex, batch) in selected.chunked(2).withIndex()) {
+                        val images = coroutineScope {
+                            batch.mapIndexed { offset, uri ->
+                                async {
+                                    val index = existing + batchIndex * 2 + offset + 1
+                                    val image = withContext(Dispatchers.IO) {
+                                        prepareImage(context, uri, "Bild ${index}")
+                                    }
+                                    preparedImages += 1
+                                    image
+                                }
+                            }.awaitAll()
+                        }
+                        images.forEach { image ->
+                            if (image != null) attach(image)
+                            else onImageError("Ein Bild konnte nicht gelesen oder nicht klein genug gemacht werden.")
+                        }
                     }
-                }.start()
+                } finally {
+                    preparingImages = 0
+                    preparedImages = 0
+                }
             }
         }
     }
@@ -813,10 +1034,16 @@ internal fun PromptComposer(
                 TextButton(enabled = !draft.sending, onClick = onDiscard) { Text("Entwurf verwerfen") }
             }
         }
+        if (preparingImages > 0) {
+            Text("Bilder vorbereiten: ${preparedImages}/${preparingImages}", style = MaterialTheme.typography.labelSmall)
+        }
         if (draft.images.isNotEmpty()) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 draft.images.forEachIndexed { index, image ->
-                    DraftThumbnail(image, enabled = enabled && !draft.uncertain) { onDetachImage(index) }
+                    DraftThumbnail(image, enabled = preparingImages == 0 && enabled && !draft.uncertain) { onDetachImage(index) }
                 }
             }
         }
@@ -826,7 +1053,7 @@ internal fun PromptComposer(
             }
             if (onAttachImage != null) {
                 IconButton(
-                    enabled = enabled && !draft.uncertain && draft.images.size < MaxPromptImages,
+                    enabled = preparingImages == 0 && enabled && !draft.uncertain && draft.images.size < MaxPromptImages,
                     onClick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
                 ) { Icon(Icons.Outlined.AddPhotoAlternate, "Bild anhängen") }
             }
@@ -839,7 +1066,7 @@ internal fun PromptComposer(
                 shape = RoundedCornerShape(17.dp),
                 maxLines = 4,
             )
-            FilledIconButton(onClick = onSend, enabled = enabled && canSend && (draft.text.isNotBlank() || draft.images.isNotEmpty()) && !draft.uncertain) {
+            FilledIconButton(onClick = onSend, enabled = preparingImages == 0 && enabled && canSend && (draft.text.isNotBlank() || draft.images.isNotEmpty()) && !draft.uncertain) {
                 if (busy) {
                     CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp)
                 } else {

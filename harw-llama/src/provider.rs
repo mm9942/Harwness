@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use harw_core::model::StopReason;
 use harw_core::{
     ConversationHistory, ModelError, ModelFuture, ModelMessage, ModelProvider, ModelRequest,
     ModelResponse, ModelStreamEvent, StreamSink,
 };
-use harw_core::model::StopReason;
-use harw_protocol::items::ToolCallResult;
+use harw_protocol::items::{OpaqueReasoning, ToolCallResult};
 use harw_tools::{ToolCall, ToolName, ToolSpec};
 use harw_types::{ReasoningEffort, TokenUsage, ToolCallId};
 use serde_json::{Value, json};
@@ -23,10 +23,9 @@ use crate::engine::{
     MEDIA_MARKER, SamplingParams,
 };
 use crate::error::LlamaError;
+use crate::inference::{InferencePermit, LocalInferenceControl};
 use crate::stream::{OutputSplitter, Piece, SplitOutput};
-use crate::template::{
-    ChatMessage, ChatToolCall, RenderInput, prompt_opens_think, render_prompt,
-};
+use crate::template::{ChatMessage, ChatToolCall, RenderInput, prompt_opens_think, render_prompt};
 use crate::toolcall::parse_tool_calls;
 
 /// Provider id reported by [`LocalGgufProvider`].
@@ -52,6 +51,8 @@ pub struct LocalGgufConfig {
     pub mmproj: Option<PathBuf>,
     /// Tokens one image may cost at most (smaller is faster on a phone).
     pub image_max_tokens: i32,
+    /// Shared settings and admission gate for local inference.
+    pub inference: LocalInferenceControl,
 }
 
 impl Default for LocalGgufConfig {
@@ -64,6 +65,7 @@ impl Default for LocalGgufConfig {
             lean: true,
             mmproj: None,
             image_max_tokens: DEFAULT_IMAGE_MAX_TOKENS,
+            inference: LocalInferenceControl::default(),
         }
     }
 }
@@ -73,8 +75,6 @@ pub struct LocalGgufProvider {
     engine: Arc<Engine>,
     model_id: String,
     config: LocalGgufConfig,
-    /// One generation at a time: a second context would double the memory use.
-    gate: Arc<Mutex<()>>,
     counter: AtomicU64,
     /// Image descriptions by (image bytes, question) hash.
     descriptions: Mutex<HashMap<u64, String>>,
@@ -110,7 +110,6 @@ impl LocalGgufProvider {
             engine: Arc::new(engine),
             model_id: model_id.into(),
             config,
-            gate: Arc::new(Mutex::new(())),
             counter: AtomicU64::new(0),
             descriptions: Mutex::new(HashMap::new()),
         })
@@ -169,26 +168,27 @@ fn emit(stream: Option<&StreamSink>, pieces: &mut Vec<Piece>) {
     }
 }
 
-fn run_job(
-    engine: &Engine,
-    gate: &Mutex<()>,
-    job: &Job,
-    abort: &AtomicBool,
-    serial: bool,
-) -> Result<Generated, LlamaError> {
-    // Beschreibungsdurchlaeufe duerfen parallel laufen (jeder hat seinen eigenen Kontext).
-    let _guard = serial.then(|| gate.lock().unwrap_or_else(PoisonError::into_inner));
+fn run_job(engine: &Engine, job: &Job, abort: &AtomicBool) -> Result<Generated, LlamaError> {
     let should_stop = || {
         abort.load(Ordering::Relaxed)
-            || job.cancel.as_ref().is_some_and(harw_types::cancel::CancelToken::is_cancelled)
+            || job
+                .cancel
+                .as_ref()
+                .is_some_and(harw_types::cancel::CancelToken::is_cancelled)
     };
     let mut splitter = OutputSplitter::new(job.start_in_think);
     let mut pieces = Vec::new();
     let images: Vec<&[u8]> = job.images.iter().map(|image| &image[..]).collect();
-    let stats = engine.generate(&job.prompt, &images, &job.sampling, &should_stop, &mut |chunk| {
-        splitter.push(chunk, &mut pieces);
-        emit(job.stream.as_ref(), &mut pieces);
-    })?;
+    let stats = engine.generate(
+        &job.prompt,
+        &images,
+        &job.sampling,
+        &should_stop,
+        &mut |chunk| {
+            splitter.push(chunk, &mut pieces);
+            emit(job.stream.as_ref(), &mut pieces);
+        },
+    )?;
     let output = splitter.finish(&mut pieces);
     emit(job.stream.as_ref(), &mut pieces);
     Ok(Generated {
@@ -344,7 +344,10 @@ fn referenced_images(text: &str) -> Vec<usize> {
         ("vierte", 4),
         ("fuenfte", 5),
     ];
-    let lower = text.to_lowercase().replace('\u{e4}', "ae").replace('\u{fc}', "ue");
+    let lower = text
+        .to_lowercase()
+        .replace('\u{e4}', "ae")
+        .replace('\u{fc}', "ue");
     let words: Vec<&str> = lower
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
@@ -505,7 +508,9 @@ fn chat_messages(
                 }
             }
             ModelMessage::Assistant { text } => messages.push(ChatMessage::new("assistant", text)),
-            ModelMessage::ToolCall { name, arguments, .. } => {
+            ModelMessage::ToolCall {
+                name, arguments, ..
+            } => {
                 let call = ChatToolCall { name, arguments };
                 match messages.last_mut() {
                     Some(last) if last.role == "assistant" => last.tool_calls.push(call),
@@ -521,7 +526,11 @@ fn chat_messages(
             }
         }
     }
-    if let Some(block) = request.data_block.as_deref().filter(|b| !b.trim().is_empty()) {
+    if let Some(block) = request
+        .data_block
+        .as_deref()
+        .filter(|b| !b.trim().is_empty())
+    {
         messages.push(ChatMessage::new("user", block));
     }
     let switch = messages
@@ -529,7 +538,11 @@ fn chat_messages(
         .rev()
         .find(|m| m.role == "user")
         .and_then(|m| take_switch(&mut m.content));
-    Chat { messages, switch, images: shown }
+    Chat {
+        messages,
+        switch,
+        images: shown,
+    }
 }
 
 fn thinking_for(request: &ModelRequest, switch: Option<bool>, default: bool) -> bool {
@@ -567,18 +580,25 @@ impl LocalGgufProvider {
         // With a projector every image is described in its own short pass first;
         // the answering run only sees the descriptions as text.
         let describe_mode = self.config.lean && self.engine.supports_vision();
-        let Chat { messages, switch, images } =
-            chat_messages(
-                request,
-                self.config.lean,
-                self.engine.supports_vision() && !describe_mode,
-                self.engine.vision_error(),
-                forced,
-                described,
-            );
+        let Chat {
+            messages,
+            switch,
+            images,
+        } = chat_messages(
+            request,
+            self.config.lean,
+            self.engine.supports_vision() && !describe_mode,
+            self.engine.vision_error(),
+            forced,
+            described,
+        );
         let thinking = thinking_for(request, switch, self.config.thinking_default);
         let tools = if self.config.lean {
-            if self.engine.supports_vision() && !describe_mode { vec![view_image_tool()] } else { Vec::new() }
+            if self.engine.supports_vision() && !describe_mode {
+                vec![view_image_tool()]
+            } else {
+                Vec::new()
+            }
         } else {
             tools_json(&request.tools)
         };
@@ -611,9 +631,18 @@ impl LocalGgufProvider {
         })
     }
 
-    fn describe_job(&self, request: &ModelRequest, question: &str, data: Arc<[u8]>) -> Result<Job, ModelError> {
+    fn describe_job(
+        &self,
+        request: &ModelRequest,
+        question: &str,
+        data: Arc<[u8]>,
+    ) -> Result<Job, ModelError> {
         let question = question.trim();
-        let question = if question.is_empty() { "(keine Frage)" } else { question };
+        let question = if question.is_empty() {
+            "(keine Frage)"
+        } else {
+            question
+        };
         let messages = vec![ChatMessage::new(
             "user",
             format!("{MEDIA_MARKER}\nFrage des Nutzers: {question}\n\n{DESCRIBE_PROMPT}"),
@@ -644,18 +673,18 @@ impl LocalGgufProvider {
         })
     }
 
-    /// Describes every image of the chat in its own short vision pass (cached).
-    /// `HARW_LOCAL_IMAGE_PARALLEL` (1..=3) lets several images run at the same time.
-    async fn describe_images(&self, request: &ModelRequest) -> Result<HashMap<usize, String>, ModelError> {
+    /// Describes each uncached image in its own context, up to the admitted limit.
+    async fn describe_images(
+        &self,
+        request: &ModelRequest,
+        turn: &InferencePermit,
+    ) -> Result<HashMap<usize, String>, ModelError> {
         let mut result = HashMap::new();
         let todo = images_to_describe(request);
         let total = todo.len();
-        let parallel = std::env::var("HARW_LOCAL_IMAGE_PARALLEL")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(1, |n| n.clamp(1, 3));
+        let parallel = turn.image_concurrency();
         let mut pending = Vec::new();
-        for (i, (number, question, data)) in todo.into_iter().enumerate() {
+        for (number, question, data) in todo {
             let key = description_key(&data, &question);
             let cached = self
                 .descriptions
@@ -668,54 +697,80 @@ impl LocalGgufProvider {
                 continue;
             }
             let job = self.describe_job(request, &question, data)?;
-            pending.push((i, number, key, job));
+            pending.push((number, key, job));
         }
-        while !pending.is_empty() {
-            let take = parallel.min(pending.len());
-            let batch: Vec<_> = pending.drain(..take).collect();
+        let progress = |finished: usize, running: usize| {
             if let Some(sink) = request.stream.as_ref() {
-                let first = batch.first().map_or(1, |b| b.0 + 1);
-                let last = batch.last().map_or(first, |b| b.0 + 1);
-                let text = if first == last {
-                    format!("Bild {first} von {total} wird angesehen \u{2026}\n")
-                } else {
-                    format!("Bilder {first}\u{2013}{last} von {total} werden gleichzeitig angesehen \u{2026}\n")
+                sink.emit(ModelStreamEvent::ReasoningDelta(format!(
+                    "Bildanalyse: {finished}/{total} fertig · {running} laufen\n"
+                )));
+            }
+        };
+        let mut pending = pending.into_iter();
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            while tasks.len() < parallel {
+                let Some((number, key, job)) = pending.next() else {
+                    break;
                 };
-                sink.emit(ModelStreamEvent::ReasoningDelta(text));
-            }
-            let mut handles = Vec::new();
-            for (_, number, key, job) in batch {
-                let abort = Arc::new(AtomicBool::new(false));
-                let guard = AbortOnDrop(Arc::clone(&abort));
-                let engine = Arc::clone(&self.engine);
-                let gate = Arc::clone(&self.gate);
-                let worker_abort = Arc::clone(&abort);
-                let serial = parallel <= 1;
-                let handle = tokio::task::spawn_blocking(move || {
-                    run_job(&engine, &gate, &job, &worker_abort, serial)
+                let (handle, guard) = self.spawn_job(job, turn);
+                tasks.spawn(async move {
+                    let _guard = guard;
+                    (number, key, handle.await)
                 });
-                handles.push((number, key, handle, guard));
             }
-            for (number, key, handle, _guard) in handles {
-                let generated = handle
-                    .await
-                    .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
-                    .map_err(map_error)?;
-                if generated.finish == FinishReason::Cancelled {
-                    return Err(ModelError::Cancelled);
-                }
-                let text = generated.output.text.trim().to_owned();
-                self.descriptions
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(key, text.clone());
-                result.insert(number, text);
+            if tasks.is_empty() {
+                break;
             }
+            progress(result.len(), tasks.len());
+            let Some(done) = tasks.join_next().await else {
+                break;
+            };
+            let (number, key, generated) =
+                done.map_err(|e| ModelError::RequestFailed(format!("image task failed: {e}")))?;
+            let generated = generated
+                .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
+                .map_err(map_error)?;
+            if generated.finish == FinishReason::Cancelled {
+                return Err(ModelError::Cancelled);
+            }
+            let text = generated.output.text.trim().to_owned();
+            self.descriptions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key, text.clone());
+            result.insert(number, text);
+        }
+        if total != 0 {
+            progress(result.len(), 0);
         }
         Ok(result)
     }
 
-    fn into_response(&self, generated: Generated, tools: &[Value]) -> Result<ModelResponse, ModelError> {
+    fn spawn_job(
+        &self,
+        job: Job,
+        turn: &InferencePermit,
+    ) -> (
+        tokio::task::JoinHandle<Result<Generated, LlamaError>>,
+        AbortOnDrop,
+    ) {
+        let engine = Arc::clone(&self.engine);
+        let turn = turn.clone();
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_on_drop = AbortOnDrop(Arc::clone(&abort));
+        let handle = tokio::task::spawn_blocking(move || {
+            let _permit = turn;
+            run_job(&engine, &job, &abort)
+        });
+        (handle, abort_on_drop)
+    }
+
+    fn into_response(
+        &self,
+        generated: Generated,
+        tools: &[Value],
+    ) -> Result<ModelResponse, ModelError> {
         if generated.finish == FinishReason::Cancelled {
             return Err(ModelError::Cancelled);
         }
@@ -730,12 +785,28 @@ impl LocalGgufProvider {
             })
             .collect();
         let text = generated.output.text;
+        // This is the same display text already emitted as a live delta by
+        // the local model, not an opaque replay block. Keep the useful tail.
+        let reasoning = generated.output.reasoning;
+        let reasoning = if reasoning.is_empty() {
+            None
+        } else {
+            let start = reasoning.ceil_char_boundary(reasoning.len().saturating_sub(16 * 1024));
+            Some(OpaqueReasoning {
+                provider: LOCAL_PROVIDER_ID.to_owned(),
+                model: LOCAL_PROVIDER_ID.to_owned(),
+                blocks: vec![json!({"type": "reasoning_content", "text": &reasoning[start..]})],
+            })
+        };
         if tool_calls.is_empty() && text.is_empty() {
             return Err(ModelError::EmptyResponse);
         }
         let stop = if !tool_calls.is_empty() {
             StopReason::ToolUse
-        } else if matches!(generated.finish, FinishReason::MaxTokens | FinishReason::ContextFull) {
+        } else if matches!(
+            generated.finish,
+            FinishReason::MaxTokens | FinishReason::ContextFull
+        ) {
             StopReason::MaxTokens
         } else {
             StopReason::EndTurn
@@ -750,7 +821,7 @@ impl LocalGgufProvider {
             tool_calls,
             usage,
             stop,
-            reasoning: None,
+            reasoning,
         })
     }
 }
@@ -758,10 +829,16 @@ impl LocalGgufProvider {
 impl ModelProvider for LocalGgufProvider {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
+            let turn = self
+                .config
+                .inference
+                .begin(request.cancel.as_ref())
+                .await
+                .ok_or(ModelError::Cancelled)?;
             let mut forced: Vec<usize> = Vec::new();
             let mut round = 0;
             let described = if self.config.lean && self.engine.supports_vision() {
-                self.describe_images(&request).await?
+                self.describe_images(&request, &turn).await?
             } else {
                 HashMap::new()
             };
@@ -769,17 +846,11 @@ impl ModelProvider for LocalGgufProvider {
                 let job = self.prepare(&request, &forced, &described)?;
                 let tools = job.tools.clone();
                 let stream = job.stream.clone();
-                let abort = Arc::new(AtomicBool::new(false));
-                let _abort_on_drop = AbortOnDrop(Arc::clone(&abort));
-                let engine = Arc::clone(&self.engine);
-                let gate = Arc::clone(&self.gate);
-                let worker_abort = Arc::clone(&abort);
-                let generated = tokio::task::spawn_blocking(move || {
-                    run_job(&engine, &gate, &job, &worker_abort, true)
-                })
-                .await
-                .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
-                .map_err(map_error)?;
+                let (handle, _abort_on_drop) = self.spawn_job(job, &turn);
+                let generated = handle
+                    .await
+                    .map_err(|e| ModelError::RequestFailed(format!("generation task failed: {e}")))?
+                    .map_err(map_error)?;
                 // `view_image` is answered here: the asked-for images are put into
                 // the prompt and the model answers again (at most twice).
                 if self.config.lean && round < 2 && generated.finish != FinishReason::Cancelled {

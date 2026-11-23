@@ -267,16 +267,38 @@ pub fn replay(
     from: u64,
     limit: usize,
 ) -> Result<Vec<FrameEnvelope>, HostError> {
+    Ok(replay_page(source, session, generation, from, limit)?.frames)
+}
+
+pub(crate) struct ReplayPage {
+    pub frames: Vec<FrameEnvelope>,
+    /// Next record after the last **scanned** record, independent of filtering.
+    pub next_sequence: u64,
+}
+
+/// Same bounded replay scan as [`replay`], with the underlying transcript progress.
+pub(crate) fn replay_page(
+    source: &dyn TranscriptSource,
+    session: &SessionId,
+    generation: u32,
+    from: u64,
+    limit: usize,
+) -> Result<ReplayPage, HostError> {
     let limit = limit.min(MAX_PAGE);
+    let mut page = ReplayPage {
+        frames: Vec::new(),
+        next_sequence: from,
+    };
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(page);
     }
-    Ok(source
-        .read_from(session, from, limit)?
-        .iter()
-        .take(limit)
-        .filter_map(|record| envelope(record, session, generation))
-        .collect())
+    for record in source.read_from(session, from, limit)?.iter().take(limit) {
+        page.next_sequence = page.next_sequence.max(record.sequence.saturating_add(1));
+        if let Some(frame) = envelope(record, session, generation) {
+            page.frames.push(frame);
+        }
+    }
+    Ok(page)
 }
 
 /// First sequence to send for an attach without cursor: head.saturating_sub(tail_items).

@@ -178,6 +178,7 @@ pub struct SessionSnapshot {
     pub running_turn_id: Option<String>,
     pub transcript: Vec<TranscriptEntry>,
     pub live_text: Option<String>,
+    pub live_reasoning: Option<String>,
     pub approvals: Vec<MobileApproval>,
     pub last_failure: Option<String>,
     pub last_sync_millis: Option<i64>,
@@ -194,6 +195,7 @@ pub enum TranscriptKind {
     Assistant,
     Tool,
     Error,
+    Reasoning,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

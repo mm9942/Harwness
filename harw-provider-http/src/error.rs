@@ -242,6 +242,23 @@ fn sanitize_diagnostic(value: &str) -> Option<String> {
     (!sanitized.is_empty()).then(|| sanitized.to_owned())
 }
 
+pub(crate) const MAX_REFUSAL_DETAIL_CHARS: usize = 240;
+
+/// Bounded plain-text detail for a typed refusal, never a raw response body.
+pub(crate) fn sanitize_refusal_detail(value: &str) -> Option<String> {
+    let display: String = value
+        .chars()
+        .take(MAX_REFUSAL_DETAIL_CHARS)
+        .filter(|character| {
+            !matches!(
+                character,
+                '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .collect();
+    sanitize_diagnostic(&display)
+}
+
 /// Fehlercodes im OpenAI-Fehlerobjekt (`error.code`/`error.type`), die ein
 /// erschöpftes Kontingent statt eines kurzfristigen Rate-Limits melden.
 const QUOTA_ERROR_CODES: &[&str] = &[

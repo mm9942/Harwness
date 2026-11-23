@@ -371,7 +371,8 @@ pub async fn run_handoff_compaction(
         StopReason::MaxTokens => true,
         StopReason::Refusal { .. }
         | StopReason::ContentFilter
-        | StopReason::ContextWindowExceeded => {
+        | StopReason::ContextWindowExceeded
+        | StopReason::StreamInterrupted => {
             return Err(HandoffFailure::Unusable(format!("{:?}", response.stop)));
         }
         _ => false,

@@ -34,7 +34,10 @@ bootstrap = [
 # harw-oauth (Claude/Codex login) is always linked so the UniFFI classes exist in every build.
 # Standalone mode: in-process harw session host, provider-http validation and the
 # model source. Off in the APK build until the phone runtime is enabled.
-local-host = ["dep:harw-local-host", "dep:harw-provider-http", "dep:harw-core", "dep:harw-llama"]
+local-host = [
+    "dep:harw-local-host", "dep:harw-provider-http", "dep:harw-core", "dep:harw-llama",
+    "dep:harw-extension-api", "dep:harw-media", "dep:harw-model-catalog", "dep:reqwest",
+]
 # On-device inference: builds llama.cpp (C/C++ via cmake and bindgen/libclang) into the
 # library. Off for host-side checks and tests of `local-host`; the APK build enables it
 # (mobile/scripts/build-native). Without it the "On this device" provider reports
@@ -49,10 +52,13 @@ bytes = "1"
 clap = { version = "4.6", features = ["derive"], optional = true }
 harw-config = { path = "../../harw-config" }
 harw-core = { path = "../../harw-core", optional = true }
+harw-extension-api = { path = "../../harw-extension-api", optional = true }
 harw-home = { path = "../../harw-home" }
 harw-infra-client = { path = "../../harw-infra-client", optional = true }
 harw-llama = { path = "../../harw-llama", optional = true }
 harw-local-host = { path = "../../harw-local-host", optional = true }
+harw-media = { path = "../../harw-media", optional = true }
+harw-model-catalog = { path = "../../harw-model-catalog", optional = true }
 harw-mobile-core = { path = "../../harw-mobile-core" }
 harw-node-listener = { path = "../../harw-node-listener", optional = true }
 harw-node-transport = { path = "../../harw-node-transport" }
@@ -66,6 +72,7 @@ harw-types = { path = "../../harw-types" }
 hex = "0.4.3"
 http = "1"
 jiff = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 rqrr = { version = "0.11", default-features = false }
 rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
 secrecy = "0.10.3"

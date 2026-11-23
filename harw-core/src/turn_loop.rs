@@ -3900,7 +3900,9 @@ async fn rewind_history_before(
         session.state(),
         crate::session::SessionState::Idle | crate::session::SessionState::Failed(_)
     ) {
-        return Err(CoreError::TurnRejected("rewind needs an idle session".to_owned()));
+        return Err(CoreError::TurnRejected(
+            "rewind needs an idle session".to_owned(),
+        ));
     }
     let Some(index) = session.history().items().iter().position(|item| {
         matches!(item, harw_protocol::items::TurnItem::UserMessage(m) if m.id.as_str() == target)
@@ -5166,6 +5168,14 @@ async fn drive_turn(
         // noch nicht enthalten — `maybe_compact` schätzt sie ab dieser Marke.
         history_mark = session.history().len();
 
+        // Defense in depth: provider adapters should already remove partial
+        // tools and reasoning on an interrupted stream. Never persist or
+        // execute either even if an alternative adapter returned them.
+        if matches!(response.stop, crate::model::StopReason::StreamInterrupted) {
+            response.tool_calls.clear();
+            response.reasoning = None;
+        }
+
         // Für die Fortschritts-Erkennung des reinen Text-Zweigs unten
         // („Assistant-Text ohne Tool-Aufrufe") vor dem Move gesichert.
         let response_had_text = response.message.is_some();
@@ -5230,6 +5240,18 @@ async fn drive_turn(
             );
         }
 
+        if matches!(response_stop, crate::model::StopReason::StreamInterrupted) {
+            return finish_model_stop(
+                session,
+                store,
+                handle,
+                total_usage,
+                pending_guard_hint.clone(),
+                ModelStopOutcome::StreamInterrupted,
+            )
+            .await;
+        }
+
         // Ein Provider darf nie dazu verleitet werden, abgeschnittene oder
         // gefilterte Tool-Argumente auszuführen. Die Antwort ist trotzdem
         // bereits als Text erhalten, damit ein Nutzer den sichtbaren Teil
@@ -5267,30 +5289,33 @@ async fn drive_turn(
                 | crate::model::StopReason::ContextWindowExceeded => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Truncated,
+                        ModelStopOutcome::Limit,
                     )
                     .await;
                 }
                 crate::model::StopReason::Refusal { detail } => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Refused { detail },
+                        ModelStopOutcome::Refused { detail },
                     )
                     .await;
                 }
                 crate::model::StopReason::ContentFilter => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Refused { detail: None },
+                        ModelStopOutcome::ContentFiltered,
                     )
                     .await;
                 }
@@ -5353,30 +5378,33 @@ async fn drive_turn(
                 | crate::model::StopReason::ContextWindowExceeded => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Truncated,
+                        ModelStopOutcome::Limit,
                     )
                     .await;
                 }
                 crate::model::StopReason::Refusal { detail } => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Refused { detail },
+                        ModelStopOutcome::Refused { detail },
                     )
                     .await;
                 }
                 crate::model::StopReason::ContentFilter => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Refused { detail: None },
+                        ModelStopOutcome::ContentFiltered,
                     )
                     .await;
                 }
@@ -7027,14 +7055,22 @@ async fn cancel_turn(
     Ok(TurnOutcome::Cancelled { reason })
 }
 
+enum ModelStopOutcome {
+    Limit,
+    StreamInterrupted,
+    ContentFiltered,
+    Refused { detail: Option<String> },
+}
+
 /// Beendet einen Turn nach einem Provider-Stop-Grund, der kein reguläres
 /// Turn-Ende ist ([`StopReason::MaxTokens`] nach ausgeschöpften
 /// Auto-Continuations, [`StopReason::ContextWindowExceeded`],
-/// [`StopReason::Refusal`], [`StopReason::ContentFilter`]).
+/// [`StopReason::StreamInterrupted`], [`StopReason::Refusal`],
+/// [`StopReason::ContentFilter`]).
 ///
 /// # Beschreibung
 /// Spiegelt den regulären Abschluss-Pfad am Ende von [`drive_turn`]
-/// (Guard-Hinweis, Observer, `TurnCompleted`, `complete_turn`), endet aber mit
+/// (Guard-Hinweis, Observer, `complete_turn`), endet aber mit
 /// dem ehrlichen [`TurnOutcome::Truncated`]- bzw. [`TurnOutcome::Refused`]-Ausgang
 /// statt `Completed`. Die bereits erhaltene Assistant-Antwort (inklusive
 /// abgeschnittener Teiltext) ist zu diesem Zeitpunkt bereits persistiert; das
@@ -7046,11 +7082,51 @@ async fn cancel_turn(
 /// `handle` nicht mehr der aktive Turn der Session ist).
 async fn finish_model_stop(
     session: &mut AgentSession,
+    store: &dyn StateStore,
     handle: TurnHandle,
     total_usage: harw_types::TokenUsage,
     pending_guard_hint: Option<String>,
-    outcome: TurnOutcome,
+    stop: ModelStopOutcome,
 ) -> CoreResult<TurnOutcome> {
+    let (outcome, incomplete) = match stop {
+        ModelStopOutcome::Limit => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Das Ausgabe- oder Kontextlimit wurde erreicht.".to_owned(),
+                true,
+            )),
+        ),
+        ModelStopOutcome::StreamInterrupted => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Der Antwortstream endete vor der Abschlussmeldung. Die Ursache ist unbekannt.".to_owned(),
+                false,
+            )),
+        ),
+        ModelStopOutcome::ContentFiltered => (
+            TurnOutcome::Refused { detail: None },
+            Some((
+                "Antwort unvollständig: Der Inhaltsfilter des Anbieters hat die Ausgabe gestoppt. Kein genauerer Grund wurde übermittelt.".to_owned(),
+                false,
+            )),
+        ),
+        ModelStopOutcome::Refused { detail } => {
+            let display_detail = detail
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+                .take(240)
+                .collect::<String>();
+            let display_detail = display_detail.trim();
+            let message = if display_detail.is_empty() {
+                "Antwort unvollständig: Das Modell hat die Antwort abgelehnt. Kein genauerer Grund wurde übermittelt.".to_owned()
+            } else {
+                format!("Antwort unvollständig: Das Modell hat die Antwort abgelehnt. Grund laut Anbieter: {display_detail}")
+            };
+            (TurnOutcome::Refused { detail }, Some((message, false)))
+        }
+    };
     // Welle FANIN-K: ein Hinweis, der am Ende der letzten Runde entstand,
     // aber keinem Tool-Ergebnis mehr zugeordnet werden konnte, geht auch an
     // dieser Endgrenze nicht verloren — er wird ans letzte Verlaufs-Item
@@ -7058,13 +7134,37 @@ async fn finish_model_stop(
     if let Some(hint) = pending_guard_hint {
         session.history_mut().append_hint_to_last(&hint);
     }
-    emit(
-        session,
-        TurnEvent::TurnCompleted {
-            turn_id: handle.turn_id.clone(),
-            usage: Some(total_usage.clone()),
-        },
-    );
+    if let Some((message, retryable)) = incomplete {
+        // Persist before the terminal event: a client can reattach as soon as
+        // it sees that event, missing any subsequent transient host notice.
+        session.history_mut().push_error(message.clone(), retryable);
+        persist_last(session, store).await?;
+        if let Some(item) = session.history().last().cloned() {
+            emit(
+                session,
+                TurnEvent::ItemAdded {
+                    turn_id: handle.turn_id.clone(),
+                    item,
+                },
+            );
+        }
+        emit(
+            session,
+            TurnEvent::TurnFailed {
+                turn_id: handle.turn_id.clone(),
+                reason: message,
+                retryable,
+            },
+        );
+    } else {
+        emit(
+            session,
+            TurnEvent::TurnCompleted {
+                turn_id: handle.turn_id.clone(),
+                usage: Some(total_usage.clone()),
+            },
+        );
+    }
     notify_turn_stop(
         session,
         &TurnStopInput {
@@ -15869,6 +15969,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_stream_preserves_partial_text_without_retrying_or_running_tools()
+    -> TestResult {
+        const PARTIAL: &str = "Abgebrochener Antwortanfang";
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(vec![
+            Ok(crate::model::ModelResponse {
+                message: Some(PARTIAL.to_owned()),
+                stop: crate::model::StopReason::StreamInterrupted,
+                tool_calls: vec![call(&ToolCallId::new(), "lookup")],
+                ..crate::model::ModelResponse::default()
+            }),
+            Ok(crate::model::ModelResponse::text("unexpected retry")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("partial response goes through durable completion"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Truncated), "{outcome:?}");
+        assert_eq!(model.requests().len(), 1);
+        let durable = store
+            .load_history(session.id())
+            .await
+            .map_err(ctx("persist partial response and interruption notice"))?;
+        assert!(durable.items().iter().any(|item| matches!(
+            item, TurnItem::AssistantMessage(message)
+                if message.content.iter().any(|part| matches!(part, ContentPart::Text { text } if text == PARTIAL))
+        )));
+        assert!(
+            !durable
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::ToolCall(_) | TurnItem::ToolResult(_)))
+        );
+        assert!(matches!(durable.last(), Some(TurnItem::Error(error))
+            if error.message.contains("Antwortstream") && !error.message.contains("limit") && !error.retryable));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn max_tokens_with_tool_calls_retries_once_with_a_doubled_output_limit() -> TestResult {
         let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
         let mut session = make_session(
@@ -15997,6 +16141,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_stop_notice_distinguishes_filter_and_refusal() -> TestResult {
+        for (stop, expected) in [
+            (
+                crate::model::StopReason::ContentFilter,
+                "Inhaltsfilter des Anbieters",
+            ),
+            (
+                crate::model::StopReason::Refusal {
+                    detail: Some("Provider-Prüfung".into()),
+                },
+                "Grund laut Anbieter: Provider-Prüfung",
+            ),
+        ] {
+            let mut session = make_session(
+                StubToolProvider::with_names(&["lookup"]),
+                SessionActivation::new(ToolProfile::Full),
+            );
+            let store = crate::state_store::InMemoryStateStore::new();
+            let model = GuardModel::new(vec![Ok(crate::model::ModelResponse {
+                stop,
+                ..crate::model::ModelResponse::text("Teilantwort")
+            })]);
+            let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+                .await
+                .map_err(ctx("provider stop"))?;
+            assert!(matches!(outcome, TurnOutcome::Refused { .. }));
+            assert_eq!(model.requests().len(), 1, "no automatic retry");
+            let history = store
+                .load_history(session.id())
+                .await
+                .map_err(ctx("load notice"))?;
+            assert!(matches!(
+                history.last(),
+                Some(TurnItem::Error(error)) if !error.retryable && error.message.contains(expected)
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn consecutive_truncations_still_stop_after_the_limit() -> TestResult {
         let mut session = make_session(
             StubToolProvider::with_names(&["lookup"]),
@@ -16011,6 +16195,25 @@ mod tests {
 
         assert!(matches!(outcome, TurnOutcome::Truncated), "{outcome:?}");
         assert_eq!(model.requests().len(), 4, "1 + 3 Fortsetzungen");
+        let durable = store
+            .load_history(session.id())
+            .await
+            .map_err(ctx("truncation stays visible after replay"))?;
+        assert!(
+            durable
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::AssistantMessage(_)))
+        );
+        assert_eq!(
+            durable
+                .items()
+                .iter()
+                .filter(|item| matches!(item, TurnItem::Error(error) if error.message.starts_with("Antwort unvollständig")))
+                .count(),
+            1,
+        );
+        assert!(matches!(durable.last(), Some(TurnItem::Error(error)) if error.retryable));
         Ok(())
     }
 

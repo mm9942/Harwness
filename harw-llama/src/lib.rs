@@ -13,6 +13,7 @@
 
 mod engine;
 mod error;
+mod inference;
 mod provider;
 mod stream;
 mod template;
@@ -23,6 +24,7 @@ pub use engine::{
     GenerateStats, MEDIA_MARKER, SamplingParams,
 };
 pub use error::LlamaError;
+pub use inference::LocalInferenceControl;
 pub use provider::{LOCAL_PROVIDER_ID, LocalGgufConfig, LocalGgufProvider};
 
 /// Context size used when the caller does not choose one.

@@ -36,6 +36,22 @@ class MissionFormatTest {
     }
 
     @Test
+    fun missionClockMovesWithMonotonicTimeNotWallClock() {
+        val anchor = MissionClockAnchor(wallMs = 15_000L, elapsedMs = 7_000L)
+        assertEquals("3s", formatElapsed(13_000L, anchor.wallAt(8_000L)))
+        assertEquals("6s", formatElapsed(13_000L, anchor.wallAt(11_000L)))
+        assertEquals(15_000L, anchor.wallAt(6_000L))
+    }
+
+    @Test
+    fun reasoningPreviewFollowsNewTextInTheSameRow() {
+        val prefix = "Initial reasoning with a long first line"
+        assertEquals(prefix, reasoningPreview(prefix))
+        assertEquals("New sentence", reasoningPreview("$prefix\n\nNew sentence\n"))
+        assertEquals("Suffix while streaming", reasoningPreview("$prefix\nSuffix while streaming"))
+    }
+
+    @Test
     fun padsRolePrefixToWidth() {
         assertEquals("coder       ", rolePrefix("coder"))
         assertEquals("abc   ", rolePrefix("abc", width = 6))
@@ -145,19 +161,19 @@ class MissionFormatTest {
     }
 
     @Test
-    fun cardIsExactSquareWhenKeyboardIsClosed() {
-        assertEquals(180f, missionCardHeightDp(180f, 800f, 200f, 40f, imeVisible = false), 0.001f)
-        assertEquals(180f, missionCardHeightDp(180f, 0f, 200f, 40f, imeVisible = false), 0.001f)
+    fun cardUsesOwnerSelectedTwoThirdsHeightWhenKeyboardIsClosed() {
+        assertEquals(120f, missionCardHeightDp(180f, 800f, 200f, 40f, imeVisible = false), 0.001f)
+        assertEquals(120f, missionCardHeightDp(180f, 0f, 200f, 40f, imeVisible = false), 0.001f)
     }
 
     @Test
-    fun cardNeverExceedsSideWhenKeyboardIsOpen() {
-        assertEquals(180f, missionCardHeightDp(180f, 2000f, 200f, 40f, imeVisible = true), 0.001f)
+    fun cardNeverExceedsOwnerSelectedTwoThirdsHeightWhenKeyboardIsOpen() {
+        assertEquals(120f, missionCardHeightDp(180f, 2000f, 200f, 40f, imeVisible = true), 0.001f)
     }
 
     @Test
     fun cardShrinksWhenKeyboardIsOpenAndSpaceIsTight() {
-        assertEquals(170f, missionCardHeightDp(180f, 600f, 200f, 40f, imeVisible = true), 0.001f)
+        assertEquals(105f, missionCardHeightDp(180f, 535f, 200f, 40f, imeVisible = true), 0.001f)
         assertEquals(72f, missionCardHeightDp(180f, 500f, 200f, 40f, imeVisible = true), 0.001f)
     }
 

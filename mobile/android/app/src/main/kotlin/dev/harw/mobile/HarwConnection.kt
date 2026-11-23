@@ -237,7 +237,26 @@ internal data class WindowState(
     val error: String? = null,
     /** Last known lease holder (`holder` frames); `null` = free or unknown. */
     val holder: MobileHolder? = null,
+    val answerReloadPending: Boolean = false,
+    val preserveAnswerWhileReloading: Boolean = false,
 )
+
+/** Main-thread tickets for native attachment reads; reload invalidates only its own session. */
+internal class AttachmentReadEpochs {
+    private val reads = mutableMapOf<String, Any>()
+
+    fun begin(sessionId: String): Any = Any().also { reads[sessionId] = it }
+
+    fun invalidate(sessionId: String) {
+        reads.remove(sessionId)
+    }
+
+    fun finish(sessionId: String, ticket: Any): Boolean {
+        if (reads[sessionId] !== ticket) return false
+        reads.remove(sessionId)
+        return true
+    }
+}
 
 internal const val ProjectPageSize = 50u
 
@@ -350,6 +369,7 @@ internal class HarwConnection(private val context: Context, private val localBac
     private val opened = mutableSetOf<String>()
     private val detachJobs = mutableMapOf<String, Job>()
     private val detaching = mutableSetOf<String>()
+    private val attachmentReadEpochs = AttachmentReadEpochs()
     private val events = CoreEvents()
 
     init {
@@ -999,6 +1019,50 @@ internal class HarwConnection(private val context: Context, private val localBac
             detachJobs.remove(sessionId)
             detachSession(sessionId)
             change { it.copy(windows = it.windows - sessionId) }
+        }
+    }
+
+    /** Reattach the reader, not the turn. This never sends or interrupts a prompt. */
+    fun reloadAnswer(sessionId: String) {
+        val native = core ?: return
+        gate.generation ?: return
+        val request = lifecycle
+        val previous = state.value.windows[sessionId] ?: return
+        if (previous.snapshot == null || sessionId !in observers ||
+            sessionId !in opened || !detaching.add(sessionId)
+        ) return
+
+        // The old read can return a snapshot but must not re-register this attachment.
+        // A reload never races a pending first open for this session.
+        attachmentReadEpochs.invalidate(sessionId)
+        opened.remove(sessionId)
+        change {
+            it.copy(windows = it.windows + (sessionId to previous.copy(
+                generation = null, error = null, answerReloadPending = true,
+                preserveAnswerWhileReloading = true,
+            )))
+        }
+        commands.launch {
+            var failure: String? = null
+            try {
+                withContext(Dispatchers.IO) { native.detachSession(sessionId) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                failure = error.displayMessage()
+            } finally {
+                detaching.remove(sessionId)
+                if (request == lifecycle && sessionId in observers) {
+                    change { current ->
+                        val window = current.windows[sessionId] ?: return@change current
+                        current.copy(windows = current.windows + (sessionId to window.copy(
+                            answerReloadPending = false, error = failure,
+                        )))
+                    }
+                    // The regular reader now opens this same session and replays
+                    // its authoritative transcript and current running turn.
+                    events.statusChanged()
+                }
+            }
         }
     }
 
@@ -1678,6 +1742,23 @@ internal class HarwConnection(private val context: Context, private val localBac
         }
     }
 
+    suspend fun hybridVisionChoices(): List<uniffi.harw_mobile_ffi.HybridVisionChoice> {
+        check(localBackend) { "Cloud-Bildanalyse ist nur im lokalen Chat verfügbar" }
+        val native = core ?: error("Lokaler Chat ist nicht verbunden")
+        return withContext(Dispatchers.IO) { native.hybridVisionChoices() }
+    }
+
+    suspend fun hybridVisionReply(
+        choice: uniffi.harw_mobile_ffi.HybridVisionChoice,
+        images: List<uniffi.harw_mobile_ffi.PromptImage>,
+        question: String,
+        progress: uniffi.harw_mobile_ffi.HybridVisionProgress,
+    ): String {
+        check(localBackend) { "Cloud-Bildanalyse ist nur im lokalen Chat verfügbar" }
+        val native = core ?: error("Lokaler Chat ist nicht verbunden")
+        return native.hybridVisionReply(choice, images, question, progress)
+    }
+
     /** Nimmt der aktive Host Bilder am Prompt an (Feature `images`)? */
     suspend fun supportsImages(): Boolean {
         val native = core ?: return false
@@ -1887,24 +1968,34 @@ internal class HarwConnection(private val context: Context, private val localBac
 
     private suspend fun refreshWindows(native: MobileCore, request: Long) {
         val generation = gate.generation ?: return
-        val windows = observers.keys.filterNot { it in detaching }.map { id -> id to (id in opened) }
+        val windows = observers.keys.filterNot { it in detaching }.map { id ->
+            Triple(id, id in opened, attachmentReadEpochs.begin(id))
+        }
         if (windows.isEmpty()) return
-        val results = withContext(Dispatchers.IO) {
-            windows.map { (id, attached) ->
-                id to try {
-                    Result.success(
-                        (if (attached) native.snapshot(id) else native.openSession(id)).let { snap ->
-                            snap to runCatching { native.sessionHolder(id) }.getOrNull()
-                        },
-                    )
-                } catch (error: Exception) {
-                    Result.failure(error)
+        val results = try {
+            withContext(Dispatchers.IO) {
+                windows.map { (id, attached, ticket) ->
+                    Triple(id, ticket, try {
+                        Result.success(
+                            (if (attached) native.snapshot(id) else native.openSession(id)).let { snap ->
+                                snap to runCatching { native.sessionHolder(id) }.getOrNull()
+                            },
+                        )
+                    } catch (error: Exception) {
+                        if (error is CancellationException) throw error
+                        Result.failure(error)
+                    })
                 }
             }
+        } catch (error: CancellationException) {
+            for ((id, _, ticket) in windows) attachmentReadEpochs.finish(id, ticket)
+            throw error
         }
-        if (request != lifecycle || gate.generation != generation) return
+        val current = results.filter { (id, ticket, _) -> attachmentReadEpochs.finish(id, ticket) }
+        if (request != lifecycle || gate.generation != generation || current.isEmpty()) return
         val updates = state.value.windows.toMutableMap()
-        for ((id, result) in results) {
+        for ((id, _, result) in current) {
+            if (id in detaching) continue
             val snapshot = result.getOrNull()?.first
             val holder = result.getOrNull()?.second
             if (snapshot != null && id !in detaching) opened.add(id)
@@ -1914,7 +2005,17 @@ internal class HarwConnection(private val context: Context, private val localBac
             }
             val previous = updates[id] ?: WindowState()
             updates[id] = if (snapshot != null) {
-                previous.copy(snapshot = snapshot, generation = generation.takeIf { snapshot.online }, holder = holder)
+                val keepStale = previous.preserveAnswerWhileReloading && !snapshot.online
+                val shown = if (keepStale) {
+                    previous.snapshot?.copy(
+                        online = false, canSubmit = false, canInterrupt = false, canApprove = false,
+                        detail = snapshot.detail,
+                    ) ?: snapshot
+                } else snapshot
+                previous.copy(
+                    snapshot = shown, generation = generation.takeIf { snapshot.online }, holder = holder,
+                    preserveAnswerWhileReloading = keepStale,
+                )
             } else {
                 previous.copy(generation = null, error = result.exceptionOrNull()?.displayMessage())
             }

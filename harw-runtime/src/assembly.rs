@@ -6083,7 +6083,15 @@ fn version_dots_to_dashes(id: &str) -> String {
 /// Die [`ModelLimits`] des Modells.
 #[must_use]
 pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits {
-    let (limits, local) = lookup_model_limits(config, model_id);
+    model_limits_for_provider(config, model_id, None)
+}
+
+fn model_limits_for_provider(
+    config: &ResolvedConfig,
+    model_id: &str,
+    provider_id: Option<&str>,
+) -> ModelLimits {
+    let (limits, local) = lookup_model_limits(config, model_id, provider_id);
     if !limits.known && local {
         tracing::warn!(
             model = model_id,
@@ -6108,7 +6116,14 @@ pub fn model_limits_for(config: &ResolvedConfig, model_id: &str) -> ModelLimits 
 /// # Rückgabe
 /// `(limits, local)` — `local` ist `true`, wenn das Modell über einen lokalen
 /// Provider läuft ([`model_runs_locally`]).
-fn lookup_model_limits(config: &ResolvedConfig, model_id: &str) -> (ModelLimits, bool) {
+fn lookup_model_limits(
+    config: &ResolvedConfig,
+    model_id: &str,
+    provider_id: Option<&str>,
+) -> (ModelLimits, bool) {
+    if let Some(limits) = foundry_model_limits(config, model_id, provider_id) {
+        return (limits, false);
+    }
     let configured = config.models.get(model_id).or_else(|| {
         config.models.values().find(|model| {
             model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
@@ -6149,6 +6164,57 @@ fn lookup_model_limits(config: &ResolvedConfig, model_id: &str) -> (ModelLimits,
     (limits, local)
 }
 
+/// Applies provider limits only when the route is known; two providers may
+/// expose the same deployment name with different limits.
+fn foundry_model_limits(
+    config: &ResolvedConfig,
+    model_id: &str,
+    provider_id: Option<&str>,
+) -> Option<ModelLimits> {
+    let mut matching_models = config.models.iter().filter_map(|(key, model)| {
+        (key == model_id || model.id == model_id || model.aliases.iter().any(|id| id == model_id))
+            .then_some(model)
+    });
+    let route = provider_id
+        .or_else(|| {
+            (config.harness.default_model.as_deref() == Some(model_id))
+                .then_some(config.harness.default_provider.as_deref())
+                .flatten()
+        })
+        .or_else(|| {
+            let mut matches = matching_models.clone();
+            let route = matches.next()?.provider.as_str();
+            matches
+                .all(|model| model.provider == route)
+                .then_some(route)
+        })?;
+    let provider = config.providers.get(route)?;
+    if !provider.enabled || provider.api != "openai-chat" {
+        return None;
+    }
+    let limits =
+        harw_provider_http::azure_foundry_chat_token_limits(route, &provider.base_url, model_id)?;
+    let configured = config
+        .models
+        .get(model_id)
+        .filter(|model| model.provider == route)
+        .or_else(|| matching_models.find(|model| model.provider == route));
+    let context_window = u64::from(limits.context_window);
+    let max_output = u64::from(limits.max_output_tokens);
+    Some(ModelLimits {
+        context_window: configured
+            .and_then(|model| model.context_window)
+            .filter(|window| *window > 0)
+            .map_or(context_window, |window| window.min(context_window)),
+        configured_max_output: configured
+            .and_then(|model| model.max_tokens)
+            .map(|max| max.min(max_output)),
+        catalog_max_output: Some(max_output),
+        thinking: configured.is_some_and(|model| model.reasoning),
+        known: true,
+    })
+}
+
 /// Runde 7, Teil L3: `true`, wenn `model_id` über einen lokalen Provider
 /// läuft ([`harw_config::ProviderToml::is_local`]: Ollama, Loopback, LAN mit
 /// `allow_insecure_lan`). Maßgeblich ist der Provider des konfigurierten
@@ -6177,9 +6243,10 @@ fn model_limits_or_fallback(
     config: &ResolvedConfig,
     model: Option<&str>,
     fallback: Option<&str>,
+    provider_id: Option<&str>,
 ) -> ModelLimits {
     match model.or(fallback) {
-        Some(model) => model_limits_for(config, model),
+        Some(model) => model_limits_for_provider(config, model, provider_id),
         None => {
             tracing::warn!(
                 fallback_tokens = UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
@@ -6219,13 +6286,14 @@ fn session_model_limits(
     offline_echo: bool,
     model: Option<&str>,
     fallback: Option<&str>,
+    provider_id: Option<&str>,
 ) -> ModelLimits {
     if !offline_echo {
-        return model_limits_or_fallback(config, model, fallback);
+        return model_limits_or_fallback(config, model, fallback, provider_id);
     }
     model
         .or(fallback)
-        .map(|model| lookup_model_limits(config, model).0)
+        .map(|model| lookup_model_limits(config, model, provider_id).0)
         .filter(|limits| limits.known)
         .unwrap_or(ModelLimits {
             context_window: OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS,
@@ -6659,6 +6727,7 @@ fn build_spawner(
                 offline_echo,
                 model,
                 window_default.as_deref(),
+                None,
             )
             .context_window
         }))
@@ -7645,11 +7714,13 @@ impl RuntimeAssembly {
         // Der Handoff-Beobachter schreibt bei jeder Verdichtung
         // `<project>/.harw/handoff.json` (Contract §"harw-runtime/src/handoff.rs").
         let offline_echo = self.offline_echo;
+        let root_provider_id = self.root_provider_id();
         let root_limits = session_model_limits(
             &self.config,
             offline_echo,
             self.root_model_id.as_deref(),
             None,
+            root_provider_id.as_deref(),
         );
         let context_window = root_limits.context_window;
         let output_reserve = root_limits.output_reserve_tokens();
@@ -7695,9 +7766,20 @@ impl RuntimeAssembly {
                 .with_context_window_resolver({
                     let config = Arc::clone(&self.config);
                     let root_model_id = self.root_model_id.clone();
+                    let root_provider_id = root_provider_id.clone();
                     Arc::new(move |model: Option<&str>| {
-                        session_model_limits(&config, offline_echo, model, root_model_id.as_deref())
-                            .context_window
+                        session_model_limits(
+                            &config,
+                            offline_echo,
+                            model,
+                            root_model_id.as_deref(),
+                            if model.is_none() {
+                                root_provider_id.as_deref()
+                            } else {
+                                None
+                            },
+                        )
+                        .context_window
                     })
                 })
                 // Live-Modellwechsel: die Ausgabereserve folgt dem neuen
@@ -7705,9 +7787,20 @@ impl RuntimeAssembly {
                 .with_output_reserve_resolver({
                     let config = Arc::clone(&self.config);
                     let root_model_id = self.root_model_id.clone();
+                    let root_provider_id = root_provider_id.clone();
                     Arc::new(move |model: Option<&str>| {
-                        session_model_limits(&config, offline_echo, model, root_model_id.as_deref())
-                            .output_reserve_tokens()
+                        session_model_limits(
+                            &config,
+                            offline_echo,
+                            model,
+                            root_model_id.as_deref(),
+                            if model.is_none() {
+                                root_provider_id.as_deref()
+                            } else {
+                                None
+                            },
+                        )
+                        .output_reserve_tokens()
                     })
                 })
                 .with_auto_compact(Some(
@@ -8271,6 +8364,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn foundry_deployments_use_verified_context_and_output_on_the_default_route() -> TestResult {
+        let mut config = two_provider_config();
+        let foundry = "azure-foundry-chat";
+        let mut provider = config.providers["local-a"].clone();
+        provider.base_url = "https://fixture.services.ai.azure.com/openai/v1/".to_owned();
+        config.providers.insert(foundry.to_owned(), provider);
+        config.harness.default_provider = Some(foundry.to_owned());
+
+        for (model, window, output) in [
+            ("grok-4.6", 200_000, 128_000),
+            ("grok-4-20-non-reasoning", 262_000, 8_192),
+            ("mistral-large-4-latest", 128_000, 4_096),
+            ("DeepSeek-V4.1-Flash-1017", 1_000_000, 128_000),
+            ("Kimi-K3.1-Pro", 1_048_576, 262_144),
+            ("Kimi-K2.7-Code", 262_144, 262_144),
+            ("grok-4.3", 200_000, 8_192),
+        ] {
+            config.harness.default_model = Some(model.to_owned());
+            let limits = model_limits_for(&config, model);
+            assert!(limits.known, "{model}");
+            assert_eq!(limits.context_window, window, "{model}");
+            assert_eq!(limits.catalog_max_output, Some(output), "{model}");
+        }
+
+        // The same deployment string on a direct/caller-defined route must not use Foundry's cap.
+        let mut direct = config.providers["local-a"].clone();
+        direct.base_url = "https://api.x.ai/v1".to_owned();
+        config.providers.insert("xai".to_owned(), direct);
+        config.harness.default_provider = Some("xai".to_owned());
+        config.harness.default_model = Some("grok-4.3".to_owned());
+        assert_eq!(
+            model_limits_for(&config, "grok-4.3"),
+            model_limits_for(&ResolvedConfig::default(), "grok-4.3"),
+        );
+        Ok(())
+    }
+
     /// A new GPT-6.1 model must not reject the first request under the 32k fallback.
     #[test]
     fn gpt_6_1_uses_known_limits_for_first_turn_budget() {
@@ -8406,7 +8537,7 @@ mod tests {
             UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
         );
         assert_eq!(
-            model_limits_or_fallback(&config, None, None).context_window,
+            model_limits_or_fallback(&config, None, None, None).context_window,
             UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
         );
     }
@@ -8422,7 +8553,7 @@ mod tests {
 
         // Echo ohne Modell (SDK `offline_echo`) und mit unbekanntem Modell.
         for (model, fallback) in [(None, None), (Some("my-local-model"), None)] {
-            let echo = session_model_limits(&config, true, model, fallback);
+            let echo = session_model_limits(&config, true, model, fallback, None);
             assert_eq!(echo.context_window, OFFLINE_ECHO_CONTEXT_WINDOW_TOKENS);
             assert!(!echo.known);
             assert!(
@@ -8433,7 +8564,7 @@ mod tests {
 
         // Echter Provider: unverändert der konservative Rückfall.
         for (model, fallback) in [(None, None), (Some("my-local-model"), None)] {
-            let real = session_model_limits(&config, false, model, fallback);
+            let real = session_model_limits(&config, false, model, fallback, None);
             assert_eq!(real.context_window, UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS);
             assert_eq!(real.context_window, 32_768);
             assert!(!real.known);
@@ -8446,10 +8577,11 @@ mod tests {
             "tiny".to_owned(),
             model_toml("tiny-model", Some(8_000), None),
         );
-        let echo_small = session_model_limits(&small, true, None, Some("tiny"));
+        let echo_small = session_model_limits(&small, true, None, Some("tiny"), None);
         assert!(echo_small.known);
         assert_eq!(echo_small.context_window, 8_000);
-        let echo_catalog = session_model_limits(&config, true, Some("claude-haiku-4-5"), None);
+        let echo_catalog =
+            session_model_limits(&config, true, Some("claude-haiku-4-5"), None, None);
         assert_eq!(
             echo_catalog.context_window,
             model_limits_for(&config, "claude-haiku-4-5").context_window

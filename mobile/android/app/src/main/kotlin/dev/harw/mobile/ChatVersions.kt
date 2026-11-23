@@ -103,6 +103,25 @@ internal fun applyViewing(entries: List<TranscriptEntry>, ui: VersionsUi): Pair<
     return entries to Int.MAX_VALUE
 }
 
+/**
+ * A local archived suffix is not on the host. At its first row the prefix is
+ * still the current transcript's prefix; later rows have no honest boundary.
+ */
+internal fun forkBoundaryId(
+    current: List<TranscriptEntry>,
+    displayed: List<TranscriptEntry>,
+    index: Int,
+    firstArchived: Int,
+): String? {
+    val shown = displayed.getOrNull(index)?.takeIf { it.kind == TranscriptKind.USER } ?: return null
+    val canonical = current.getOrNull(index)?.takeIf { it.kind == TranscriptKind.USER } ?: return null
+    return when {
+        index < firstArchived && shown.id == canonical.id -> canonical.id
+        index == firstArchived -> canonical.id
+        else -> null
+    }
+}
+
 /** Versehentlich mehrfach gesendete, identische Nachrichten ohne Antwort dazwischen zeigt die Ansicht nur einmal. */
 internal fun dedupeUserRuns(entries: List<TranscriptEntry>): List<TranscriptEntry> {
     if (entries.size < 2) return entries

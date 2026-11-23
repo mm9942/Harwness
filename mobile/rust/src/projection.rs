@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use harw_mobile_core::{EntryKind, SessionView, ToolState};
 use harw_protocol::items::{ContentPart, ToolCallItem, ToolCallResult, TurnItem, UserMessageItem};
 use harw_protocol::session_wire::{
-    AttachAck, ClientCaps, Cursor, FrameEnvelope, HostedState, SessionSummary,
+    AttachAck, ClientCaps, Cursor, FrameEnvelope, HostedState, MAX_VISIBLE_REASONING_BYTES,
+    SessionSummary,
 };
 use harw_protocol::{ApprovalRequest, SessionEvent, SessionFrame, TurnEvent};
 use harw_types::{ApprovalId, ItemId, ReviewDecision, RiskLevel, SessionId, TurnId};
@@ -28,6 +29,7 @@ pub(crate) struct SessionState {
     deciding: HashSet<ApprovalId>,
     partial: Option<PartialText>,
     running_turn: Option<TurnId>,
+    live_reasoning: Option<(TurnId, String)>,
     head: Option<Cursor>,
     replay_target: Option<Cursor>,
     /// Nach einem "Neu senden" (rewind_before) erwartet: der nächste *live* gemeldete Verlaufsersatz lädt den Chat neu.
@@ -229,6 +231,7 @@ impl SessionState {
                 | HostedState::Interrupted
         ) {
             self.running_turn = None;
+            self.live_reasoning = None;
         }
     }
 
@@ -238,6 +241,12 @@ impl SessionState {
         if let Some(worker) = self.worker.take() {
             worker.task.abort();
         }
+    }
+
+    /// Keep the durable cursor and the visible mission while the same worker reattaches.
+    pub fn recover_stream(&mut self) -> Option<Cursor> {
+        self.begin_attach("Reconnecting to the session stream");
+        self.head
     }
 
     pub fn worker_ended(&mut self, detail: &str) {
@@ -255,6 +264,7 @@ impl SessionState {
         self.deciding.clear();
         self.partial = None;
         self.running_turn = None;
+        self.live_reasoning = None;
         self.last_sync_millis = None;
         self.server_error = None;
     }
@@ -332,9 +342,14 @@ impl SessionState {
             SessionFrame::Snapshot {
                 turn_id,
                 assistant_text,
+                reasoning_text,
                 ..
             } => {
                 self.running_turn = Some(turn_id.clone());
+                self.live_reasoning = None;
+                if let Some(text) = reasoning_text {
+                    self.append_visible_reasoning(turn_id, text);
+                }
                 self.partial = Some(PartialText {
                     turn_id: turn_id.clone(),
                     text: assistant_text.clone(),
@@ -343,6 +358,9 @@ impl SessionState {
             }
             SessionFrame::Turn(TurnEvent::TurnStarted { turn_id, .. }) => {
                 self.running_turn = Some(turn_id.clone());
+                if self.live_reasoning.as_ref().is_some_and(|(id, _)| id != turn_id) {
+                    self.live_reasoning = None;
+                }
                 self.server_error = None;
                 self.restart_hint = false;
                 if self
@@ -359,15 +377,23 @@ impl SessionState {
                 | TurnEvent::TurnFailed { .. },
             ) => {
                 self.running_turn = None;
+                self.live_reasoning = None;
                 self.partial = None;
                 if self.ready {
                     return self.refresh_transcript();
                 }
             }
             SessionFrame::Turn(TurnEvent::ItemAdded {
+                turn_id,
                 item: TurnItem::AssistantMessage(_),
-                ..
-            }) => self.partial = None,
+            }) => {
+                self.partial = None;
+                self.clear_visible_reasoning(turn_id);
+            }
+            SessionFrame::Turn(TurnEvent::ItemAdded {
+                turn_id,
+                item: TurnItem::Reasoning(_),
+            }) => self.clear_visible_reasoning(turn_id),
             SessionFrame::Session(SessionEvent::SessionClosed { .. }) => {
                 self.closed = true;
                 self.running_turn = None;
@@ -482,7 +508,12 @@ impl SessionState {
 
     fn observe_mission(&mut self, frame: &SessionFrame) {
         match frame {
-            SessionFrame::Turn(event) => self.mission.root_event(event),
+            SessionFrame::Turn(event) => {
+                if let TurnEvent::ReasoningDelta { turn_id, text } = event {
+                    self.append_visible_reasoning(turn_id, text);
+                }
+                self.mission.root_event(event);
+            }
             SessionFrame::Child {
                 agent,
                 parent,
@@ -501,6 +532,28 @@ impl SessionState {
                 summary,
             } => self.mission.job(work_id, kind, state, summary.as_deref()),
             _ => {}
+        }
+    }
+
+    fn append_visible_reasoning(&mut self, turn_id: &TurnId, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let (id, text) = self.live_reasoning.get_or_insert_with(|| (turn_id.clone(), String::new()));
+        if &*id != turn_id {
+            *id = turn_id.clone();
+            text.clear();
+        }
+        text.push_str(delta);
+        if text.len() > MAX_VISIBLE_REASONING_BYTES {
+            let keep_from = text.ceil_char_boundary(text.len() - MAX_VISIBLE_REASONING_BYTES);
+            text.drain(..keep_from);
+        }
+    }
+
+    fn clear_visible_reasoning(&mut self, turn_id: &TurnId) {
+        if self.live_reasoning.as_ref().is_some_and(|(id, _)| id == turn_id) {
+            self.live_reasoning = None;
         }
     }
 
@@ -711,6 +764,9 @@ impl SessionState {
             running_turn_id,
             transcript: self.view.transcript().iter().map(project_entry).collect(),
             live_text: self.partial.as_ref().map(|partial| partial.text.clone()),
+            live_reasoning: self.live_reasoning.as_ref()
+                .filter(|(id, _)| self.running_turn_id() == Some(id))
+                .map(|(_, text)| text.clone()),
             approvals: approvals.into_iter().map(project_approval).collect(),
             last_failure: self
                 .server_error
@@ -785,6 +841,7 @@ fn project_entry(entry: &harw_mobile_core::Entry) -> TranscriptEntry {
     let (kind, text, tool_state) = match &entry.kind {
         EntryKind::User(text) => (TranscriptKind::User, text, None),
         EntryKind::Assistant(text) => (TranscriptKind::Assistant, text, None),
+        EntryKind::Reasoning(text) => (TranscriptKind::Reasoning, text, None),
         EntryKind::Error(text) => (TranscriptKind::Error, text, None),
         EntryKind::Tool { name, state } => {
             let state = match state {
