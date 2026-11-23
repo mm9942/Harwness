@@ -38,14 +38,14 @@ import uniffi.harw_mobile_ffi.ConnectionPhase
 import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
 
-internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias }
+internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias, Knowledge }
 
 /** Eltern-Route fuer Zurueck; `null` = Einstellungen schliessen. */
 internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route) {
     SettingsRoute.Hub -> null
     SettingsRoute.Connection, SettingsRoute.Models, SettingsRoute.Commands,
     SettingsRoute.Providers, SettingsRoute.Agents, SettingsRoute.Jobs, SettingsRoute.LocalModels,
-    SettingsRoute.Files, SettingsRoute.Termux, SettingsRoute.Uias -> SettingsRoute.Hub
+    SettingsRoute.Files, SettingsRoute.Termux, SettingsRoute.Uias, SettingsRoute.Knowledge -> SettingsRoute.Hub
 }
 
 internal const val UI_PREFS = "harw_ui"
@@ -199,6 +199,7 @@ internal fun SettingsHub(
                 onOpen(SettingsRoute.Models)
             }
             HubRow("Befehle", "Alle Slash-Befehle des Servers", block) { onOpen(SettingsRoute.Commands) }
+            HubRow("Gedächtnis & Workbench", "Gedächtnis, Tagebuch, Workbench und Ziele des Servers", block) { onOpen(SettingsRoute.Knowledge) }
             HubRow("Provider (auf diesem Gerät)", "Schlüssel und Routen für den Standalone-Betrieb", null) { onOpen(SettingsRoute.Providers) }
             HubRow("Agenten-Profile", "UI-Agenten (UIA) anlegen und aktivieren", null) { onOpen(SettingsRoute.Uias) }
             HubRow("Agenten", "Laufende Agenten und Agentenbibliothek (Lokal und Cloud)", null) { onOpen(SettingsRoute.Agents) }

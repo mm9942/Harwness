@@ -249,7 +249,8 @@ internal open class MainActivity : ComponentActivity() {
         // Verwalten ist eine Server-Funktion: Hub, Modelle und Befehle sprechen immer mit der Cloud,
         // auch wenn gerade die Lokal-Ansicht offen ist (der On-Device-Host kennt keine Verwaltung).
         val manageRoute = settingsRoute == SettingsRoute.Hub || settingsRoute == SettingsRoute.Models ||
-            settingsRoute == SettingsRoute.Providers || settingsRoute == SettingsRoute.Commands
+            settingsRoute == SettingsRoute.Providers || settingsRoute == SettingsRoute.Commands ||
+            settingsRoute == SettingsRoute.Knowledge
         val manageConnection = if (manageRoute) cloud else connection
         val manageState = if (manageRoute) cloudState else state
         // Step-up-Host: immer ueber allen Zweigen, auch im Hub. Nichts davon ueberlebt Prozesstod.
@@ -359,6 +360,8 @@ internal open class MainActivity : ComponentActivity() {
             FilesScreen(onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Termux) {
             TermuxScreen(onBack = { openSettings(SettingsRoute.Hub) })
+        } else if (settingsRoute == SettingsRoute.Knowledge) {
+            KnowledgeScreen(state = manageState, connection = manageConnection, onBack = { openSettings(SettingsRoute.Hub) })
         } else if (settingsRoute == SettingsRoute.Commands) {
             CommandsScreen(
                 state = manageState,
