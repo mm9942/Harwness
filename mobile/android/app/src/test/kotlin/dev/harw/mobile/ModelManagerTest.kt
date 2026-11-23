@@ -1,8 +1,11 @@
 package dev.harw.mobile
 
+import java.io.File
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -201,5 +204,49 @@ class ModelManagerTest {
         assertEquals(false, linkedSizeMatches("999", 1000L))
         assertEquals(false, linkedSizeMatches("abc", 1000L))
         assertEquals(false, linkedSizeMatches("", 1000L))
+    }
+    @Test
+    fun oversizedPartialWithFailedDeleteIsNotEligibleForDownload() {
+        val part = StagedPart(bytes = 101L, deleteSucceeded = false)
+        assertThrows(IOException::class.java) { initialPartialOffset(part, 100L) }
+        assertEquals(1, part.deleteAttempts)
+    }
+
+    @Test
+    fun oversizedPartialRestartsAfterPassingCleanup() {
+        val part = StagedPart(bytes = 101L, deleteSucceeded = true)
+        assertEquals(0L, initialPartialOffset(part, 100L))
+        assertEquals(1, part.deleteAttempts)
+    }
+
+    @Test
+    fun validPartialIsResumedWithoutDeletion() {
+        val part = StagedPart(bytes = 25L, deleteSucceeded = false)
+        assertEquals(25L, initialPartialOffset(part, 100L))
+        assertEquals(0, part.deleteAttempts)
+    }
+
+    @Test
+    fun nonRegularPartialIsNotEligibleForDownload() {
+        val part = StagedPart(bytes = 0L, deleteSucceeded = false, isRegular = false)
+        assertThrows(IOException::class.java) { initialPartialOffset(part, 100L) }
+        assertEquals(0, part.deleteAttempts)
+    }
+
+    private class StagedPart(
+        private val bytes: Long,
+        private val deleteSucceeded: Boolean,
+        private val isRegular: Boolean = true,
+    ) : File("test-model.gguf.part") {
+        var deleteAttempts = 0
+            private set
+
+        override fun exists(): Boolean = true
+        override fun isFile(): Boolean = isRegular
+        override fun length(): Long = bytes
+        override fun delete(): Boolean {
+            deleteAttempts++
+            return deleteSucceeded
+        }
     }
 }

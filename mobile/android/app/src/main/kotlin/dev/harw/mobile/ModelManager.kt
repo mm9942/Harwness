@@ -80,6 +80,16 @@ internal fun hasRoom(freeBytes: Long, sizeBytes: Long, haveBytes: Long): Boolean
     return freeBytes >= needed + StorageMarginBytes
 }
 
+/** Prepare resume before making a network request; a failed cleanup is not a fresh download. */
+internal fun initialPartialOffset(part: File, expectedBytes: Long): Long {
+    if (!part.exists()) return 0L
+    if (!part.isFile) throw IOException("partial model is not a file")
+    val offset = part.length()
+    if (offset <= expectedBytes) return offset
+    if (!part.delete()) throw IOException("cannot remove oversized partial model")
+    return 0L
+}
+
 internal fun isRedirect(status: Int): Boolean =
     status == 301 || status == 302 || status == 303 || status == 307 || status == 308
 
@@ -196,15 +206,11 @@ internal class ModelManager(private val store: ModelStore) {
         return withContext(Dispatchers.IO) {
             ModelDirLock.mutex.withLock {
                 try {
-                    val dir = store.modelsDir()
+                    val dir = store.requireDownloadDir()
                     val part = File(dir, model.fileName + ".part")
-                    var offset = if (part.exists()) part.length() else 0L
-                    if (offset > size) {
-                        part.delete()
-                        offset = 0L
-                    }
+                    val offset = initialPartialOffset(part, size)
                     if (offset < size) {
-                        val free = store.freeBytes()
+                        val free = store.freeBytes(dir)
                         if (!hasRoom(free, size, offset)) {
                             return@withLock DownloadResult.NoSpace(size - offset + StorageMarginBytes, free)
                         }
@@ -219,6 +225,8 @@ internal class ModelManager(private val store: ModelStore) {
                     throw e
                 } catch (e: IOException) {
                     DownloadResult.Failed(e.message ?: "network error")
+                } catch (_: SecurityException) {
+                    DownloadResult.Failed("model storage access denied")
                 }
             }
         }

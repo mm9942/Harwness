@@ -4,7 +4,9 @@ import android.content.Context
 import android.os.Environment
 import android.os.StatFs
 import android.util.Log
+import java.io.DataInputStream
 import java.io.File
+import java.io.IOException
 import java.security.SecureRandom
 import kotlinx.coroutines.sync.Mutex
 
@@ -48,6 +50,40 @@ internal fun modelsDirFor(location: ModelLocation, documentsRoot: File, filesDir
 
 internal data class ProbeResult(val location: ModelLocation, val ok: Boolean, val detail: String)
 
+/** Null means all three operations succeeded. A failed removal makes the folder ineligible. */
+internal fun probeModelDirectory(
+    dir: File,
+    createProbe: (File) -> File = { File.createTempFile(ProbePrefix, null, it) },
+): String? {
+    val probe = try {
+        if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) return "cannot create folder"
+        createProbe(dir)
+    } catch (e: Exception) {
+        return e.javaClass.simpleName
+    }
+
+    val removed: Boolean
+    val failure = try {
+        val data = ByteArray(ProbeBytes).also { SecureRandom().nextBytes(it) }
+        probe.outputStream().use { it.write(data) }
+        val matches = DataInputStream(probe.inputStream()).use { input ->
+            val bytes = ByteArray(ProbeBytes)
+            input.readFully(bytes)
+            bytes.contentEquals(data) && input.read() == -1
+        }
+        if (matches) null else "read back differs"
+    } catch (e: Exception) {
+        e.javaClass.simpleName
+    } finally {
+        removed = try {
+            probe.delete()
+        } catch (_: Exception) {
+            false
+        }
+    }
+    return if (removed) failure else "cannot remove model storage probe"
+}
+
 internal class ModelStore(context: Context) {
     private val app: Context = context.applicationContext
     private val prefs = app.getSharedPreferences(ModelStorePrefs, Context.MODE_PRIVATE)
@@ -73,56 +109,24 @@ internal class ModelStore(context: Context) {
     /** The default folder (Documents/.harw/models or its fallback), ignoring a custom choice. */
     fun defaultDir(): File = dirFor(location)
 
-    /** Creates [dir], writes a probe file and removes it again. */
-    fun probeDir(dir: File): Boolean {
-        var probe: File? = null
-        return try {
-            if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) return false
-            val file = File(dir, ProbePrefix + System.currentTimeMillis())
-            probe = file
-            file.outputStream().use { it.write(ByteArray(ProbeBytes)) }
-            true
-        } catch (_: Exception) {
-            false
-        } finally {
-            try {
-                probe?.delete()
-            } catch (_: Exception) {
-            }
-        }
-    }
+    /** Checks whether the model folder supports write, read-back and cleanup. */
+    fun probeDir(dir: File): Boolean = probeModelDirectory(dir) == null
 
     fun modelsDir(): File = (customDir() ?: dirFor(location)).also { it.mkdirs() }
+
+    /** Fail before network I/O if the actual target cannot support a complete write. */
+    fun requireDownloadDir(): File {
+        val dir = modelsDir()
+        probeModelDirectory(dir)?.let { throw IOException(it) }
+        return dir
+    }
 
     fun dirFor(location: ModelLocation): File =
         modelsDirFor(location, documentsRoot, app.filesDir)
 
-    /** Creates the folder, writes 16 random bytes to a probe file, reads them back, deletes it. */
     fun probe(location: ModelLocation): ProbeResult {
-        val dir = dirFor(location)
-        var probe: File? = null
-        return try {
-            if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) {
-                return ProbeResult(location, false, "cannot create folder")
-            }
-            val file = File(dir, ProbePrefix + System.currentTimeMillis())
-            probe = file
-            val data = ByteArray(ProbeBytes).also { SecureRandom().nextBytes(it) }
-            file.outputStream().use { it.write(data) }
-            val back = file.inputStream().use { it.readBytes() }
-            if (back.contentEquals(data)) {
-                ProbeResult(location, true, "ok")
-            } else {
-                ProbeResult(location, false, "read back differs")
-            }
-        } catch (e: Exception) {
-            ProbeResult(location, false, e.javaClass.simpleName)
-        } finally {
-            try {
-                probe?.delete()
-            } catch (_: Exception) {
-            }
-        }
+        val failure = probeModelDirectory(dirFor(location))
+        return ProbeResult(location, failure == null, failure ?: "ok")
     }
 
     /**
@@ -140,8 +144,7 @@ internal class ModelStore(context: Context) {
         return chosen
     }
 
-    fun freeBytes(): Long {
-        val dir = modelsDir()
+    fun freeBytes(dir: File = modelsDir()): Long {
         return try {
             StatFs(dir.path).availableBytes
         } catch (_: Exception) {
