@@ -43,6 +43,9 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.CallSplit
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Construction
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Security
@@ -396,15 +399,33 @@ internal fun SessionConversation(
             )
         }
             val agentName = rememberChatAgentName(sessionId, state.local, agentVersion) ?: "Harw"
+            var versions by remember(sessionId) { mutableStateOf(ChatVersions.load(ctx, sessionId)) }
+            var viewing by remember(sessionId) { mutableStateOf(emptyMap<String, Int>()) }
+            val resend = { entryId: String, text: String, images: List<uniffi.harw_mobile_ffi.PromptImage> ->
+                val all = snapshot?.transcript.orEmpty()
+                val at = all.indexOfFirst { it.id == entryId }
+                val currentHead = snapshot?.head
+                val draft = window.draft(sessionId)
+                if (generation != null && currentHead != null && at >= 0 &&
+                    draft.text.isBlank() && draft.images.isEmpty() && !draft.sending && !draft.uncertain
+                ) {
+                    versions = ChatVersions.append(ctx, sessionId, versions, ChatVersions.anchorOf(all, at), ChatVersion(all.drop(at)))
+                    viewing = emptyMap()
+                }
+                if (generation != null && currentHead != null) window.regenerate(connection, sessionId, generation, currentHead, entryId, text, images)
+            }
+            val versionsUi = VersionsUi(
+                versions, viewing,
+                onView = { anchor, index -> viewing = if (index == null) viewing - anchor else viewing + (anchor to index) },
+                onEdit = { entry, _, text, images -> resend(entry.id, text, images) },
+            )
             ConversationFeed(
                 agentName = agentName,
                 entries = snapshot?.transcript.orEmpty(),
                 sentImages = { text, count -> window.sentImages(sessionId, text, count) },
                 fetchMedia = { ref -> connection.mediaThumbnail(sessionId, ref) },
-                onRegenerate = { entryId, text, images ->
-                    val currentHead = snapshot?.head
-                    if (generation != null && currentHead != null) window.regenerate(connection, sessionId, generation, currentHead, entryId, text, images)
-                },
+                onRegenerate = resend,
+                versionsUi = versionsUi,
                 onFork = { text, images ->
                     val open = { id: String -> window.prefillDraft(id, text, images); window.projectKey?.let { applyProjectAgent(ctx, it, id) }; window.select(id) }
                     val project = window.projectKey
@@ -463,6 +484,7 @@ private fun ConversationFeed(
     fetchMedia: suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?,
     onRegenerate: ((String, String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
     onFork: ((String, List<uniffi.harw_mobile_ffi.PromptImage>) -> Unit)? = null,
+    versionsUi: VersionsUi? = null,
     liveText: String?,
     jumpToLatest: Int,
     emptyMessage: String,
@@ -473,7 +495,12 @@ private fun ConversationFeed(
         return
     }
     // A reversed list keeps the latest line at the bottom during bursty token updates.
-    val reversed = remember(entries) { entries.asReversed() }
+    val viewed = remember(entries, versionsUi?.versions, versionsUi?.viewing) {
+        if (versionsUi == null) entries to Int.MAX_VALUE else applyViewing(entries, versionsUi)
+    }
+    val shown = viewed.first
+    val readOnlyFrom = viewed.second
+    val reversed = remember(shown) { shown.asReversed() }
     val listState = rememberLazyListState()
     var followLatest by rememberSaveable { mutableStateOf(true) }
     LaunchedEffect(listState) {
@@ -506,21 +533,31 @@ private fun ConversationFeed(
                 TranscriptKind.ERROR -> "Fehler"
             }
             if (entry.kind == TranscriptKind.USER) {
-                val (clean, count) = splitImagePlaceholders(entry.text)
-                if (count > 0) {
-                    val thumbs = sentImages(clean, count)
-                    MessageBlock(
-                        label, clean, entry.kind, imageCount = count, thumbs = thumbs,
-                        imageRefs = entry.images, fetchMedia = fetchMedia,
-                        onRegenerate = onRegenerate?.let { cb -> { cb(entry.id, clean, thumbs.orEmpty()) } },
-                        onFork = onFork?.let { cb -> { cb(forkText(entries, entry, clean), thumbs.orEmpty()) } },
+                val index = shown.indexOfFirst { it.id == entry.id }
+                val anchor = ChatVersions.anchorOf(shown, index)
+                val known = versionsUi?.versions?.get(anchor).orEmpty()
+                val viewingIdx = versionsUi?.viewing?.get(anchor)
+                val canAct = index in 0 until readOnlyFrom
+                val nav = if (known.isEmpty() || versionsUi == null) null else {
+                    val current = (viewingIdx ?: known.size) + 1
+                    VersionNav(
+                        current = current,
+                        total = known.size + 1,
+                        onPrev = if (current > 1) ({ versionsUi.onView(anchor, current - 2) }) else null,
+                        onNext = if (current < known.size + 1) ({ versionsUi.onView(anchor, if (current >= known.size) null else current) }) else null,
                     )
-                    return@items
                 }
+                val (clean, count) = splitImagePlaceholders(entry.text)
+                val thumbs = if (count > 0) sentImages(clean, count) else null
+                val shownText = if (count > 0) clean else entry.text
                 MessageBlock(
-                    label, entry.text, entry.kind,
-                    onRegenerate = onRegenerate?.let { cb -> { cb(entry.id, entry.text, emptyList()) } },
-                    onFork = onFork?.let { cb -> { cb(forkText(entries, entry, entry.text), emptyList()) } },
+                    label, shownText, entry.kind, imageCount = count, thumbs = thumbs,
+                    imageRefs = entry.images, fetchMedia = fetchMedia,
+                    onRegenerate = if (canAct) onRegenerate?.let { cb -> { cb(entry.id, shownText, thumbs.orEmpty()) } } else null,
+                    onFork = onFork?.let { cb -> { cb(forkText(shown, entry, shownText), thumbs.orEmpty()) } },
+                    onEdit = if (canAct && versionsUi != null) ({ newText -> versionsUi.onEdit(entry, anchor, newText, thumbs.orEmpty()) }) else null,
+                    nav = nav,
+                    oldVersion = viewingIdx != null && index >= 0 && !canAct,
                 )
                 return@items
             }
@@ -540,6 +577,9 @@ private fun MessageBlock(
     fetchMedia: (suspend (String) -> uniffi.harw_mobile_ffi.PromptImage?)? = null,
     onRegenerate: (() -> Unit)? = null,
     onFork: (() -> Unit)? = null,
+    onEdit: ((String) -> Unit)? = null,
+    nav: VersionNav? = null,
+    oldVersion: Boolean = false,
 ) {
     val colors = MaterialTheme.colorScheme
     val user = kind == TranscriptKind.USER
@@ -572,16 +612,50 @@ private fun MessageBlock(
                         )
                     }
                 }
-                if (user && (onRegenerate != null || onFork != null)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        if (onFork != null) {
-                            IconButton(onClick = onFork, modifier = Modifier.size(36.dp)) {
-                                Icon(Icons.Outlined.CallSplit, contentDescription = "Ab hier in neuem Chat fortsetzen (Fork)", modifier = Modifier.size(20.dp))
-                            }
+                if (user && (onRegenerate != null || onFork != null || onEdit != null || nav != null)) {
+                    var editing by remember(text) { mutableStateOf(false) }
+                    var draftText by remember(text) { mutableStateOf(text) }
+                    if (editing && onEdit != null) {
+                        androidx.compose.material3.OutlinedTextField(
+                            value = draftText, onValueChange = { draftText = it }, modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Nachricht bearbeiten") },
+                        )
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            TextButton(onClick = { editing = false; draftText = text }) { Text("Abbrechen") }
+                            TextButton(
+                                enabled = draftText.isNotBlank(),
+                                onClick = { editing = false; onEdit(draftText.trim()) },
+                            ) { Text("Senden") }
                         }
-                        if (onRegenerate != null) {
-                            IconButton(onClick = onRegenerate, modifier = Modifier.size(36.dp)) {
-                                Icon(Icons.Outlined.Refresh, contentDescription = "Neu generieren", modifier = Modifier.size(20.dp))
+                    } else {
+                        if (oldVersion) {
+                            Text("Ältere Fassung (nur Ansicht)", style = MaterialTheme.typography.labelSmall)
+                        }
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            if (nav != null) {
+                                IconButton(onClick = { nav.onPrev?.invoke() }, enabled = nav.onPrev != null, modifier = Modifier.size(32.dp)) {
+                                    Icon(Icons.AutoMirrored.Outlined.KeyboardArrowLeft, contentDescription = "Ältere Fassung", modifier = Modifier.size(20.dp))
+                                }
+                                Text("${nav.current}/${nav.total}", style = MaterialTheme.typography.labelSmall)
+                                IconButton(onClick = { nav.onNext?.invoke() }, enabled = nav.onNext != null, modifier = Modifier.size(32.dp)) {
+                                    Icon(Icons.AutoMirrored.Outlined.KeyboardArrowRight, contentDescription = "Neuere Fassung", modifier = Modifier.size(20.dp))
+                                }
+                            }
+                            androidx.compose.foundation.layout.Spacer(Modifier.weight(1f))
+                            if (onFork != null) {
+                                IconButton(onClick = onFork, modifier = Modifier.size(36.dp)) {
+                                    Icon(Icons.Outlined.CallSplit, contentDescription = "Ab hier in neuem Chat fortsetzen (Fork)", modifier = Modifier.size(20.dp))
+                                }
+                            }
+                            if (onRegenerate != null) {
+                                IconButton(onClick = onRegenerate, modifier = Modifier.size(36.dp)) {
+                                    Icon(Icons.Outlined.Refresh, contentDescription = "Neu generieren", modifier = Modifier.size(20.dp))
+                                }
+                            }
+                            if (onEdit != null) {
+                                IconButton(onClick = { editing = true }, modifier = Modifier.size(36.dp)) {
+                                    Icon(Icons.Outlined.Edit, contentDescription = "Nachricht bearbeiten", modifier = Modifier.size(20.dp))
+                                }
                             }
                         }
                     }
@@ -590,6 +664,8 @@ private fun MessageBlock(
         }
     }
 }
+
+internal data class VersionNav(val current: Int, val total: Int, val onPrev: (() -> Unit)?, val onNext: (() -> Unit)?)
 
 /**
  * Text für den Fork: der Verlauf vor der gewählten Nachricht als Kontext, dann die Nachricht selbst.
