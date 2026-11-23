@@ -985,7 +985,8 @@ docs/
     │   └── HARW_LINUX_JOB_RUNTIME_FOUNDATION.md
     │
     ├── 30-crypto-infrastructure/
-    │   └── Harwness_Crypto_Infrastructure_Masterplan_v2.md
+    │   ├── Harwness_Crypto_Infrastructure_Masterplan_v2.md
+    │   └── kms-user-crypto-contract.md
     │
     ├── 40-cryptguard-service/
     │   └── crypt_guard_service_hyper_tower_plan.md
