@@ -106,7 +106,7 @@ impl OnionClient {
     /// Opens a Tor stream to `locator`, bootstrapping first if needed.
     ///
     /// The whole operation (bootstrap plus rendezvous) is bounded by
-    /// `timeout`; exceeding it yields [`OnionError::ConnectTimeout`].
+    /// `timeout`; deadline errors distinguish bootstrap from the onion dial.
     pub async fn dial(
         &self,
         locator: &OnionLocator,
@@ -131,12 +131,8 @@ impl OnionClient {
         timeout: Duration,
         retry: bool,
     ) -> Result<OnionStream, OnionError> {
-        let started = Instant::now();
+        let deadline = Instant::now() + timeout;
         let attempt = async {
-            self.client
-                .bootstrap()
-                .await
-                .map_err(|e| map_arti_error(&e, OnionError::Bootstrap))?;
             let connect = |fresh| async move {
                 let mut prefs = StreamPrefs::new();
                 prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
@@ -151,7 +147,7 @@ impl OnionClient {
                     .await
             };
             let stream = if retry {
-                let initial_budget = timeout.saturating_sub(started.elapsed()) / 2;
+                let initial_budget = deadline.saturating_duration_since(Instant::now()) / 2;
                 retry_circuit(initial_budget, connect, |error| {
                     circuit_retry_delay(error.kind())
                 })
@@ -162,15 +158,35 @@ impl OnionClient {
             .map_err(|error| map_arti_error(&error, OnionError::Connect))?;
             Ok::<OnionStream, OnionError>(Box::pin(stream))
         };
-        let result = match tokio::time::timeout(timeout, attempt).await {
-            Ok(result) => result,
-            Err(_) => Err(OnionError::ConnectTimeout(timeout)),
+        let bootstrap = async {
+            self.client
+                .bootstrap()
+                .await
+                .map_err(|e| map_arti_error(&e, OnionError::Bootstrap))
         };
+        let result = dial_before_deadline(deadline, timeout, bootstrap, attempt).await;
         if let Err(error) = &result {
             tracing::debug!(target = %locator.redacted(), %error, "onion dial failed");
         }
         result
     }
+}
+
+async fn dial_before_deadline<T>(
+    deadline: Instant,
+    total: Duration,
+    bootstrap: impl Future<Output = Result<(), OnionError>>,
+    dial: impl Future<Output = Result<T, OnionError>>,
+) -> Result<T, OnionError> {
+    tokio::time::timeout_at(deadline, bootstrap)
+        .await
+        .map_err(|_| OnionError::BootstrapTimeout(total))??;
+    if Instant::now() >= deadline {
+        return Err(OnionError::ConnectTimeout(total));
+    }
+    tokio::time::timeout_at(deadline, dial)
+        .await
+        .map_err(|_| OnionError::ConnectTimeout(total))?
 }
 
 fn circuit_retry_delay(kind: ErrorKind) -> Option<Duration> {
@@ -363,6 +379,33 @@ mod tests {
         .await;
         assert_eq!(attempts, [false, true]);
         assert_eq!(result, Err(ErrorKind::TorNetworkTimeout));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_deadline_does_not_start_an_onion_dial() {
+        let total = Duration::from_millis(10);
+        let result = dial_before_deadline::<()>(
+            Instant::now() + total,
+            total,
+            std::future::pending(),
+            async { panic!("expired bootstrap must not start an onion dial") },
+        )
+        .await;
+        assert!(matches!(result, Err(OnionError::BootstrapTimeout(t)) if t == total));
+    }
+
+    #[tokio::test]
+    async fn onion_dial_uses_the_same_deadline_after_bootstrap() {
+        let total = Duration::from_secs(120);
+        // A past deadline must not be replaced with another 120-second budget.
+        let result = dial_before_deadline::<()>(
+            Instant::now() - Duration::from_millis(1),
+            total,
+            std::future::ready(Ok(())),
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(result, Err(OnionError::ConnectTimeout(t)) if t == total));
     }
 
     #[tokio::test]

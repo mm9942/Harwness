@@ -45,6 +45,20 @@ async fn echo(mut stream: OnionStream) {
     }
 }
 
+async fn verify_echo(client: &OnionClient, locator: &OnionLocator) -> TestResult {
+    let mut stream = client.dial_with_retry(locator, Duration::from_secs(180)).await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        stream.write_all(PING).await?;
+        stream.flush().await?;
+        let mut echoed = vec![0u8; PING.len()];
+        stream.read_exact(&mut echoed).await?;
+        assert_eq!(echoed, PING);
+        Ok::<(), std::io::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
 /// Launches the echo service; `accepted` counts the streams that reach the handler.
 async fn launch_server(
     state: &Path,
@@ -83,13 +97,7 @@ async fn launches_an_onion_service_and_dials_it() -> TestResult {
     );
 
     let client = OnionClient::launch(&OnionClientConfig::new(&client_state, &client_cache))?;
-    let mut stream = client.dial(&locator, Duration::from_secs(180)).await?;
-    stream.write_all(PING).await?;
-    stream.flush().await?;
-    let mut echoed = vec![0u8; PING.len()];
-    stream.read_exact(&mut echoed).await?;
-    assert_eq!(echoed, PING);
-    drop(stream);
+    verify_echo(&client, &locator).await?;
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
 
     // Only the virtual port may be served: a BEGIN to any other port must be
@@ -108,6 +116,13 @@ async fn launches_an_onion_service_and_dials_it() -> TestResult {
     );
     drop(client);
 
+    // Recreate the client in-process with exactly the same persisted state.
+    // An actual Android process death is a separate device-level test.
+    let client = OnionClient::launch(&OnionClientConfig::new(&client_state, &client_cache))?;
+    verify_echo(&client, &locator).await?;
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    drop(client);
+
     server.shutdown();
     let relaunched = launch_server(&server_state, &server_cache, &accepted).await?;
     assert_eq!(
@@ -119,6 +134,12 @@ async fn launches_an_onion_service_and_dials_it() -> TestResult {
         "relaunched onion service {}",
         relaunched.locator().redacted()
     );
+    assert!(relaunched.wait_reachable(Duration::from_secs(300)).await);
+    let fresh_state = private_dir(&dir.path().join("fresh-client/state"))?;
+    let fresh_cache = private_dir(&dir.path().join("fresh-client/cache"))?;
+    let fresh_client = OnionClient::launch(&OnionClientConfig::new(&fresh_state, &fresh_cache))?;
+    verify_echo(&fresh_client, &locator).await?;
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
     relaunched.shutdown();
     Ok(())
 }

@@ -247,20 +247,25 @@ impl Dialer {
     /// Returns the running Tor client, starting it on first use.
     #[cfg(feature = "onion")]
     fn tor_client(&self) -> Result<Arc<harw_onion::OnionClient>, String> {
-        let dirs = lock(&self.inner.dirs).clone();
         if let Some(client) = lock(&self.inner.tor).as_ref() {
             return Ok(Arc::clone(client));
         }
-        let (state, cache) = dirs.ok_or_else(|| "Tor storage is not configured".to_owned())?;
-        // Launch without holding the lock: it opens Tor storage and can be slow,
-        // and `tor_status` (polled by the UI) must not block meanwhile.
-        let launched =
-            harw_onion::OnionClient::launch(&harw_onion::OnionClientConfig::new(state, cache))
-                .map_err(|error| error.to_string())?;
-        let mut tor = lock(&self.inner.tor);
-        // If another task won the race, keep its client; ours is dropped.
-        let client = tor.get_or_insert_with(|| Arc::new(launched));
-        Ok(Arc::clone(client))
+        // Serialize cold starts and directory changes without holding the
+        // status mutex during disk I/O. A discarded second launch can still
+        // open the same Arti state/cache and start bootstrap tasks.
+        let dirs = lock(&self.inner.dirs);
+        if let Some(client) = lock(&self.inner.tor).as_ref() {
+            return Ok(Arc::clone(client));
+        }
+        let (state, cache) = dirs
+            .as_ref()
+            .ok_or_else(|| "Tor storage is not configured".to_owned())?;
+        let config = harw_onion::OnionClientConfig::new(state.clone(), cache.clone());
+        let client = Arc::new(
+            harw_onion::OnionClient::launch(&config).map_err(|error| error.to_string())?,
+        );
+        *lock(&self.inner.tor) = Some(Arc::clone(&client));
+        Ok(client)
     }
 }
 

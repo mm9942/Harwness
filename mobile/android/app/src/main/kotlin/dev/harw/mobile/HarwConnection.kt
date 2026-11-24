@@ -687,6 +687,7 @@ internal class HarwConnection(private val context: Context, private val localBac
         state.value.detail?.let { detail ->
             detail.contains("tor: onion connect failed: tor: tor operation timed out:") ||
                 detail.contains("tor: onion connect did not finish within") ||
+                detail.contains("tor: tor bootstrap did not finish within") ||
                 detail.contains("tor: attempted to use unbootstrapped client:")
         } == true
 

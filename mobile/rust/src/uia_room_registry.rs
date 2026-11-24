@@ -133,9 +133,9 @@ pub(crate) fn decode_frame(
     )?)
 }
 
-fn checked_dir(file: File, exact_private: bool) -> Result<File, NativeError> {
+fn checked_private_dir(file: File) -> Result<File, NativeError> {
     ensure_owned_directory(&file)?;
-    if exact_private && file.metadata()?.mode() & 0o077 != 0 {
+    if file.metadata()?.mode() & 0o077 != 0 {
         return Err(NativeError::Denied);
     }
     Ok(file)
@@ -257,10 +257,20 @@ fn lock_scope(root: &Path, scope: SelectedScope) -> Result<File, NativeError> {
     if !root.is_absolute() {
         return Err(NativeError::Denied);
     }
-    let root_fd = checked_dir(File::from(open_dir_nofollow(root)?), false)?;
-    let ns = checked_dir(open_dir_at(root_fd.as_fd(), Path::new(PIN_NAMESPACE))?, true)?;
+    let root_fd = File::from(open_dir_nofollow(root)?);
+    let root_metadata = root_fd.metadata()?;
+    // Android's no_backup parent can be 0771 with the app UID as its GID.
+    // The PIN namespace itself still has to be owned by this process and private.
+    let root_mode = root_metadata.mode();
+    if root_mode & 0o002 != 0 || (root_mode & 0o020 != 0 && root_metadata.gid() != root_metadata.uid()) {
+        return Err(NativeError::Denied);
+    }
+    let ns = checked_private_dir(open_dir_at(root_fd.as_fd(), Path::new(PIN_NAMESPACE))?)?;
+    if root_metadata.uid() != ns.metadata()?.uid() {
+        return Err(NativeError::Denied);
+    }
     let uuid = scope.canonical_uuid();
-    let scope_fd = checked_dir(open_dir_at(ns.as_fd(), Path::new(&uuid))?, true)?;
+    let scope_fd = checked_private_dir(open_dir_at(ns.as_fd(), Path::new(&uuid))?)?;
     match scope_fd.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => return Err(NativeError::Busy),
@@ -286,7 +296,7 @@ fn room_store(
         }
         scope_fd.sync_all().map_err(|_| NativeError::Uncertain)?;
     }
-    let pinned = checked_dir(open_dir_at(scope_fd.as_fd(), Path::new(ROOM_DIR))?, true)?;
+    let pinned = checked_private_dir(open_dir_at(scope_fd.as_fd(), Path::new(ROOM_DIR))?)?;
     let path = root.join(PIN_NAMESPACE).join(scope.canonical_uuid()).join(ROOM_DIR);
     let named = File::from(open_dir_nofollow(&path)?);
     let a = pinned.metadata()?;
@@ -328,7 +338,7 @@ fn uncommitted_retirement(scope_fd: &File, scope: SelectedScope) -> Result<Optio
                 }
             }
             Some(ROOM_DIR) => {
-                let room = checked_dir(open_dir_at(scope_fd.as_fd(), Path::new(ROOM_DIR))?, true)?;
+                let room = checked_private_dir(open_dir_at(scope_fd.as_fd(), Path::new(ROOM_DIR))?)?;
                 for entry in read_dir_names(room.as_fd())? {
                     if entry != ENROLLMENT_LOCK {
                         return Err(NativeError::Recovery);
@@ -694,6 +704,31 @@ mod tests {
             assert_eq!(input, [0; 89]);
             registry.open(self.dir.path(), self.scope, mode, proof)
         }
+    }
+
+    #[test]
+    fn android_no_backup_rules_keep_vault_directories_private() -> TestResult {
+        let f = Fixture::new()?;
+        let registry = Registry::default();
+        f.platform(1)?;
+        let namespace = f.dir.path().join(PIN_NAMESPACE);
+        let scope_dir = namespace.join(f.scope.canonical_uuid());
+        File::create_new(scope_dir.join("state.lock"))?;
+
+        // On a development machine UID and GID may differ. Under the Android
+        // app-owned UID/GID pair, exercise the framework's 0771 mode.
+        let metadata = std::fs::metadata(f.dir.path())?;
+        if metadata.uid() == metadata.gid() {
+            std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o771))?;
+            assert!(registry.restart_uncommitted(f.dir.path(), f.scope, false).is_ok());
+        }
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o773))?;
+        assert!(matches!(f.open(&registry, Mode::Provision), Err(NativeError::EnrollmentRoomDirectory)));
+
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(namespace, std::fs::Permissions::from_mode(0o770))?;
+        assert!(matches!(f.open(&registry, Mode::Provision), Err(NativeError::EnrollmentRoomDirectory)));
+        Ok(())
     }
 
     #[test]

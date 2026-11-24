@@ -521,10 +521,12 @@ internal class AndroidVaultBiometricSlot private constructor(
         } else {
             info.isInsideSecureHardware
         }
+        // Keystore2 also reports 0 when the auth-per-use key has no AUTH_TIMEOUT tag.
+        val authSeconds = info.userAuthenticationValidityDurationSeconds
         if (!hardware || !info.isUserAuthenticationRequired ||
             !info.isUserAuthenticationRequirementEnforcedBySecureHardware ||
             info.userAuthenticationType != KeyProperties.AUTH_BIOMETRIC_STRONG ||
-            info.userAuthenticationValidityDurationSeconds != -1 ||
+            (authSeconds != -1 && authSeconds != 0) ||
             !info.isInvalidatedByBiometricEnrollment
         ) bioFail(VaultBiometricFailure.Unsupported)
     }
