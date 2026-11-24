@@ -124,7 +124,7 @@ impl SealedRoomVault {
         drop(keys);
         self.require_active()?;
         if cancel.is_cancelled() { return Err(VaultError::Locked); }
-        let (input, request) = oneshot::channel();
+        let (input, request) = oneshot::channel::<RoomCompletionRequest>();
         let join = tokio::spawn(async move {
             let (answer, approval) = tokio::select! {
                 biased;
@@ -209,11 +209,13 @@ impl SealedRoomVault {
     }
 }
 
+type RoomCompletionRequest = (Zeroizing<String>, RoomResponseApproval);
+
 /// The model worker can deliver one validated response and get only a commit
 /// status. Dropping the sender or cancelling the exact attempt drops the
 /// waiting actor; it exposes no arbitrary sign/verify/decrypt/read operation.
 pub(crate) struct RoomCompletionMailbox {
-    input: oneshot::Sender<(Zeroizing<String>, RoomResponseApproval)>,
+    input: oneshot::Sender<RoomCompletionRequest>,
     join: JoinHandle<Result<bool, VaultError>>,
 }
 

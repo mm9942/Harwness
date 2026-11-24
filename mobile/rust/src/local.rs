@@ -15,7 +15,9 @@ pub(crate) const LOCAL_HOST_UNAVAILABLE: &str = "the on-device host is not avail
 static LOCAL_INFERENCE: std::sync::LazyLock<harw_llama::LocalInferenceControl> =
     std::sync::LazyLock::new(|| {
         let control = harw_llama::LocalInferenceControl::default();
-        let _ = control.set_image_concurrency(crate::vision_admission::DEFAULT_LOCAL_VISION_CONCURRENCY as u8);
+        let _ = control.set_image_concurrency(
+            crate::local_vision::DEFAULT_LOCAL_VISION_CONCURRENCY as u8,
+        );
         control
     });
 

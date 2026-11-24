@@ -7,6 +7,7 @@
 //! and other route settings that affect the rate budget. There is no fallback
 //! route, network, persistence, or clock read in this module.
 
+use crate::local_vision::MAX_LOCAL_VISION_CONCURRENCY;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 /// Maximum images in a job at construction, including those later in flight.
@@ -14,8 +15,6 @@ pub(crate) const MAX_SELECTED_VISION_IMAGES: usize = 50;
 pub(crate) const MIN_API_VISION_CONCURRENCY: usize = 5;
 pub(crate) const MAX_VISION_REQUEST_CONCURRENCY: usize = 50;
 pub(crate) const DEFAULT_API_VISION_CONCURRENCY: usize = 30;
-pub(crate) const MAX_LOCAL_VISION_CONCURRENCY: usize = 5;
-pub(crate) const DEFAULT_LOCAL_VISION_CONCURRENCY: usize = 3;
 const LOWEST_EFFECTIVE_API_CONCURRENCY: usize = 1;
 const FIRST_THROTTLE_DECREASE: usize = 10;
 const LATER_THROTTLE_DECREASE: usize = 5;
@@ -421,7 +420,7 @@ mod tests {
     #[test]
     fn selection_and_configured_concurrency_have_independent_hard_limits() {
         assert_eq!(DEFAULT_API_VISION_CONCURRENCY, 30);
-        assert_eq!(DEFAULT_LOCAL_VISION_CONCURRENCY, 3);
+        assert_eq!(crate::local_vision::DEFAULT_LOCAL_VISION_CONCURRENCY, 3);
         for (n, limit, expected) in [
             (0, 5, AdmissionError::InvalidSelectionCount),
             (51, 5, AdmissionError::InvalidSelectionCount),

@@ -38,6 +38,11 @@ use harw_types::cancel::{CancelReason, CancelToken};
 #[cfg(feature = "local-host")]
 use std::sync::Arc;
 
+#[cfg(any(feature = "local-host", test))]
+pub(crate) const MAX_LOCAL_VISION_CONCURRENCY: usize = 5;
+#[cfg(any(feature = "local-host", test))]
+pub(crate) const DEFAULT_LOCAL_VISION_CONCURRENCY: usize = 3;
+
 #[cfg(feature = "local-host")]
 const MAX_IMAGES: usize = 50;
 #[cfg(feature = "local-host")]
@@ -149,7 +154,7 @@ pub(crate) fn supervisor_runtime() -> Result<&'static tokio::runtime::Runtime, M
                 .worker_threads(1)
                 // One shared inference gate fences batches; allow up to five
                 // admitted native caption workers instead of silently queueing one.
-                .max_blocking_threads(crate::vision_admission::MAX_LOCAL_VISION_CONCURRENCY)
+                .max_blocking_threads(MAX_LOCAL_VISION_CONCURRENCY)
                 .thread_name("harw-local-vision")
                 .build()
                 .ok()
