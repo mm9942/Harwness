@@ -6,6 +6,7 @@ import android.provider.Settings
 import android.system.Os
 import android.system.OsConstants
 import java.io.IOException
+import java.security.KeyStore
 
 /** Not wired to an app or profile. All calls, including directory fsync, are worker-thread work. */
 internal object AndroidVaultPinStateStore {
@@ -20,6 +21,16 @@ internal object AndroidVaultPinStateStore {
             Os.fsync(fd)
         } finally {
             Os.close(fd)
+        }
+    }
+
+    fun localProfiles(context: Context) = LocalUiaDevProfiles(privateRoot(context), durability::force)
+
+    fun eraseScope(context: Context, scope: VaultPinScope) {
+        VaultPinDiskStateStore.eraseScope(privateRoot(context), scope, durability) {
+            val keys = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            keys.deleteEntry(AndroidVaultPinMac.alias(scope.vaultId))
+            keys.deleteEntry(AndroidVaultBiometricSlot.alias(scope))
         }
     }
 

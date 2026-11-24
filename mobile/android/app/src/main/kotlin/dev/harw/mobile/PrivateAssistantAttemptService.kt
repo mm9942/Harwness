@@ -118,6 +118,12 @@ internal object PrivateAssistantAttemptAdmission {
         retired?.stop()
     }
 
+    suspend fun stopForVaultReset(profile: LocalUiaProfile) {
+        val ticket = synchronized(guard) { current?.takeIf { it.profile == profile } } ?: return
+        ticket.stop()
+        ticket.ended.await()
+    }
+
     fun parkedStop(profile: LocalUiaProfile, vaultScope: VaultPinScope): (() -> Unit)? =
         synchronized(guard) {
             current?.takeIf {

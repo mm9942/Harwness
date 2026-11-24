@@ -39,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
@@ -79,6 +80,15 @@ internal open class MainActivity : HarwLocaleActivity() {
     private var themePref by mutableStateOf("system")
     private var openUpdate by mutableStateOf(false)
     private var assistantDev by mutableStateOf<LocalUiaDevSession?>(null)
+    private var startupPin by mutableStateOf<LocalUiaProfile?>(null)
+    private var startupAuth by mutableStateOf<LocalUiaDevSession?>(null)
+    private var startupAuthenticated by mutableStateOf(false)
+    private var deferredLink: Intent? = null
+    private val startupPinListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        closeExternalSurfaces()
+        startupAuthenticated = false
+        refreshStartupPin()
+    }
     private var assistantStartsInLibrary by mutableStateOf(false)
     // Cloud routes are not restored, and never share the local vault owner.
     private var cloudAssistant by mutableStateOf<CloudAssistantTarget?>(null)
@@ -154,6 +164,20 @@ internal open class MainActivity : HarwLocaleActivity() {
         cloudLibrary = cloudLibrary.resume()
     }
 
+    override fun onStart() {
+        super.onStart()
+        getSharedPreferences(PinPrefs, MODE_PRIVATE).registerOnSharedPreferenceChangeListener(startupPinListener)
+        if (!startupAuthenticated) refreshStartupPin()
+    }
+
+    private fun refreshStartupPin() {
+        val desired = readAppPinProfile(this)
+        startupPin = desired
+        if (startupAuth?.profile == desired) return
+        startupAuth?.close()
+        startupAuth = desired?.let { LocalUiaVaultReset.open(application as HarwApplication, it, VaultAccess.AppStart) }
+    }
+
     override fun onPause() {
         cloudLibrary = cloudLibrary.pause()
         cloudAssistant = null
@@ -165,8 +189,13 @@ internal open class MainActivity : HarwLocaleActivity() {
     }
 
     override fun onStop() {
+        getSharedPreferences(PinPrefs, MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(startupPinListener)
         if (assistantDev != null) libraryPhoto = null
         hideAssistantDevForActivity()
+        startupAuth?.close()
+        startupAuth = null
+        startupAuthenticated = false
+        startupPin = readAppPinProfile(this)
         super.onStop()
     }
     private var openedProtectedContent = false
@@ -189,6 +218,7 @@ internal open class MainActivity : HarwLocaleActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        refreshStartupPin()
         approvalAuthorization.restoreCredentialState(savedInstanceState?.getBoolean(AwaitingCredentialKey) == true)
         lifecycleScope.launch {
             // The app-owned local host can come online without a Cloud login.
@@ -231,7 +261,8 @@ internal open class MainActivity : HarwLocaleActivity() {
                     if (!setupPending) window.useProfile(profile?.windowKey())
                 }
         }
-        if (savedInstanceState == null) handleLink(intent)
+        if (startupPin != null) deferredLink = intent
+        else if (savedInstanceState == null) handleLink(intent)
         enableEdgeToEdge()
         openUpdate = intent?.getBooleanExtra(ExtraOpenUpdate, false) == true
         themePref = readThemePref(this)
@@ -247,8 +278,33 @@ internal open class MainActivity : HarwLocaleActivity() {
             }
             HarwTheme(dark = dark) {
                 Surface(Modifier.fillMaxSize()) {
-                    Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) { Workspace() }
-                    if (assistantDev == null && cloudAssistant == null && cloudLibrary.visit == null) UpdateHost(openRequested = openUpdate)
+                    val gate = startupAuth
+                    if (startupPin != null && !startupAuthenticated) {
+                        Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+                            if (gate != null) VaultAuthenticationScreen(
+                                gate, this@MainActivity, stringResource(R.string.pin_app_locked), ::finish,
+                            ) {
+                                if (startupAuth === gate && readAppPinProfile(this@MainActivity) == gate.profile &&
+                                    lifecycle.currentState == Lifecycle.State.RESUMED
+                                ) {
+                                    startupAuthenticated = true
+                                    gate.close()
+                                    startupAuth = null
+                                    val pending = deferredLink
+                                    deferredLink = null
+                                    handleLink(pending)
+                                }
+                            } else {
+                                Column {
+                                    HarwHeader(title = stringResource(R.string.pin_app_locked), onBack = ::finish) {}
+                                    TextButton(onClick = ::refreshStartupPin) { Text(stringResource(R.string.pin_try_again)) }
+                                }
+                            }
+                        }
+                    } else {
+                        Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) { Workspace() }
+                        if (assistantDev == null && cloudAssistant == null && cloudLibrary.visit == null) UpdateHost(openRequested = openUpdate)
+                    }
                 }
             }
         }
@@ -257,6 +313,11 @@ internal open class MainActivity : HarwLocaleActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (startupPin != null && !startupAuthenticated) {
+            deferredLink = intent
+            if (intent.getBooleanExtra(ExtraOpenUpdate, false)) openUpdate = true
+            return
+        }
         if (intent.action == HarwConnectionService.OpenSessionAlertAction ||
             (intent.data == null && intent.hasExtra(HarwConnectionService.ExtraOpenSession))
         ) {
@@ -319,6 +380,9 @@ internal open class MainActivity : HarwLocaleActivity() {
         libraryPick = null
         libraryPhoto = null
         closeAssistantDev()
+        startupAuth?.close()
+        startupAuth = null
+        deferredLink = null
         approvalAuthorization.cancel()
         stepUpAuthorization.cancel()
         getSharedPreferences(UI_PREFS, MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(themeListener)
@@ -349,6 +413,11 @@ internal open class MainActivity : HarwLocaleActivity() {
                 }
                 return
             }
+        }
+        var settingsRouteName by rememberSaveable { mutableStateOf<String?>(null) }
+        val settingsRoute = settingsRouteName?.let { runCatching { SettingsRoute.valueOf(it) }.getOrNull() }
+        fun openSettings(route: SettingsRoute?) {
+            settingsRouteName = route?.name
         }
         var devProfile by remember { mutableStateOf<LocalUiaProfile?>(null) }
         val app = application as HarwApplication
@@ -465,13 +534,12 @@ internal open class MainActivity : HarwLocaleActivity() {
             HarwHeader(title = "Cloud-Session", onBack = { window.select(null) }) { }
             return
         }
-        LaunchedEffect(viewLocal, localState.online, localState.generation) {
+        val needsLocalProfile = viewLocal || settingsRoute == SettingsRoute.PinBiometrics
+        LaunchedEffect(viewLocal, needsLocalProfile, localState.online, localState.generation) {
             devProfile = null
-            if (!BuildConfig.LOCAL_UIA || !viewLocal || !localState.online) {
-                if (!localState.online) PrivateAssistantAttemptAdmission.cancelOnProfileChange(null)
-                closeAssistantDev()
-                return@LaunchedEffect
-            }
+            if (!viewLocal || !localState.online) closeAssistantDev()
+            if (!localState.online) PrivateAssistantAttemptAdmission.cancelOnProfileChange(null)
+            if (!BuildConfig.LOCAL_UIA || !needsLocalProfile || !localState.online) return@LaunchedEffect
             while (true) {
                 val native = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     LocalUiaDevCapability.current(app)
@@ -504,7 +572,7 @@ internal open class MainActivity : HarwLocaleActivity() {
             if (assistantDev == null) {
                 preparePrivateWindow()
                 assistantStartsInLibrary = true
-                assistantDev = LocalUiaDevSession(app, picked.request.profile)
+                assistantDev = LocalUiaVaultReset.open(app, picked.request.profile)
             }
         }
         assistantDev?.let { assistant ->
@@ -546,7 +614,7 @@ internal open class MainActivity : HarwLocaleActivity() {
             // the user explicitly opted out in the display settings.
             preparePrivateWindow()
             assistantStartsInLibrary = library
-            assistantDev = LocalUiaDevSession(app, profile)
+            assistantDev = LocalUiaVaultReset.open(app, profile)
         }
         fun openCloudPrivate() {
             val target = availableCloudAssistant ?: return
@@ -587,11 +655,6 @@ internal open class MainActivity : HarwLocaleActivity() {
                     readAutoConnect(this@MainActivity) && !readManualDisconnect(this@MainActivity)
                 ) startConnection()
             }
-        }
-        var settingsRouteName by rememberSaveable { mutableStateOf<String?>(null) }
-        val settingsRoute = settingsRouteName?.let { runCatching { SettingsRoute.valueOf(it) }.getOrNull() }
-        fun openSettings(route: SettingsRoute?) {
-            settingsRouteName = route?.name
         }
         var connectingFromSetup by rememberSaveable { mutableStateOf(false) }
         var connectingLocalFromSetup by rememberSaveable { mutableStateOf(false) }
@@ -745,6 +808,18 @@ internal open class MainActivity : HarwLocaleActivity() {
                     onOpen = ::openSettings,
                     diagnosticsConnection = connection,
                     diagnosticsLocal = viewLocal,
+                )
+            }
+            settingsRoute == SettingsRoute.PinBiometrics -> {
+                PinBiometricsSettings(app, this, devProfile,
+                    onBack = { openSettings(SettingsRoute.Hub) },
+                    onSetupVault = {
+                        devProfile?.let { profile ->
+                            preparePrivateWindow()
+                            viewLocal = true
+                            assistantDev = LocalUiaVaultReset.open(app, profile)
+                        }
+                    },
                 )
             }
             settingsRoute == SettingsRoute.Models -> {

@@ -4,6 +4,9 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Files
+import java.nio.file.FileVisitResult
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
@@ -42,12 +45,18 @@ internal class LocalUiaDevProfiles(private val noBackup: Path, private val force
         val entry = namespace.resolve(profile.key)
         if (absent(namespace)) return null
         requirePrivate(namespace)
+        if (!absent(resetEntry(profile))) fail()
         if (absent(entry)) return null
         requirePrivate(entry)
         // Once the profile entry exists, an interrupted or missing committed
         // map is recovery-only, not permission to allocate a new identity.
         if (!absent(entry.resolve("pending")) || !absent(entry.resolve("next"))) fail()
-        val file = entry.resolve("scope")
+        val scope = readScope(profile, entry.resolve("scope"))
+        forceDirectory(entry)
+        return scope
+    }
+
+    private fun readScope(profile: LocalUiaProfile, file: Path): VaultPinScope {
         if (Files.getPosixFilePermissions(file, NOFOLLOW_LINKS) != files ||
             Files.getOwner(file, NOFOLLOW_LINKS) != Files.getOwner(noBackup, NOFOLLOW_LINKS) ||
             !Files.isRegularFile(file, NOFOLLOW_LINKS)
@@ -71,7 +80,6 @@ internal class LocalUiaDevProfiles(private val noBackup: Path, private val force
         // A previous replacement may have been renamed just before a power loss
         // or an uncertain directory sync. Never use it for enrollment until the
         // directory is durably synced on the reader side too.
-        forceDirectory(entry)
         return VaultPinScope(uuid, epoch)
     }
 
@@ -84,6 +92,7 @@ internal class LocalUiaDevProfiles(private val noBackup: Path, private val force
             forceDirectory(noBackup)
         }
         requirePrivate(namespace)
+        if (!absent(resetEntry(profile))) fail()
         val entry = namespace.resolve(profile.key)
         Files.createDirectory(entry, PosixFilePermissions.asFileAttribute(dirs))
         forceDirectory(namespace)
@@ -137,6 +146,30 @@ internal class LocalUiaDevProfiles(private val noBackup: Path, private val force
         created
     }
 
+    fun eraseVault(profile: LocalUiaProfile, eraseScope: (VaultPinScope) -> Unit) {
+        requirePrivate(noBackup, strict = false)
+        if (absent(namespace)) return
+        requirePrivate(namespace)
+        val entry = namespace.resolve(profile.key)
+        val reset = resetEntry(profile)
+        if (absent(reset)) {
+            if (absent(entry)) return
+            requirePrivate(entry)
+            Files.move(entry, reset, ATOMIC_MOVE)
+        } else if (!absent(entry)) fail()
+        requirePrivate(reset)
+        forceDirectory(namespace)
+        val installed = reset.resolve("scope")
+        val staged = reset.resolve("next")
+        if (!absent(installed) && !absent(staged)) fail()
+        val scopeFile = if (absent(installed)) staged else installed
+        if (!absent(scopeFile)) eraseScope(readScope(profile, scopeFile))
+        deleteLocalVaultTree(reset)
+        forceDirectory(namespace)
+    }
+
+    private fun resetEntry(profile: LocalUiaProfile) = namespace.resolve("reset-${profile.key}")
+
     private fun tag(profile: LocalUiaProfile, payload: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").run {
         update("harw-local-uia-development-scope-v1".encodeToByteArray())
         update(profile.key.encodeToByteArray())
@@ -177,4 +210,20 @@ internal class LocalUiaRouteFence {
         if (!active) { onLate(); return false }
         return true
     }
+}
+
+
+internal fun deleteLocalVaultTree(path: Path) {
+    Files.walkFileTree(path, object : SimpleFileVisitor<Path>() {
+        override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+            Files.delete(file)
+            return FileVisitResult.CONTINUE
+        }
+
+        override fun postVisitDirectory(dir: Path, exc: IOException?): FileVisitResult {
+            if (exc != null) throw exc
+            Files.delete(dir)
+            return FileVisitResult.CONTINUE
+        }
+    })
 }

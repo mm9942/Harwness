@@ -21,9 +21,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import uniffi.harw_mobile_ffi.ConnectionPhase
@@ -128,6 +130,7 @@ internal class HarwConnectionService : Service() {
     private var latestStart = 0
     private var observation: Job? = null
     private var alertObservation: Job? = null
+    private var restoration: Job? = null
     private val alertTracker = SessionAlertTracker()
     private val localAlertTracker = SessionAlertTracker()
 
@@ -145,7 +148,45 @@ internal class HarwConnectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         latestStart = startId
         val action = intent?.action
+        if (action == null || action == DisconnectAction || action == ConnectAction) restoration?.cancel()
         when (action) {
+            null -> {
+                if (!canRestoreCloud()) {
+                    finishForeground(startId)
+                    return START_NOT_STICKY
+                }
+                try {
+                    ensureForeground()
+                    restoration = scope.launch {
+                        try {
+                            connection.state.first { !it.setupPending }
+                            val profile = connection.state.value.profile ?: return@launch
+                            val route = connection.state.value.routePreference
+                            for (attempt in 0..2) {
+                                if (attempt > 0) delay(5_000L * attempt)
+                                val current = connection.state.value
+                                if (!canRestoreCloud() || current.profile != profile || current.routePreference != route ||
+                                    current.phase == ConnectionPhase.REVOKED || !connection.connect()
+                                ) return@launch
+                                startObservation()
+                                val result = connection.state.first { it.phase != ConnectionPhase.CONNECTING }
+                                if (result.phase != ConnectionPhase.FAILED || !connection.canRetryCloudConnect()) return@launch
+                            }
+                        } finally {
+                            if (kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.isCancelled != true &&
+                                !holdWorkspaceConnection(connection.state.value, localConnection.state.value)
+                            ) {
+                                finishForeground(latestStart)
+                            }
+                        }
+                    }
+                } catch (error: Exception) {
+                    connection.reportServiceError(error)
+                    finishForeground(startId)
+                    return START_NOT_STICKY
+                }
+                return START_STICKY
+            }
             DisconnectAction -> {
                 // This notification action is an explicit stop, unlike removing
                 // an Activity/task or Android reclaiming the service.
@@ -176,9 +217,8 @@ internal class HarwConnectionService : Service() {
                         HoldExistingAction -> Unit
                     }
                     if (holdWorkspaceConnection(connection.state.value, localConnection.state.value)) {
-                        if (observation?.isActive != true) observeConnection()
-                        if (alertObservation?.isActive != true) observeAlerts()
-                    } else {
+                        startObservation()
+                    } else if (restoration?.isActive != true) {
                         finishForeground(startId)
                     }
                 } catch (error: Exception) {
@@ -189,9 +229,14 @@ internal class HarwConnectionService : Service() {
             }
             else -> if (!foreground) stopSelfResult(startId)
         }
-        // A lost process cannot restore a live native/provider request. Never
-        // auto-replay a prompt to recover from system kill or user force-stop.
-        return START_NOT_STICKY
+        return if (connection.state.value.hasConnection && canRestoreCloud()) START_STICKY else START_NOT_STICKY
+    }
+
+    private fun canRestoreCloud(): Boolean = readAutoConnect(this) && !readManualDisconnect(this)
+
+    private fun startObservation() {
+        if (observation?.isActive != true) observeConnection()
+        if (alertObservation?.isActive != true) observeAlerts()
     }
 
     private fun ensureForeground() {
@@ -257,7 +302,7 @@ internal class HarwConnectionService : Service() {
         if (text == null) {
             // Drop an obsolete inactive emission if a new start became active
             // before the combined collector reached it.
-            if (!holdWorkspaceConnection(connection.state.value, localConnection.state.value)) {
+            if (restoration?.isActive != true && !holdWorkspaceConnection(connection.state.value, localConnection.state.value)) {
                 finishForeground(latestStart)
             }
             return

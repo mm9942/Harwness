@@ -1,0 +1,24 @@
+<resources>
+    <string name="pin_biometrics_title">PIN und Biometrie</string>
+    <string name="pin_biometric_login">Mit Biometrie anmelden</string>
+    <string name="pin_biometric_setup">Biometrie einrichten</string>
+    <string name="pin_biometric_remove">Biometrie entfernen</string>
+    <string name="pin_biometric_reset">Biometrie-Einrichtung zurücksetzen</string>
+    <string name="pin_biometric_repair_detail">Nach dem Zurücksetzen kannst du Biometrie mit deiner bestehenden Harw-PIN neu einrichten.</string>
+    <string name="pin_settings_requires_vault">Richte zuerst eine PIN für den lokalen Tresor ein.</string>
+    <string name="pin_settings_local_required">Starte den lokalen Arbeitsbereich, um PIN und Tresor zu verwalten.</string>
+    <string name="pin_setup_vault">Tresor-PIN einrichten</string>
+    <string name="pin_scope_vault">Schutz nur für den lokalen Tresor</string>
+    <string name="pin_scope_app">Schutz für die gesamte App und den lokalen Tresor</string>
+    <string name="pin_protect_app">Gesamte App sperren</string>
+    <string name="pin_protect_vault_only">Nur Tresor sperren</string>
+    <string name="pin_app_locked">Harw entsperren</string>
+    <string name="pin_checking">Geschützter Speicher wird geprüft …</string>
+    <string name="pin_settings_save_failed">Die Änderung konnte nicht bestätigt werden.</string>
+    <string name="pin_vault_reset">Lokalen Tresor zurücksetzen</string>
+    <string name="pin_vault_reset_scope">Wähle vor dem Zurücksetzen den Schutz nur für den Tresor.</string>
+    <string name="pin_vault_reset_detail">Das löscht diesen lokalen Tresor mit privaten Chats, Bibliothek, PIN und Biometrie dauerhaft.</string>
+    <string name="pin_vault_reset_done">Der lokale Tresor wurde zurückgesetzt.</string>
+    <string name="pin_settings_summary">Tresor, Biometrie und App-Schutz</string>
+    <string name="pin_try_again">Erneut versuchen</string>
+</resources>

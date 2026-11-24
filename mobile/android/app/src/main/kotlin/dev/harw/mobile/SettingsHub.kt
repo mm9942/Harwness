@@ -52,14 +52,15 @@ import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.setLocalImageConcurrency
 
-internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias, Knowledge }
+internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias, Knowledge, PinBiometrics }
 
 /** Eltern-Route fuer Zurueck; `null` = Einstellungen schliessen. */
 internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route) {
     SettingsRoute.Hub -> null
     SettingsRoute.Connection, SettingsRoute.Models, SettingsRoute.Commands,
     SettingsRoute.Providers, SettingsRoute.Agents, SettingsRoute.Jobs, SettingsRoute.LocalModels,
-    SettingsRoute.Files, SettingsRoute.Termux, SettingsRoute.Uias, SettingsRoute.Knowledge -> SettingsRoute.Hub
+    SettingsRoute.Files, SettingsRoute.Termux, SettingsRoute.Uias, SettingsRoute.Knowledge,
+    SettingsRoute.PinBiometrics -> SettingsRoute.Hub
 }
 
 internal const val UI_PREFS = "harw_ui"
@@ -288,6 +289,11 @@ internal fun SettingsHub(
                 HubRow("Termux", stringResource(R.string.settings_hub_termux_detail), null) { onOpen(SettingsRoute.Termux) }
             }
             HubSection(stringResource(R.string.settings_hub_app_section)) {
+                if (BuildConfig.LOCAL_UIA) {
+                    HubRow(stringResource(R.string.pin_biometrics_title), stringResource(R.string.pin_settings_summary), null) {
+                        onOpen(SettingsRoute.PinBiometrics)
+                    }
+                }
                 HubRow(stringResource(R.string.settings_hub_notifications), stringResource(R.string.settings_hub_notifications_detail), null) {
                     openNotificationSettings(context)
                 }

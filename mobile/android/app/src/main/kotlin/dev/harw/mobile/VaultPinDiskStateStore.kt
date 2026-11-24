@@ -428,22 +428,36 @@ internal class VaultPinDiskStateStore private constructor(
      * Logical revocation is durable before deleting the exact alias. Retain ciphertext and all
      * staging evidence. Cleanup failure cannot restore authority; a later fresh PIN can retry it.
      */
-    fun revokeUiaBiometricSlot(pinnedPin: UiaRoomPinSlot, deleteExactAlias: () -> Boolean): VaultBiometricAvailability = locked {
+    fun revokeUiaBiometricSlot(
+        pinnedPin: UiaRoomPinSlot,
+        resetForEnrollment: Boolean = false,
+        deleteExactAlias: () -> Boolean,
+    ): VaultBiometricAvailability = locked {
         verifyBiometricPinSnapshot(pinnedPin)
         when (biometricAvailabilityLocked()) {
             VaultBiometricAvailability.Enrolled, VaultBiometricAvailability.Interrupted -> {
                 createPrivateFile(directory.resolve(BioRevokedFile))
             }
             VaultBiometricAvailability.RevocationPending -> Unit
-            VaultBiometricAvailability.Revoked -> return@locked VaultBiometricAvailability.Revoked
+            VaultBiometricAvailability.Revoked -> if (!resetForEnrollment) return@locked VaultBiometricAvailability.Revoked
             else -> unavailable()
         }
         // Ensure any marker from an earlier uncertain attempt is durable, too.
         durability.force(directory)
         try {
             if (!deleteExactAlias()) return@locked VaultBiometricAvailability.RevocationPending
-            createPrivateFile(directory.resolve(BioCleanupFile))
+            if (attributes(directory.resolve(BioCleanupFile)) == null) createPrivateFile(directory.resolve(BioCleanupFile))
             durability.force(directory)
+            if (resetForEnrollment) {
+                // The revoke marker bars old credentials throughout cleanup. Remove it last.
+                listOf(BioFile, BioClaimFile, BioNextFile, BioCancelledFile, BioCleanupFile).forEach {
+                    Files.deleteIfExists(directory.resolve(it))
+                }
+                durability.force(directory)
+                Files.delete(directory.resolve(BioRevokedFile))
+                durability.force(directory)
+                return@locked VaultBiometricAvailability.Eligible
+            }
             VaultBiometricAvailability.Revoked
         } catch (_: Exception) {
             VaultBiometricAvailability.RevocationPending
@@ -571,6 +585,27 @@ internal class VaultPinDiskStateStore private constructor(
     }
 
     companion object {
+        fun eraseScope(parent: Path, scope: VaultPinScope, durability: VaultPinDirectorySync, eraseKeys: () -> Unit) =
+            synchronized(ProcessLock) {
+                verifyDirectory(parent, requirePrivate = false)
+                val namespace = parent.resolve(StoreFolder)
+                if (attributes(namespace) == null) {
+                    eraseKeys()
+                    return@synchronized
+                }
+                verifyDirectory(namespace)
+                val directory = namespace.resolve(scope.vaultId.toString())
+                val retired = namespace.resolve("reset-${scope.vaultId}")
+                if (attributes(directory) != null) {
+                    if (attributes(retired) != null) unavailable()
+                    Files.move(directory, retired, ATOMIC_MOVE)
+                }
+                durability.force(namespace)
+                eraseKeys()
+                if (attributes(retired) != null) deleteLocalVaultTree(retired)
+                durability.force(namespace)
+            }
+
         /** Reopen only the registry-selected existing scope. A missing file never initializes anything. */
         fun open(parent: Path, scope: VaultPinScope, durability: VaultPinDirectorySync): VaultPinDiskStateStore =
             VaultPinDiskStateStore(parent, scope, durability).also { it.read() }

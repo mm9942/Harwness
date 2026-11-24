@@ -76,7 +76,7 @@ internal class AndroidVaultPinMac private constructor(
             AndroidVaultPinMac(vaultId, key)
         }
 
-        private fun alias(vaultId: UUID): String = "dev.harw.mobile.vault.pin.v1.$vaultId"
+        fun alias(vaultId: UUID): String = "dev.harw.mobile.vault.pin.v1.$vaultId"
 
         private fun store(): KeyStore = KeyStore.getInstance(StoreName).apply { load(null) }
 

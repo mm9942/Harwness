@@ -40,6 +40,23 @@ class LocalUiaDevProfilesTest {
         assertThrows(Exception::class.java) { set.allocate(local) { error("cannot overwrite") } }
     }
 
+    @Test fun resetRetainsExactScopeForRetryAndLeavesOtherProfilesIntact() {
+        val registry = LocalUiaDevProfiles(tmp.root.toPath()) {}
+        val selected = VaultPinScope(UUID.randomUUID(), 1)
+        val other = VaultPinScope(UUID.randomUUID(), 1)
+        registry.allocate(local) { selected }
+        registry.allocate(another) { other }
+
+        assertThrows(java.io.IOException::class.java) {
+            registry.eraseVault(local) { throw java.io.IOException("interrupted") }
+        }
+        assertThrows(java.io.IOException::class.java) { registry.lookup(local) }
+        registry.eraseVault(local) { assertEquals(selected, it) }
+
+        assertNull(registry.lookup(local))
+        assertEquals(other, registry.lookup(another))
+    }
+
     @Test fun backOrBackgroundRevokesLateSessionAndNeverRestoresIt() {
         for (exit in listOf("back", "pause")) {
             val lease = LocalUiaRouteFence()

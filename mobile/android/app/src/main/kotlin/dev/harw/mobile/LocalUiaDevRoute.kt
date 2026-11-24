@@ -16,6 +16,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.ui.Alignment
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -42,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -91,9 +96,10 @@ internal sealed interface DevUiaView {
         val biometric: Boolean = false,
         val recovering: Boolean = false,
         val disableBiometric: Boolean = false,
-        val biometricManagement: VaultBiometricAvailability = VaultBiometricAvailability.Unavailable,
+        val autoBiometric: Boolean = false,
     ) : DevUiaView
     data object OfferBiometric : DevUiaView
+    data object Authorized : DevUiaView
     class Parked(val stopExact: (() -> Unit)?) : DevUiaView
     data object ParkedCheckUnavailable : DevUiaView
     class Ready(val chat: UiaRoomChatConnection, val biometricNotice: String? = null) : DevUiaView
@@ -116,12 +122,16 @@ private data class DevUiaBinding(
     }
 }
 
-/** Created only from a verified on-device Harw runtime profile; never survives activity/back. */
+internal enum class VaultAccess { Vault, AppStart, EnableBiometrics, DisableBiometrics, ConfirmPin }
+
+/** Scoped authentication presentation. No unlocked state is serialized. */
 internal class LocalUiaDevSession(
     private val app: HarwApplication,
     val profile: LocalUiaProfile,
+    private val access: VaultAccess = VaultAccess.Vault,
 ) {
     private val worker = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    val lifetime: Job get() = checkNotNull(worker.coroutineContext[Job])
     private val guard = Any()
     private val fence = LocalUiaRouteFence()
     private val profileMap = LocalUiaDevProfiles(app.noBackupFilesDir.toPath()) { path ->
@@ -167,7 +177,7 @@ internal class LocalUiaDevSession(
                 } else null
                 val canUseBiometric = AndroidVaultBiometricSlot.supported(app)
                 val slotState = if (registration is VaultPinRegistration.Ready && disk != null) {
-                    runCatching { disk.uiaBiometricAvailability() }.getOrDefault(VaultBiometricAvailability.Unavailable)
+                    AndroidVaultBiometricSlot.forSelectedStore(app, disk).use { it.availability() }
                 } else VaultBiometricAvailability.Unavailable
                 synchronized(guard) {
                     if (!fence.active()) return@synchronized
@@ -175,15 +185,17 @@ internal class LocalUiaDevSession(
                     biometricSupported = canUseBiometric
                     biometricAvailability = slotState
                     projection.value = when (registration) {
-                        null, VaultPinRegistration.Fresh -> DevUiaView.Gate(new = true)
+                        null, VaultPinRegistration.Fresh -> if (access == VaultAccess.Vault) DevUiaView.Gate(new = true, prompt = true)
+                            else DevUiaView.Stop(app.getString(R.string.pin_settings_requires_vault))
                         is VaultPinRegistration.Ready -> DevUiaView.Opening
                         VaultPinRegistration.Provisioning, is VaultPinRegistration.Recovering ->
-                            resumeGate ?: enrollmentStop(VaultPinEnrollmentStage.Claim)
+                            if (access == VaultAccess.Vault) resumeGate ?: enrollmentStop(VaultPinEnrollmentStage.Claim)
+                            else enrollmentStop(VaultPinEnrollmentStage.Claim)
                     }
                 }
                 if (registration is VaultPinRegistration.Ready && disk != null) {
                     AndroidUiaRoomPinNative.forSelectedStore(app, disk).use { probe ->
-                        if (!interceptParked(probe, disk.scope)) publishFreshPinGate()
+                        if (access != VaultAccess.Vault || !interceptParked(probe, disk.scope)) publishFreshPinGate()
                     }
                 }
             } catch (e: CancellationException) { throw e }
@@ -194,15 +206,6 @@ internal class LocalUiaDevSession(
     fun prompt() = synchronized(guard) {
         val gate = projection.value as? DevUiaView.Gate
         if (fence.active() && gate != null) projection.value = gate.copy(prompt = true)
-    }
-
-    fun cancelPrompt() = synchronized(guard) {
-        clearDigits()
-        val gate = projection.value as? DevUiaView.Gate
-        if (fence.active() && gate != null) {
-            projection.value = if (gate.new || gate.recovering) gate.copy(prompt = false, info = null)
-                else pinGate()
-        }
     }
 
     fun authenticate(activity: Activity?) {
@@ -231,7 +234,7 @@ internal class LocalUiaDevSession(
                 val scope = synchronized(guard) { registered }
                 if (!enroll && !resume) {
                     checkNotNull(scope)
-                    if (interceptParked(current.native, scope)) return@launch
+                    if (access == VaultAccess.Vault && interceptParked(current.native, scope)) return@launch
                 }
                 var bioSetupFailed = false
                 var bioShutdown: VaultBiometricAvailability? = null
@@ -250,7 +253,7 @@ internal class LocalUiaDevSession(
                                 VaultPinAction.Rejected -> showGate(false, "PIN nicht akzeptiert.", optIn = true)
                                 is VaultPinAction.Delayed -> showGate(false, delayInfo(check), optIn = true)
                                 is VaultPinAction.RecoveryRequired -> stop(RECOVERY)
-                                else -> showGate(false, "Biometrie nicht aktiviert. Nutze deine Harw-PIN.")
+                                else -> showGate(false, "Biometrie nicht aktiviert. Nutze deine Harw-PIN.", optIn = true)
                             }
                             return@launch
                         }
@@ -270,12 +273,12 @@ internal class LocalUiaDevSession(
                         }
                         if (grant == null) {
                             biometricAvailability = current.biometric.availability()
-                            showGate(false, biometricSetupResult())
+                            showGate(false, biometricSetupResult(), optIn = biometricAvailability == VaultBiometricAvailability.Eligible)
                             return@launch
                         }
                         try {
                             requireCurrent()
-                            if (scope != null && interceptParked(current.native, scope)) return@launch
+                            if (access == VaultAccess.Vault && scope != null && interceptParked(current.native, scope)) return@launch
                             current.pin.unlockAndEnableBiometric(entered, grant).also {
                                 biometricAvailability = current.biometric.availability()
                                 bioSetupFailed = it == VaultPinAction.Unlocked &&
@@ -288,7 +291,7 @@ internal class LocalUiaDevSession(
                 requireCurrent()
                 if (bioSetupFailed) {
                     current.pin.relock()
-                    showGate(false, biometricSetupResult())
+                    showGate(false, biometricSetupResult(), optIn = access == VaultAccess.EnableBiometrics)
                     return@launch
                 }
                 if (action == VaultPinAction.Unlocked) {
@@ -300,16 +303,22 @@ internal class LocalUiaDevSession(
                         return@launch
                     }
                     val notice = when (bioShutdown) {
-                        VaultBiometricAvailability.Revoked -> "Biometrie deaktiviert. Deine Harw-PIN bleibt unverändert."
+                        VaultBiometricAvailability.Revoked, VaultBiometricAvailability.Eligible ->
+                            "Biometrie deaktiviert. Deine Harw-PIN bleibt unverändert."
                         VaultBiometricAvailability.RevocationPending ->
                             "Biometrie ist gesperrt. Das Löschen des Geräteschlüssels konnte nicht bestätigt werden."
                         null -> null
                         else -> "Die Deaktivierung konnte nicht bestätigt werden. Deine Harw-PIN bleibt unverändert."
                     }
-                    publishAuthenticated(current, notice)
+                    if (gate.disableBiometric && bioShutdown != VaultBiometricAvailability.Eligible) {
+                        current.pin.relock()
+                        showGate(false, notice.orEmpty(), disable = true)
+                    } else {
+                        publishAuthenticated(current, notice)
+                    }
                 } else when (action) {
-                    VaultPinAction.Rejected -> showGate(false, "PIN nicht akzeptiert.", recovering = resume, disable = gate.disableBiometric)
-                    is VaultPinAction.Delayed -> showGate(false, delayInfo(action), recovering = resume, disable = gate.disableBiometric)
+                    VaultPinAction.Rejected -> showGate(false, "PIN nicht akzeptiert.", recovering = resume, optIn = gate.optIn, disable = gate.disableBiometric)
+                    is VaultPinAction.Delayed -> showGate(false, delayInfo(action), recovering = resume, optIn = gate.optIn, disable = gate.disableBiometric)
                     VaultPinAction.ConfirmationMismatch -> showGate(true, "Die PINs stimmen nicht überein.")
                     VaultPinAction.InvalidPin -> showGate(enroll, "Die PIN muss 8 bis 16 Ziffern haben.", recovering = resume)
                     is VaultPinAction.EnrollmentFailed -> stopEnrollment(action.stage)
@@ -387,14 +396,14 @@ internal class LocalUiaDevSession(
                 requireCurrent()
                 val owner = getBinding(enroll = false) ?: return@launch
                 val scope = synchronized(guard) { registered } ?: return@launch
-                if (interceptParked(owner.native, scope)) return@launch
+                if (access == VaultAccess.Vault && interceptParked(owner.native, scope)) return@launch
                 val grant = requestBioGrant(
                     activity, owner.biometric::prepareUnlock, owner.biometric::showUnlock, owner.biometric::cancel,
                 )
                 if (grant != null) {
                     try {
                         requireCurrent()
-                        if (interceptParked(owner.native, scope)) return@launch
+                        if (access == VaultAccess.Vault && interceptParked(owner.native, scope)) return@launch
                         if (owner.pin.unlockWithBiometric(grant) == VaultPinAction.Unlocked) {
                             requireCurrent()
                             publishAuthenticated(owner)
@@ -403,6 +412,8 @@ internal class LocalUiaDevSession(
                     } finally { grant.close() }
                 }
                 showGate(false, "Biometrie nicht verfügbar. Nutze deine Harw-PIN.")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 showGate(false, "Biometrie nicht verfügbar. Nutze deine Harw-PIN.")
             }
@@ -410,6 +421,15 @@ internal class LocalUiaDevSession(
     }
 
     private fun publishAuthenticated(owner: DevUiaBinding, biometricNotice: String? = null) {
+        if (access != VaultAccess.Vault) {
+            val authenticated = owner.pin.session() != null
+            owner.pin.relock()
+            synchronized(guard) {
+                if (fence.active()) projection.value = if (authenticated) DevUiaView.Authorized
+                else enrollmentStop(VaultPinEnrollmentStage.AssistantHandoff)
+            }
+            return
+        }
         val room = (owner.pin.session() as? UiaRoomChatSession)?.chat()
         synchronized(guard) {
             if (fence.admit { runCatching { owner.close() } }) {
@@ -440,6 +460,7 @@ internal class LocalUiaDevSession(
                         }
                     ) return@withContext null
                     val life = (activity as? LifecycleOwner)?.lifecycle ?: return@withContext null
+                    if (life.currentState != Lifecycle.State.RESUMED) return@withContext null
                     val approved = suspendCancellableCoroutine<T?> { waiting ->
                         waiting.invokeOnCancellation { cancel(prepared) }
                         show(activity, prepared) { result ->
@@ -478,7 +499,7 @@ internal class LocalUiaDevSession(
         val retired = synchronized(guard) {
             if (!fence.active() || projection.value !is DevUiaView.Ready) return
             clearDigits()
-            projection.value = pinGate(prompt = prompt)
+            projection.value = pinGate(prompt = prompt, auto = prompt)
             binding.also { binding = null }
         }
         runCatching { retired?.close() }
@@ -532,7 +553,10 @@ internal class LocalUiaDevSession(
     }
 
     private fun requireCurrent() {
-        check(fence.active() && LocalUiaDevCapability.current(app) == profile)
+        check(fence.active())
+        if (access == VaultAccess.AppStart) check(readAppPinProfile(app) == profile)
+        else check(LocalUiaDevCapability.current(app) == profile ||
+            (access == VaultAccess.ConfirmPin && readAppPinProfile(app) == profile))
     }
 
     private fun getBinding(enroll: Boolean): DevUiaBinding? {
@@ -569,7 +593,11 @@ internal class LocalUiaDevSession(
     private fun publishFreshPinGate() = synchronized(guard) {
         if (fence.active()) {
             clearDigits()
-            projection.value = pinGate()
+            projection.value = pinGate(
+                prompt = true, optIn = access == VaultAccess.EnableBiometrics,
+                disable = access == VaultAccess.DisableBiometrics,
+                auto = access == VaultAccess.Vault || access == VaultAccess.AppStart,
+            )
         }
     }
 
@@ -722,10 +750,11 @@ internal class LocalUiaDevSession(
 
     private fun pinGate(
         prompt: Boolean = false, info: String? = null, optIn: Boolean = false, disable: Boolean = false,
+        auto: Boolean = false,
     ): DevUiaView.Gate = DevUiaView.Gate(
         new = false, prompt = prompt, info = info, optIn = optIn,
-        biometric = !optIn && !disable && biometricEnabled, disableBiometric = disable,
-        biometricManagement = biometricManagement(),
+        biometric = !optIn && !disable && access != VaultAccess.ConfirmPin && biometricEnabled,
+        disableBiometric = disable, autoBiometric = auto,
     )
 
     private fun showGate(
@@ -933,13 +962,15 @@ internal fun LocalUiaDevScreen(
     }
     BackHandler { onBack() }
     val context = LocalContext.current
-    val activity = context as? Activity
+    val activity = context.findVaultActivity()
+    AutoVaultBiometric(session, view, activity)
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             TextButton(onClick = onBack) { Text("Zurück") }
             Text("Nur lokal", Modifier.padding(vertical = 14.dp), style = MaterialTheme.typography.labelLarge)
         }
         when (val showing = view) {
+            DevUiaView.Authorized -> Unit
             DevUiaView.Opening -> Text("Privaten Raum prüfen …", Modifier.padding(16.dp))
             is DevUiaView.Parked -> {
                 Text(stringResource(R.string.private_assistant_parked_pending), Modifier.padding(16.dp))
@@ -1023,26 +1054,7 @@ internal fun LocalUiaDevScreen(
                         })
                     }
                 } else {
-                    PinPad(session, showing, activity)
-                }
-                if (!showing.prompt && !showing.new && !showing.recovering) {
-                    when (showing.biometricManagement) {
-                        VaultBiometricAvailability.Eligible -> if (activity != null) {
-                            TextButton(onClick = { session.changeBiometric(enable = true) }) { Text("Biometrie einrichten") }
-                        }
-                        VaultBiometricAvailability.Enrolled, VaultBiometricAvailability.Interrupted -> {
-                            TextButton(onClick = { session.changeBiometric(enable = false) }) { Text("Biometrie deaktivieren") }
-                        }
-                        VaultBiometricAvailability.RevocationPending -> {
-                            TextButton(onClick = { session.changeBiometric(enable = false) }) { Text("Biometrie-Deaktivierung abschließen") }
-                        }
-                        else -> Unit
-                    }
-                }
-                if (showing.biometric && !showing.optIn && !showing.disableBiometric && activity != null) {
-                    TextButton(onClick = { session.biometricUnlock(activity) }, modifier = Modifier.padding(horizontal = 16.dp)) {
-                        Text("Mit Biometrie entsperren")
-                    }
+                    PinPad(session, showing, activity, onCancel = onBack)
                 }
             }
             is DevUiaView.Ready -> {
@@ -1118,7 +1130,6 @@ internal fun LocalUiaDevScreen(
                     }
                     return@Column
                 }
-                TextButton(onClick = session::manageBiometric) { Text("Biometrie verwalten") }
                 TextButton(onClick = { libraryOpen = true }) { Text("Private Library") }
                 UiaRoomPanel(
                     roomState ?: UiaRoomState.Locked,
@@ -1217,37 +1228,79 @@ internal fun LocalUiaDevScreen(
 }
 
 @Composable
-private fun PinPad(session: LocalUiaDevSession, gate: DevUiaView.Gate, activity: Activity?) {
-    var confirming by androidx.compose.runtime.remember(gate) { androidx.compose.runtime.mutableStateOf(false) }
-    val bytes = if (confirming) session.confirmation else session.pin
-    Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(if (confirming) "PIN wiederholen" else "Harw-PIN", style = MaterialTheme.typography.titleLarge)
-        Text("•".repeat(bytes.count), style = MaterialTheme.typography.bodyLarge)
-        gate.info?.let { Text(it) }
-        for (row in listOf(listOf(1,2,3), listOf(4,5,6), listOf(7,8,9))) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (digit in row) OutlinedButton(onClick = { bytes.add(digit) }, Modifier.weight(1f)) { Text(digit.toString()) }
-            }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            TextButton(onClick = session::cancelPrompt, Modifier.weight(1f)) { Text("Abbrechen") }
-            OutlinedButton(onClick = { bytes.add(0) }, Modifier.weight(1f)) { Text("0") }
-            OutlinedButton(onClick = bytes::erase, Modifier.weight(1f)) { Text("Löschen") }
-        }
-        Button(onClick = {
-            if (gate.new && !confirming) confirming = true else session.authenticate(activity)
-        }, enabled = bytes.count >= 8) {
-            Text(when {
-                gate.new && !confirming -> "Weiter"
-                gate.new -> "Einrichten"
-                gate.disableBiometric -> "Biometrie endgültig deaktivieren"
-                gate.optIn -> "Mit Harw-PIN bestätigen"
-                else -> "Entsperren"
-            })
-        }
+internal fun AutoVaultBiometric(session: LocalUiaDevSession, view: DevUiaView, activity: Activity?) {
+    val gate = view as? DevUiaView.Gate
+    LaunchedEffect(session, gate?.autoBiometric, activity) {
+        if (gate?.autoBiometric != true || !gate.biometric || activity == null) return@LaunchedEffect
+        val life = (activity as? LifecycleOwner)?.lifecycle ?: return@LaunchedEffect
+        life.currentStateFlow.first { it == Lifecycle.State.RESUMED }
+        session.biometricUnlock(activity)
     }
 }
 
+@Composable
+internal fun PinPad(
+    session: LocalUiaDevSession,
+    gate: DevUiaView.Gate,
+    activity: Activity?,
+    onCancel: () -> Unit,
+) {
+    var confirming by remember(gate) { mutableStateOf(false) }
+    val digits = if (confirming) session.confirmation else session.pin
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val availableHeight = maxHeight
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).heightIn(min = availableHeight)
+                .padding(horizontal = 24.dp, vertical = 18.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Column(
+                Modifier.widthIn(max = 340.dp).fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(if (confirming) "PIN wiederholen" else "Harw-PIN", style = MaterialTheme.typography.headlineSmall)
+                Text(if (digits.count == 0) "8–16 Ziffern" else "•".repeat(digits.count),
+                    style = MaterialTheme.typography.bodyLarge)
+                gate.info?.let { Text(it) }
+                for (row in listOf(listOf(1, 2, 3), listOf(4, 5, 6), listOf(7, 8, 9))) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        for (digit in row) OutlinedButton(onClick = { digits.add(digit) }, Modifier.weight(1f)) {
+                            Text(digit.toString())
+                        }
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    TextButton(onClick = {
+                        if (confirming) {
+                            session.confirmation.clear()
+                            confirming = false
+                        } else onCancel()
+                    }, Modifier.weight(1f)) { Text("Abbrechen") }
+                    OutlinedButton(onClick = { digits.add(0) }, Modifier.weight(1f)) { Text("0") }
+                    TextButton(onClick = digits::erase, Modifier.weight(1f)) { Text("Löschen") }
+                }
+                Button(onClick = {
+                    if (gate.new && !confirming) confirming = true else session.authenticate(activity)
+                }, modifier = Modifier.fillMaxWidth(), enabled = digits.count >= 8) {
+                    Text(when {
+                        gate.new && !confirming -> "Weiter"
+                        gate.new -> "Einrichten"
+                        gate.disableBiometric -> "Biometrie deaktivieren"
+                        gate.optIn -> "Mit Harw-PIN bestätigen"
+                        else -> "Entsperren"
+                    })
+                }
+                if (gate.biometric && activity != null) {
+                    TextButton(onClick = { session.biometricUnlock(activity) }, Modifier.fillMaxWidth()) {
+                        Text(stringResource(R.string.pin_biometric_login))
+                    }
+                }
+            }
+        }
+    }
+}
 
 @Composable
 private fun PrivateLibraryGate(

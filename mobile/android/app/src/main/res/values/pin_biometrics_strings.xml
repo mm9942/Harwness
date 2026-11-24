@@ -1,0 +1,24 @@
+<resources>
+    <string name="pin_biometrics_title">PIN &amp; Biometrics</string>
+    <string name="pin_biometric_login">Biometric login</string>
+    <string name="pin_biometric_setup">Set up biometrics</string>
+    <string name="pin_biometric_remove">Remove biometrics</string>
+    <string name="pin_biometric_reset">Reset biometric setup</string>
+    <string name="pin_biometric_repair_detail">After resetting biometric setup, enroll again using your existing Harw PIN.</string>
+    <string name="pin_settings_requires_vault">Set up a local vault PIN first.</string>
+    <string name="pin_settings_local_required">Start the on-device workspace to manage its PIN and vault.</string>
+    <string name="pin_setup_vault">Set up vault PIN</string>
+    <string name="pin_scope_vault">Protection: local vault only</string>
+    <string name="pin_scope_app">Protection: app and local vault</string>
+    <string name="pin_protect_app">Protect the whole app</string>
+    <string name="pin_protect_vault_only">Protect only the vault</string>
+    <string name="pin_app_locked">Unlock Harw</string>
+    <string name="pin_checking">Opening secure storage…</string>
+    <string name="pin_settings_save_failed">The change could not be confirmed.</string>
+    <string name="pin_vault_reset">Reset local vault</string>
+    <string name="pin_vault_reset_scope">Select vault-only protection before resetting this vault.</string>
+    <string name="pin_vault_reset_detail">This permanently removes this local vault, its private chats, library, PIN and biometric credentials.</string>
+    <string name="pin_vault_reset_done">The local vault was reset.</string>
+    <string name="pin_settings_summary">Vault, biometrics and app protection</string>
+    <string name="pin_try_again">Try again</string>
+</resources>

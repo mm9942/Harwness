@@ -142,7 +142,7 @@ internal class AndroidVaultBiometricSlot private constructor(
                 if (requested != scope || closed || active != null || preparing) {
                     bioFail(VaultBiometricFailure.Unavailable)
                 }
-                store.revokeUiaBiometricSlot(pinSlot) {
+                store.revokeUiaBiometricSlot(pinSlot, resetForEnrollment = true) {
                     val keys = keyStore()
                     val exact = alias()
                     if (keys.containsAlias(exact)) keys.deleteEntry(exact)
@@ -152,7 +152,10 @@ internal class AndroidVaultBiometricSlot private constructor(
         }
 
     internal fun availability(): VaultBiometricAvailability = try {
-        store.uiaBiometricAvailability()
+        val state = store.uiaBiometricAvailability()
+        if (state == VaultBiometricAvailability.Enrolled &&
+            runCatching { keyStore().getKey(alias(), null) }.getOrNull() == null
+        ) VaultBiometricAvailability.Interrupted else state
     } catch (_: Exception) {
         VaultBiometricAvailability.Unavailable
     }
@@ -337,8 +340,8 @@ internal class AndroidVaultBiometricSlot private constructor(
             val prompt = BiometricPrompt.Builder(activity)
                 .setTitle(if (mode == VaultBiometricMode.OptIn) "Biometrie für Harw aktivieren" else "Harw-Tresor entsperren")
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-                .setConfirmationRequired(true)
-                .setNegativeButton("Abbrechen", activity.mainExecutor) { _, _ ->
+                .setConfirmationRequired(mode == VaultBiometricMode.OptIn)
+                .setNegativeButton(if (mode == VaultBiometricMode.Unlock) "Harw-PIN" else "Abbrechen", activity.mainExecutor) { _, _ ->
                     fail(VaultBiometricFailure.Cancelled)
                 }
                 .build()
@@ -368,6 +371,10 @@ internal class AndroidVaultBiometricSlot private constructor(
                             if (errorCode == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED) VaultBiometricFailure.Cancelled
                             else VaultBiometricFailure.Unavailable
                         )
+                    }
+
+                    override fun onAuthenticationFailed() {
+                        if (mode == VaultBiometricMode.Unlock) fail(VaultBiometricFailure.Cancelled)
                     }
                 },
             )
@@ -500,7 +507,7 @@ internal class AndroidVaultBiometricSlot private constructor(
         (keyStore().getKey(alias(), null) as? SecretKey ?: bioFail(VaultBiometricFailure.Invalidated))
             .also(::requireStrongHardware)
 
-    private fun alias(): String = "dev.harw.mobile.vault.bio.v1.${scope.vaultId}.${scope.keyGeneration}"
+    private fun alias(): String = alias(scope)
 
     private fun keyStore() = KeyStore.getInstance(BioStore).apply { load(null) }
 
@@ -523,6 +530,7 @@ internal class AndroidVaultBiometricSlot private constructor(
     }
 
     companion object {
+        fun alias(scope: VaultPinScope) = "dev.harw.mobile.vault.bio.v1.${scope.vaultId}.${scope.keyGeneration}"
         fun supported(application: HarwApplication): Boolean = Build.VERSION.SDK_INT >= 30 &&
             runCatching {
                 application.getSystemService(BiometricManager::class.java)

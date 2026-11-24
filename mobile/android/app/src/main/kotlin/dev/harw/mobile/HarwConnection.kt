@@ -683,6 +683,13 @@ internal class HarwConnection(private val context: Context, private val localBac
         change { it.copy(setupError = "Start connection: ${error.displayMessage()}") }
     }
 
+    internal fun canRetryCloudConnect(): Boolean =
+        state.value.detail?.let { detail ->
+            detail.contains("tor: onion connect failed: tor: tor operation timed out:") ||
+                detail.contains("tor: onion connect did not finish within") ||
+                detail.contains("tor: attempted to use unbootstrapped client:")
+        } == true
+
     fun connect(force: Boolean = false): Boolean {
         val start = state.value
         val profile = start.profile ?: return false
