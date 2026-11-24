@@ -9,7 +9,9 @@ if(list){
  const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
  function chips(names,optional=[]){return names.length?names.map(n=>`<button type="button" data-crate="${esc(n)}" class="${optional.includes(n)?'optional':''}">${esc(n)}${optional.includes(n)?' ◇':''}</button>`).join(''):'<span class="none">None in this local package graph.</span>'}
  function show(n,focus=false){
-  const c=crates.find(x=>x.name===n);if(!c)return;selected=n;
+  const c=crates.find(x=>x.name===n);
+  if(!c){return;}
+  selected=n;
   const optional=c.edges.filter(e=>e.optional&&e.kind!=='dev-dependencies').map(e=>e.name),dev=c.edges.filter(e=>e.kind==='dev-dependencies').map(e=>e.name);
   detail.innerHTML=`<div class="eyebrow">${esc(c.domain.toUpperCase())} / LEVEL ${c.level}</div><h2>${esc(c.name)}</h2><p>${esc(c.summary)}</p><div class="detail-stats"><span><strong>${c.deps.length}</strong>dependencies</span><span><strong>${c.consumers.length}</strong>direct consumers</span><span><strong>${c.transitive_consumers.length}</strong>transitive consumers</span></div><h3>Depends on</h3><div class="dependency-chips">${chips(c.deps,optional)}</div>${optional.length?'<p class="subtle-note">◇ Optional dependency; requires the relevant Cargo feature.</p>':''}<h3>Direct consumers</h3><div class="dependency-chips">${chips(c.consumers)}</div><details class="detail-disclosure"><summary>All ${c.transitive_consumers.length} transitive consumers</summary><div class="dependency-chips">${chips(c.transitive_consumers)}</div></details><details class="detail-disclosure"><summary>Development dependencies & modules</summary><h3>Local dev dependencies</h3><div class="dependency-chips">${chips(dev)}</div><h3>Top-level modules</h3><p>${esc(c.modules.join(' · ')||'Single module or facade')}</p></details><div class="source-note">${esc(c.path)}/Cargo.toml<br>${c.source_files} Rust source files in src/ · source relationships, not runtime activation</div>`;
   for(const b of list.querySelectorAll('button'))b.setAttribute('aria-pressed',String(b.dataset.crate===n));

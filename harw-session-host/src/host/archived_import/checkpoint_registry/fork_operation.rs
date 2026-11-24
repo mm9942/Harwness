@@ -110,7 +110,10 @@ impl HostConnection {
             if self.fork_source_scope(&source, true)? != source_scope {
                 return Err(HostError::NotFound);
             }
-            self.check_displayed_fork_attachment(&source_slot.lock()?)?;
+            {
+                let source_state = source_slot.lock()?;
+                self.check_displayed_fork_attachment(&source_state)?;
+            }
             let state = slot.lock()?;
             return Ok(self.host.summary(&state));
         }

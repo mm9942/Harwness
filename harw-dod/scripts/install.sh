@@ -193,6 +193,7 @@ uninstall_package() {
 						'LoadState=not-found
 ActiveState=inactive'|'ActiveState=inactive
 LoadState=not-found') continue ;;
+						*) fail "could not stop and disable $unit; package files were retained" ;;
 					esac
 				fi
 				fail "could not stop and disable $unit; package files were retained"

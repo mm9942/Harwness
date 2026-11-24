@@ -146,15 +146,15 @@ install_termux_dependencies() {
     local termux_bin="${PREFIX:-}/bin"
     [[ -n "${PREFIX:-}" && -d "$termux_bin" ]] || die "Termux PREFIX/bin is unavailable"
     export PATH="$termux_bin:$HOME/.cargo/bin:$PATH"
-    for tool in cargo rustc; do [ -x "$termux_bin/$tool" ] || missing+=("$tool"); done
+    for tool in cargo rustc; do [[ -x "$termux_bin/$tool" ]] || missing+=("$tool"); done
     for tool in make cc pkg-config cmake git; do command -v "$tool" >/dev/null 2>&1 || missing+=("$tool"); done
-    if [ "${#missing[@]}" -gt 0 ]; then
+    if [[ "${#missing[@]}" -gt 0 ]]; then
       log "Installing missing Termux packages for: ${missing[*]}"
       install_packages build
       missing=()
-      for tool in cargo rustc; do [ -x "$termux_bin/$tool" ] || missing+=("$tool"); done
+      for tool in cargo rustc; do [[ -x "$termux_bin/$tool" ]] || missing+=("$tool"); done
       for tool in make cc pkg-config cmake git; do command -v "$tool" >/dev/null 2>&1 || missing+=("$tool"); done
-      [ "${#missing[@]}" -eq 0 ] || die "Termux build tools still missing after pkg install: ${missing[*]}"
+      [[ "${#missing[@]}" -eq 0 ]] || die "Termux build tools still missing after pkg install: ${missing[*]}"
     fi
   fi
   log "Android/Termux: no sandbox (no bubblewrap, no user namespaces)."

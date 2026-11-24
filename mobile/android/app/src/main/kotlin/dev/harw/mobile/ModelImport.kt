@@ -219,18 +219,24 @@ internal class ModelImport(context: Context, private val store: ModelStore) {
                     onProgress(ImportProgress(ImportPhase.Verifying, 0, 1))
                     attachProjectorImport(dir.path, modelId, staged, name)
                 } catch (e: CopyCancelled) {
-                    File(dir, staged).delete()
+                    deleteStagedProjector(File(dir, staged))
                     ProjectorAttach(null, "Abgebrochen.")
                 } catch (e: CancellationException) {
-                    File(dir, staged).delete()
+                    deleteStagedProjector(File(dir, staged))
                     throw e
                 } catch (e: Exception) {
-                    File(dir, staged).delete()
+                    deleteStagedProjector(File(dir, staged))
                     ProjectorAttach(null, "Projektor konnte nicht übernommen werden: ${e.message ?: "Fehler"}")
                 }
             }
         } finally {
             ModelDirLock.mutex.unlock()
+        }
+    }
+
+    private fun deleteStagedProjector(file: File) {
+        if (!file.delete() && file.exists()) {
+            Log.w("HarwModelImport", "Staged projector cleanup incomplete")
         }
     }
 
