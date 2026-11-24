@@ -5,6 +5,7 @@
 //! [`OnionClient::dial`] carry no peer identity. Authentication happens in
 //! the node transport layered on top.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +26,7 @@ pub(crate) type ArtiClient = TorClient<TokioRustlsRuntime>;
 
 /// Set once the "this build is outdated" warning has been logged.
 static OUTDATED_WARNED: AtomicBool = AtomicBool::new(false);
+const ONION_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Storage locations of an embedded Tor client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +112,26 @@ impl OnionClient {
         locator: &OnionLocator,
         timeout: Duration,
     ) -> Result<OnionStream, OnionError> {
+        self.dial_inner(locator, timeout, None).await
+    }
+
+    /// Opens a Tor stream, retrying once if Arti reports a network timeout
+    /// during the dial. Bootstrap, retry delay and both dials share `timeout`.
+    pub async fn dial_with_retry(
+        &self,
+        locator: &OnionLocator,
+        timeout: Duration,
+    ) -> Result<OnionStream, OnionError> {
+        self.dial_inner(locator, timeout, Some(ONION_RETRY_DELAY))
+            .await
+    }
+
+    async fn dial_inner(
+        &self,
+        locator: &OnionLocator,
+        timeout: Duration,
+        retry_delay: Option<Duration>,
+    ) -> Result<OnionStream, OnionError> {
         let attempt = async {
             self.client
                 .bootstrap()
@@ -117,11 +139,25 @@ impl OnionClient {
                 .map_err(|e| map_arti_error(&e, OnionError::Bootstrap))?;
             let mut prefs = StreamPrefs::new();
             prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
-            let stream = self
-                .client
-                .connect_with_prefs((locator.host(), locator.port()), &prefs)
-                .await
-                .map_err(|e| map_arti_error(&e, OnionError::Connect))?;
+            let prefs = &prefs;
+            let connect = || async move {
+                self.client
+                    .connect_with_prefs((locator.host(), locator.port()), prefs)
+                    .await
+                    .map_err(|error| {
+                        let wrap = match error.kind() {
+                            ErrorKind::TorNetworkTimeout | ErrorKind::RemoteNetworkTimeout => {
+                                OnionError::NetworkTimeout
+                            }
+                            _ => OnionError::Connect,
+                        };
+                        map_arti_error(&error, wrap)
+                    })
+            };
+            let stream = match retry_delay {
+                Some(delay) => retry_on_network_timeout(connect, delay).await?,
+                None => connect().await?,
+            };
             Ok::<OnionStream, OnionError>(Box::pin(stream))
         };
         let result = match tokio::time::timeout(timeout, attempt).await {
@@ -132,6 +168,20 @@ impl OnionClient {
             tracing::debug!(target = %locator.redacted(), %error, "onion dial failed");
         }
         result
+    }
+}
+
+async fn retry_on_network_timeout<T, F: Future<Output = Result<T, OnionError>>>(
+    mut connect: impl FnMut() -> F,
+    delay: Duration,
+) -> Result<T, OnionError> {
+    match connect().await {
+        Err(error @ OnionError::NetworkTimeout(_)) => {
+            tracing::debug!(%error, "retrying onion dial after Arti network timeout");
+            tokio::time::sleep(delay).await;
+            connect().await
+        }
+        result => result,
     }
 }
 
@@ -278,5 +328,44 @@ mod tests {
         assert_eq!(progress.percent, 0);
         assert!(!progress.ready);
         assert!(!progress.summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn onion_network_timeout_gets_one_more_dial() -> TestResult {
+        for recover in [true, false] {
+            let mut calls = 0;
+            let result = retry_on_network_timeout(
+                || {
+                    calls += 1;
+                    std::future::ready(if recover && calls == 2 {
+                        Ok(())
+                    } else {
+                        Err(OnionError::NetworkTimeout("synthetic timeout".into()))
+                    })
+                },
+                Duration::ZERO,
+            )
+            .await;
+            assert_eq!(calls, 2);
+            assert_eq!(result.is_ok(), recover);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn other_onion_connect_errors_are_returned_without_retry() {
+        let mut calls = 0;
+        let result = retry_on_network_timeout(
+            || {
+                calls += 1;
+                std::future::ready(Err::<(), _>(OnionError::Connect(
+                    "synthetic refusal".into(),
+                )))
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert!(matches!(result, Err(OnionError::Connect(_))));
     }
 }

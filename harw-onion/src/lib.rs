@@ -243,6 +243,9 @@ pub enum OnionError {
     /// Connecting to an onion service failed.
     #[error("onion connect failed: {0}")]
     Connect(String),
+    /// Arti reported a network timeout while opening the onion stream.
+    #[error("onion network timeout: {0}")]
+    NetworkTimeout(String),
     /// Connecting to an onion service did not finish in time.
     #[error("onion connect did not finish within {0:?}")]
     ConnectTimeout(Duration),

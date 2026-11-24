@@ -212,7 +212,7 @@ impl Dialer {
             .ok_or_else(|| "this server profile has no .onion route".to_owned())?;
         let client = self.tor_client()?;
         client
-            .dial(locator, ONION_DIAL_TIMEOUT)
+            .dial_with_retry(locator, ONION_DIAL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())
     }
