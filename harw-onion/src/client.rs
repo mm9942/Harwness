@@ -5,6 +5,7 @@
 //! [`OnionClient::dial`] carry no peer identity. Authentication happens in
 //! the node transport layered on top.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,7 @@ use arti_client::{ErrorKind, HasKind, StreamPrefs, TorClient, TorClientConfig};
 use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tor_rtcompat::tokio::TokioRustlsRuntime;
 
 use crate::{BootstrapProgress, OnionError, OnionLocator, OnionStream};
@@ -110,18 +112,54 @@ impl OnionClient {
         locator: &OnionLocator,
         timeout: Duration,
     ) -> Result<OnionStream, OnionError> {
+        self.dial_inner(locator, timeout, false).await
+    }
+
+    /// Opens a Tor stream with one fresh-circuit retry for a transient error
+    /// or a stalled first dial. Bootstrap and both dials share `timeout`.
+    pub async fn dial_with_retry(
+        &self,
+        locator: &OnionLocator,
+        timeout: Duration,
+    ) -> Result<OnionStream, OnionError> {
+        self.dial_inner(locator, timeout, true).await
+    }
+
+    async fn dial_inner(
+        &self,
+        locator: &OnionLocator,
+        timeout: Duration,
+        retry: bool,
+    ) -> Result<OnionStream, OnionError> {
+        let started = Instant::now();
         let attempt = async {
             self.client
                 .bootstrap()
                 .await
                 .map_err(|e| map_arti_error(&e, OnionError::Bootstrap))?;
-            let mut prefs = StreamPrefs::new();
-            prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
-            let stream = self
-                .client
-                .connect_with_prefs((locator.host(), locator.port()), &prefs)
+            let connect = |fresh| async move {
+                let mut prefs = StreamPrefs::new();
+                prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
+                if fresh {
+                    // Avoid reusing the first attempt's tunnel or pending request.
+                    // The original Arti client still owns the guard state.
+                    prefs.new_isolation_group();
+                    tracing::debug!(target = %locator.redacted(), "retrying with a fresh onion circuit");
+                }
+                self.client
+                    .connect_with_prefs((locator.host(), locator.port()), &prefs)
+                    .await
+            };
+            let stream = if retry {
+                let initial_budget = timeout.saturating_sub(started.elapsed()) / 2;
+                retry_circuit(initial_budget, connect, |error| {
+                    circuit_retry_delay(error.kind())
+                })
                 .await
-                .map_err(|e| map_arti_error(&e, OnionError::Connect))?;
+            } else {
+                connect(false).await
+            }
+            .map_err(|error| map_arti_error(&error, OnionError::Connect))?;
             Ok::<OnionStream, OnionError>(Box::pin(stream))
         };
         let result = match tokio::time::timeout(timeout, attempt).await {
@@ -133,6 +171,37 @@ impl OnionClient {
         }
         result
     }
+}
+
+fn circuit_retry_delay(kind: ErrorKind) -> Option<Duration> {
+    match kind {
+        // Arti's Onion directory can lag behind its general bootstrap.
+        ErrorKind::BootstrapRequired => Some(Duration::from_secs(2)),
+        ErrorKind::TorNetworkTimeout
+        | ErrorKind::RemoteNetworkTimeout
+        | ErrorKind::OnionServiceConnectionFailed => Some(Duration::ZERO),
+        _ => None,
+    }
+}
+
+async fn retry_circuit<T, E, F: Future<Output = Result<T, E>>>(
+    initial_budget: Duration,
+    mut connect: impl FnMut(bool) -> F,
+    retry_delay: impl FnOnce(&E) -> Option<Duration>,
+) -> Result<T, E> {
+    match tokio::time::timeout(initial_budget, connect(false)).await {
+        Ok(Ok(stream)) => return Ok(stream),
+        Ok(Err(error)) => {
+            let Some(delay) = retry_delay(&error) else {
+                return Err(error);
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        Err(_) => {}
+    }
+    connect(true).await
 }
 
 impl Drop for OnionClient {
@@ -278,5 +347,60 @@ mod tests {
         assert_eq!(progress.percent, 0);
         assert!(!progress.ready);
         assert!(!progress.summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn onion_network_timeout_gets_one_fresh_attempt() {
+        let mut attempts = Vec::new();
+        let result = retry_circuit(
+            Duration::from_secs(1),
+            |fresh| {
+                attempts.push(fresh);
+                std::future::ready(Err::<(), _>(ErrorKind::TorNetworkTimeout))
+            },
+            |kind| circuit_retry_delay(*kind),
+        )
+        .await;
+        assert_eq!(attempts, [false, true]);
+        assert_eq!(result, Err(ErrorKind::TorNetworkTimeout));
+    }
+
+    #[tokio::test]
+    async fn other_onion_connect_errors_are_returned_without_retry() {
+        let result = retry_circuit(
+            Duration::from_secs(1),
+            |fresh| {
+                assert!(!fresh);
+                std::future::ready(Err::<(), _>(ErrorKind::OnionServiceWrongClientAuth))
+            },
+            |kind| circuit_retry_delay(*kind),
+        )
+        .await;
+        assert_eq!(result, Err(ErrorKind::OnionServiceWrongClientAuth));
+    }
+
+    #[tokio::test]
+    async fn stalled_onion_dial_leaves_time_for_a_fresh_attempt() {
+        let result = retry_circuit(
+            Duration::ZERO,
+            |fresh| async move {
+                if fresh {
+                    Ok::<_, ErrorKind>(())
+                } else {
+                    std::future::pending().await
+                }
+            },
+            |kind| circuit_retry_delay(*kind),
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn incomplete_onion_directory_has_a_retry_delay() {
+        assert_eq!(
+            circuit_retry_delay(ErrorKind::BootstrapRequired),
+            Some(Duration::from_secs(2))
+        );
     }
 }
