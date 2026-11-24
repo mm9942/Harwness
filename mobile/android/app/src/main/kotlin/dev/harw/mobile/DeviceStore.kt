@@ -197,8 +197,15 @@ internal class DeviceStore(private val context: Context) {
             throw error
         }
         if (durableDirectory) {
-            val directory = Os.open(requireNotNull(baseFile.parent), OsConstants.O_RDONLY or OsConstants.O_DIRECTORY, 0)
+            val directory = Os.open(
+                requireNotNull(baseFile.parent),
+                OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW or OsConstants.O_CLOEXEC or OsConstants.O_NONBLOCK,
+                0,
+            )
             try {
+                check(OsConstants.S_ISDIR(Os.fstat(directory).st_mode)) {
+                    "Connection data sync target is not a directory."
+                }
                 Os.fsync(directory)
             } finally {
                 Os.close(directory)
