@@ -7,12 +7,22 @@ import java.net.URL
 import org.json.JSONObject
 
 /** Ergebnis der Anfrage an den Admin-Dienst: Anfrage-ID und Prüfcode des Schlüssels. */
-internal data class AdminRequest(val id: String, val fingerprint: String, val base: String)
+internal data class AdminRequest(
+    val id: String,
+    val fingerprint: String,
+    val base: String,
+    val remainingSeconds: Long,
+)
 
 internal val AdminRequestPattern = Regex("^[0-9a-f]{32}$")
 
-/** Anfragen laufen serverseitig nach 10 Minuten ab; die App wartet etwas länger auf den Rückweg. */
-internal const val AdminRequestMaxAgeMs = 15 * 60 * 1000L
+internal const val AdminServerTtlSeconds = 10 * 60L
+private const val AdminCallbackGraceMs = 5 * 60 * 1000L
+internal const val AdminRequestMaxAgeMs = AdminServerTtlSeconds * 1000L + AdminCallbackGraceMs
+
+/** The callback grace applies to the original grant only, never to a fresh browser retry. */
+internal fun adminCallbackDeadline(requestStartedAt: Long, remainingSeconds: Long): Long =
+    requestStartedAt + remainingSeconds.coerceIn(0, AdminServerTtlSeconds) * 1000L + AdminCallbackGraceMs
 
 private const val MaxAdminResponseBytes = 16 * 1024
 private const val AdminTimeoutMs = 15_000

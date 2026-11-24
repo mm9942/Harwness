@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cloud_assistant_recall_clear">Effacer la sélection</string>
+    <string name="cloud_assistant_recall_choose">Sélectionner des échanges précédents pour ce message</string>
+    <string name="cloud_assistant_recall_disclosure">Choisissez jusqu’à quatre échanges (8 Kio au total). Pour ce message uniquement, le fournisseur configuré sur votre passerelle reçoit ces échanges en plus de la conversation récente.</string>
+    <string name="cloud_assistant_recall_include">Inclure cet échange</string>
+    <string name="cloud_assistant_recall_count">%1$d échanges sur %2$d sélectionnés pour ce message</string>
+    <string name="cloud_assistant_recall_send">Envoyer avec les échanges sélectionnés</string>
+</resources>

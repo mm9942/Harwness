@@ -316,6 +316,7 @@ impl Fixture {
             .push(ProfileRow {
                 session_id: id.clone(),
                 title: title.to_owned(),
+                stored_title: Some(title.to_owned()),
                 project_key: None,
                 project_label: None,
                 updated_at: jiff::Timestamp::from_millisecond(1_764_000_000_000)?,

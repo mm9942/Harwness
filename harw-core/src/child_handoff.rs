@@ -372,7 +372,9 @@ pub async fn run_handoff_compaction(
         StopReason::Refusal { .. }
         | StopReason::ContentFilter
         | StopReason::ContextWindowExceeded
-        | StopReason::StreamInterrupted => {
+        | StopReason::StreamInterrupted
+        | StopReason::StreamTransportInterrupted
+        | StopReason::IncompleteUnknown => {
             return Err(HandoffFailure::Unusable(format!("{:?}", response.stop)));
         }
         _ => false,

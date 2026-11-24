@@ -622,8 +622,9 @@ fn part_path(dir: &Path, model: &CatalogModel) -> PathBuf {
 fn file_len(path: &Path) -> Option<u64> {
     fs::metadata(path)
         .ok()
-        .filter(|meta| meta.is_file())
-        .map(|meta| meta.len())
+        .filter(fs::Metadata::is_file)
+        .as_ref()
+        .map(fs::Metadata::len)
 }
 
 fn exists(path: &Path) -> bool {

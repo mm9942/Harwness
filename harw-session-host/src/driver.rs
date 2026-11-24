@@ -49,6 +49,8 @@ pub enum DriverEvent {
     },
     /// The turn parked on an approval.
     ApprovalRequested(ApprovalRequest),
+    /// The selected prompt and its replacement committed atomically.
+    HistoryReplaced,
     /// The durable transcript advanced; the host re-reads the head.
     DurableAdvanced,
 }
@@ -70,12 +72,16 @@ pub struct TurnInput {
     pub client_msg_id: String,
     /// Presence label of the submitting client (audit/log only).
     pub submitted_by: String,
+    /// Host-owned origin; never deserialize this from a client.
+    pub title_seed_human: bool,
     /// Host-derived actor of the submitting client.
     pub actor: ApprovalActor,
     /// Connection that submitted it (revocation drops its queued inputs).
     pub origin: ConnectionId,
     /// Item id of an earlier user message: history is cut before it and replaced before the turn runs.
     pub rewind_before: Option<String>,
+    /// Host-derived canonical replacement ID; this is not sent by the client.
+    pub rewrite_replacement_id: Option<harw_types::ItemId>,
 }
 
 /// How a turn ended.
@@ -243,8 +249,38 @@ impl ExecutionAdmission {
     }
 }
 
+/// Configured physical journal used by this exact driver's state store.
+#[derive(Clone, Debug)]
+pub struct ArchiveJournalBinding {
+    pub root: std::path::PathBuf,
+    pub thread: harw_types::ThreadRef,
+}
+
 /// The runtime behind the host.
 pub trait TurnDriver: Send + Sync + 'static {
+    /// Whether the configured writer can issue real durable checkpoints.
+    fn supports_archive_checkpoints(&self) -> bool {
+        false
+    }
+
+    /// Whether the driver commits an exact edit and signals the hosted replay boundary.
+    fn supports_exact_rewind(&self) -> bool { false }
+
+    /// Actual processed-writer post-sync cursor, not a replay or file head.
+    fn archive_published_head(&self, _session: &SessionId) -> Result<Option<std::num::NonZeroU64>, HostError> {
+        Ok(None)
+    }
+
+    /// The authoritative destination/source mapping, without opening a core or model.
+    fn archive_journal_binding(&self, _session: &SessionId) -> Result<ArchiveJournalBinding, HostError> {
+        Err(HostError::NotImplemented("archive journal binding"))
+    }
+
+    /// The exact content-addressed prompt media store used by this driver.
+    fn archive_media_store(&self) -> Option<&harw_media::MediaStore> {
+        None
+    }
+
     /// Install freshly revalidated creator authority before building or running
     /// a core session. Drivers that execute effects must enforce this ceiling.
     fn prepare_execution(
@@ -272,14 +308,24 @@ pub trait TurnDriver: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Fill the freshly created session `new` with the history of `source` before its user message `before_item`.
-    fn fork_history(
+    /// Read the actual process-local writer cursor without locking the source
+    /// model. `new` is the fresh session built by the same host factory.
+    fn committed_fork_head(
         &self,
         _new: &SessionId,
         _source: &SessionId,
-        _before_item: &str,
-    ) -> DriverFuture<'_, ()> {
-        Box::pin(async { Err(HostError::Driver("driver does not support fork".into())) })
+    ) -> DriverFuture<'_, Option<u64>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Install only the host-authorized, visible prefix in a new session.
+    /// Return the new transcript's post-sync sequence.
+    fn seed_fork_history(
+        &self,
+        _new: &SessionId,
+        _items: Vec<harw_protocol::items::TurnItem>,
+    ) -> DriverFuture<'_, u64> {
+        Box::pin(async { Err(HostError::NotImplemented("durable session fork")) })
     }
 
     /// Prepare durable state for a new session (transcript, meta).

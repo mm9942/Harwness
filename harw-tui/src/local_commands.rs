@@ -65,6 +65,8 @@ pub(crate) struct LocalCommandContext<'a> {
     pub live_provider: Option<&'a str>,
     /// Live-Sitzungsmodell, falls bekannt.
     pub live_model: Option<&'a str>,
+    /// Canonical picker command for the mounted session root.
+    pub live_model_command: &'static str,
     /// Projektwurzel (für spätere Dateiprüfungen; `@pfad` expandiert der
     /// Submit-Pfad).
     #[allow(dead_code)]
@@ -285,10 +287,11 @@ pub(crate) fn intercept(raw: &str, ctx: &LocalCommandContext<'_>) -> Option<Loca
     }
 
     match name {
-        "settings" if bare && ctx.tier >= PermissionTier::Operator => {
-            Some(LocalIntercept::OpenOverlay(Box::new(
-                crate::settings_view::SettingsView::new(ctx.hidden_commands),
-            )))
+        "settings" if (bare || args == "models") && ctx.tier >= PermissionTier::Operator => {
+            let view = crate::settings_view::SettingsView::new(ctx.hidden_commands)
+                .with_live_model_command(ctx.live_model_command);
+            let view = if bare { view } else { view.open_models_tab() };
+            Some(LocalIntercept::OpenOverlay(Box::new(view)))
         }
         "resume" if bare => Some(LocalIntercept::OpenSessionPicker),
         "agent" if bare => Some(LocalIntercept::OpenAgentTree),
@@ -395,10 +398,24 @@ fn mention_intercept(trimmed: &str, mention: &str, roles: &[&str]) -> Option<Loc
     }
 }
 
-/// `/models` bare/`show` → Rollenansicht; `/models pick <rolle>` → Picker.
+/// Model overview, role management and TUI-only links to existing pickers/settings.
 fn models_intercept(args: &str, ctx: &LocalCommandContext<'_>) -> Option<LocalIntercept> {
     let mut words = args.split_whitespace();
     match words.next() {
+        Some("settings") if words.next().is_none() => {
+            // Reuse the same access checks as the canonical /settings panel.
+            intercept("/settings models", ctx).or_else(|| {
+                Some(LocalIntercept::System(
+                    tr(
+                        "command_feedback.models_settings_operator",
+                        "Model settings require operator access.",
+                    )
+                    .to_owned(),
+                ))
+            })
+        }
+        Some("session") if words.next().is_none() => intercept(ctx.live_model_command, ctx),
+        Some("uia") if words.next().is_none() => intercept("/uia-model", ctx),
         None | Some("show") if words.clone().next().is_none() => {
             let view = match ctx.config {
                 Some(config) => {
@@ -562,6 +579,7 @@ mod tests {
                 approval: Some(ApprovalMode::ALL[0]),
                 live_provider: Some("prov"),
                 live_model: Some("mod-1"),
+                live_model_command: "/model",
                 project_root: &self.root,
                 session_id: &self.session,
                 tier: PermissionTier::Operator,
@@ -805,6 +823,31 @@ mod tests {
         // Worker-Bereich; mit Argumenten geht es an die Operation.
         assert!(overlay_debug(fx.run("/models worker"))?.contains("UiaWorkers"));
         assert!(fx.run("/models worker uia-writer uia").is_none());
+        assert!(overlay_debug(fx.run("/models settings"))?.contains("SettingsView"));
+        assert!(fx.run("/models settings extra").is_none());
+        assert!(matches!(
+            fx.run("/models session"),
+            Some(LocalIntercept::OpenModelPicker(PickerTarget::Orchestrator))
+        ));
+        assert!(matches!(
+            fx.run("/models uia"),
+            Some(LocalIntercept::OpenModelPicker(PickerTarget::Uia))
+        ));
+        let mut uia_root = fx.ctx();
+        uia_root.live_model_command = "/uia-model";
+        assert!(matches!(
+            intercept("/models session", &uia_root),
+            Some(LocalIntercept::OpenModelPicker(PickerTarget::Uia))
+        ));
+        uia_root.tier = PermissionTier::Observer;
+        assert!(matches!(
+            intercept("/models settings", &uia_root),
+            Some(LocalIntercept::System(_))
+        ));
+        let restricted = empty().with_hidden(&["uia-model", "settings"]);
+        for raw in ["/models uia", "/models settings"] {
+            assert!(matches!(restricted.run(raw), Some(LocalIntercept::System(_))));
+        }
         Ok(())
     }
 

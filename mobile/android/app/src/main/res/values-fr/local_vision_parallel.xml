@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_local_vision_parallel_title">Analyse locale des images · parallélisme</string>
+    <string name="harw_local_vision_parallel_explainer">Choisissez de 1 à 5 (3 par défaut). Chaque nouveau lot vérifie le modèle chargé, la mémoire disponible et le processeur. Il peut lancer moins de tâches. Les requêtes API et les lots en cours ne changent pas.</string>
+    <string name="harw_local_vision_parallel_requested">Maximum configuré : %1$d</string>
+    <string name="harw_local_vision_parallel_estimate">Estimation : jusqu’à %1$d analyses simultanées. Vérifiée à nouveau au démarrage du lot.</string>
+    <plurals name="harw_local_vision_parallel_images">
+        <item quantity="one">%d image</item>
+        <item quantity="other">%d images</item>
+    </plurals>
+</resources>

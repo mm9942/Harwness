@@ -40,7 +40,7 @@ use zeroize::Zeroizing;
 
 use super::account::{self, Account, MAX_PASSWORD_BYTES, now_unix};
 use super::audit;
-use super::enroll::{self, EnrollState, Pending, ServerIdentity};
+use super::enroll::{self, ApprovalStart, EnrollState, Pending, ServerIdentity};
 use super::{host_of, public_base, totp};
 
 const SESSION_COOKIE: &str = "__Host-hs";
@@ -616,6 +616,7 @@ impl App {
                 .filter(|r| valid_req(r))
                 .and_then(|r| lock(&self.enroll).get(r));
             return match found {
+                Some(p) if p.approval.is_some() => self.approval_receipt(&p, csrf),
                 Some(p) => self.enroll_page(&p, csrf),
                 None => self.message_page(
                     StatusCode::NOT_FOUND,
@@ -644,12 +645,17 @@ impl App {
             }
             "/reject" => {
                 let id = form.get("req").map(String::as_str).unwrap_or("");
-                if let Some(p) = valid_req(id).then(|| lock(&self.enroll).take(id)).flatten() {
-                    self.audit(
+                match self.take_enrollment(id, ip, csrf) {
+                    Ok(Some(pending)) => self.audit(
                         "enroll_rejected",
                         ip,
-                        serde_json::json!({ "device": p.node_id, "fingerprint": p.fingerprint() }),
-                    );
+                        serde_json::json!({
+                            "device": pending.node_id,
+                            "fingerprint": pending.fingerprint(),
+                        }),
+                    ),
+                    Ok(None) => {}
+                    Err(reply) => return reply,
                 }
                 Reply::redirect("/")
             }
@@ -657,7 +663,12 @@ impl App {
                 let device = form.get("device").map(String::as_str).unwrap_or("");
                 let remote_dir = self.remote_dir.clone();
                 let device_owned = device.to_owned();
-                let result = crate::device_cmd::revoke(&remote_dir, &device_owned);
+                let result = {
+                    // The web admin's own revocation and enrollment never race
+                    // its local registry edit. External CLI edits remain independent.
+                    let _enrollment = lock(&self.enroll);
+                    crate::device_cmd::revoke(&remote_dir, &device_owned)
+                };
                 match result {
                     Ok(outcome) => {
                         self.audit(
@@ -682,6 +693,63 @@ impl App {
         }
     }
 
+    fn take_enrollment(&self, id: &str, ip: &str, csrf: &str) -> Result<Option<Pending>, Reply> {
+        if !valid_req(id) {
+            return Ok(None);
+        }
+        let result = lock(&self.enroll).take(id);
+        result.map_err(|error| self.enrollment_storage_error(&error, ip, csrf))
+    }
+
+    fn enrollment_storage_error(&self, error: &str, ip: &str, csrf: &str) -> Reply {
+        tracing::warn!(%error, "enrollment operation not persisted");
+        self.audit("enroll_storage_unavailable", ip, serde_json::json!({}));
+        self.message_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Enrollment-Speicher nicht verfügbar",
+            "Die Anfrage konnte nicht sicher bearbeitet werden. Bitte prüfe den Admin-Dienst und versuche es erneut.",
+            csrf,
+        )
+    }
+
+    fn approval_pending_check(&self, csrf: &str) -> Reply {
+        self.message_page(
+            StatusCode::CONFLICT,
+            "Freigabe nicht bestätigt",
+            "Der gespeicherte Freigabeversuch stimmt nicht eindeutig mit den aktuellen Gerätedaten überein. Es wurde nichts erneut freigegeben. Bitte prüfe die Geräteübersicht oder den Gateway-Administrator.",
+            csrf,
+        )
+    }
+
+    fn verify_approval_current(&self, pending: &Pending) -> bool {
+        match enroll::verify_approval(&self.remote_dir, &self.admin.tenant, pending) {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                tracing::warn!(%error, "approval receipt readback refused");
+                false
+            }
+        }
+    }
+
+    /// Authenticated readback: never writes the pins/registry or restarts the gateway.
+    fn approval_receipt(&self, pending: &Pending, csrf: &str) -> Reply {
+        let mut state = lock(&self.enroll);
+        let Some(pending) = state.get(&pending.id).filter(|request| request.approval.is_some()) else {
+            return self.approval_pending_check(csrf);
+        };
+        if !self.verify_approval_current(&pending) {
+            return self.approval_pending_check(csrf);
+        }
+        if let Err(error) = state.record_completion(&pending.id) {
+            return self.enrollment_storage_error(&error, "receipt", csrf);
+        }
+        self.enrolled_page(
+            &pending,
+            "Die Freigabe ist eingetragen. Hier wurde das Gateway nicht noch einmal neu gestartet. Falls die Verbindung nicht klappt, prüfe den Gateway-Dienst.",
+            false,
+        )
+    }
+
     async fn approve(self: &Arc<Self>, ip: &str, form: &HashMap<String, String>, csrf: &str) -> Reply {
         let id = form.get("req").map(String::as_str).unwrap_or("");
         let tier = match form.get("tier").map(String::as_str) {
@@ -691,28 +759,62 @@ impl App {
             _ => return Reply::plain(StatusCode::BAD_REQUEST, "Ungültig."),
         };
         let approve_optin = form.get("approve").is_some_and(|v| v == "on");
-        let Some(pending) = valid_req(id).then(|| lock(&self.enroll).take(id)).flatten() else {
-            return self.message_page(
-                StatusCode::NOT_FOUND,
-                "Anfrage nicht gefunden",
-                "Die Anfrage ist unbekannt, abgelaufen oder bereits bearbeitet.",
-                csrf,
-            );
-        };
-        if let Err(error) = enroll::apply_approval(
-            &self.remote_dir,
-            &self.admin.tenant,
-            &pending,
-            tier,
-            approve_optin,
-        ) {
-            self.audit(
-                "enroll_failed",
-                ip,
-                serde_json::json!({ "device": pending.node_id, "reason": error }),
-            );
-            return self.message_page(StatusCode::CONFLICT, "Freigabe fehlgeschlagen", &error, csrf);
+        if !valid_req(id) {
+            return Reply::plain(StatusCode::BAD_REQUEST, "Ungültig.");
         }
+        let pending = {
+            // Serialize the admin's local pin/registry writes with journaling.
+            // This synchronous guard never crosses the gateway restart await.
+            let mut state = lock(&self.enroll);
+            if let Some(request) = state.get(id)
+                && request.approval.is_none()
+                && let Err(error) = enroll::preflight_approval(
+                    &self.remote_dir, &self.admin.tenant, &request, tier, approve_optin,
+                )
+            {
+                self.audit("enroll_failed", ip, serde_json::json!({ "device": request.node_id, "reason": error }));
+                return self.message_page(StatusCode::CONFLICT, "Freigabe fehlgeschlagen", &error, csrf);
+            }
+            let request = match state.begin_approval(id, tier, approve_optin) {
+                Ok(ApprovalStart::Applying(pending)) => pending,
+                Ok(ApprovalStart::Recorded(pending)) => {
+                    drop(state);
+                    return self.approval_receipt(&pending, csrf);
+                }
+                Ok(ApprovalStart::DifferentDecision) => {
+                    return self.message_page(
+                        StatusCode::CONFLICT,
+                        "Freigabe bereits festgelegt",
+                        "Für diese Anfrage wurde eine andere Freigabeentscheidung gespeichert. Die Rechte wurden nicht geändert.",
+                        csrf,
+                    );
+                }
+                Ok(ApprovalStart::Missing) => {
+                    return self.message_page(
+                        StatusCode::NOT_FOUND,
+                        "Anfrage nicht gefunden",
+                        "Die Anfrage ist unbekannt, abgelaufen oder bereits bearbeitet.",
+                        csrf,
+                    );
+                }
+                Err(error) => return self.enrollment_storage_error(&error, ip, csrf),
+            };
+            if let Err(error) = enroll::apply_approval(&self.remote_dir, &self.admin.tenant, &request) {
+                self.audit(
+                    "enroll_failed",
+                    ip,
+                    serde_json::json!({ "device": request.node_id, "reason": error }),
+                );
+                return self.message_page(StatusCode::CONFLICT, "Freigabe fehlgeschlagen", &error, csrf);
+            }
+            if !self.verify_approval_current(&request) {
+                return self.approval_pending_check(csrf);
+            }
+            if let Err(error) = state.record_completion(&request.id) {
+                return self.enrollment_storage_error(&error, ip, csrf);
+            }
+            request
+        };
         self.audit(
             "enroll_approved",
             ip,
@@ -739,16 +841,25 @@ impl App {
                 self.admin.gateway_unit
             )
         };
+        if !self.verify_approval_current(&pending) {
+            return self.approval_pending_check(csrf);
+        }
+        self.enrolled_page(&pending, &restart_note, true)
+    }
+
+    fn enrolled_page(&self, pending: &Pending, restart_note: &str, auto_open: bool) -> Reply {
         let link = self.server.deep_link(&pending.id);
         let body = format!(
             "<h1>Gerät freigegeben</h1><p class=\"ok\">{} ist eingetragen.</p><p>{}</p>\
 <p><a class=\"btn\" href=\"{}\">Harw-App öffnen</a></p>\
 <p class=\"muted\">Öffnet sich die App nicht automatisch, tippe auf den Knopf.</p><p><a href=\"/\">Zur Übersicht</a></p>",
             esc(&pending.label),
-            esc(&restart_note),
+            esc(restart_note),
             esc(&link)
         );
-        Reply::html(StatusCode::OK, "Gerät freigegeben", &body, Some(&link))
+        Reply::html(
+            StatusCode::OK, "Gerät freigegeben", &body, auto_open.then_some(link.as_str()),
+        )
     }
 
     /// `systemctl --user restart <unit>` (feste Argumente, keine Shell), danach
@@ -835,25 +946,39 @@ impl App {
             ip,
         );
         match result {
-            Ok(id) => {
-                let fingerprint = lock(&self.enroll).get(&id).map(|p| p.fingerprint()).unwrap_or_default();
+            Ok(submission) => {
                 self.audit(
-                    "enroll_requested",
+                    if submission.reused {
+                        "enroll_resumed"
+                    } else {
+                        "enroll_requested"
+                    },
                     ip,
-                    serde_json::json!({ "device": parsed.node_id, "fingerprint": fingerprint }),
+                    serde_json::json!({
+                        "device": parsed.node_id,
+                        "fingerprint": &submission.fingerprint,
+                    }),
                 );
                 Reply::json(
                     StatusCode::OK,
                     &serde_json::json!({
-                        "req": id,
-                        "fingerprint": fingerprint,
-                        "expires_in": enroll::REQUEST_TTL.as_secs(),
+                        "req": submission.id,
+                        "fingerprint": submission.fingerprint,
+                        "expires_in": submission.expires_in,
                     }),
                 )
             }
-            Err(_) => {
+            Err(enroll::SubmitError::Refused) => {
                 self.audit("enroll_refused", ip, serde_json::json!({}));
                 denied()
+            }
+            Err(enroll::SubmitError::Storage(error)) => {
+                tracing::warn!(%error, "enrollment request not persisted");
+                self.audit("enroll_storage_unavailable", ip, serde_json::json!({}));
+                Reply::json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &serde_json::json!({ "error": "nicht verfügbar" }),
+                )
             }
         }
     }
@@ -1079,6 +1204,7 @@ pub(super) fn serve(home: &std::path::Path, config: &ResolvedConfig) -> Result<(
             allowed_hosts.push(host_of(base));
             allowed_origins.push(base.to_ascii_lowercase());
         }
+        let enroll = EnrollState::open(home, &server, &admin.tenant)?;
         let app = Arc::new(App {
             home: home.to_path_buf(),
             remote_dir,
@@ -1091,7 +1217,7 @@ pub(super) fn serve(home: &std::path::Path, config: &ResolvedConfig) -> Result<(
             gateway_addr: listener_cfg.listen.parse().ok(),
             sessions: Mutex::new(HashMap::new()),
             login_tokens: Mutex::new(HashMap::new()),
-            enroll: Mutex::new(EnrollState::default()),
+            enroll: Mutex::new(enroll),
             limiter: Mutex::new(Limiter::default()),
             argon_gate: tokio::sync::Semaphore::new(2),
             restart_lock: tokio::sync::Mutex::new(()),

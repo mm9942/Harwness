@@ -45,7 +45,7 @@ use harw_config::ConfigWriter;
 use harw_model_catalog::lifecycle::OffsetDateTime as Timestamp;
 use harw_provider_http::discovery::{self, DiscoveredModel};
 
-use crate::cli::{InternalAction, ModelsAction, OnOff};
+use crate::cli::{GlobalArgs, ImageModelAction, InternalAction, ModelsAction, OnOff, RoleModelAction};
 
 /// Monotoner Zähler für kollisionsfreie Temp-Dateinamen innerhalb dieses
 /// Prozesses (Uniqueness kommt letztlich von `create_new`).
@@ -94,6 +94,7 @@ pub enum ModelsError {
     ProviderDisabled {
         provider: String,
     },
+    ProfileOperation { reason: String },
 }
 
 impl fmt::Display for ModelsError {
@@ -134,6 +135,7 @@ impl fmt::Display for ModelsError {
             Self::ProviderDisabled { provider } => {
                 write!(f, "Provider {provider:?} ist deaktiviert")
             }
+            Self::ProfileOperation { reason } => f.write_str(reason),
         }
     }
 }
@@ -167,25 +169,75 @@ impl From<harw_config::ConfigError> for ModelsError {
     }
 }
 
-/// Führt `harw models [action]` aus.
-///
-/// # Arguments
-/// - `home_override` (`Option<PathBuf>`): expliziter `--home`-Wert; siehe
-///   [`crate::home::resolve_home`].
-/// - `action` (`Option<ModelsAction>`): Unterbefehl, oder `None` für `list`.
+/// Führt die alte Modellverwaltung und die profilgebundene /models-Fläche aus.
 ///
 /// # Errors
-/// `String` mit menschenlesbarem Kontext — konsistent mit den übrigen
-/// `harw-cli`-Subcommand-Läufern (siehe `crate::settings::run`).
-pub fn run(home_override: Option<PathBuf>, action: Option<ModelsAction>) -> Result<(), String> {
-    // Der Katalog braucht kein angelegtes Home und läuft über denselben Weg
-    // wie der frühere Befehl `harw catalog`.
-    if let Some(ModelsAction::Catalog { refresh }) = action {
-        return crate::lifecycle::catalog(home_override, refresh);
-    }
-    let home = crate::home::resolve_home(home_override)?;
+/// Home, Config, Modellvalidierung, Persistenz oder Ausgabe ist fehlgeschlagen.
+pub fn run(global: &GlobalArgs, action: Option<ModelsAction>) -> Result<(), String> {
+    let action = match action {
+        Some(ModelsAction::Roles { action }) => return run_role_model(global, action),
+        Some(ModelsAction::Image { action }) => return run_image_model(global, action),
+        Some(ModelsAction::Catalog { refresh }) =>
+            return crate::lifecycle::catalog(global.home.clone(), refresh),
+        legacy => legacy,
+    };
+    let home = crate::home::resolve_home(global.home.clone())?;
     crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
     execute(&home, action).map_err(|error| error.to_string())
+}
+
+fn model_token(value: String) -> Result<String, String> {
+    if value.is_empty() || value.len() > 512
+        || value.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err("Modell-, Rollen- und Effort-Werte müssen einzelne gültige Argumente sein.".into());
+    }
+    Ok(value)
+}
+
+fn run_role_model(global: &GlobalArgs, action: Option<RoleModelAction>) -> Result<(), String> {
+    let (args, writes) = match action.unwrap_or(RoleModelAction::Show) {
+        RoleModelAction::Show => (vec!["profile".into()], false),
+        RoleModelAction::Set { role, target, effort } => {
+            let mut args = vec!["set".into(), model_token(role)?, model_token(target)?];
+            if let Some(effort) = effort { args.push(model_token(effort)?); }
+            (args, true)
+        }
+        RoleModelAction::Reset { role } => (vec!["reset".into(), model_token(role)?], true),
+    };
+    run_profile_model_operation(global, args, writes)
+}
+
+fn run_image_model(global: &GlobalArgs, action: Option<ImageModelAction>) -> Result<(), String> {
+    let (args, writes) = match action.unwrap_or(ImageModelAction::Show) {
+        ImageModelAction::Show => (vec!["image".into(), "show".into()], false),
+        // The explicit Set grammar cannot accidentally turn a model named
+        // "show" or "reset" into a different operation.
+        ImageModelAction::Set { target } => (
+            vec!["set".into(), "image-understanding".into(), model_token(target)?], true,
+        ),
+        ImageModelAction::Reset => (vec!["image".into(), "reset".into()], true),
+    };
+    run_profile_model_operation(global, args, writes)
+}
+
+fn run_profile_model_operation(global: &GlobalArgs, args: Vec<String>, writes: bool) -> Result<(), String> {
+    let cwd = crate::jobs_cmd::working_dir(global)?;
+    let output = crate::op_bridge::run_operation(
+        crate::op_bridge::OpTarget { home: global.home.clone(), cwd: &cwd },
+        "/models",
+        args,
+    )?;
+    // A TUI can continue with a live-only change; an isolated CLI command
+    // must not signal success to scripts unless persistence was confirmed.
+    if writes && output.data.as_ref().and_then(|data| data.get("persisted"))
+        .and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        let note = output.data.as_ref().and_then(|data| data.get("note"))
+            .and_then(serde_json::Value::as_str);
+        return Err(note.unwrap_or("Modellwahl konnte nicht als gespeichert bestätigt werden.").to_owned());
+    }
+    crate::output::Printer::new(global.output()).op_output(&output)
 }
 
 /// Testbarer Kern von [`run`]: nimmt einen bereits aufgelösten Root-Space.
@@ -209,6 +261,11 @@ fn execute(home: &Path, action: Option<ModelsAction>) -> Result<(), ModelsError>
             println!("Standardmodell auf {id:?} gesetzt.");
             Ok(())
         }
+        // The local command bridge requires the original profile/cwd/output
+        // context; never stand it up through the legacy discovery path.
+        Some(ModelsAction::Roles { .. } | ModelsAction::Image { .. }) => Err(ModelsError::ProfileOperation {
+            reason: "Profil-Modellwahl muss über die lokale Befehlsbrücke laufen.".into(),
+        }),
         // [`run`] fängt den Katalog vorher ab; dieser Zweig hält nur das
         // `match` vollständig.
         Some(ModelsAction::Catalog { refresh }) => {

@@ -25,7 +25,10 @@ pub use engine::{
 };
 pub use error::LlamaError;
 pub use inference::LocalInferenceControl;
-pub use provider::{LOCAL_PROVIDER_ID, LocalGgufConfig, LocalGgufProvider};
+pub use provider::{
+    LOCAL_PROVIDER_ID, LocalGgufConfig, LocalGgufProvider, LocalImageDescription,
+    LocalImageDescriptionOutcome,
+};
 
 /// Context size used when the caller does not choose one.
 pub const DEFAULT_N_CTX: u32 = 16384;

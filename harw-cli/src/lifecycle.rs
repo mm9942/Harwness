@@ -389,7 +389,11 @@ impl GatewayOp {
             GatewayAction::Restart => Some(Self::Restart),
             GatewayAction::Enable => Some(Self::Enable),
             GatewayAction::Disable => Some(Self::Disable),
-            GatewayAction::Status => None,
+            GatewayAction::Status | GatewayAction::Control(_) => None,
+            #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+            GatewayAction::OwnerCreationReceipt { .. } => None,
+            #[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+            GatewayAction::OwnerPlacementHub { .. } | GatewayAction::VerifyOwnerCreationReceipt { .. } | GatewayAction::VerifyOwnerCreationReadiness { .. } => None,
         }
     }
 }
@@ -483,6 +487,17 @@ pub fn gateway_service(
     home_override: Option<PathBuf>,
     action: GatewayAction,
 ) -> Result<(), String> {
+    #[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+    if matches!(&action, GatewayAction::OwnerPlacementHub { .. } | GatewayAction::VerifyOwnerCreationReceipt { .. } | GatewayAction::VerifyOwnerCreationReadiness { .. }) {
+        return Err("Owner placement and verification are not local service actions".into());
+    }
+    #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+    if matches!(&action, GatewayAction::OwnerCreationReceipt { .. }) {
+        return Err("Owner creation receipt export is not a local service action".into());
+    }
+    if matches!(&action, GatewayAction::Control(_)) {
+        return Err("Gateway control is not a local service action".into());
+    }
     let home = resolve_home(home_override)?;
     let backend = detect_gateway_backend()?;
     let [_serve, gateway] = service_specs(

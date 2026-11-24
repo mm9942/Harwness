@@ -10,6 +10,7 @@ import uniffi.harw_mobile_ffi.MobileHolder
 import uniffi.harw_mobile_ffi.MobileHolderKind
 import uniffi.harw_mobile_ffi.MobileLastOrigin
 import uniffi.harw_mobile_ffi.MobileRowOrigin
+import uniffi.harw_mobile_ffi.MobileSessionPurpose
 import uniffi.harw_mobile_ffi.MobileSessionRow
 import uniffi.harw_mobile_ffi.MobileSessionState
 import uniffi.harw_mobile_ffi.MobileShareInfo
@@ -29,6 +30,7 @@ class WorkspaceScreenTest {
         turns = null, state = MobileSessionState.IDLE, attached = 0u, model = null,
         origin = MobileRowOrigin.HOSTED, continuable = true, reason = null, holder = holder,
         lastOrigin = lastOrigin, firstMessage = firstMessage,
+        purpose = MobileSessionPurpose.UNKNOWN,
     )
 
     private fun holder(kind: MobileHolderKind) = MobileHolder(kind, "2026-11-22T10:00:00Z")

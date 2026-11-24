@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="workspace_refresh_sessions">Refresh sessions</string>
+    <string name="workspace_session_loading">Loading sessions…</string>
+    <string name="workspace_session_load_error">Could not load sessions: %1$s</string>
+    <string name="workspace_session_refresh_error">Could not refresh sessions: %1$s</string>
+    <string name="workspace_sessions_empty">No sessions yet. Start one with New session.</string>
+    <string name="workspace_no_sessions_visible">No sessions are visible to this device.</string>
+    <string name="workspace_open_session_window">Open %1$s in a new window</string>
+    <string name="workspace_optional_title">Title (optional)</string>
+    <string name="workspace_disconnecting">Disconnecting…</string>
+    <string name="workspace_connecting">Connecting…</string>
+    <string name="workspace_reconnecting">Connection lost. Reconnecting…</string>
+    <string name="workspace_connection_failed">Connection failed.</string>
+    <string name="workspace_connection_revoked">Access to this server was revoked.</string>
+    <string name="workspace_connection_offline">Offline.</string>
+    <string name="workspace_sessions_cached">Showing the last loaded sessions.</string>
+    <string name="workspace_connect_to_load">Connect to load sessions.</string>
+    <string name="workspace_project_search_empty">No sessions match “%1$s”.</string>
+    <string name="workspace_project_share_off">This gateway does not share terminal sessions.</string>
+    <string name="workspace_project_legacy">This server does not support projects. Showing mobile sessions only.</string>
+    <string name="workspace_project_sessions_empty">No sessions in this project yet. Use + to start one.</string>
+    <string name="workspace_project_none_visible">No sessions in this project are visible to this device.</string>
+    <string name="workspace_load_more">Load more</string>
+    <string name="workspace_loading">Loading…</string>
+    <string name="workspace_session_turns">%1$s turns</string>
+    <string name="internal_directory_legacy_dream">This older host has no Internal catalog. Only identifiable Dream metadata is listed; other categories are unavailable.</string>
+    <string name="workspace_title_field">Title</string>
+    <string name="workspace_month_unknown">Unknown date</string>
+    <string name="workspace_gateway_running">Running on gateway</string>
+    <string name="workspace_terminal_held">In use by a terminal</string>
+    <string name="workspace_job_held">In use by a job</string>
+    <string name="workspace_held">In use</string>
+    <string name="workspace_last_phone">Last used on a phone</string>
+    <string name="workspace_last_terminal">Last used in a terminal</string>
+    <string name="workspace_observer">Observer</string>
+    <string name="workspace_operator">Operator</string>
+    <string name="workspace_maintainer">Maintainer</string>
+    <string name="workspace_owner">Owner</string>
+    <string name="workspace_share_read_only">This gateway shares read-only access</string>
+    <string name="workspace_foreign_origin">Created in a different channel</string>
+    <string name="workspace_no_workdir">Working directory unavailable</string>
+    <string name="workspace_no_write_permission">No write permission</string>
+    <string name="workspace_closed">Closed</string>
+    <string name="workspace_read_only">Read only</string>
+</resources>

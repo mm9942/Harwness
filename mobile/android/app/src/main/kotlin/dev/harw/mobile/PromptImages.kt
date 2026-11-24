@@ -8,6 +8,7 @@ import android.util.Base64
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.input.pointer.pointerInput
@@ -18,20 +19,17 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.Image
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -41,14 +39,20 @@ import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import uniffi.harw_mobile_ffi.PromptImage
+import uniffi.harw_mobile_ffi.TranscriptEntry
 
 /** Wie viele Bilder die App an eine Nachricht haengt (Draht erlaubt 4; die Grenze haelt Platz im 1-MiB-Limit). */
 internal const val MaxPromptImages = Int.MAX_VALUE
@@ -91,25 +95,30 @@ internal fun prepareImage(context: Context, uri: Uri, label: String): DraftImage
     } catch (_: Exception) {
         null
     } ?: return null
-    try {
-        for (edge in EdgeSteps) {
-            val scaled = scaleTo(decoded, edge)
+    return try {
+        val bytes = encodePickerJpeg(decoded) ?: return null
+        val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+        DraftImage(label, PromptImage("image/jpeg", b64), bytes.size, freshlyPicked = true)
+    } finally {
+        decoded.recycle()
+    }
+}
+
+private fun encodePickerJpeg(decoded: Bitmap): ByteArray? {
+    for (edge in EdgeSteps) {
+        val scaled = scaleTo(decoded, edge)
+        try {
             for (quality in QualitySteps) {
                 val out = ByteArrayOutputStream()
                 scaled.compress(Bitmap.CompressFormat.JPEG, quality, out)
                 val bytes = out.toByteArray()
-                if (bytes.size <= MaxImageBytes) {
-                    if (scaled !== decoded) scaled.recycle()
-                    val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-                    return DraftImage(label, PromptImage("image/jpeg", b64), bytes.size, freshlyPicked = true)
-                }
+                if (bytes.size <= MaxImageBytes) return bytes
             }
+        } finally {
             if (scaled !== decoded) scaled.recycle()
         }
-        return null
-    } finally {
-        decoded.recycle()
     }
+    return null
 }
 
 private fun scaleTo(source: Bitmap, edge: Int): Bitmap {
@@ -126,78 +135,36 @@ private fun scaleTo(source: Bitmap, edge: Int): Bitmap {
 
 private const val ImagePlaceholder = "[image]"
 
-/** Trennt die `[image]`-Platzhalter des Servers vom Text: (Text ohne Platzhalter, Anzahl Bilder). */
+/** The wire view joins each attachment marker as its own line, never inline with authored text. */
 internal fun splitImagePlaceholders(text: String): Pair<String, Int> {
-    val count = text.split(ImagePlaceholder).size - 1
+    val lines = text.split('\n')
+    val count = lines.count { it == ImagePlaceholder }
     if (count == 0) return text to 0
-    return text.replace(ImagePlaceholder, "").trim() to count
+    return lines.filterNot { it == ImagePlaceholder }.joinToString("\n") to count
 }
 
-/** Vergleichsschluessel fuer gesendeten Text; ein reiner Bild-Prompt wird als "(Bild)" gesendet. */
-internal fun sentTextKey(text: String): String = text.trim().let { if (it == "(Bild)") "" else it }
-
-/** Zwischenspeicher fuer vom Host geholte Vorschaubilder (Schluessel: Bildreferenz). */
-private object ThumbCache {
-    val cache = object : android.util.LruCache<String, Bitmap>(24 * 1024 * 1024) {
-        override fun sizeOf(key: String, value: Bitmap) = value.byteCount
-    }
+/** New rows keep actual attachments separate from text the user typed literally. */
+internal fun TranscriptEntry.userTextAndImageCount(): Pair<String, Int> {
+    val typed = userPresentation
+    if (typed != null) return typed.text to maxOf(typed.imageCount.coerceAtMost(Int.MAX_VALUE.toUInt()).toInt(), images.size)
+    val (authored, legacyCount) = splitImagePlaceholders(text)
+    return authored to maxOf(legacyCount, images.size)
 }
 
-private fun decodeThumb(image: PromptImage, targetPx: Int): Bitmap? = try {
+internal fun decodeThumb(image: PromptImage, targetPx: Int): Bitmap? = try {
     val bytes = Base64.decode(image.dataB64, Base64.DEFAULT)
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-    var sample = 1
-    while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= targetPx) sample *= 2
-    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
+    val longest = maxOf(bounds.outWidth, bounds.outHeight)
+    if (bounds.outWidth !in 1..32_768 || bounds.outHeight !in 1..32_768 || targetPx <= 0) {
+        null
+    } else {
+        var sample = 1
+        while (longest / sample > targetPx) sample *= 2
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
+    }
 } catch (_: Exception) {
     null
-}
-
-/**
- * Kleine Vorschauen gesendeter Bilder. Vorrang hat die lokale Kopie; sonst werden die Bilder ueber [fetch]
- * vom Host geholt und zwischengespeichert. Nur wenn das nicht klappt (oder ohne Referenz), erscheint ein "Bild"-Chip.
- */
-@Composable
-internal fun ImageStrip(
-    count: Int,
-    thumbs: List<PromptImage>?,
-    refs: List<String> = emptyList(),
-    fetch: (suspend (String) -> PromptImage?)? = null,
-) {
-    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        if (thumbs != null && thumbs.size == count) {
-            thumbs.forEach { Thumbnail(it) }
-        } else if (fetch != null && refs.isNotEmpty()) {
-            refs.forEach { RemoteThumbnail(it, fetch) }
-        } else {
-            repeat(count) { ImageChip() }
-        }
-    }
-}
-
-@Composable
-private fun RemoteThumbnail(ref: String, fetch: suspend (String) -> PromptImage?) {
-    var failed by remember(ref) { mutableStateOf(false) }
-    val bitmap by produceState<ImageBitmap?>(ThumbCache.cache.get(ref)?.asImageBitmap(), ref) {
-        if (value != null) return@produceState
-        val decoded = withContext(Dispatchers.IO) { fetch(ref)?.let { decodeThumb(it, 288) } }
-        if (decoded != null) {
-            ThumbCache.cache.put(ref, decoded)
-            value = decoded.asImageBitmap()
-        } else {
-            failed = true
-        }
-    }
-    val shown = bitmap
-    val shape = RoundedCornerShape(10.dp)
-    var open by remember(ref) { mutableStateOf(false) }
-    if (open) ImageViewerDialog({ fetch(ref)?.let { decodeThumb(it, 1800) } ?: ThumbCache.cache.get(ref) }) { open = false }
-    when {
-        shown != null -> Image(shown, contentDescription = "Gesendetes Bild", contentScale = ContentScale.Crop, modifier = Modifier.size(72.dp).clip(shape).clickable { open = true })
-        failed -> ImageChip()
-        else -> Box(Modifier.size(72.dp).clip(shape).background(MaterialTheme.colorScheme.surfaceContainerHighest))
-    }
 }
 
 /** Entwurfsbild als kleine Vorschau mit Entfernen-Knopf (x). */
@@ -208,7 +175,13 @@ internal fun DraftThumbnail(image: DraftImage, enabled: Boolean, onRemove: () ->
     }
     val shape = RoundedCornerShape(10.dp)
     var open by remember(image.image.dataB64) { mutableStateOf(false) }
-    if (open) ImageViewerDialog({ decodeThumb(image.image, 1800) }) { open = false }
+    if (open) ImageViewerDialog(
+        load = {
+            decodeThumb(image.image, 1800)?.let { ImageViewerLoad.Ready(it) }
+                ?: ImageViewerLoad.Failed(ImageViewerFailure.Unreadable)
+        },
+        onClose = { open = false },
+    )
     Box(Modifier.size(72.dp)) {
         val shown = bitmap
         if (shown != null) {
@@ -230,71 +203,103 @@ internal fun DraftThumbnail(image: DraftImage, enabled: Boolean, onRemove: () ->
     }
 }
 
-@Composable
-private fun ImageChip() {
-    Surface(
-        shape = RoundedCornerShape(50),
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-    ) {
-        Row(
-            Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
-        ) {
-            Icon(Icons.Outlined.Image, contentDescription = null, Modifier.size(16.dp))
-            Text("Bild", style = MaterialTheme.typography.labelMedium)
-        }
-    }
+internal enum class ImageViewerFailure(val message: Int, val retryable: Boolean = false) {
+    Missing(R.string.chat_media_missing),
+    Denied(R.string.chat_media_denied),
+    Unsupported(R.string.chat_media_unsupported),
+    Unreadable(R.string.chat_media_unreadable),
+    Offline(R.string.chat_media_offline, true),
+    Busy(R.string.chat_media_busy, true),
+    Unexpected(R.string.chat_media_unexpected, true),
 }
 
-@Composable
-private fun Thumbnail(image: PromptImage) {
-    val bitmap by produceState<ImageBitmap?>(null, image.dataB64) {
-        value = withContext(Dispatchers.Default) {
-            try {
-                val bytes = Base64.decode(image.dataB64, Base64.DEFAULT)
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 4 })?.asImageBitmap()
-            } catch (_: Exception) {
-                null
-            }
-        }
-    }
-    val shape = RoundedCornerShape(10.dp)
-    val shown = bitmap
-    var open by remember(image.dataB64) { mutableStateOf(false) }
-    if (open) ImageViewerDialog({ decodeThumb(image, 1800) }) { open = false }
-    if (shown != null) {
-        Image(shown, contentDescription = "Gesendetes Bild", contentScale = ContentScale.Crop, modifier = Modifier.size(72.dp).clip(shape).clickable { open = true })
-    } else {
-        Box(Modifier.size(72.dp).clip(shape).background(MaterialTheme.colorScheme.surfaceContainerHighest))
-    }
+internal sealed interface ImageViewerLoad {
+    data object Loading : ImageViewerLoad
+    data class Ready(val bitmap: Bitmap) : ImageViewerLoad
+    data class Failed(val reason: ImageViewerFailure) : ImageViewerLoad
 }
 
+private fun boundViewerOffset(wanted: Offset, viewport: IntSize, image: ImageBitmap, scale: Float): Offset {
+    if (viewport.width <= 0 || viewport.height <= 0 || scale <= 1f) return Offset.Zero
+    val fit = minOf(viewport.width.toFloat() / image.width, viewport.height.toFloat() / image.height)
+    val x = ((image.width * fit * scale - viewport.width) / 2f).coerceAtLeast(0f)
+    val y = ((image.height * fit * scale - viewport.height) / 2f).coerceAtLeast(0f)
+    return Offset(wanted.x.coerceIn(-x, x), wanted.y.coerceIn(-y, y))
+}
 
-/** Vollbild-Ansicht eines Bildes: Doppeltippen/Kneifen zum Zoomen, X oben rechts schliesst. */
+/** View the authorized image occurrence ONLY. User gestures never change the media scope. */
 @Composable
-internal fun ImageViewerDialog(load: suspend () -> Bitmap?, onClose: () -> Unit) {
-    val bitmap by produceState<ImageBitmap?>(null) { value = withContext(Dispatchers.IO) { load()?.asImageBitmap() } }
-    var scale by remember { mutableFloatStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
+internal fun ImageViewerDialog(load: suspend () -> ImageViewerLoad, onClose: () -> Unit) {
+    var attempt by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    val result by produceState<ImageViewerLoad>(ImageViewerLoad.Loading, attempt) {
+        value = ImageViewerLoad.Loading
+        value = try {
+            withContext(Dispatchers.IO) { load() }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            ImageViewerLoad.Failed(ImageViewerFailure.Unexpected)
+        }
+    }
+    val shown = remember(result) { (result as? ImageViewerLoad.Ready)?.bitmap?.asImageBitmap() }
+    var scale by remember(result) { mutableFloatStateOf(1f) }
+    var offset by remember(result) { mutableStateOf(Offset.Zero) }
+    var viewport by remember { mutableStateOf(IntSize.Zero) }
+
+    fun transformAt(image: ImageBitmap, bounds: IntSize, point: Offset, zoom: Float, pan: Offset = Offset.Zero) {
+        val target = zoom.coerceIn(1f, 6f)
+        val center = Offset(bounds.width / 2f, bounds.height / 2f)
+        val pivot = point - center
+        val wanted = pivot - (pivot - offset) * (target / scale) + pan
+        offset = boundViewerOffset(wanted, bounds, image, target)
+        scale = target
+    }
+
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.94f))) {
-            val shown = bitmap
-            if (shown == null) {
-                CircularProgressIndicator(Modifier.align(Alignment.Center))
-            } else {
-                Image(
-                    shown, contentDescription = "Bild", contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize()
-                        .pointerInput(Unit) {
-                            detectTransformGestures { _, pan, zoom, _ ->
-                                scale = (scale * zoom).coerceIn(1f, 6f)
-                                offset = if (scale == 1f) Offset.Zero else offset + pan
-                            }
+        Box(Modifier.fillMaxSize().clipToBounds().background(Color.Black.copy(alpha = 0.94f))) {
+            when (val snapshot = result) {
+                ImageViewerLoad.Loading -> CircularProgressIndicator(Modifier.align(Alignment.Center))
+                is ImageViewerLoad.Failed -> {
+                    val reason = snapshot.reason
+                    val label = Modifier.align(Alignment.Center).padding(24.dp)
+                    if (reason.retryable) {
+                        TextButton(onClick = { attempt++ }, modifier = label) {
+                            Text(stringResource(R.string.chat_media_retry, stringResource(reason.message)), color = Color.White)
                         }
-                        .graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y),
-                )
+                    } else {
+                        Text(stringResource(reason.message), modifier = label, color = Color.White)
+                    }
+                }
+                is ImageViewerLoad.Ready -> if (shown != null) {
+                    Image(
+                        shown, contentDescription = stringResource(R.string.chat_media_image), contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize()
+                            .onSizeChanged { size ->
+                                viewport = size
+                                offset = boundViewerOffset(offset, size, shown, scale)
+                            }
+                            .pointerInput(shown) {
+                                detectTapGestures(onDoubleTap = { point ->
+                                    transformAt(shown, size, point, if (scale > 1f) 1f else 2.5f)
+                                })
+                            }
+                            .pointerInput(shown) {
+                                detectTransformGestures { point, pan, zoom, _ ->
+                                    transformAt(shown, size, point, scale * zoom, pan)
+                                }
+                            }
+                            .graphicsLayer(scaleX = scale, scaleY = scale, translationX = offset.x, translationY = offset.y),
+                    )
+                    TextButton(
+                        onClick = {
+                            val center = Offset(viewport.width / 2f, viewport.height / 2f)
+                            transformAt(shown, viewport, center, if (scale > 1f) 1f else 2.5f)
+                        },
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(14.dp),
+                    ) {
+                        Text(stringResource(if (scale > 1f) R.string.chat_media_zoom_reset else R.string.chat_media_zoom_in), color = Color.White)
+                    }
+                }
             }
             Surface(
                 onClick = onClose,
@@ -304,7 +309,7 @@ internal fun ImageViewerDialog(load: suspend () -> Bitmap?, onClose: () -> Unit)
                 modifier = Modifier.align(Alignment.TopEnd).padding(16.dp).size(44.dp),
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Icon(Icons.Outlined.Close, contentDescription = "Schließen", Modifier.size(26.dp))
+                    Icon(Icons.Outlined.Close, contentDescription = stringResource(R.string.chat_media_close), Modifier.size(26.dp))
                 }
             }
         }

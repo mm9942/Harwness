@@ -13,7 +13,29 @@ pub(crate) const LOCAL_HOST_UNAVAILABLE: &str = "the on-device host is not avail
 
 #[cfg(feature = "local-host")]
 static LOCAL_INFERENCE: std::sync::LazyLock<harw_llama::LocalInferenceControl> =
-    std::sync::LazyLock::new(harw_llama::LocalInferenceControl::default);
+    std::sync::LazyLock::new(|| {
+        let control = harw_llama::LocalInferenceControl::default();
+        let _ = control.set_image_concurrency(crate::vision_admission::DEFAULT_LOCAL_VISION_CONCURRENCY as u8);
+        control
+    });
+
+/// Model loads (including host reopen) cannot overtake a local vision batch
+/// while its worker or cancellation cleanup still owns the device model.
+#[cfg(feature = "local-host")]
+static LOCAL_MODEL_LIFECYCLE: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
+#[cfg(feature = "local-host")]
+async fn load_model<R: Send + 'static>(
+    load: impl FnOnce() -> R + Send + 'static,
+) -> Result<R, tokio::task::JoinError> {
+    let fence = Arc::clone(&LOCAL_MODEL_LIFECYCLE).lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _fence = fence;
+        load()
+    })
+    .await
+}
 
 /// Change the on-device cap for new inference calls without reloading a model.
 /// Invalid values or builds without a local host return false.
@@ -70,17 +92,20 @@ pub(crate) async fn open_local(
     let fingerprint = projector_fingerprint(&home);
     let revision = provider_revision(&home, selection.as_ref());
     let resolver_for_build = resolver.clone();
-    let built = tokio::task::spawn_blocking(move || {
-        build_active_model(&model_home, &resolver_for_build)
-    })
-    .await
-    .map_err(|_| host_task_failed())??;
+    let built = load_model(move || build_active_model(&model_home, &resolver_for_build))
+        .await
+        .map_err(|_| host_task_failed())??;
     // The host keeps this wrapper for its whole life: a later provider/model
     // activation is picked up by the next turn (see `SwitchingModel`).
     let model = Arc::new(SwitchingModel {
         home: home.clone(),
         resolver,
-        current: tokio::sync::Mutex::new((selection, fingerprint, revision, built)),
+        current: tokio::sync::Mutex::new((
+            ModelCacheKey::Route(selection),
+            fingerprint,
+            revision,
+            built,
+        )),
     });
     // The device tools follow the profile switch (off by default for the on-device model).
     let (shell, files) = device;
@@ -92,6 +117,8 @@ pub(crate) async fn open_local(
     }
     // A phone model has a small context window: the on-device GGUF is
     // text-only ("nur Text, keine Werkzeuge"), a cloud route sees a lean set.
+    #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+    remember_uia_runtime(&model);
     let surface = if home.active_local_model()?.is_some() {
         harw_local_host::ToolSurface::default()
     } else {
@@ -100,9 +127,34 @@ pub(crate) async fn open_local(
         }
     };
     let host_provider: Arc<dyn harw_core::ModelProvider> = model.clone();
-    let mut backend = open_local_with_tools(home, host_provider, features, contributors, Some(surface)).await?;
+    let mut backend =
+        open_local_with_tools(home, host_provider, features, contributors, Some(surface)).await?;
     backend.hybrid_model = Some(model);
     Ok(backend)
+}
+
+#[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+static UIA_RUNTIME: std::sync::Mutex<Option<std::sync::Weak<SwitchingModel>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+fn remember_uia_runtime(model: &Arc<SwitchingModel>) {
+    if let Ok(mut slot) = UIA_RUNTIME.lock() { *slot = Some(Arc::downgrade(model)); }
+}
+
+#[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+pub(crate) fn uia_runtime_for(files: &std::path::Path) -> Option<Arc<SwitchingModel>> {
+    let model = UIA_RUNTIME.lock().ok()?.as_ref()?.upgrade()?;
+    matches_uia_home(&model.home, files).then_some(model)
+}
+
+#[cfg(all(feature = "vault-uia-chat", any(target_os = "android", test)))]
+fn matches_uia_home(home: &crate::home::AppHome, files: &std::path::Path) -> bool {
+    if home.files_dir() != files {
+        return false;
+    }
+    let selection = harw_home::active_profile_name(home.home());
+    harw_home::profile_dir(home.home(), &selection).ok().as_deref() == Some(home.profile_dir())
 }
 
 /// Model provider of the on-device host that follows the active selection.
@@ -118,12 +170,139 @@ pub(crate) struct SwitchingModel {
     home: crate::home::AppHome,
     resolver: crate::secrets::KeystoreSecretResolver,
     current: tokio::sync::Mutex<(
-        Option<(String, String)>,
+        ModelCacheKey,
         Option<ProjectorFingerprint>,
         Option<blake3::Hash>,
-        Arc<dyn harw_core::ModelProvider>,
+        CachedProvider,
     )>,
 }
+
+#[cfg(feature = "local-host")]
+#[derive(PartialEq, Eq)]
+enum ModelCacheKey {
+    Route(Option<(String, String)>),
+    LocalAssistant(String, VisionFileFingerprint),
+    #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+    PrivateAssistantVision(String, VisionFiles),
+}
+
+#[cfg(feature = "local-host")]
+enum CachedProvider {
+    Other(Arc<dyn harw_core::ModelProvider>),
+    Local {
+        model: Arc<harw_llama::LocalGgufProvider>,
+        vision_files: Option<VisionFiles>,
+        loaded_revision: u64,
+    },
+}
+
+#[cfg(feature = "local-host")]
+impl CachedProvider {
+    fn for_chat(&self) -> Arc<dyn harw_core::ModelProvider> {
+        match self {
+            Self::Other(model) => Arc::clone(model),
+            Self::Local { model, .. } => model.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "local-host")]
+#[derive(Clone, PartialEq, Eq)]
+struct VisionFiles {
+    model: VisionFileFingerprint,
+    projector: VisionFileFingerprint,
+}
+
+/// A concrete non-lean private GGUF/projector pair, prepared while its
+/// caller is foreground-authorized. Owns only the exact local engine/path
+/// identity and the remapping fence; no host, route resolver or vault.
+#[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+pub(crate) struct PinnedPrivateAssistantVision {
+    selected: (String, VisionFiles),
+    home: crate::home::AppHome,
+    model: Arc<harw_llama::LocalGgufProvider>,
+    _mapping: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+impl PinnedPrivateAssistantVision {
+    pub(crate) fn is_current(&self) -> bool {
+        private_assistant_vision_selection(&self.home).as_ref() == Some(&self.selected)
+    }
+
+    /// Consume the pin. Dispatch cannot load/reselect an engine or fall back
+    /// to HTTP or captions. Await native completion before dropping the fence.
+    pub(crate) async fn respond(
+        self, request: harw_core::ModelRequest, jpeg: impl AsRef<[u8]> + Send + 'static,
+        first_output: impl FnOnce() + Send + 'static,
+    ) -> Result<harw_core::ModelResponse, crate::uia_room::PrivateVisionError> {
+        use crate::uia_room::PrivateVisionError::{Cancelled, Incomplete, Inference, Model};
+        let cancel = request.cancel.clone().ok_or(Cancelled)?;
+        if cancel.is_cancelled() { return Err(Cancelled); }
+        if !self.is_current() { return Err(Model); }
+        let result = self.model.respond_with_private_image_observed(request, jpeg, first_output).await;
+        if cancel.is_cancelled() { return Err(Cancelled); }
+        if !self.is_current() { return Err(Model); }
+        result.map_err(|error| match error {
+            harw_core::ModelError::Cancelled => Cancelled,
+            harw_core::ModelError::ContextLength { .. } => Incomplete,
+            _ => Inference,
+        })
+    }
+}
+
+/// Exact files of the active local profile and explicitly selected GGUF.
+#[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+fn private_assistant_vision_selection(home: &crate::home::AppHome) -> Option<(String, VisionFiles)> {
+    let active = harw_home::active_profile_name(home.home());
+    if harw_home::profile_dir(home.home(), &active).ok().as_deref() != Some(home.profile_dir()) {
+        return None;
+    }
+    let id = home.active_local_model().ok()??;
+    let dir = home.local_models_dir()?;
+    let projector = crate::models::vision_path_in(std::path::Path::new(&dir), &id)?;
+    let model = crate::models::model_path(dir, id.clone()).ok()?;
+    Some((id, vision_files(&model, Some(&projector))?))
+}
+
+#[cfg(feature = "local-host")]
+#[derive(Clone, PartialEq, Eq)]
+struct VisionFileFingerprint {
+    path: String,
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    file_identity: (u64, u64, i64, i64),
+}
+
+#[cfg(feature = "local-host")]
+fn vision_file_fingerprint(path: &str) -> Option<VisionFileFingerprint> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some(VisionFileFingerprint {
+        path: path.to_owned(),
+        length: meta.len(),
+        modified: meta.modified().ok()?,
+        #[cfg(unix)]
+        file_identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+    })
+}
+
+#[cfg(feature = "local-host")]
+fn vision_files(path: &str, projector: Option<&str>) -> Option<VisionFiles> {
+    Some(VisionFiles {
+        model: vision_file_fingerprint(path)?,
+        projector: vision_file_fingerprint(projector?)?,
+    })
+}
+
+#[cfg(feature = "local-host")]
+static MODEL_REVISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Path, size and modification time of the projector of the active on-device
 /// model; a changed value means the model must be reloaded (the add-on was
@@ -148,14 +327,20 @@ fn provider_revision(
 ) -> Option<blake3::Hash> {
     use std::io::Read;
     let (provider, _) = selection?;
-    if provider == crate::home::LOCAL_ROUTE_ID || !provider.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
-    }) {
+    if provider == crate::home::LOCAL_ROUTE_ID
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
         return None;
     }
     let path = home.providers_dir().join(format!("{provider}.toml"));
     let mut bytes = Vec::new();
-    std::fs::File::open(path).ok()?.take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    std::fs::File::open(path)
+        .ok()?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
     (bytes.len() <= 64 * 1024).then(|| blake3::hash(&bytes))
 }
 
@@ -173,16 +358,19 @@ impl SwitchingModel {
         if !harw_llama::engine_available() {
             return Ok(None);
         }
-        Ok(self.home.active_local_model()?.filter(|id| {
-            id.starts_with("qwen3.5-") || id.starts_with("qwen3-")
-        }))
+        Ok(self
+            .home
+            .active_local_model()?
+            .filter(|id| id.starts_with("qwen3.5-") || id.starts_with("qwen3-")))
     }
 
     pub(crate) async fn pin_hybrid_qwen(
         &self,
         selected: &str,
     ) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
-        let changed = || MobileError::Session { detail: "Das gewählte lokale Qwen ist nicht aktiv".into() };
+        let changed = || MobileError::Session {
+            detail: "Das gewählte lokale Qwen ist nicht aktiv".into(),
+        };
         if self.hybrid_qwen_id()?.as_deref() != Some(selected) {
             return Err(changed());
         }
@@ -195,25 +383,281 @@ impl SwitchingModel {
         Ok(provider)
     }
 
+    /// Pin the locally selected GGUF without constructing or falling back to
+    /// an HTTP provider, even if the profile changes while loading.
+    pub(crate) async fn pin_local_assistant_model(
+        &self,
+    ) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
+        let missing = || MobileError::Session {
+            detail: "Wähle zuerst ein lokales GGUF-Modell".into(),
+        };
+        let selected_file = || -> Result<(String, VisionFileFingerprint), MobileError> {
+            let id = self.home.active_local_model()?.ok_or_else(missing)?;
+            let dir = self.home.local_models_dir().ok_or_else(missing)?;
+            let path = crate::models::model_path(dir, id.clone()).map_err(|_| missing())?;
+            let file = vision_file_fingerprint(&path).ok_or_else(missing)?;
+            Ok((id, file))
+        };
+        let (id, file) = selected_file()?;
+        // The UIA text-only provider is distinct from the coding/vision
+        // profile even when it maps the same GGUF.
+        let wanted = ModelCacheKey::LocalAssistant(id.clone(), file.clone());
+        let mut current = self.current.lock().await;
+        if selected_file()? != (id.clone(), file.clone()) {
+            return Err(missing());
+        }
+        if current.0 != wanted || !crate::uia_room::is_pinned_local(&current.3.for_chat(), &id) {
+            // Release the old model before mapping another; share the same
+            // cache lock as the coding host.
+            current.3 = CachedProvider::Other(Arc::new(NoModel));
+            let home = self.home.clone();
+            let selected = id.clone();
+            let built = load_model(move || build_local_assistant_gguf(&home, &selected))
+                .await
+                .map_err(|_| missing())??;
+            *current = (wanted, None, None, built);
+        }
+        if selected_file()? != (id.clone(), file)
+            || !crate::uia_room::is_pinned_local(&current.3.for_chat(), &id)
+        {
+            return Err(missing());
+        }
+        Ok(current.3.for_chat())
+    }
+
+    /// Resolve and load only the exact local model/projector. The caller's
+    /// native authorization is still live here; model admission is complete
+    /// before a durable inference attempt can be created.
+    #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+    pub(crate) async fn pin_private_assistant_vision(
+        &self, cancel: &harw_core::cancel::CancelToken,
+    ) -> Result<PinnedPrivateAssistantVision, crate::uia_room::PrivateVisionError> {
+        use crate::uia_room::PrivateVisionError::{Busy, Cancelled, Model};
+        use harw_core::ModelProvider as _;
+
+        let selected = private_assistant_vision_selection(&self.home).ok_or(Model)?;
+        let wanted = ModelCacheKey::PrivateAssistantVision(selected.0.clone(), selected.1.clone());
+        let mut current = self.current.try_lock().map_err(|_| Busy)?;
+        let mut mapping = Arc::clone(&LOCAL_MODEL_LIFECYCLE).try_lock_owned().map_err(|_| Busy)?;
+        if cancel.is_cancelled() { return Err(Cancelled); }
+        let cached_exact = current.0 == wanted && matches!(
+            &current.3,
+            CachedProvider::Local { model, vision_files: Some(files), .. }
+                if files == &selected.1 && model.supports_vision()
+        );
+        if !cached_exact {
+            // Fence out another load or vision worker until this exact native
+            // operation finishes. Don't retain two GGUF mappings in the cache.
+            LOCAL_INFERENCE.wait_idle().await;
+            if cancel.is_cancelled() { return Err(Cancelled); }
+            current.3 = CachedProvider::Other(Arc::new(NoModel));
+            let home = self.home.clone();
+            let id = selected.0.clone();
+            // Keep remapping exclusion with the blocking loader even if
+            // the preparing future is dropped while native GGUF opens.
+            let (built, held_mapping) = tokio::task::spawn_blocking(move || {
+                let result = build_local_gguf_profile(&home, &id, false, true);
+                (result, mapping)
+            }).await.map_err(|_| Model)?;
+            mapping = held_mapping;
+            let built = built.map_err(|_| Model)?;
+            // Do not cache failed/changed projector loads as a valid pin.
+            if !matches!(&built, CachedProvider::Local { vision_files: Some(files), .. } if files == &selected.1) {
+                return Err(Model);
+            }
+            *current = (wanted, None, None, built);
+        }
+        if cancel.is_cancelled() { return Err(Cancelled); }
+        if private_assistant_vision_selection(&self.home).as_ref() != Some(&selected) {
+            return Err(Model);
+        }
+        let CachedProvider::Local { model, vision_files: Some(files), .. } = &current.3 else {
+            return Err(Model);
+        };
+        if files != &selected.1 || model.pinned_model_id().as_deref() != Some(selected.0.as_str())
+            || model.pinned_provider_id().as_deref() != Some(harw_llama::LOCAL_PROVIDER_ID)
+            || !model.supports_vision()
+        {
+            return Err(Model);
+        }
+        let model = Arc::clone(model);
+        drop(current);
+        Ok(PinnedPrivateAssistantVision {
+            selected, home: self.home.clone(), model, _mapping: mapping,
+        })
+    }
+
+    pub(crate) fn session_title_local_choices(&self) -> Result<Vec<crate::SessionTitleLocalChoice>, MobileError> {
+        let current = self.current.try_lock().map_err(|_| local_vision_busy())?;
+        Ok(self.loaded_title_model(&current.0, &current.3)?
+            .map(|(_, choice)| choice).into_iter().collect())
+    }
+
+    fn loaded_title_model<'a>(
+        &self,
+        key: &ModelCacheKey,
+        cached: &'a CachedProvider,
+    ) -> Result<Option<(&'a harw_llama::LocalGgufProvider, crate::SessionTitleLocalChoice)>, MobileError> {
+        use harw_core::ModelProvider as _;
+        let active = harw_home::active_profile_name(self.home.home());
+        if harw_home::profile_dir(self.home.home(), &active).ok().as_deref() != Some(self.home.profile_dir()) {
+            return Ok(None);
+        }
+        let Some(id) = self.home.active_local_model()? else { return Ok(None); };
+        let matches_key = match key {
+            ModelCacheKey::Route(Some((provider, model))) => provider == crate::home::LOCAL_ROUTE_ID && model == &id,
+            ModelCacheKey::LocalAssistant(model, _) => model == &id,
+            _ => false,
+        };
+        let CachedProvider::Local { model, loaded_revision, .. } = cached else { return Ok(None); };
+        if !matches_key || model.pinned_provider_id().as_deref() != Some(harw_llama::LOCAL_PROVIDER_ID) ||
+            model.pinned_model_id().as_deref() != Some(id.as_str())
+        {
+            return Ok(None);
+        }
+        Ok(Some((model.as_ref(), crate::SessionTitleLocalChoice {
+            model_id: id,
+            loaded_revision: *loaded_revision,
+        })))
+    }
+
+    pub(crate) async fn generate_pinned_local_title(
+        &self,
+        choice: &crate::SessionTitleLocalChoice,
+        prompt: String,
+        cancel: &harw_types::cancel::CancelToken,
+    ) -> Result<String, MobileError> {
+        use harw_core::ModelProvider as _;
+        let current = self.current.try_lock().map_err(|_| local_vision_busy())?;
+        let _lifecycle = Arc::clone(&LOCAL_MODEL_LIFECYCLE).try_lock_owned()
+            .map_err(|_| local_vision_busy())?;
+        let (model, _) = self.loaded_title_model(&current.0, &current.3)?
+            .filter(|(_, loaded)| loaded == choice)
+            .ok_or_else(|| MobileError::Session { detail: "Das gewählte lokale Titelmodell ist nicht mehr geladen.".into() })?;
+        if cancel.is_cancelled() { return Err(MobileError::Disconnected); }
+        let request = crate::session_title::local_request(prompt, cancel.clone());
+        let result = model.respond(request).await;
+        LOCAL_INFERENCE.wait_idle().await;
+        let output = result.map_err(|_| MobileError::Session { detail: "Das lokale Modell hat keinen Titel geliefert.".into() })?;
+        if cancel.is_cancelled() { return Err(MobileError::Disconnected); }
+        crate::session_title::complete_response(output)
+    }
+
+    pub(crate) fn local_vision_choices(
+        &self,
+    ) -> Result<Vec<crate::LocalVisionChoice>, MobileError> {
+        let current = self.current.try_lock().map_err(|_| local_vision_busy())?;
+        let Some(model_id) = self.home.active_local_model()? else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .exact_loaded_vision(&model_id, &current.0, &current.3)
+            .map(|(model, loaded_revision)| crate::LocalVisionChoice {
+                model_id,
+                effective_parallelism: model.effective_image_concurrency() as u8,
+                loaded_revision,
+            })
+            .into_iter()
+            .collect())
+    }
+
+    fn exact_loaded_vision<'a>(
+        &self,
+        selected: &str,
+        key: &ModelCacheKey,
+        entry: &'a CachedProvider,
+    ) -> Option<(&'a harw_llama::LocalGgufProvider, u64)> {
+        use harw_core::ModelProvider as _;
+
+        let ModelCacheKey::Route(Some((provider, model_id))) = key else {
+            return None;
+        };
+        let CachedProvider::Local {
+            model,
+            vision_files: Some(loaded_files),
+            loaded_revision,
+        } = entry
+        else {
+            return None;
+        };
+        if provider != crate::home::LOCAL_ROUTE_ID
+            || model_id != selected
+            || self.home.active_local_model().ok()?.as_deref() != Some(selected)
+            || model.pinned_model_id()?.as_str() != selected
+            || !model.supports_vision()
+        {
+            return None;
+        }
+        let dir = self.home.local_models_dir()?;
+        let mmproj = crate::models::vision_path_in(std::path::Path::new(&dir), selected)?;
+        let gguf = crate::models::model_path(dir, selected.to_owned()).ok()?;
+        (vision_files(&gguf, Some(&mmproj)).as_ref() == Some(loaded_files))
+            .then_some((model.as_ref(), *loaded_revision))
+    }
+
+    /// Acquire cache and process-wide load exclusion without ever activating or
+    /// mapping another model. Even a disconnected or cancelled FFI caller keeps
+    /// its supervisor working through the last blocking native worker.
+    pub(crate) async fn describe_pinned_local_vision(
+        &self,
+        choice: &crate::LocalVisionChoice,
+        images: Vec<(u64, Arc<[u8]>)>,
+        cancel: &harw_types::cancel::CancelToken,
+        on_result: &(dyn Fn(harw_llama::LocalImageDescription) + Send + Sync),
+    ) -> Result<(), MobileError> {
+        let current = self.current.try_lock().map_err(|_| local_vision_busy())?;
+        let _lifecycle = Arc::clone(&LOCAL_MODEL_LIFECYCLE)
+            .try_lock_owned()
+            .map_err(|_| local_vision_busy())?;
+        let (model, _) = self.exact_loaded_vision(&choice.model_id, &current.0, &current.3)
+            .filter(|(_, revision)| *revision == choice.loaded_revision)
+            .ok_or_else(|| MobileError::Session {
+            detail: "Das ausgewählte GGUF-Modell oder sein Projektor ist nicht mehr geladen. Bitte Auswahl aktualisieren.".into(),
+        })?;
+        let result = model
+            .describe_selected_images(images, cancel, on_result)
+            .await;
+        LOCAL_INFERENCE.wait_idle().await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(harw_core::ModelError::Cancelled) => Err(MobileError::Session {
+                detail: "Lokale Bildanalyse gestoppt.".into(),
+            }),
+            Err(_) => Err(MobileError::Session {
+                detail: "Lokale Bildanalyse fehlgeschlagen.".into(),
+            }),
+        }
+    }
+
     async fn provider(&self) -> Result<Arc<dyn harw_core::ModelProvider>, harw_core::ModelError> {
         let failed = |detail: String| harw_core::ModelError::RequestFailed(detail);
-        let wanted = self.home.active_route().map_err(|e| failed(e.to_string()))?;
+        let wanted = self
+            .home
+            .active_route()
+            .map_err(|e| failed(e.to_string()))?;
         let fingerprint = projector_fingerprint(&self.home);
         let revision = provider_revision(&self.home, wanted.as_ref());
+        let wanted = ModelCacheKey::Route(wanted);
         let mut current = self.current.lock().await;
         if current.0 != wanted || current.1 != fingerprint || current.2 != revision {
             // Release the old model first: two loaded GGUFs do not fit in memory.
-            let placeholder: Arc<dyn harw_core::ModelProvider> = Arc::new(NoModel);
-            current.3 = placeholder;
+            current.3 = CachedProvider::Other(Arc::new(NoModel));
             let home = self.home.clone();
             let resolver = self.resolver.clone();
-            let built = tokio::task::spawn_blocking(move || build_active_model(&home, &resolver))
+            let built = load_model(move || build_active_model(&home, &resolver))
                 .await
                 .map_err(|_| failed("on-device model switch failed".to_owned()))?
                 .map_err(|e| failed(e.to_string()))?;
             *current = (wanted, fingerprint, revision, built);
         }
-        Ok(Arc::clone(&current.3))
+        Ok(current.3.for_chat())
+    }
+}
+
+#[cfg(feature = "local-host")]
+fn local_vision_busy() -> MobileError {
+    MobileError::Busy {
+        detail: "Das lokale Modell wird gerade verwendet oder lädt noch.".into(),
     }
 }
 
@@ -224,9 +668,11 @@ impl harw_core::ModelProvider for SwitchingModel {
             let provider = self.provider().await?;
             // Pro Chat gewählte UIA: ihre Persona ersetzt die der aktiven UIA in der Systemanweisung.
             if let Some(session) = harw_core::current_session_id()
-                && let Some((chosen, active)) = crate::uia::session_persona(&self.home, session.as_str())
+                && let Some((chosen, active)) =
+                    crate::uia::session_persona(&self.home, session.as_str())
             {
-                request.system_prompt = swap_persona(&request.system_prompt, &chosen, active.as_deref());
+                request.system_prompt =
+                    swap_persona(&request.system_prompt, &chosen, active.as_deref());
             }
             request.model_id = None;
             request.provider_id = None;
@@ -289,10 +735,10 @@ const LEAN_TOOLS: &[&str] = &[
 fn build_active_model(
     home: &crate::home::AppHome,
     resolver: &crate::secrets::KeystoreSecretResolver,
-) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
+) -> Result<CachedProvider, MobileError> {
     match home.active_local_model()? {
         Some(model_id) => build_local_gguf(home, &model_id),
-        None => crate::providers::build_model_provider(home, resolver),
+        None => crate::providers::build_model_provider(home, resolver).map(CachedProvider::Other),
     }
 }
 
@@ -332,7 +778,25 @@ fn local_gguf_config() -> harw_llama::LocalGgufConfig {
 fn build_local_gguf(
     home: &crate::home::AppHome,
     model_id: &str,
-) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
+) -> Result<CachedProvider, MobileError> {
+    build_local_gguf_profile(home, model_id, true, true)
+}
+
+#[cfg(feature = "local-host")]
+fn build_local_assistant_gguf(
+    home: &crate::home::AppHome,
+    model_id: &str,
+) -> Result<CachedProvider, MobileError> {
+    build_local_gguf_profile(home, model_id, false, false)
+}
+
+#[cfg(feature = "local-host")]
+fn build_local_gguf_profile(
+    home: &crate::home::AppHome,
+    model_id: &str,
+    coding_profile: bool,
+    needs_projector: bool,
+) -> Result<CachedProvider, MobileError> {
     let session = |detail: String| MobileError::Session { detail };
     if !harw_llama::engine_available() {
         return Err(session(
@@ -343,24 +807,42 @@ fn build_local_gguf(
         session("the on-device model folder is unknown; choose the model again".to_owned())
     })?;
     // Fails unless the file is complete and readable (e.g. deleted since selecting).
-    let vision = crate::models::vision_path_in(std::path::Path::new(&models_dir), model_id);
+    let vision = needs_projector
+        .then(|| crate::models::vision_path_in(std::path::Path::new(&models_dir), model_id))
+        .flatten();
+    if needs_projector && !coding_profile && vision.is_none() {
+        return Err(session("the private assistant needs a local vision projector".into()));
+    }
     let path = crate::models::model_path(models_dir, model_id.to_owned())?;
+    let before = vision_files(&path, vision.as_deref());
     let mut config = local_gguf_config();
     let has_projector = vision.is_some();
-    config.mmproj = vision.map(Into::into);
-    let provider = harw_llama::LocalGgufProvider::open(
-        std::path::Path::new(&path),
-        model_id,
-        config,
-    )
-    .map_err(|e| session(e.to_string()))?;
-    crate::models::set_local_vision_status(crate::models::LocalVisionStatus {
-        model_id: model_id.to_owned(),
-        projector_present: has_projector,
-        loaded: provider.supports_vision(),
-        error: provider.vision_error().map(str::to_owned),
+    config.mmproj = vision.as_deref().map(Into::into);
+    if !coding_profile {
+        // The ordinary lean profile substitutes its own system prompt. The
+        // tool-free room must keep its explicit personal-assistant prompt.
+        config.lean = false;
+    }
+    let provider =
+        harw_llama::LocalGgufProvider::open(std::path::Path::new(&path), model_id, config)
+            .map_err(|e| session(e.to_string()))?;
+    if coding_profile {
+        crate::models::set_local_vision_status(crate::models::LocalVisionStatus {
+            model_id: model_id.to_owned(),
+            projector_present: has_projector,
+            loaded: provider.supports_vision(),
+            error: provider.vision_error().map(str::to_owned),
+        });
+    }
+    let vision_files = before.filter(|checked| {
+        provider.supports_vision()
+            && vision_files(&path, vision.as_deref()).as_ref() == Some(checked)
     });
-    Ok(Arc::new(provider))
+    Ok(CachedProvider::Local {
+        model: Arc::new(provider),
+        vision_files,
+        loaded_revision: MODEL_REVISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 /// Starts the host over `model` without device tools.
@@ -391,7 +873,7 @@ async fn open_local_with_tools(
     let config = home.local_host_config();
     let projects_root = Some(home.projects_dir());
     let host = tokio::task::spawn_blocking(move || {
-        harw_local_host::LocalHost::open_with_projects(
+        harw_local_host::LocalHost::open_phone_with_projects(
             config,
             model,
             contributors,
@@ -469,6 +951,28 @@ mod tests {
         Arc::new(harw_core::EchoModelProvider::new("hi"))
     }
 
+    #[cfg(feature = "vault-uia-chat")]
+    #[test]
+    fn local_uia_scope_is_independent_of_model_availability() -> TestResult {
+        let app = tempfile::tempdir()?;
+        let other = tempfile::tempdir()?;
+        let home = AppHome::open(app.path())?;
+        let key = uia_home_key(&home);
+        assert!(matches_uia_home(&home, app.path()));
+        assert!(!matches_uia_home(&home, other.path()));
+        assert_ne!(key, uia_home_key(&AppHome::open(other.path())?));
+
+        home.set_active_route("example-api", "example-model")?;
+        assert_eq!(home.active_local_model()?, None);
+        assert_eq!(uia_home_key(&home), key);
+
+        home.set_active_route(crate::home::LOCAL_ROUTE_ID, "missing-gguf")?;
+        assert!(home.local_models_dir().is_none());
+        assert!(matches_uia_home(&home, app.path()));
+        assert_eq!(uia_home_key(&home), key);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_backend_creates_and_lists_a_session() -> TestResult {
         let dir = tempfile::tempdir()?;
@@ -532,4 +1036,30 @@ mod tests {
             Some(MobileError::Session { detail }) if detail == LOCAL_HOST_UNAVAILABLE
         ));
     }
+}
+
+#[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+pub(crate) fn uia_profile_key(files: &std::path::Path) -> Option<String> {
+    Some(uia_home_key(&uia_runtime_for(files)?.home))
+}
+
+/// Pin the selected profile of the actual model runtime being admitted,
+/// not of a replacement runtime that could have raced with lookup.
+#[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+pub(crate) fn uia_runtime_profile_key(
+    runtime: &SwitchingModel, files: &std::path::Path,
+) -> Option<String> {
+    matches_uia_home(&runtime.home, files).then(|| uia_home_key(&runtime.home))
+}
+
+/// Opening an authenticated room or Library is a storage operation, not a
+/// model request. A missing, changed, or API model must not lock the vault or
+/// change its owner. Send and caption retain their independent model checks.
+#[cfg(all(feature = "vault-uia-chat", any(target_os = "android", test)))]
+fn uia_home_key(home: &crate::home::AppHome) -> String {
+    // No raw local profile, path or cloud identity exported to Kotlin.
+    // Keep the original derivation domain so opted-in installations reopen.
+    let mut key = blake3::Hasher::new_derive_key("harw local uia development profile registration v1");
+    key.update(home.profile_dir().as_os_str().as_encoded_bytes());
+    key.finalize().to_hex().to_string()
 }

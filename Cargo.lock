@@ -290,6 +290,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "arti-client"
@@ -782,6 +785,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -3161,6 +3165,7 @@ dependencies = [
  "harw-channel",
  "harw-channel-telegram",
  "harw-channel-telegram-transport",
+ "harw-cloud-gateway",
  "harw-command",
  "harw-completions",
  "harw-config",
@@ -3270,10 +3275,21 @@ name = "harw-cloud-gateway"
 version = "0.10.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
+ "harw-fsutil",
+ "harw-infra-client",
+ "harw-node-transport",
+ "harw-onion",
+ "harw-protocol",
+ "harw-session-host",
+ "http",
+ "http-body-util",
  "pingora",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
+ "tower-service",
  "tracing",
 ]
 
@@ -4503,6 +4519,8 @@ dependencies = [
  "harw-config",
  "harw-core",
  "harw-extension-api",
+ "harw-operations",
+ "harw-ops",
  "harw-protocol",
  "harw-registry-defaults",
  "harw-runtime",
@@ -4676,6 +4694,7 @@ version = "0.10.0"
 dependencies = [
  "bytes",
  "fs4",
+ "getrandom 0.4.3",
  "harw-macros",
  "harw-types",
  "http-body-util",
@@ -5209,6 +5228,7 @@ dependencies = [
  "harw-observe",
  "harw-operations",
  "harw-ops",
+ "harw-placement-model",
  "harw-plan",
  "harw-plan-bridge",
  "harw-project-discovery",
@@ -5421,7 +5441,11 @@ dependencies = [
 name = "harw-session-host"
 version = "0.10.0"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.23.1",
+ "blake3",
+ "chacha20poly1305 0.11.0",
+ "crypt_guard",
  "fs4",
  "getrandom 0.4.3",
  "harw-authority",
@@ -5440,6 +5464,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -5482,6 +5507,7 @@ dependencies = [
  "jiff 0.2.37",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
  "tracing",
 ]
@@ -5492,8 +5518,10 @@ version = "0.10.0"
 dependencies = [
  "bytes",
  "futures-util",
+ "harw-media",
  "harw-protocol",
  "harw-session-host",
+ "harw-session-store",
  "harw-types",
  "http",
  "http-body-util",

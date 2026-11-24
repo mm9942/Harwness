@@ -15,6 +15,7 @@ use crate::mission::Mission;
 use crate::{
     ApprovalDecision, ApprovalRisk, MobileAgentState, MobileApproval, MobileError, MobileSession,
     MobileSessionState, MobileToolState, SessionSnapshot, TranscriptEntry, TranscriptKind,
+    UserTranscriptPresentation,
 };
 
 const MAX_LIVE_TEXT_BYTES: usize = 1024 * 1024;
@@ -29,14 +30,15 @@ pub(crate) struct SessionState {
     deciding: HashSet<ApprovalId>,
     partial: Option<PartialText>,
     running_turn: Option<TurnId>,
+    last_turn_aborted: bool,
     live_reasoning: Option<(TurnId, String)>,
     head: Option<Cursor>,
     replay_target: Option<Cursor>,
-    /// Nach einem "Neu senden" (rewind_before) erwartet: der nächste *live* gemeldete Verlaufsersatz lädt den Chat neu.
-    expect_history_replace: bool,
     host_epoch: Option<u64>,
     granted: ClientCaps,
     ready: bool,
+    #[cfg(feature = "onion")]
+    owner_status_scope: Option<CancellationToken>,
     readonly: bool,
     closed: bool,
     last_sync_millis: Option<i64>,
@@ -188,12 +190,15 @@ impl SessionState {
     pub fn resume(&mut self, host_epoch: u64) -> Option<Cursor> {
         if self.host_epoch != Some(host_epoch) {
             self.reset_view();
+            self.restart_hint = false;
         }
         self.host_epoch = Some(host_epoch);
         self.head
     }
 
     pub fn begin_attach(&mut self, detail: &str) {
+        #[cfg(feature = "onion")]
+        self.clear_owner_status_scope();
         self.ready = false;
         self.granted = ClientCaps::NONE;
         self.detail = Some(detail.into());
@@ -203,11 +208,13 @@ impl SessionState {
         if fresh {
             // Stored message IDs can differ from their live IDs. Rebuild the
             // authoritative tail as one transcript, including user prompts.
+            let aborted = self.last_turn_aborted;
             let failure = self
                 .server_error
                 .take()
                 .or_else(|| self.view.last_failure().map(str::to_owned));
             self.reset_view();
+            self.last_turn_aborted = aborted;
             self.server_error = failure;
         }
         self.granted = ack.granted;
@@ -267,6 +274,7 @@ impl SessionState {
         self.live_reasoning = None;
         self.last_sync_millis = None;
         self.server_error = None;
+        self.last_turn_aborted = false;
     }
 
     pub fn observe(&mut self, envelope: &FrameEnvelope) -> FrameAction {
@@ -275,14 +283,6 @@ impl SessionState {
             SessionFrame::Revoked => return FrameAction::Revoked,
             SessionFrame::HostDraining { retry_after_ms } => {
                 return FrameAction::Draining(*retry_after_ms);
-            }
-            SessionFrame::HistoryReplaced { .. } if self.expect_history_replace => {
-                // Nur der durch unser Neu-Senden ausgelöste, live gemeldete Ersatz lädt neu; beim Wiederholen alter
-                // Verlaufsersätze (Replay beim Anhängen, Verdichtung) wird er ignoriert, sonst entstünde eine Schleife.
-                self.expect_history_replace = false;
-                self.reset_view();
-                self.begin_attach("Refreshing transcript after your edit");
-                return FrameAction::Reattach(None);
             }
             SessionFrame::Resync { .. } => {
                 self.reset_view();
@@ -346,6 +346,7 @@ impl SessionState {
                 ..
             } => {
                 self.running_turn = Some(turn_id.clone());
+                self.last_turn_aborted = false;
                 self.live_reasoning = None;
                 if let Some(text) = reasoning_text {
                     self.append_visible_reasoning(turn_id, text);
@@ -358,6 +359,7 @@ impl SessionState {
             }
             SessionFrame::Turn(TurnEvent::TurnStarted { turn_id, .. }) => {
                 self.running_turn = Some(turn_id.clone());
+                self.last_turn_aborted = false;
                 if self.live_reasoning.as_ref().is_some_and(|(id, _)| id != turn_id) {
                     self.live_reasoning = None;
                 }
@@ -372,10 +374,17 @@ impl SessionState {
                 }
             }
             SessionFrame::Turn(
-                TurnEvent::TurnCompleted { .. }
-                | TurnEvent::TurnAborted { .. }
-                | TurnEvent::TurnFailed { .. },
+                TurnEvent::TurnCompleted { turn_id, .. }
+                | TurnEvent::TurnAborted { turn_id, .. }
+                | TurnEvent::TurnFailed { turn_id, .. },
             ) => {
+                if self.running_turn.as_ref().is_some_and(|current| current != turn_id) {
+                    return FrameAction::Continue;
+                }
+                if self.running_turn.as_ref() == Some(turn_id) {
+                    self.last_turn_aborted = matches!(&envelope.frame,
+                        SessionFrame::Turn(TurnEvent::TurnAborted { .. }));
+                }
                 self.running_turn = None;
                 self.live_reasoning = None;
                 self.partial = None;
@@ -395,6 +404,8 @@ impl SessionState {
                 item: TurnItem::Reasoning(_),
             }) => self.clear_visible_reasoning(turn_id),
             SessionFrame::Session(SessionEvent::SessionClosed { .. }) => {
+                #[cfg(feature = "onion")]
+                self.clear_owner_status_scope();
                 self.closed = true;
                 self.running_turn = None;
                 return FrameAction::Closed;
@@ -602,11 +613,6 @@ impl SessionState {
         });
     }
 
-    /// Merkt, dass ein Neu-Senden (rewind_before) lief und der Verlaufsersatz erwartet wird.
-    pub fn expect_history_replace(&mut self) {
-        self.expect_history_replace = true;
-    }
-
     pub fn echo_prompt(
         &mut self,
         id: &SessionId,
@@ -687,6 +693,29 @@ impl SessionState {
         self.ready && self.granted.approve && !self.closed
     }
 
+    /// An exact ready view. Cancels even if the same worker starts replay
+    /// again while the general node connection remains online.
+    #[cfg(feature = "onion")]
+    pub(crate) fn owner_status_scope(&mut self) -> Option<CancellationToken> {
+        if !self.can_read_owner_status() {
+            return None;
+        }
+        Some(self.owner_status_scope.get_or_insert_with(CancellationToken::new).clone())
+    }
+
+    #[cfg(feature = "onion")]
+    pub(crate) fn can_read_owner_status(&self) -> bool {
+        self.ready && !self.closed && self.granted.observe
+            && self.worker.as_ref().is_some_and(|worker| !worker.stop.is_cancelled())
+    }
+
+    #[cfg(feature = "onion")]
+    fn clear_owner_status_scope(&mut self) {
+        if let Some(scope) = self.owner_status_scope.take() {
+            scope.cancel();
+        }
+    }
+
     pub fn require_live(&self) -> Result<(), MobileError> {
         if self.ready {
             Ok(())
@@ -744,6 +773,18 @@ impl SessionState {
         }
     }
 
+    /// A ready/current session attachment, not a cloned transcript tail.
+    pub(crate) fn auto_title_attachment(&self) -> Option<(u32, CancellationToken)> {
+        if !self.can_submit() {
+            return None;
+        }
+        let worker = self.worker.as_ref()?;
+        if worker.stop.is_cancelled() {
+            return None;
+        }
+        Some((self.head?.generation, worker.stop.clone()))
+    }
+
     pub fn snapshot(&self, session: &SessionId, connected: bool) -> SessionSnapshot {
         let online = connected && self.ready;
         let running_turn_id = self.running_turn_id().map(ToString::to_string);
@@ -760,8 +801,9 @@ impl SessionState {
             online,
             can_submit: online && self.can_submit(),
             can_approve: online && self.can_approve(),
-            can_interrupt: online && self.can_submit() && running_turn_id.is_some(),
+            can_interrupt: online && self.can_submit() && running_turn_id.is_some() && self.pending.is_empty(),
             running_turn_id,
+            last_turn_interrupted: self.last_turn_aborted || self.restart_hint,
             transcript: self.view.transcript().iter().map(project_entry).collect(),
             live_text: self.partial.as_ref().map(|partial| partial.text.clone()),
             live_reasoning: self.live_reasoning.as_ref()
@@ -857,6 +899,10 @@ fn project_entry(entry: &harw_mobile_core::Entry) -> TranscriptEntry {
         kind,
         text: text.clone(),
         tool_state,
+        user_presentation: entry.user_presentation.as_ref().map(|present| UserTranscriptPresentation {
+            text: present.text.clone(),
+            image_count: present.image_count,
+        }),
         images: entry
             .media
             .iter()

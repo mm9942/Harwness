@@ -559,6 +559,11 @@ pub enum StopReason {
     /// A response stream ended without a terminal event or finish reason.
     /// A visible answer prefix may be retained, but no tools may be accepted.
     StreamInterrupted,
+    /// Native provider body transport broke or hit a stream idle timeout after text was received.
+    StreamTransportInterrupted,
+    /// The provider sent a terminal incomplete status without a recognized cause.
+    /// This is not a filter or a regular end; partial tools are never accepted.
+    IncompleteUnknown,
     /// Eine konfigurierte Stop-Sequenz wurde erreicht.
     StopSequence,
     /// Der Provider hat den Turn pausiert (z. B. Anthropic `pause_turn` bei

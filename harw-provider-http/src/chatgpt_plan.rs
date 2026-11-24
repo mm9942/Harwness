@@ -126,39 +126,47 @@ pub(crate) async fn read_response(
     response: reqwest::Response,
     sink: Option<&StreamSink>,
     idle_timeout: Duration,
-) -> Result<Value, ModelError> {
+) -> Result<crate::sse::NativeStreamOutcome, ModelError> {
+    use crate::sse::{NativeStreamOutcome, ResponsesPartialText};
+
     let mut terminal = None;
-    crate::sse::read_sse(response, Some(idle_timeout), |frame| {
+    let mut partial = ResponsesPartialText::default();
+    let body_read = crate::sse::read_sse(response, Some(idle_timeout), |frame| {
         if frame.data.trim().is_empty() || frame.data.trim() == "[DONE]" {
             return Ok(false);
         }
         let event: Value = serde_json::from_str(&frame.data)?;
+        partial.observe(&event);
         let kind = event.get("type").and_then(Value::as_str);
-        match kind {
-            Some("response.failed" | "error") => {
-                return Err(response_error(&event).unwrap_or_else(|| {
-                    ModelError::RequestFailed(
-                        "ChatGPT plan response stream reported a failure".into(),
-                    )
-                }));
+        if !partial.has_text() {
+            match kind {
+                Some("response.failed" | "error") => {
+                    if let Some(error) = response_error(&event) {
+                        return Err(error);
+                    }
+                }
+                Some("response.cancelled") => return Err(ModelError::Cancelled),
+                _ => {}
             }
-            Some("response.cancelled") => return Err(ModelError::Cancelled),
-            _ => {}
         }
-        let value = crate::sse::responses_event(&event, sink)?;
+        let value = match partial.terminal_error(&event) {
+            Some(failure) => Some(failure),
+            None => crate::sse::responses_event(&event, sink)?,
+        };
         if let Some(value) = value {
-            if value
-                .get("output")
-                .and_then(Value::as_array)
-                .is_some_and(|output| {
-                    output.iter().any(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("function_call")
-                            && item
-                                .get("namespace")
-                                .and_then(Value::as_str)
-                                .is_some_and(|namespace| namespace != TOOL_NAMESPACE)
+            if value.get("status").and_then(Value::as_str).unwrap_or("completed") == "completed"
+                && value
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .is_some_and(|output| {
+                        output.iter().any(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("function_call")
+                                && item
+                                    .get("namespace")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|namespace| namespace != TOOL_NAMESPACE)
+                        })
                     })
-                })
             {
                 return Err(ModelError::RequestFailed(
                     "ChatGPT plan returned an unexpected tool namespace".into(),
@@ -168,10 +176,20 @@ pub(crate) async fn read_response(
         }
         Ok(terminal.is_some())
     })
-    .await?;
-    terminal.ok_or_else(|| ModelError::Truncated {
-        message: "ChatGPT plan response stream ended before its terminal event".into(),
-    })
+    .await;
+    match body_read {
+        Ok(()) => match terminal {
+            Some(body) => Ok(NativeStreamOutcome::Completed(partial.retain_visible_text(body))),
+            None if partial.has_text() => Ok(partial.into_interrupted(false)),
+            None => Err(ModelError::Truncated {
+                message: "ChatGPT plan response stream ended before its terminal event".into(),
+            }),
+        },
+        Err(ModelError::Truncated { .. } | ModelError::Timeout { .. }) if partial.has_text() => {
+            Ok(partial.into_interrupted(true))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -248,7 +266,11 @@ mod tests {
             .get(endpoint)
             .send()
             .await?;
-        let response = read_response(response, None, Duration::from_secs(3)).await?;
+        let crate::sse::NativeStreamOutcome::Completed(response) =
+            read_response(response, None, Duration::from_secs(3)).await?
+        else {
+            return Err(io::Error::other("expected completed plan stream").into());
+        };
         assert_eq!(response["status"], "completed");
         assert_eq!(response["output"][0]["call_id"], "call_1");
         server

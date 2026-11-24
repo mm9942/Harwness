@@ -2,6 +2,7 @@ package dev.harw.mobile
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -45,6 +46,12 @@ class ConnectionRouteTest {
         assertFalse(routeChoiceEnabled(RoutePreference.ONION, profile(null)))
         assertTrue(routeChoiceEnabled(RoutePreference.DIRECT, profile(null)))
         assertTrue(routeChoiceEnabled(RoutePreference.ONION, profile(vector)))
+        assertFalse(routeChoiceEnabled(RoutePreference.AUTO, profile(null)))
+        assertTrue(routeChoiceEnabled(RoutePreference.AUTO, profile(vector)))
+        val onionOnly = profile(vector).copy(endpoint = "")
+        assertEquals(listOf(ConnectionRoute.ONION), profileRoutes(onionOnly))
+        assertFalse(routeChoiceEnabled(RoutePreference.DIRECT, onionOnly))
+        assertFalse(routeChoiceEnabled(RoutePreference.AUTO, onionOnly))
     }
 
     @Test
@@ -84,12 +91,22 @@ class ConnectionRouteTest {
     }
 
     @Test
-    fun onionPreferenceResetsToAutoWithoutOnionProfile() {
-        for (choice in RoutePreference.values()) {
-            assertEquals(choice, normalizedPreference(choice, hasOnion = true))
-        }
-        assertEquals(RoutePreference.AUTO, normalizedPreference(RoutePreference.ONION, hasOnion = false))
-        assertEquals(RoutePreference.AUTO, normalizedPreference(RoutePreference.AUTO, hasOnion = false))
-        assertEquals(RoutePreference.DIRECT, normalizedPreference(RoutePreference.DIRECT, hasOnion = false))
+    fun missingOrMalformedScopedPreferenceNeverChoosesDirectOrAuto() {
+        assertEquals(RoutePreference.ONION, storedProfileRoute(null))
+        assertEquals(RoutePreference.ONION, storedProfileRoute("garbled"))
+        assertEquals(RoutePreference.ONION, storedProfileRoute("direct"))
+        assertEquals(RoutePreference.DIRECT, storedProfileRoute("DIRECT"))
+        assertEquals(RoutePreference.AUTO, storedProfileRoute("AUTO"))
+    }
+
+    @Test
+    fun consentKeyBindsBothLocatorsAndPinnedIdentityButNotLabel() {
+        val saved = profile(vector)
+        val key = saved.routePreferenceKey()
+        assertEquals(key, saved.copy(label = "Renamed").routePreferenceKey())
+        assertNotEquals(key, saved.copy(endpoint = "").routePreferenceKey())
+        assertNotEquals(key, saved.copy(onion = null).routePreferenceKey())
+        assertNotEquals(key, saved.copy(serverNodeId = "node-b").routePreferenceKey())
+        assertNotEquals(key, saved.copy(serverPublicKeyHex = "02".repeat(1952)).routePreferenceKey())
     }
 }

@@ -8,6 +8,8 @@ use std::sync::{
 use harw_types::cancel::CancelToken;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+const MAX_IMAGE_CONCURRENCY: u8 = 5;
+
 /// A live image-concurrency setting and the gate for all local generations
 /// sharing the same device budget. Clones share both.
 #[derive(Clone, Debug)]
@@ -27,20 +29,27 @@ impl Default for LocalInferenceControl {
 
 impl LocalInferenceControl {
     /// Changes the maximum simultaneous image descriptions for future calls.
-    /// Returns false and keeps the previous setting if `count` is not in 1..=3.
+    /// Returns false and keeps the previous setting if `count` is not in 1..=5.
     #[must_use]
     pub fn set_image_concurrency(&self, count: u8) -> bool {
-        if !(1..=3).contains(&count) {
+        if !(1..=MAX_IMAGE_CONCURRENCY).contains(&count) {
             return false;
         }
         self.image_concurrency.store(count, Ordering::Relaxed);
         true
     }
 
-    /// The number of image descriptions permitted for the next admitted call.
+    /// The configured limit; the loaded provider can admit fewer workers.
     #[must_use]
     pub fn image_concurrency(&self) -> usize {
         usize::from(self.image_concurrency.load(Ordering::Relaxed))
+    }
+
+    /// Wait until prior native workers (including queued blocking closures)
+    /// release their shared inference admission. Callers must separately
+    /// hold model-lifecycle exclusion if they intend to replace a model.
+    pub async fn wait_idle(&self) {
+        let _idle = self.gate.lock().await;
     }
 
     pub(crate) async fn begin(&self, cancel: Option<&CancelToken>) -> Option<InferencePermit> {
@@ -84,11 +93,11 @@ mod tests {
     fn range_is_validated_without_changing_last_selection() {
         let control = LocalInferenceControl::default();
         assert_eq!(control.image_concurrency(), 1);
-        for count in [2, 3, 1, 2] {
+        for count in [2, 3, 4, 5, 1, 2] {
             assert!(control.set_image_concurrency(count));
             assert_eq!(control.image_concurrency(), usize::from(count));
         }
-        for count in [0, 4, u8::MAX] {
+        for count in [0, 6, u8::MAX] {
             assert!(!control.set_image_concurrency(count));
             assert_eq!(control.image_concurrency(), 2);
         }
@@ -123,6 +132,47 @@ mod tests {
             .await
             .expect("next turn admitted");
         assert_eq!(next.image_concurrency(), 3);
+    }
+
+    #[test]
+    fn idle_wait_includes_a_cancelled_batch_worker_not_yet_started() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (pool_started, pool_ready) = tokio::sync::oneshot::channel();
+            let (free_pool, occupied) = std::sync::mpsc::channel();
+            let occupant = tokio::task::spawn_blocking(move || {
+                pool_started.send(()).expect("pool occupant started");
+                occupied.recv().expect("free blocking pool");
+            });
+            pool_ready.await.expect("blocking pool occupied");
+
+            let control = LocalInferenceControl::default();
+            let permit = control.begin(None).await.expect("vision permit");
+            let retained_by_worker = permit.clone();
+            let (worker_started, worker_ready) = tokio::sync::oneshot::channel();
+            let (allow_exit, wait_for_exit) = std::sync::mpsc::channel();
+            let queued = tokio::task::spawn_blocking(move || {
+                let _permit = retained_by_worker;
+                worker_started.send(()).expect("start queued worker");
+                wait_for_exit.recv().expect("worker actually exits");
+            });
+            // Represents a cancelled parent that owns only this permit clone.
+            drop(permit);
+            let drain = tokio::spawn(async move { control.wait_idle().await });
+            tokio::task::yield_now().await;
+            assert!(!drain.is_finished());
+
+            free_pool.send(()).expect("unblock pool");
+            worker_ready.await.expect("original queued job started");
+            assert!(!drain.is_finished());
+            allow_exit.send(()).expect("finish native work");
+            queued.await.expect("blocking join");
+            occupant.await.expect("occupant join");
+            drain.await.expect("idle barrier released");
+        });
     }
 
     #[tokio::test]

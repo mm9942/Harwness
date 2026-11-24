@@ -51,7 +51,14 @@ use crate::items::{ResultTrust, ToolCallResult, ToolPlacement};
 /// - 4: manage (`commands.list`, `command.run`, `catalog.get`, `config.get`),
 ///   stepup (`config.set`/`reset`, `secret.put`, `stepup.confirm`/`cancel`,
 ///   frame `stepup_request`).
-pub const SESSION_WIRE_MINOR: u32 = 4;
+/// - 5: optional durable archive checkpoint and exact inclusive fork (no edit).
+pub const SESSION_WIRE_MINOR: u32 = 5;
+
+/// First wire minor with feature `archive_checkpoint_v1`.
+pub const ARCHIVE_CHECKPOINT_WIRE_MINOR: u32 = 5;
+
+/// First wire minor with the opt-in direct owner status capability.
+pub const DIRECT_OWNER_STATUS_WIRE_MINOR: u32 = 5;
 
 /// First wire minor with the features `manage` and `stepup`.
 pub const MANAGE_WIRE_MINOR: u32 = 4;
@@ -119,9 +126,42 @@ pub mod features {
     pub const IMAGES: &str = "images";
     /// The host serves `media.get`: the stored bytes of a prompt image of a session the caller may observe. A client calls it only when the host granted this feature.
     pub const MEDIA: &str = "media";
+    pub const SESSION_MEDIA_PREVIEW_V1: &str = "session_media_preview_v1";
     /// Global jobs and agents views (`jobs.list`, `jobs.get`, `jobs.cancel`, `jobs.retry`,
     /// `agents.list`, `agents.stop`). Additive; needs no session.
     pub const OVERVIEW: &str = "overview";
+    /// Host-owned exact archive checkpoint, verified pages and inclusive fork (minor >= 5).
+    pub const ARCHIVE_CHECKPOINT_V1: &str = "archive_checkpoint_v1";
+    /// Explicit reassignment to a pre-existing project; never creates a directory.
+    pub const EXISTING_PROJECT_ASSIGNMENT_V1: &str = "existing_project_assignment_v1";
+    /// Owner-scoped title probe and compare-and-set publication.
+    pub const AUTO_TITLE_CAS_V1: &str = "auto_title_cas_v1";
+    pub const AUTO_TITLE_SEED_V1: &str = "auto_title_seed_v1";
+    /// Opt-in, metadata-only Dream rows in `session.page`.
+    pub const SESSION_DREAM_ROWS_V1: &str = "session_dream_rows_v1";
+    /// Dedicated, metadata-only System session page.
+    pub const SESSION_SYSTEM_ROWS_V1: &str = "session_system_rows_v1";
+    pub const CLOUD_ASSISTANT_V1: &str = "cloud_assistant_v1";
+    /// Explicit, bounded recall of completed pairs from the same Cloud Assistant room.
+    pub const CLOUD_ASSISTANT_RECALL_V1: &str = "cloud_assistant_recall_v1";
+    /// Explicit newly created shared room, separate from device-room v1.
+    pub const CLOUD_ASSISTANT_SHARED_V1: &str = "cloud_assistant_shared_v1";
+    pub const ARCHIVE_RETAINED_REWRITE_V1: &str = "archive_retained_rewrite_v1";
+    /// Exact retained edit/retry, atomic prompt replacement and live resync (minor >= 5).
+    pub const EXACT_REWIND_V1: &str = "exact_rewind_v1";
+    /// A retransmission at an old displayed revision can recover the exact
+    /// durable edit receipt, but may not execute a new stale edit.
+    pub const EXACT_REWIND_RECEIPT_V1: &str = "exact_rewind_receipt_v1";
+    /// The host enforces the exact optional TurnId in session.interrupt.
+    pub const EXACT_TURN_INTERRUPT_V1: &str = "exact_turn_interrupt_v1";
+    /// Explicitly installed, gateway-owned profile-bound encrypted Library.
+    pub const CLOUD_LIBRARY_V1: &str = "cloud_library_v1";
+    /// Explicit device-owner empty Cloud work publication with durable operation receipts.
+    pub const MANUAL_CLOUD_WORK_V1: &str = "manual_cloud_work_v1";
+    /// Optional direct owner connection: one exact status, no stream or control.
+    pub const DIRECT_OWNER_STATUS_V1: &str = "direct_owner_status_v1";
+    /// Separately negotiated exact selected placement, requiring an installed Hub verifier.
+    pub const DIRECT_OWNER_STATUS_FENCED_V1: &str = "direct_owner_status_fenced_v1";
 }
 
 /// Position in a session stream.
@@ -460,6 +500,28 @@ pub enum RowOrigin {
     Unknown,
 }
 
+/// Trusted purpose of a session-page row, independent of title and storage origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRowPurpose {
+    /// A Harw Dream transcript. Its internal prompt is not part of this surface.
+    Dream,
+    Diary,
+    Ledger,
+    MemoryReconciliation,
+    AutomaticWorkbench,
+    /// The server makes no purpose assertion about the row.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl SessionRowPurpose {
+    const fn is_unknown(value: &Self) -> bool {
+        matches!(value, Self::Unknown)
+    }
+}
+
 /// Why a row cannot be continued. Clients translate it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -517,6 +579,8 @@ pub struct SessionRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub origin: RowOrigin,
+    #[serde(default, skip_serializing_if = "SessionRowPurpose::is_unknown")]
+    pub purpose: SessionRowPurpose,
     pub continuable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<ReadOnlyReason>,
@@ -559,6 +623,13 @@ pub struct PageParams {
     pub query: Option<String>,
     #[serde(default)]
     pub include_archived: bool,
+    /// Send only after negotiating `session_dream_rows_v1`. False stays off the old wire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_dreams: bool,
+    /// Dedicated system-only page, never a request against a real project.
+    /// Requires `session_system_rows_v1` and excludes `include_dreams`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_system: bool,
     #[serde(default)]
     pub limit: Option<u32>,
     #[serde(default)]
@@ -588,6 +659,45 @@ pub struct CreateInParams {
 pub struct SetProjectParams {
     pub session_id: SessionId,
     pub project_key: String,
+}
+
+/// The caller may specify only an observed session and transcript generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoTitleSession {
+    pub session_id: SessionId,
+    pub expected_generation: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoTitlePublish {
+    pub scope: AutoTitleSession,
+    pub title: String,
+    /// Opaque digest of the exact authorized input, not the input itself.
+    pub seed_digest: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoTitleSeedPair {
+    pub user: String,
+    pub assistant: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoTitleSeed {
+    pub pairs: [AutoTitleSeedPair; 3],
+    pub digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoTitlePublication {
+    Applied,
+    AlreadyTitled,
+    Stale,
 }
 
 /// `session.rename`.
@@ -863,13 +973,67 @@ pub struct CreateParams {
     pub fork_from: Option<ForkFrom>,
 }
 
+/// Request has no title, workspace, model, prompt or local transcript fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManualCloudWorkCommandV1 {
+    CreateEmpty { operation_id: String },
+    Resolve { operation_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManualCloudWorkReplyV1 {
+    Created { session: SessionSummary },
+    /// No durable intent in this exact scope; never implies the client should re-submit.
+    Missing,
+    /// Intent exists, but its original target cannot be confirmed; never create a replacement.
+    OutcomeUnknown,
+}
+
 /// Source of a forked session (`session.create` with `fork_from`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForkFrom {
     pub session_id: SessionId,
-    /// Item id of a user message of the source session; the fork keeps everything before it.
+    /// Legacy fork boundary (exclusive). In displayed mode this names the final included row.
     pub before_item: String,
+    /// Optional exact current display request. An older host must reject rather than
+    /// silently interpreting this as a legacy exclusive fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<DisplayedForkV1>,
+}
+
+/// Either the complete displayed prefix or no fork; exceeding this bound is an error.
+pub const DISPLAYED_FORK_MAX_ROWS: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayedForkRoleV1 { User, Assistant }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayedForkRowV1 {
+    pub item_id: String,
+    pub role: DisplayedForkRoleV1,
+    /// Exact visible text and scoped canonical media identity, never content supplied for import.
+    pub body_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayedForkV1 {
+    pub head: Cursor,
+    pub rows: Vec<DisplayedForkRowV1>,
+    /// Requires the host to reserve a durable operation before creation.
+    /// Older hosts reject this field rather than making another child.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub durable_receipt: bool,
+}
+
+/// Canonical encoding shared by the phone projection and host verifier.
+pub fn displayed_fork_body_v1(text: &str, media: &[crate::MediaRef]) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&("harw/displayed-fork-body/v1", text, media))
 }
 
 /// Default number of durable items sent on an attach without a cursor.
@@ -910,6 +1074,154 @@ pub struct SessionRef {
     pub session_id: SessionId,
 }
 
+/// Status only, with no session selector or reusable authority in the response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerObservationStatus {
+    Idle,
+    Active,
+    Interrupted,
+    Failed,
+}
+
+/// A client observation used only for compare-and-capture. The host verifies
+/// its own current writer fence and never interprets this as archive authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivePositionV1 {
+    pub generation: u32,
+    pub durable_next: u64,
+}
+
+/// `session.revision_checkpoint.issue` captures a current server revision.
+/// The expected position is a freshness check, not proof of what a device
+/// displayed at that position. This does not enqueue an edit or run anything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointIssueV1 {
+    pub session_id: SessionId,
+    pub expected: ArchivePositionV1,
+}
+
+/// `session.revision_checkpoint.describe` re-authorizes a server-issued ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointDescribeV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+}
+
+/// Stable opaque revision handle. Not a bearer capability. No history,
+/// provider state, media bytes, or writable inputs are carried here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointInfoV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    pub revision: ArchivePositionV1,
+}
+
+/// Discover a fully retained predecessor of a completed source rewrite.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointPreviousV1 {
+    pub session_id: SessionId,
+    /// Optional exclusive continuation returned as before_sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sequence: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveRewriteCauseV1 {
+    UserEdit,
+    HistoryRewrite,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRetainedRevisionV1 {
+    pub checkpoint: ArchiveCheckpointInfoV1,
+    pub before_sequence: u64,
+    /// Timestamp of the replacement END record, not client time.
+    pub recorded_at: jiff::Timestamp,
+    pub cause: ArchiveRewriteCauseV1,
+}
+
+/// Exact occurrence inside one verified revision, never matched by text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRowLocatorV1 {
+    pub sequence: u64,
+    pub item_id: harw_types::ItemId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveVisibleRoleV1 {
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveVerifiedRowV1 {
+    pub locator: ArchiveRowLocatorV1,
+    pub role: ArchiveVisibleRoleV1,
+    pub text_parts: Vec<String>,
+    pub recorded_at: jiff::Timestamp,
+    // Images remain source-scoped; this response conveys no media grant.
+    pub image_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointPageV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointRowsV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    /// Ascending record order in this page.
+    pub rows: Vec<ArchiveVerifiedRowV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_sequence: Option<u64>,
+}
+
+/// Creates one durable target for this bound operation ID. Retry an unknown
+/// outcome with this exact request, never synthesize a second operation ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkInclusiveV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    pub row: ArchiveRowLocatorV1,
+    pub client_operation_id: String,
+    /// Optional exact display proof. An older host rejects the new field;
+    /// it must never fall back to exporting an unseen archived prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed_prefix: Option<ArchivedDisplayedPrefixV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivedDisplayedPrefixV1 {
+    pub row_count: u16,
+    pub digest: [u8; 32],
+}
+
+pub fn archived_displayed_prefix_v1(rows: &[DisplayedForkRowV1]) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&("harw/archived-displayed-fork-prefix/v1", rows))
+}
+
 /// `session.history`: page older durable frames.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -943,7 +1255,9 @@ pub struct SubmitParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<SubmitImage>,
     /// Item id of an earlier user message of this session: the history is cut before it and replaced,
-    /// then `text` runs as a new turn ("resend" replaces instead of duplicating).
+    /// then `text` runs as a new turn, retaining the original stored media. For
+    /// negotiated `exact_rewind_v1`, empty text retries the entire old prompt,
+    /// and client image payloads are not allowed when a rewind target is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewind_before: Option<String>,
 }
@@ -968,6 +1282,75 @@ pub struct MediaGetResult {
     pub mime: String,
     /// Standard base64 (with padding) of the stored image.
     pub data_b64: String,
+}
+
+/// Each original-media part remains below the existing media.get envelope cap.
+pub const MEDIA_PREVIEW_PART_BYTES: usize = 256 * 1024;
+/// Maximum known retained original under the current prompt media-store policy.
+pub const MEDIA_PREVIEW_MAX_BYTES: usize = 7 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionMediaSourceV1 {
+    Canonical { item_id: harw_types::ItemId },
+    Archive { checkpoint_id: String, row: ArchiveRowLocatorV1 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMediaModeV1 {
+    Thumbnail,
+    VisiblePreview,
+    Viewer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMediaPreviewV1 {
+    pub session_id: SessionId,
+    pub source: SessionMediaSourceV1,
+    /// Zero-based among stored Media parts of that exact user item.
+    pub attachment_index: u32,
+    pub mode: SessionMediaModeV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionMediaPreviewReplyV1 {
+    Part {
+        mime: String,
+        total_bytes: u32,
+        offset: u32,
+        data_b64: String,
+        continuation: Option<String>,
+    },
+    OpenRequired,
+    Missing,
+    Unsupported,
+    Busy,
+    Unreadable,
+}
+
+/// Predicts the item identity for a receipt-aware exact replacement. This
+/// identifies the resulting prompt, not authority or evidence of a commit.
+/// The caller may present a version only once this exact ID is durable.
+#[must_use]
+pub fn exact_rewrite_item_id(
+    session: &SessionId,
+    target: &str,
+    observed: crate::Cursor,
+    request_id: &str,
+) -> harw_types::ItemId {
+    let mut material = b"harw exact rewrite item v1\0".to_vec();
+    material.extend_from_slice(&observed.generation.to_be_bytes());
+    material.extend_from_slice(&observed.durable.to_be_bytes());
+    for value in [session.as_str(), target, request_id] {
+        material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        material.extend_from_slice(value.as_bytes());
+    }
+    harw_types::ItemId::from_str(format!("rewrite-{}", harw_types::ContentDigest::of(&material)))
 }
 
 /// Most images one `turn.submit` may carry.
@@ -2247,6 +2630,7 @@ mod tests {
             attached: 0,
             model: None,
             origin: RowOrigin::Profile,
+            purpose: SessionRowPurpose::Unknown,
             continuable: false,
             reason: Some(ReadOnlyReason::ShareReadOnly),
             holder: None,
@@ -2267,6 +2651,45 @@ mod tests {
         assert_eq!(value["reason"], "share_read_only");
         let back: SessionRow = ctx(serde_json::from_value(value), "decode row")?;
         assert_eq!(back, row);
+        Ok(())
+    }
+
+    #[test]
+    fn dream_page_defaults_keep_strict_legacy_shape() -> TestResult {
+        let old: PageParams = ctx(serde_json::from_str("{}"), "old page request")?;
+        assert!(!old.include_dreams);
+        let encoded = ctx(serde_json::to_value(&old), "default page request")?;
+        assert!(encoded.get("include_dreams").is_none());
+        let opted: PageParams = ctx(
+            serde_json::from_str(r#"{"include_dreams":true}"#),
+            "opt-in page request",
+        )?;
+        assert!(opted.include_dreams);
+        assert!(serde_json::from_str::<PageParams>(r#"{"include_dreams":true,"tenant":"test"}"#).is_err());
+        assert_eq!(ctx(serde_json::to_value(SessionRowPurpose::Dream), "Dream purpose")?, "dream");
+        assert_eq!(
+            ctx(serde_json::from_str::<SessionRowPurpose>(r#""future_purpose""#), "future purpose")?,
+            SessionRowPurpose::Unknown,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn system_page_flag_is_strict_and_wire_compatible_by_default() -> TestResult {
+        let default = ctx(serde_json::to_value(PageParams::default()), "default page")?;
+        assert!(default.get("include_system").is_none());
+        let system: PageParams = ctx(serde_json::from_str(r#"{"include_system":true}"#), "System page")?;
+        assert!(system.include_system && !system.include_dreams);
+        assert!(serde_json::from_str::<PageParams>(r#"{"include_system":true,"scope":"other"}"#).is_err());
+        for (purpose, tag) in [
+            (SessionRowPurpose::Dream, "dream"),
+            (SessionRowPurpose::Diary, "diary"),
+            (SessionRowPurpose::Ledger, "ledger"),
+            (SessionRowPurpose::MemoryReconciliation, "memory_reconciliation"),
+            (SessionRowPurpose::AutomaticWorkbench, "automatic_workbench"),
+        ] {
+            assert_eq!(ctx(serde_json::to_value(purpose), "System tag")?, tag);
+        }
         Ok(())
     }
 
@@ -2577,4 +3000,92 @@ mod tests {
         assert_eq!(json, r#"{"result":"accepted","position":0}"#);
         Ok(())
     }
+}
+
+
+/// No target, source history, attachments or permissions in Assistant requests.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantSubmit {
+    pub client_message_id: String,
+    pub text: String,
+}
+
+/// Explicit opt-in for one request to replay exact earlier pairs from this
+/// room. IDs are room-local references, never a new target or client text.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantRecallSubmit {
+    pub client_message_id: String,
+    pub text: String,
+    pub recall_message_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudAssistantStatus {
+    Unprovisioned,
+    Ready,
+    Revoked,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantTurn {
+    pub client_message_id: String,
+    pub text: String,
+    pub answer: String,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantSnapshot {
+    pub status: CloudAssistantStatus,
+    pub turns: Vec<CloudAssistantTurn>,
+}
+
+/// No account or tenant selector: these come only from live gateway membership.
+/// Request IDs select earlier gateway-recorded join requests in this same room.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CloudAssistantSharedCommandV1 {
+    Status,
+    Provision,
+    RequestJoin,
+    Approve { request_id: String },
+    WithdrawOrRemove { request_id: String },
+    RevokeRoom,
+    Submit { client_message_id: String, text: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudAssistantSharedStatusV1 {
+    Unprovisioned,
+    NotGranted,
+    Pending,
+    Owner,
+    Participant,
+    Revoked,
+}
+
+/// Owner-only device verification metadata. Never account discovery or a
+/// credential; a request ID alone cannot admit a connection.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantSharedDeviceV1 {
+    pub request_id: String,
+    pub device_id: String,
+    pub node_id: String,
+    pub key_fingerprint_hex: String,
+    pub pending: bool,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantSharedSnapshotV1 {
+    pub status: CloudAssistantSharedStatusV1,
+    pub turns: Vec<CloudAssistantTurn>,
+    pub own_request_id: Option<String>,
+    pub devices: Vec<CloudAssistantSharedDeviceV1>,
 }

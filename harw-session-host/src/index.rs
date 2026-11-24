@@ -9,9 +9,9 @@ use std::sync::Arc;
 pub use harw_protocol::session_wire::ShareMode;
 use harw_protocol::session_wire::{
     HolderInfo, HolderKind as WireHolderKind, LastOrigin as WireLastOrigin, PageParams,
-    ProjectSummary, ProjectsParams,
+    ProjectSummary, ProjectsParams, SessionRowPurpose,
 };
-use harw_session_store::{HolderKind, LastOrigin, LeaseHolder};
+use harw_session_store::{HolderKind, LastOrigin, LeaseHolder, SessionPurpose};
 use harw_types::{PermissionTier, SessionId, TenantId};
 
 use crate::error::HostError;
@@ -25,6 +25,8 @@ pub enum ThreadOrigin {
     Web,
     Run,
     Gateway,
+    /// Verified internal transcript; never inferred from thread prefix alone.
+    System(SystemSessionCategory),
     Other,
 }
 
@@ -53,12 +55,96 @@ impl ThreadOrigin {
     }
 }
 
+/// Recognized metadata categories for authoritative internal transcripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SystemSessionCategory {
+    Dream,
+    Diary,
+    Ledger,
+    MemoryReconciliation,
+    AutomaticWorkbench,
+}
+
+impl SystemSessionCategory {
+    fn from_store(purpose: SessionPurpose) -> Option<Self> {
+        Some(match purpose {
+            SessionPurpose::Dream => Self::Dream,
+            SessionPurpose::Diary => Self::Diary,
+            SessionPurpose::Ledger => Self::Ledger,
+            SessionPurpose::MemoryReconciliation => Self::MemoryReconciliation,
+            SessionPurpose::AutomaticWorkbench => Self::AutomaticWorkbench,
+            SessionPurpose::Internal => return None,
+        })
+    }
+
+    #[must_use]
+    pub const fn wire(self) -> SessionRowPurpose {
+        match self {
+            Self::Dream => SessionRowPurpose::Dream,
+            Self::Diary => SessionRowPurpose::Diary,
+            Self::Ledger => SessionRowPurpose::Ledger,
+            Self::MemoryReconciliation => SessionRowPurpose::MemoryReconciliation,
+            Self::AutomaticWorkbench => SessionRowPurpose::AutomaticWorkbench,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dream => "Dream",
+            Self::Diary => "Diary",
+            Self::Ledger => "Ledger",
+            Self::MemoryReconciliation => "Memory Reconciliation",
+            Self::AutomaticWorkbench => "Automatic Workbench",
+        }
+    }
+}
+
+/// Disjoint scopes for session-page selection, applied before sorting and pagination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileSessionSelection {
+    Ordinary,
+    OrdinaryWithDream,
+    SystemOnly,
+}
+
+impl ProfileSessionSelection {
+    /// # Errors
+    /// A real project or the legacy Dream flag cannot be combined with System.
+    pub fn from_page(params: &PageParams) -> Result<Self, HostError> {
+        if params.include_system {
+            if params.project_key.is_some() || params.include_dreams {
+                return Err(HostError::Protocol("invalid System session page scope".to_owned()));
+            }
+            return Ok(Self::SystemOnly);
+        }
+        Ok(if params.include_dreams && params.project_key.is_none() {
+            Self::OrdinaryWithDream
+        } else {
+            Self::Ordinary
+        })
+    }
+
+    #[must_use]
+    pub const fn allows(self, row: &ProfileRow) -> bool {
+        match (self, row.system_category()) {
+            (Self::Ordinary | Self::OrdinaryWithDream, None) => true,
+            (Self::OrdinaryWithDream, Some(SystemSessionCategory::Dream))
+            | (Self::SystemOnly, Some(_)) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Eine Zeile des Profil-Index (Server-intern; Pfade verlassen den Server nie).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileRow {
     pub session_id: SessionId,
     /// `SessionMeta::display_title()` (nie leer).
     pub title: String,
+    /// The named title, distinct from a derived first-prompt label; phones with
+    /// model-selected titles use a neutral display until this value exists.
+    pub stored_title: Option<String>,
     pub project_key: Option<String>,
     /// Anzeige-Name des Projekts (Basename bzw. Teil vor dem Hash).
     pub project_label: Option<String>,
@@ -69,6 +155,50 @@ pub struct ProfileRow {
     pub origin: ThreadOrigin,
     pub last_origin: Option<LastOrigin>,
     pub archived: bool,
+}
+
+impl ProfileRow {
+    /// Redacted metadata projection. It never reads internal context or model values.
+    #[must_use]
+    pub fn system_metadata(
+        session_id: SessionId,
+        updated_at: jiff::Timestamp,
+        archived: bool,
+        purpose: SessionPurpose,
+    ) -> Option<Self> {
+        let category = SystemSessionCategory::from_store(purpose)?;
+        Some(Self {
+            session_id,
+            title: category.label().to_owned(),
+            stored_title: Some(category.label().to_owned()),
+            project_key: None,
+            project_label: None,
+            updated_at,
+            turns: 0,
+            first_message: None,
+            origin: ThreadOrigin::System(category),
+            last_origin: None,
+            archived,
+        })
+    }
+
+    #[must_use]
+    pub const fn system_category(&self) -> Option<SystemSessionCategory> {
+        match self.origin {
+            ThreadOrigin::System(category) => Some(category),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_system(&self) -> bool {
+        self.system_category().is_some()
+    }
+
+    #[must_use]
+    pub const fn is_dream(&self) -> bool {
+        matches!(self.system_category(), Some(SystemSessionCategory::Dream))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +228,14 @@ pub struct ResolvedProject {
 pub trait ProfileIndex: Send + Sync {
     /// Transcript-Wurzel (= `profile_sessions_root`).
     fn sessions_root(&self) -> &Path;
+    /// This index can prove and redact Dream metadata for the opt-in page.
+    fn supports_dream_session_rows(&self) -> bool {
+        false
+    }
+    /// This index can prove and redact all recognized System session categories.
+    fn supports_system_session_rows(&self) -> bool {
+        false
+    }
     /// Projekte, sortiert nach `last_activity` absteigend, dann `project_key` aufsteigend.
     /// `query`: Teilstring ohne Gross/Klein in `label` und `path_hint`. Archivierte zaehlen nicht.
     ///
@@ -124,6 +262,17 @@ pub trait ProfileIndex: Send + Sync {
     /// # Errors
     /// `HostError` bei Speicherfehlern.
     fn resolve_project(&self, project_key: &str) -> Result<Option<ResolvedProject>, HostError>;
+    /// Optional strictly non-creating resolution. The default is fail closed.
+    fn supports_existing_project_assignment(&self) -> bool {
+        false
+    }
+    /// A visible existing destination, never a create-on-lookup operation.
+    ///
+    /// # Errors
+    /// Index/storage failures may be returned instead of a destination.
+    fn resolve_existing_project(&self, _project_key: &str) -> Result<Option<ResolvedProject>, HostError> {
+        Ok(None)
+    }
     /// Geprueft Arbeitsordner einer Session: `project_root` aus der Meta, sonst `cwd`; muss
     /// existieren, kanonisch gleich sein und in den bekannten `project_root`s liegen
     /// (eingeschraenkt durch `share_roots`). Filtert NICHT nach leer. `None` = nur lesen.

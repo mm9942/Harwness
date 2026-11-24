@@ -16,9 +16,9 @@
 //! - [`planned_commands`]: Befehle aus dem Interaktionsvertrag, die weder als
 //!   Operation noch lokal existieren — für die Hilfe („geplant").
 //!
-//! Die Daten (Hinweistabellen, Zusammenfassungen, geplante und lokale
-//! Befehle) liegen in `harw_ops::command_meta`; dieses Modul übersetzt sie
-//! nur über `tr` und baut daraus TUI-Spezifikationen.
+//! Die gemeinsamen Daten liegen in `harw_ops::command_meta`. Dieses Modul
+//! übersetzt sie über `tr` und ergänzt bei Bedarf rein interaktive Hinweise,
+//! die nicht in den Remote-Katalog gehören.
 //!
 //! # Nebenläufigkeit
 //! Nur reine Funktionen über `const`-Daten; kein geteilter Zustand.
@@ -35,6 +35,28 @@ use crate::command::{
 use crate::i18n::tr;
 use harw_operations::operation::OperationDomain;
 use harw_ops::command_meta::{self, HintEntry};
+
+// Interactive shortcuts only: do not advertise these in the remote command catalog.
+const TUI_MODELS_SHORTCUTS: &[HintEntry] = &[
+    HintEntry::new(
+        "settings",
+        "",
+        "commands.subcommand.models.settings",
+        "Open the Models tab in Settings",
+    ),
+    HintEntry::new(
+        "session",
+        "",
+        "commands.subcommand.models.session",
+        "Open the active session model picker",
+    ),
+    HintEntry::new(
+        "uia",
+        "",
+        "commands.subcommand.models.uia",
+        "Open the UIA model picker (not the UIA profile)",
+    ),
+];
 
 /// Owned metadata is translated by identity; syntax and supplied metadata are payload.
 fn localized(hint: &HintEntry) -> SubcommandHint {
@@ -59,8 +81,16 @@ fn map_domain(domain: OperationDomain) -> CommandDomain {
 /// # Rückgabe
 /// Die lokalisierte Hinweisliste oder eine leere Liste für unbekannte Befehle.
 pub(crate) fn subcommand_hints(name: &str) -> Vec<SubcommandHint> {
-    command_meta::help_for(name)
-        .map_or_else(Vec::new, |help| help.hints.iter().map(localized).collect())
+    let hints = command_meta::help_for(name).map_or(&[][..], |help| help.hints);
+    if name == "models" {
+        hints
+            .iter()
+            .chain(TUI_MODELS_SHORTCUTS)
+            .map(localized)
+            .collect()
+    } else {
+        hints.iter().map(localized).collect()
+    }
 }
 
 /// Localized planned summaries, keyed by owned command identity.
@@ -73,6 +103,11 @@ pub(crate) fn planned_commands() -> Vec<(&'static str, &'static str)> {
 
 /// Nutzungszeile aus der Katalogtabelle, falls vorhanden.
 fn usage_for(name: &str) -> Option<&'static str> {
+    if name == "models" {
+        return Some(
+            "/models [settings|session|uia|show|image [show|reset|target]|set <role> <target> [effort]|reset <role>|pick <role>|worker [<role|all> <uia|target>]]",
+        );
+    }
     command_meta::help_for(name)
         .map(|help| help.usage_key.map_or(help.usage, |key| tr(key, help.usage)))
 }
@@ -248,7 +283,12 @@ mod tests {
                 assert_eq!(spec.subcommands[2].summary, spec.subcommands[1].summary);
             } else {
                 assert!(!hints.is_empty(), "{name} has an empty static hint list");
-                assert_eq!(spec.subcommands.len(), hints.len());
+                let local_count = if *name == "models" {
+                    TUI_MODELS_SHORTCUTS.len()
+                } else {
+                    0
+                };
+                assert_eq!(spec.subcommands.len(), hints.len() + local_count);
             }
             assert!(
                 !spec.subcommands.is_empty(),
@@ -315,7 +355,10 @@ mod tests {
             |cmd: &str| -> Vec<&str> { subcommand_hints(cmd).iter().map(|h| h.name).collect() };
         assert_eq!(names("model"), ["show", "list", "switch"]);
         assert_eq!(names("provider"), ["show", "list", "test"]);
-        assert_eq!(names("models"), ["show", "set", "reset", "pick", "worker"]);
+        assert_eq!(
+            names("models"),
+            ["show", "set", "reset", "pick", "worker", "settings", "session", "uia"]
+        );
         assert_eq!(names("sandbox-lease"), ["status", "revoke"]);
         assert!(names("mode").contains(&"default"));
         assert!(names("tools").contains(&"profile"));
@@ -406,7 +449,12 @@ mod tests {
             for language in UiLanguage::ALL {
                 with_language(language, || {
                     let localized = subcommand_hints(name);
-                    assert_eq!(localized.len(), hints.len());
+                    let local_count = if *name == "models" {
+                        TUI_MODELS_SHORTCUTS.len()
+                    } else {
+                        0
+                    };
+                    assert_eq!(localized.len(), hints.len() + local_count);
                     for (actual, owned) in localized.iter().zip(hints) {
                         assert_eq!((actual.name, actual.args), (owned.name, owned.args));
                         assert_eq!(actual.summary, tr_for(language, owned.key, owned.english));

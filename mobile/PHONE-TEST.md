@@ -13,6 +13,55 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 
 This builds the arm64 library, generates Kotlin bindings from that library, runs the Android unit tests, assembles the debug APK, checks its signature and 16 KB zip alignment, and prints its SHA-256. The APK is `mobile/android/app/build/outputs/apk/debug/app-debug.apk`. Set `MOBILE_OFFLINE=1` on a host with the required dependencies and Gradle distribution already cached.
 
+### Include the private on-device assistant
+
+Set `HARW_LOCAL_UIA=1` for the entire build (native and Gradle). Both build
+variants support it. The ordinary development debug build defaults to off;
+official signed release and OTA APKs require it. An opted-in build checks all
+room, PIN and Library JNI methods and matches the native library digest before
+packaging. The resulting APK is checked again. Use **the same** setting
+and artifact when reusing native output; otherwise rebuild.
+
+```sh
+HARW_LOCAL_UIA=1 ./mobile/scripts/build-apk
+```
+
+For an already configured signed release build, run native and Gradle with
+that same environment setting and assemble `:app:assembleRelease`. Building
+does not require publishing to the update channel.
+
+Open **Assistent** or **Library** from the on-device view with the local host
+connected. Create the required Harw PIN on first use. The local model is
+only needed for an Assistant reply or automatic image description, not for
+opening the room or Library.
+On supported devices you can explicitly enroll strong biometrics after entering
+that PIN again and authenticating the Android cryptographic prompt. The Harw PIN
+remains available whenever biometrics cannot unlock. No cloud route, coding
+tools or device-lock PIN substitute is used. The private room reopens using its
+existing device-bound, non-backed-up ledger. Opening the room applies the
+saved **Block screenshots** setting for this Activity. Turning protection off
+permits capture but does not unlock the room or share Library data.
+
+For a failed first PIN setup, follow the app's explicit recovery path;
+see [Restarting a failed first PIN setup](PIN-FIRST-SETUP-RECOVERY.md).
+Do not clear application data to make the restart action appear.
+
+## Copy a chat or streaming diagnostic
+
+In Android **Settings → Debug log**, open the log on the connection where the
+problem occurred. Set **Streaming** to **Info** for terminal summaries, **Debug** for
+attachment recovery, or enable **Trace** to see individual delta events for
+up to ten minutes. Reproduce the issue, then use **Copy** to share the log
+yourself. It is in memory only; **Clear** also excludes summaries from turns
+that were already running.
+
+An `observed_turn_end` line covers only a turn whose live start and terminal
+event this attachment both observed. It reports count and UTF-8 byte length of
+answer deltas, the count of reasoning deltas, and whether the wire reported
+completion, explicit abort or failure. It does not include message content,
+provider error prose, real turn IDs or a claim about durable transcript length.
+A lost attachment or a late join may have no summary at all.
+
 ## Build the server launcher
 
 On the server, use the installed `harw` that supports `[session_listener]` and the `harw-auth-hub` executable. If the AuthHub executable is available only in a checkout build, pass its exact path with `--auth-hub`. Smoke mode needs Python 3 on the server.
@@ -34,6 +83,12 @@ If you set `CARGO_TARGET_DIR`, use the executable in that target directory. You 
 
 ## Start a USB test from one terminal
 
+USB with ADB reverse, SSH loopback forwarding, and tailnet testing are direct
+transport tests. **Onion only** is the default for new profiles. For a
+dedicated direct test profile, select **Direct IP only** and confirm it
+explicitly for that profile. This is not needed for an Onion test and never
+changes the choice for a different profile.
+
 On a Linux computer with the gateway binaries, built APK, and connected USB phone, run the helper below. Enable USB debugging on the phone and authorize this computer first.
 
 ```sh
@@ -44,7 +99,7 @@ The helper installs and opens the app, waits for the public enrollment export, s
 
 ## Install and export the phone enrollment
 
-On the computer physically connected to the phone, enable USB debugging, connect the USB cable, and authorize the computer on the phone. Use the repository's ADB helper on this computer. It selects the device automatically when exactly one is visible. For multiple devices, run `adb devices` and pass `--serial SERIAL` before each helper command. Python 3 validates the public server profile before the helper copies it to the phone.
+On the computer physically connected to the phone, enable USB debugging, connect the USB cable, and authorize the computer on the phone. Use the repository's ADB helper on this computer. It selects the device automatically when exactly one is visible. For multiple devices, run `adb devices` and pass `--serial SERIAL` before each helper command. Python 3 validates the public server profile before the helper copies it to the phone. Use an explicit absolute path or a path relative to the current directory, without symlinks or parent (`..`) components. Traversed directories must be owned by you or root and cannot be writable by other users unless protected by the sticky bit (for example, `/tmp`).
 
 ```sh
 ./mobile/scripts/phone-adb install /path/to/app-debug.apk
@@ -173,7 +228,10 @@ STATE="/tmp/harw-phone-onion-$(date +%s)"
 
 Wait for the gateway to print `session onion  : reachable`. Before that it prints Tor bootstrap progress lines, and the first start can take several minutes. If it prints `not confirmed reachable after 180 s; continuing`, the gateway still runs, but check the phone connection before trusting it. The launcher writes the public profile with the `.onion` locator to `$STATE/harw-server-profile.json`. Render the QR with `./mobile/scripts/phone-qr profile`, which emits a v2 code when the profile has an onion route, or import the profile file as described for USB. No USB reverse or SSH forward is needed for this route.
 
-On the phone, open **Connection**, choose **Auto** or **Tor (.onion)** as the route, and tap **Connect**. The first Tor bootstrap on the phone can take one to two minutes and shows its progress in the app. When the link is up, the status chip shows `Live · onion`.
+On the phone, open **Connection**, leave **Onion only** selected, and tap **Connect**.
+It never uses the saved direct endpoint on a Tor failure. The separate
+**Tor first, then direct IP** option requires explicit consent and is not
+appropriate when verifying Onion-only transport. The first Tor bootstrap on the phone can take one to two minutes and shows its progress in the app. When the link is up, the status chip shows `Live · onion`.
 
 Keep these limits in mind:
 
@@ -212,7 +270,8 @@ On the gateway host, open a second terminal and run `harw attach --socket "$STAT
 
 ## Exercise the app
 
-1. In **Connection**, tap **Import profile**, select `Download/harw-server-profile.json`, and tap **Connect**. Verify that the app shows a connection and lists sessions.
+1. In **Connection**, tap **Import profile** and select `Download/harw-server-profile.json`.
+   Keep **Onion only** for the Onion test, or confirm **Direct IP only** for a dedicated USB/tailnet test profile. Tap **Connect**. Verify that the app lists sessions and shows the expected transport.
 2. Create a session, open it, and submit a short message. Confirm the message appears once and the assistant reply streams into the transcript. In smoke mode the expected reply is **HARW MOBILE SMOKE REPLY**.
 3. Open a second session in a new window. Send separate messages in both sessions and verify each window retains its own transcript. Rotate the phone and use Android's split-screen option to check the windows.
 4. Leave and reopen the app while the foreground notification is active. Confirm the sessions are available and any running turn was submitted only once. Disconnect from the connection screen or stop the connection from its notification, then connect again.

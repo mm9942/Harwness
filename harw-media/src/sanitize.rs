@@ -87,7 +87,30 @@ fn png(bytes: &[u8]) -> Result<Vec<u8>, MediaError> {
 // --- JPEG --------------------------------------------------------------
 
 fn jpeg(bytes: &[u8]) -> Result<Vec<u8>, MediaError> {
-    let mut out = vec![0xFF, 0xD8];
+    let mut out = Vec::new();
+    write_jpeg(bytes, &mut out)?;
+    Ok(out)
+}
+
+/// Sanitize JPEG into an empty caller-owned buffer. The result is never
+/// larger than the input; reserve once before copying any image bytes.
+/// Private callers can use a zeroizing buffer, including on parsing error.
+///
+/// # Errors
+/// A nonempty output or malformed JPEG is rejected. On parsing error any
+/// partial result stays in `out`; it must not be used as an image.
+pub fn sanitize_jpeg_into(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), MediaError> {
+    if !out.is_empty() || !bytes.starts_with(&[0xFF, 0xD8]) {
+        return Err(bad("jpeg input or destination"));
+    }
+    // Input is already bounded by callers that accept private photos. Avoid
+    // growing a buffer after it contains private JPEG bytes.
+    out.reserve_exact(bytes.len());
+    write_jpeg(bytes, out)
+}
+
+fn write_jpeg(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), MediaError> {
+    out.extend_from_slice(&[0xFF, 0xD8]);
     let mut at = 2usize;
     let mut saw_frame = false;
     loop {
@@ -105,7 +128,7 @@ fn jpeg(bytes: &[u8]) -> Result<Vec<u8>, MediaError> {
                     return Err(bad("jpeg without frame"));
                 }
                 out.extend_from_slice(&[0xFF, 0xD9]);
-                return Ok(out); // anything after EOI is dropped
+                return Ok(()); // anything after EOI is dropped
             }
             0x00 => return Err(bad("jpeg stray stuffing")),
             0x01 | 0xD0..=0xD8 => {} // no payload, not expected here, harmless

@@ -334,6 +334,7 @@ async fn serve(args: Serve) -> Result<()> {
         server_public_key_hex: hex::encode(public_key),
         onion: None,
         admin_url: None,
+        owner_status_hub: None,
     };
     // With onion the profile can only be completed once the gateway has
     // published its locator, so it is built at the readiness line instead.
@@ -968,7 +969,16 @@ fn smoke_test(binaries: &Binaries) -> Result<()> {
             return Err(format!("smoke submit was not accepted: {:?}", receipt.outcome).into());
         }
     }
-    for (session_id, prompt) in &cases {
+    verify_smoke_transcripts(&core, &cases)?;
+    core.disconnect();
+    println!(
+        "Authenticated gateway verified with shared desktop/phone sessions and two independent replies."
+    );
+    Ok(())
+}
+
+fn verify_smoke_transcripts(core: &MobileCore, cases: &[(String, &str)]) -> Result<()> {
+    for (session_id, prompt) in cases {
         wait_for(
             "persisted assistant smoke reply",
             Duration::from_secs(60),
@@ -998,10 +1008,6 @@ fn smoke_test(binaries: &Binaries) -> Result<()> {
             },
         )?;
     }
-    core.disconnect();
-    println!(
-        "Authenticated gateway verified with shared desktop/phone sessions and two independent replies."
-    );
     Ok(())
 }
 

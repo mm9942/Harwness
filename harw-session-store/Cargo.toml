@@ -28,6 +28,7 @@ harw-retention = { path = "../harw-retention" }
 harw-untrusted-text = { path = "../harw-untrusted-text" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11.0"
 jiff = { workspace = true }
 # C-APPR: defekte Approval-Einträge werden in `pending_all` mit `warn!` übersprungen.
 tracing = { workspace = true }

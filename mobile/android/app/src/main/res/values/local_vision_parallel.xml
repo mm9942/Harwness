@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_local_vision_parallel_title">Local image analysis · concurrency</string>
+    <string name="harw_local_vision_parallel_explainer">Choose 1–5 (default 3). Each new batch checks the loaded model, available memory and CPU, and may use fewer workers. This does not change API requests or running batches.</string>
+    <string name="harw_local_vision_parallel_requested">Configured maximum: %1$d</string>
+    <string name="harw_local_vision_parallel_estimate">Resource estimate: up to %1$d at once. Rechecked when the batch starts.</string>
+    <plurals name="harw_local_vision_parallel_images">
+        <item quantity="one">%d image</item>
+        <item quantity="other">%d images</item>
+    </plurals>
+</resources>

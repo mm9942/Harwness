@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="workspace_refresh_sessions">Sessions aktualisieren</string>
+    <string name="workspace_session_loading">Sessions werden geladen …</string>
+    <string name="workspace_session_load_error">Sessions konnten nicht geladen werden: %1$s</string>
+    <string name="workspace_session_refresh_error">Sessions konnten nicht aktualisiert werden: %1$s</string>
+    <string name="workspace_sessions_empty">Noch keine Sessions. Starte eine mit „Neue Session“.</string>
+    <string name="workspace_no_sessions_visible">Für dieses Gerät sind keine Sessions sichtbar.</string>
+    <string name="workspace_open_session_window">%1$s in neuem Fenster öffnen</string>
+    <string name="workspace_optional_title">Titel (optional)</string>
+    <string name="workspace_disconnecting">Verbindung wird getrennt …</string>
+    <string name="workspace_connecting">Verbindung wird hergestellt …</string>
+    <string name="workspace_reconnecting">Verbindung verloren. Verbinde erneut …</string>
+    <string name="workspace_connection_failed">Verbindung fehlgeschlagen.</string>
+    <string name="workspace_connection_revoked">Der Zugriff auf diesen Server wurde beendet.</string>
+    <string name="workspace_connection_offline">Offline.</string>
+    <string name="workspace_sessions_cached">Zeige die zuletzt geladenen Sessions.</string>
+    <string name="workspace_connect_to_load">Verbinde dich, um Sessions zu laden.</string>
+    <string name="workspace_project_search_empty">Keine Treffer für „%1$s“.</string>
+    <string name="workspace_project_share_off">Dieses Gateway teilt keine TUI-Sessions.</string>
+    <string name="workspace_project_legacy">Dieser Server kennt keine Projekte. Es werden nur Handy-Sessions angezeigt.</string>
+    <string name="workspace_project_sessions_empty">In diesem Projekt gibt es noch keine Sessions. Mit + startest du eine.</string>
+    <string name="workspace_project_none_visible">In diesem Projekt sind für dieses Gerät keine Sessions sichtbar.</string>
+    <string name="workspace_load_more">Weitere laden</string>
+    <string name="workspace_loading">Lädt …</string>
+    <string name="workspace_session_turns">%1$s Turns</string>
+    <string name="internal_directory_legacy_dream">Dieser ältere Host hat keinen Internal-Katalog. Nur eindeutig erkennbare Dream-Metadaten werden angezeigt; andere Kategorien sind nicht verfügbar.</string>
+    <string name="workspace_title_field">Titel</string>
+    <string name="workspace_month_unknown">Unbekanntes Datum</string>
+    <string name="workspace_gateway_running">Läuft auf Gateway</string>
+    <string name="workspace_terminal_held">Belegt im Terminal</string>
+    <string name="workspace_job_held">Belegt durch einen Job</string>
+    <string name="workspace_held">Belegt</string>
+    <string name="workspace_last_phone">Zuletzt: Handy</string>
+    <string name="workspace_last_terminal">Zuletzt: Terminal</string>
+    <string name="workspace_observer">Nur beobachten</string>
+    <string name="workspace_operator">Bedienen</string>
+    <string name="workspace_maintainer">Verwalten</string>
+    <string name="workspace_owner">Besitzer</string>
+    <string name="workspace_share_read_only">Dieses Gateway teilt nur lesend</string>
+    <string name="workspace_foreign_origin">Stammt aus einem anderen Kanal</string>
+    <string name="workspace_no_workdir">Arbeitsordner fehlt</string>
+    <string name="workspace_no_write_permission">Keine Berechtigung zum Schreiben</string>
+    <string name="workspace_closed">Beendet</string>
+    <string name="workspace_read_only">Nur lesen</string>
+</resources>

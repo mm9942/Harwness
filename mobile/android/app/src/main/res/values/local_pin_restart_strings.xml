@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="local_pin_restart">Restart PIN setup</string>
+    <string name="local_pin_restart_confirm_detail">Harw can verify that the failed setup never created a recoverable vault. Choose a new PIN in a fresh setup. Existing files are not deleted. If verification no longer succeeds, Harw will refuse to restart.</string>
+    <string name="local_pin_restart_confirm">Start a new PIN setup</string>
+    <string name="local_pin_restart_not_confirmed">Harw could not confirm the restart. No existing vault was deleted. Reopen the assistant to check the current setup status.</string>
+    <string name="local_pin_setup_failed">Local PIN setup could not be completed. Nothing was reset. Diagnostic: %1$s.</string>
+    <string name="local_pin_assistant_handoff_failed">The PIN step finished, but the local Assistant could not open its private session. Close and reopen the Assistant and use your existing PIN. Nothing was reset. Diagnostic: %1$s.</string>
+    <string name="local_pin_copy_diagnostic">Copy diagnostic code</string>
+    <string name="local_pin_copy_diagnostic_failed">Could not copy the code. You can still use the code shown above.</string>
+</resources>

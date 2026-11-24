@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_ui_appearance_title">Appearance</string>
+    <string name="harw_ui_language">App language</string>
+    <string name="harw_ui_language_summary">This changes the app interface only. It does not change your phone language or chat content.</string>
+    <string name="harw_ui_language_apply">Apply</string>
+    <string name="harw_ui_language_cancel">Cancel</string>
+    <string name="harw_ui_language_follow_device">Follow device</string>
+</resources>

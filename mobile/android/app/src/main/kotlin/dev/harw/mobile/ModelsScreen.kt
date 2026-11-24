@@ -40,6 +40,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -208,7 +209,7 @@ private fun VisionAddonRow(
     }
 }
 
-/** "Bildverständnis" of an imported model: any compatible mmproj file can be attached (own file, folder hit or catalog default). */
+/** "Bildverständnis" of an imported model: any compatible mmproj file can be attached. */
 @Composable
 private fun ProjectorBlock(
     model: LocalModel,
@@ -225,29 +226,23 @@ private fun ProjectorBlock(
     var waitingDefault by remember { mutableStateOf<VisionAddon?>(null) }
     val ready = model.state == ModelFileState.COMPLETE
     val info by produceState<ProjectorInfo?>(null, model.id, rev) {
-        value = if (ready) try { manager.projector(model.id) } catch (_: Exception) { null } else null
+        value = if (ready) readProjectorValue(null) { manager.projector(model.id) } else null
     }
     val suggestions by produceState<List<ProjectorInfo>>(emptyList(), model.id, rev) {
-        value = if (ready) try { manager.projectorSuggestions(model.id) } catch (_: Exception) { emptyList() } else emptyList()
+        value = if (ready) readProjectorValue(emptyList()) { manager.projectorSuggestions(model.id) } else emptyList()
     }
     val defaultAddon by produceState<VisionAddon?>(null, model.id, rev) {
-        value = if (ready) try { manager.defaultProjector(model.id) } catch (_: Exception) { null } else null
+        value = if (ready) readProjectorValue(null) { manager.defaultProjector(model.id) } else null
     }
 
-    fun attach(fileName: String) {
+    fun changeProjector(failureText: String, clearMessage: Boolean = true, change: suspend () -> Unit) {
         working = true
-        message = null
+        if (clearMessage) message = null
         scope.launch {
             try {
-                val result = manager.attachProjectorFile(model.id, fileName)
-                message = if (result.info == null) result.message else "Projektor zugeordnet (gilt ab der nächsten Antwort)"
-                if (result.info != null) {
-                    manager.activeLocal(context.filesDir.path)?.takeIf { it == model.id }?.let {
-                        manager.useLocal(context.filesDir.path, model.id)
-                    }
-                }
+                change()
             } catch (e: Exception) {
-                message = e.message ?: "Projektor konnte nicht zugeordnet werden"
+                message = e.message ?: failureText
             } finally {
                 working = false
                 rev++
@@ -255,111 +250,150 @@ private fun ProjectorBlock(
         }
     }
 
+    fun attach(fileName: String) = changeProjector("Projektor konnte nicht zugeordnet werden") {
+        val result = manager.attachProjectorFile(model.id, fileName)
+        message = projectorAttachmentMessage(result.info, result.message)
+        if (result.info != null) reloadActiveProjector(manager, context, model.id)
+    }
+
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
-        working = true
-        message = null
-        scope.launch {
-            try {
-                val result = ModelImport(context.applicationContext, ModelStore(context.applicationContext))
-                    .attachProjector(model.id, uri) {}
-                message = if (result.info == null) result.message else "Projektor zugeordnet (gilt ab der nächsten Antwort)"
-                if (result.info != null && manager.activeLocal(context.filesDir.path) == model.id) {
-                    manager.useLocal(context.filesDir.path, model.id)
-                }
-            } catch (e: Exception) {
-                message = e.message ?: "Projektor konnte nicht übernommen werden"
-            } finally {
-                working = false
-                rev++
-            }
+        changeProjector("Projektor konnte nicht übernommen werden") {
+            val result = ModelImport(context.applicationContext, ModelStore(context.applicationContext))
+                .attachProjector(model.id, uri) {}
+            message = projectorAttachmentMessage(result.info, result.message)
+            if (result.info != null) reloadActiveProjector(manager, context, model.id)
         }
     }
 
     LaunchedEffect(current) {
         val wanted = waitingDefault ?: return@LaunchedEffect
-        val d = current
-        if (d is ModelDownloadState.Finished && d.modelId == wanted.file.id) {
-            waitingDefault = null
-            if (d.result is DownloadResult.Done) {
-                attach(wanted.file.fileName)
-            } else {
-                message = "Der Standard-Projektor konnte nicht geladen werden."
-                rev++
-            }
+        if (current !is ModelDownloadState.Finished || current.modelId != wanted.file.id) return@LaunchedEffect
+        waitingDefault = null
+        if (current.result is DownloadResult.Done) {
+            attach(wanted.file.fileName)
+        } else {
+            message = "Der Standard-Projektor konnte nicht geladen werden."
+            rev++
         }
     }
 
+    val modelActions = ProjectorActions(
+        attach = ::attach,
+        openPicker = { picker.launch(arrayOf("*/*")) },
+        detach = {
+            changeProjector("Projektor konnte nicht entfernt werden", clearMessage = false) {
+                manager.detachProjectorOf(model.id)
+                message = "Projektor entfernt"
+                reloadActiveProjector(manager, context, model.id)
+            }
+        },
+        download = { addon ->
+            waitingDefault = addon
+            requestDownload(addon.file.id)
+        },
+    )
+    val runningDefault = (current as? ModelDownloadState.Running)
+        ?.takeIf { it.modelId == waitingDefault?.file?.id }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text("Bildverständnis", style = MaterialTheme.typography.titleSmall)
-        val proj = info
-        if (proj != null && proj.compatible) {
-            Text(
-                "Bereit: ${proj.fileName} (${gb(proj.sizeBytes.toLong())}). Gilt ab der nächsten Antwort.",
-                style = MaterialTheme.typography.bodySmall,
-            )
-        } else {
-            Text(
-                if (proj != null) "Projektor ${proj.fileName} passt nicht: ${proj.detail}"
-                else "Kein Projektor: das Modell liest nur Text und ignoriert Bilder.",
-                style = MaterialTheme.typography.bodySmall,
-                color = if (proj != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        val running = current is ModelDownloadState.Running && waitingDefault != null && current.modelId == waitingDefault?.file?.id
-        if (running && current is ModelDownloadState.Running) {
-            if (current.phase == DownloadPhase.Verifying) {
-                LinearProgressIndicator(Modifier.fillMaxWidth())
-            } else {
-                LinearProgressIndicator(progress = { downloadFraction(current.done, current.total) }, modifier = Modifier.fillMaxWidth())
-            }
-        }
-        if (ready && (proj == null || !proj.compatible)) {
-            suggestions.firstOrNull()?.let { s ->
-                Text("Gefunden im Modellordner: ${s.fileName} (passt zum Modell)", style = MaterialTheme.typography.bodySmall)
-                Button(enabled = !working && !busy, onClick = { attach(s.fileName) }) { Text("Diesen Projektor verwenden") }
-            }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(enabled = ready && !working && !busy, onClick = { picker.launch(arrayOf("*/*")) }) {
-                Text("Projektor-Datei wählen")
-            }
-            if (proj != null) {
-                OutlinedButton(enabled = !working && !busy, onClick = {
-                    working = true
-                    scope.launch {
-                        try {
-                            manager.detachProjectorOf(model.id)
-                            message = "Projektor entfernt"
-                            if (manager.activeLocal(context.filesDir.path) == model.id) {
-                                manager.useLocal(context.filesDir.path, model.id)
-                            }
-                        } catch (e: Exception) {
-                            message = e.message ?: "Projektor konnte nicht entfernt werden"
-                        } finally {
-                            working = false
-                            rev++
-                        }
-                    }
-                }) { Text("Entfernen") }
-            }
-        }
-        val addon = defaultAddon
-        if (addon != null && (proj == null || !proj.compatible)) {
-            OutlinedButton(
-                enabled = !working && !busy && waitingDefault == null,
-                onClick = {
-                    waitingDefault = addon
-                    requestDownload(addon.file.id)
-                },
-            ) { Text("Passenden Standard-Projektor laden (${gb(addon.file.sizeBytes.toLong())})") }
-            Text(
-                "Hinweis: ${addon.file.label}. Finetunes behalten meist den Bild-Teil des Basismodells, garantiert ist das nicht; passt er nicht, kommt eine Fehlermeldung und das Modell liest weiter nur Text.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+        ProjectorStatus(info)
+        ProjectorProgress(runningDefault)
+        ProjectorOptions(
+            state = ProjectorOptionState(
+                info, suggestions.firstOrNull(), defaultAddon, ready, !working && !busy, waitingDefault != null,
+            ),
+            actions = modelActions,
+        )
         message?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+    }
+}
+
+private suspend fun <T> readProjectorValue(default: T, read: suspend () -> T): T =
+    try {
+        read()
+    } catch (_: Exception) {
+        default
+    }
+
+private fun projectorAttachmentMessage(info: ProjectorInfo?, message: String?): String? =
+    if (info == null) message else "Projektor zugeordnet (gilt ab der nächsten Antwort)"
+
+private suspend fun reloadActiveProjector(manager: ModelManager, context: Context, modelId: String) {
+    val path = context.filesDir.path
+    if (manager.activeLocal(path) == modelId) manager.useLocal(path, modelId)
+}
+
+private data class ProjectorOptionState(
+    val info: ProjectorInfo?,
+    val suggestion: ProjectorInfo?,
+    val defaultAddon: VisionAddon?,
+    val ready: Boolean,
+    val enabled: Boolean,
+    val waitingDefault: Boolean,
+)
+
+private data class ProjectorActions(
+    val attach: (String) -> Unit,
+    val openPicker: () -> Unit,
+    val detach: () -> Unit,
+    val download: (VisionAddon) -> Unit,
+)
+
+@Composable
+private fun ProjectorStatus(info: ProjectorInfo?) {
+    val label = when {
+        info == null -> "Kein Projektor: das Modell liest nur Text und ignoriert Bilder."
+        info.compatible -> "Bereit: ${info.fileName} (${gb(info.sizeBytes.toLong())}). Gilt ab der nächsten Antwort."
+        else -> "Projektor ${info.fileName} passt nicht: ${info.detail}"
+    }
+    val color = when {
+        info == null -> MaterialTheme.colorScheme.onSurfaceVariant
+        info.compatible -> Color.Unspecified
+        else -> MaterialTheme.colorScheme.error
+    }
+    Text(label, style = MaterialTheme.typography.bodySmall, color = color)
+}
+
+@Composable
+private fun ProjectorProgress(current: ModelDownloadState.Running?) {
+    if (current == null) return
+    if (current.phase == DownloadPhase.Verifying) {
+        LinearProgressIndicator(Modifier.fillMaxWidth())
+    } else {
+        LinearProgressIndicator(progress = { downloadFraction(current.done, current.total) }, modifier = Modifier.fillMaxWidth())
+    }
+}
+
+@Composable
+private fun ProjectorOptions(state: ProjectorOptionState, actions: ProjectorActions) {
+    val missingOrIncompatible = state.info?.compatible != true
+    val suggestion = state.suggestion
+    if (state.ready && missingOrIncompatible && suggestion != null) {
+        Text("Gefunden im Modellordner: ${suggestion.fileName} (passt zum Modell)", style = MaterialTheme.typography.bodySmall)
+        Button(enabled = state.enabled, onClick = { actions.attach(suggestion.fileName) }) {
+            Text("Diesen Projektor verwenden")
+        }
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(enabled = state.ready && state.enabled, onClick = actions.openPicker) {
+            Text("Projektor-Datei wählen")
+        }
+        if (state.info != null) {
+            OutlinedButton(enabled = state.enabled, onClick = actions.detach) { Text("Entfernen") }
+        }
+    }
+    val addon = state.defaultAddon
+    if (addon != null && missingOrIncompatible) {
+        OutlinedButton(
+            enabled = state.enabled && !state.waitingDefault,
+            onClick = { actions.download(addon) },
+        ) { Text("Passenden Standard-Projektor laden (${gb(addon.file.sizeBytes.toLong())})") }
+        Text(
+            "Hinweis: ${addon.file.label}. Finetunes behalten meist den Bild-Teil des Basismodells, garantiert ist das nicht; passt er nicht, kommt eine Fehlermeldung und das Modell liest weiter nur Text.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

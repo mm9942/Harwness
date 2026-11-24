@@ -331,8 +331,9 @@ class DocsSpikeActivity : ComponentActivity() {
         val renamed = deleted && tmp.renameTo(File(dir, SpikeMarker))
         val final = File(dir, SpikeMarker)
         val same = final.exists() && final.readBytes().contentEquals(content)
-        if (!deleted) tmp.delete()
-        return (deleted && renamed && same) to "bytes=${content.size} deleted=$deleted renamed=$renamed same=$same"
+        val cleanupFailed = !deleted && !tmp.delete() && tmp.exists()
+        return (deleted && renamed && same) to
+            "bytes=${content.size} deleted=$deleted renamed=$renamed same=$same cleanupFailed=$cleanupFailed"
     }
 
     private fun d9(): Pair<Boolean, String> {

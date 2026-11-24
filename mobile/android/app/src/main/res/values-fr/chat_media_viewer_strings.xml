@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_media_image">Image</string>
+    <string name="chat_media_open">Ouvrir l’image</string>
+    <string name="chat_media_close">Fermer l’image</string>
+    <string name="chat_media_zoom_in">Agrandir</string>
+    <string name="chat_media_zoom_reset">Réinitialiser le zoom</string>
+    <string name="chat_media_missing">Fichier image manquant</string>
+    <string name="chat_media_denied">Accès refusé à cette image</string>
+    <string name="chat_media_unsupported">Cet hôte ne peut pas fournir cette image</string>
+    <string name="chat_media_unreadable">Impossible de lire cette image</string>
+    <string name="chat_media_offline">Non connecté</string>
+    <string name="chat_media_busy">Demande d’image occupée</string>
+    <string name="chat_media_unexpected">Échec du chargement de l’image</string>
+    <string name="chat_media_retry">%1$s · Réessayer</string>
+    <string name="chat_media_retry_short">Recharger</string>
+</resources>

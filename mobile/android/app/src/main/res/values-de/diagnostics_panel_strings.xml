@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_diagnostics_title_local">Debug-Protokoll · Lokal</string>
+    <string name="harw_diagnostics_title_cloud">Debug-Protokoll · Cloud</string>
+    <string name="harw_diagnostics_clipboard_label">Harw Debug-Protokoll</string>
+    <string name="harw_diagnostics_privacy">Nur im laufenden App-Prozess gespeichert. Keine Nachrichten, Bilder, Zugangsdaten oder Serveradressen. Es wird nichts automatisch geteilt.</string>
+    <string name="harw_diagnostics_unavailable">Das Debug-Protokoll dieser Verbindung ist gerade nicht verfügbar.</string>
+    <string name="harw_diagnostics_failed">Das Debug-Protokoll konnte nicht gelesen oder geändert werden.</string>
+    <string name="harw_diagnostics_domain_chat">Chat</string>
+    <string name="harw_diagnostics_domain_stream">Datenstrom</string>
+    <string name="harw_diagnostics_domain_onion">Onion</string>
+    <string name="harw_diagnostics_level_off">Aus</string>
+    <string name="harw_diagnostics_level_error">Fehler</string>
+    <string name="harw_diagnostics_level_warn">Warnung</string>
+    <string name="harw_diagnostics_level_info">Info</string>
+    <string name="harw_diagnostics_level_debug">Debug</string>
+    <string name="harw_diagnostics_trace_enable">Trace für 10 Minuten aktivieren</string>
+    <string name="harw_diagnostics_trace_extend">Trace verlängern · beim letzten Abruf aktiv</string>
+    <string name="harw_diagnostics_refreshing">Wird aktualisiert …</string>
+    <string name="harw_diagnostics_counts">Einträge: %1$s · verworfen: %2$s</string>
+    <string name="harw_diagnostics_empty">Noch keine Einträge für die gewählten Stufen.</string>
+    <string name="harw_diagnostics_refresh">Aktualisieren</string>
+    <string name="harw_diagnostics_clear">Leeren</string>
+    <string name="harw_diagnostics_copy">Kopieren</string>
+    <string name="harw_diagnostics_copy_failed">Das Debug-Protokoll konnte nicht kopiert werden.</string>
+    <string name="harw_diagnostics_close">Schließen</string>
+</resources>

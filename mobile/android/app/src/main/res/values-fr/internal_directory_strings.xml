@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="internal_directory_subtitle">Exécutions internes</string>
+    <string name="internal_directory_category_dream">Rêve</string>
+    <string name="internal_directory_category_diary">Journal personnel</string>
+    <string name="internal_directory_category_ledger">Registre</string>
+    <string name="internal_directory_category_memory">Réconciliation de la mémoire</string>
+    <string name="internal_directory_category_workbench">Atelier automatique</string>
+    <string name="internal_directory_back_projects">Retour aux projets</string>
+    <string name="internal_directory_disconnected">Connectez ce profil pour afficher ses exécutions internes.</string>
+    <string name="internal_directory_back">Retour</string>
+    <string name="internal_directory_scope_local">Local</string>
+    <string name="internal_directory_scope_cloud">Cloud</string>
+    <string name="internal_directory_scope_title">%1$s · %2$s</string>
+    <string name="internal_directory_refresh">Actualiser</string>
+    <string name="internal_directory_unsupported">Cet hôte ne fournit pas encore de catalogue distinct pour les exécutions internes.</string>
+    <string name="internal_directory_dream_only">Cet hôte ne fournit actuellement que les exécutions de rêve.</string>
+    <string name="internal_directory_load_error">Impossible de charger les exécutions internes.</string>
+    <string name="internal_directory_last_activity">Dernière activité : %1$s</string>
+    <string name="internal_directory_access">Accès : métadonnées uniquement</string>
+    <string name="internal_directory_details_note">Cette vue affiche des métadonnées internes, pas un historique de conversation.</string>
+    <string name="internal_directory_empty_group">Aucune exécution vérifiée dans cette catégorie.</string>
+    <string name="internal_directory_load_more">Charger plus d’exécutions</string>
+    <string name="internal_directory_unknown_run">Exécution interne</string>
+    <string name="internal_directory_time_unavailable">Heure indisponible</string>
+</resources>

@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, Read, Write};
@@ -138,13 +139,13 @@ pub fn discover_sessions(sessions_dir: &Path) -> ResumeResult<Vec<DiscoveredSess
             continue;
         }
 
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        if path.extension().and_then(OsStr::to_str) != Some("jsonl") {
             continue;
         }
 
         let stem = path
             .file_stem()
-            .and_then(|stem| stem.to_str())
+            .and_then(OsStr::to_str)
             .ok_or_else(|| ResumeError::InvalidSessionFilename { path: path.clone() })?;
         let id = SessionId::try_from(stem.to_owned())
             .map_err(|_| ResumeError::InvalidSessionFilename { path: path.clone() })?;
@@ -567,7 +568,7 @@ pub fn backfill_projects(
             continue;
         };
         let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        if path.extension().and_then(OsStr::to_str) != Some("jsonl") {
             continue;
         }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -580,7 +581,7 @@ pub fn backfill_projects(
         report.scanned += 1;
         let Some(id) = path
             .file_stem()
-            .and_then(|stem| stem.to_str())
+            .and_then(OsStr::to_str)
             .and_then(|stem| SessionId::try_from(stem.to_owned()).ok())
         else {
             report.skipped += 1;

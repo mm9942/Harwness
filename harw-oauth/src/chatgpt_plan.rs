@@ -16,6 +16,7 @@ use harw_fsutil::{
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::codex_refresh::{RefreshLockGuard, acquire_token_file_lock};
 use crate::store::write_private_file_atomically;
@@ -153,13 +154,70 @@ impl ChatGptPlanStore {
         self.persist(record)
     }
 
+    /// Opaque consent scope of the current linked registration. It contains no
+    /// credential, email or raw subject and is stable across legitimate token renewal.
+    ///
+    /// # Errors
+    /// Returns an error if the registration is not linked or usable.
+    pub fn linked_registration_scope(&self) -> PlanResult<String> {
+        let current = active_credentials(self.read()?)?;
+        Ok(self.registration_scope(&current))
+    }
+
+    fn registration_scope(&self, record: &ChatGptPlanCredentials) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"harw/chatgpt-plan/auxiliary-consent/v1");
+        for field in [
+            self.home.as_os_str().as_encoded_bytes(),
+            record.client_id.as_bytes(),
+            record.subject.as_bytes(),
+        ] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        digest.finalize().iter().flat_map(|byte| {
+            let byte = *byte;
+            [HEX[(byte >> 4) as usize] as char, HEX[(byte & 15) as usize] as char]
+        }).collect()
+    }
+
+    fn check_registration(
+        &self,
+        expected: Option<&str>,
+        current: &ChatGptPlanCredentials,
+    ) -> PlanResult<()> {
+        if expected.is_some_and(|scope| scope != self.registration_scope(current)) {
+            return Err(ChatGptPlanError::DifferentRegistration);
+        }
+        Ok(())
+    }
+
     /// Gets a usable bearer token and rotates it near expiration when allowed.
     ///
     /// # Errors
     /// Returns an error if no authorized plan is linked, or renewal fails and
     /// the stored access token is no longer usable.
     pub async fn access_token(&self) -> PlanResult<SecretString> {
+        self.read_token(None).await
+    }
+
+    /// Returns only a token for the previously authorized registration. The
+    /// identity check applies to the same record that supplies the token,
+    /// including if refresh reopens the credential store after a relink.
+    ///
+    /// # Errors
+    /// Returns an error if the registration or authorization changed.
+    pub async fn access_token_for_registration(&self, scope: &str) -> PlanResult<SecretString> {
+        if scope.len() != 64 || !scope.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ChatGptPlanError::DifferentRegistration);
+        }
+        self.read_token(Some(scope.to_owned())).await
+    }
+
+    async fn read_token(&self, expected: Option<String>) -> PlanResult<SecretString> {
         let current = active_credentials(self.read()?)?;
+        self.check_registration(expected.as_deref(), &current)?;
         let now = unix_now();
         if !refresh_due(&current, now) {
             return usable_token(current, now);
@@ -168,17 +226,18 @@ impl ChatGptPlanStore {
         // token. The storage transaction must finish even if the caller drops
         // its wait for the replacement.
         let store = self.clone();
-        tokio::spawn(async move { store.refresh(TOKEN_URL).await })
+        tokio::spawn(async move { store.refresh(TOKEN_URL, expected.as_deref()).await })
             .await
             .map_err(network)?
     }
 
-    async fn refresh(&self, endpoint: &str) -> PlanResult<SecretString> {
+    async fn refresh(&self, endpoint: &str, expected: Option<&str>) -> PlanResult<SecretString> {
         let dir = self
             .open_secrets(false)?
             .ok_or(ChatGptPlanError::NotLinked)?;
         let _lock = self.lock(&dir).await?;
         let current = active_credentials(read_credentials(&dir)?)?;
+        self.check_registration(expected, &current)?;
         let now = unix_now();
         // The previous lock holder may already have installed a new token.
         if !refresh_due(&current, now) {
@@ -786,7 +845,7 @@ mod tests {
             String::from_utf8(body).map_err(io::Error::other)
         });
 
-        let (first, second) = tokio::join!(store.refresh(&endpoint), store.refresh(&endpoint));
+        let (first, second) = tokio::join!(store.refresh(&endpoint, None), store.refresh(&endpoint, None));
         assert!(first?.expose_secret() == "replacement-access");
         assert!(second?.expose_secret() == "replacement-access");
         let persisted = active_credentials(store.read()?)?;

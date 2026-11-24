@@ -6,6 +6,7 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.security.MessageDigest
 import uniffi.harw_mobile_ffi.DeviceException
 import uniffi.harw_mobile_ffi.FileAccess
@@ -53,6 +54,20 @@ internal fun rootIdFor(uri: String): String {
         hex.append("0123456789abcdef"[byte.toInt() and 0xF])
     }
     return hex.substring(0, 16)
+}
+
+internal fun readSafBytes(stream: InputStream, cap: Long): ByteArray {
+    val out = ByteArrayOutputStream()
+    val buffer = ByteArray(SAF_BUFFER_BYTES)
+    var total = 0L
+    while (true) {
+        val count = stream.read(buffer)
+        if (count < 0) break
+        total += count
+        if (total > cap) throw DeviceException.TooLarge()
+        out.write(buffer, 0, count)
+    }
+    return out.toByteArray()
 }
 
 internal class SafStore(private val context: Context) : FileAccess {
@@ -141,19 +156,7 @@ internal class SafStore(private val context: Context) : FileAccess {
         if (child.size > cap) throw DeviceException.TooLarge()
         val uri = DocumentsContract.buildDocumentUriUsingTree(tree, child.docId)
         val input = resolver.openInputStream(uri) ?: throw DeviceException.Failed("i/o error")
-        input.use { stream ->
-            val out = ByteArrayOutputStream()
-            val buffer = ByteArray(SAF_BUFFER_BYTES)
-            var total = 0L
-            while (true) {
-                val n = stream.read(buffer)
-                if (n < 0) break
-                total += n
-                if (total > cap) throw DeviceException.TooLarge()
-                out.write(buffer, 0, n)
-            }
-            out.toByteArray()
-        }
+        input.use { readSafBytes(it, cap) }
     }
 
     override fun write(rootId: String, path: String, data: ByteArray) = guard {

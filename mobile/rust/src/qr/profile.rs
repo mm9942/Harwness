@@ -89,5 +89,6 @@ pub(crate) fn decode_profile_text(text: &str) -> Result<ServerProfile, MobileErr
         server_public_key_hex,
         onion,
         admin_url: None,
+        owner_status_hub: None,
     })
 }

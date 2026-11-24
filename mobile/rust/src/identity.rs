@@ -116,15 +116,32 @@ pub fn parse_server_profile(json: String) -> Result<ServerProfile, MobileError> 
 #[derive(Clone)]
 pub(crate) struct ValidatedProfile {
     pub profile: ServerProfile,
-    pub endpoint: NodeEndpoint,
+    pub direct_endpoint: Option<NodeEndpoint>,
+    pub expected_node: NodeId,
     pub verifier: TranscriptWrappedVerifier<PinnedPeers>,
     pub onion: Option<harw_onion::OnionLocator>,
+    #[cfg_attr(not(feature = "onion"), allow(dead_code))]
+    pub owner_status_hub: Option<ValidatedOwnerStatusHub>,
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(feature = "onion"), allow(dead_code))]
+pub(crate) struct ValidatedOwnerStatusHub {
+    pub node: NodeId,
+    pub onion: harw_onion::OnionLocator,
+    pub verifier: TranscriptWrappedVerifier<PinnedPeers>,
 }
 
 impl ValidatedProfile {
     pub fn same_authority(&self, other: &Self) -> bool {
-        self.endpoint == other.endpoint
+        self.expected_node == other.expected_node
+            && self.direct_endpoint == other.direct_endpoint
             && self.profile.server_public_key_hex == other.profile.server_public_key_hex
+    }
+
+    /// A direct opt-in may not carry over when any locator or pinned key changes.
+    pub fn same_route_authority(&self, other: &Self) -> bool {
+        self.same_authority(other) && self.profile.onion == other.profile.onion
     }
 
     pub fn new(mut profile: ServerProfile) -> Result<Self, MobileError> {
@@ -133,17 +150,18 @@ impl ValidatedProfile {
         }
         check_label(&profile.label).map_err(invalid_profile)?;
         let expected_node = check_node_id(&profile.server_node_id).map_err(invalid_profile)?;
-        let addr = profile
-            .endpoint
-            .parse::<SocketAddr>()
-            .map_err(|_| invalid_profile("endpoint must be an IP address with a port"))?;
-        if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
-            return Err(invalid_profile(
-                "endpoint must identify a unicast host and nonzero port",
-            ));
-        }
+        let direct_endpoint = if profile.endpoint.is_empty() {
+            None
+        } else {
+            let addr = profile.endpoint.parse::<SocketAddr>()
+                .map_err(|_| invalid_profile("endpoint must be an IP address with a port"))?;
+            if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+                return Err(invalid_profile("endpoint must identify a unicast host and nonzero port"));
+            }
+            profile.endpoint = addr.to_string();
+            Some(NodeEndpoint { addr, expected_node: expected_node.clone() })
+        };
         let key = decode_public_key(&profile.server_public_key_hex).map_err(invalid_profile)?;
-        profile.endpoint = addr.to_string();
         profile.server_public_key_hex = hex::encode(&key);
         let onion = match profile.onion.as_deref() {
             Some(text) => {
@@ -155,20 +173,51 @@ impl ValidatedProfile {
             }
             None => None,
         };
+        if direct_endpoint.is_none() && onion.is_none() {
+            return Err(invalid_profile("profile must publish a Tor (.onion) or direct route"));
+        }
         if let Some(url) = profile.admin_url.as_deref() {
             profile.admin_url = Some(check_admin_url(url).map_err(invalid_profile)?);
         }
+        let owner_status_hub = match profile.owner_status_hub.as_mut() {
+            Some(pin) => {
+                let owner_onion = onion.as_ref()
+                    .ok_or_else(|| invalid_profile("Owner status requires an Onion route for the owner"))?;
+                let node = check_node_id(&pin.node_id).map_err(invalid_profile)?;
+                let hub_key = decode_public_key(&pin.public_key_hex).map_err(invalid_profile)?;
+                let locator = pin.onion.parse::<harw_onion::OnionLocator>()
+                    .map_err(|_| invalid_profile("Invalid v3 Onion locator for the owner status Hub"))?;
+                if harw_node_transport::node_key_fingerprint(&key).is_none()
+                    || harw_node_transport::node_key_fingerprint(&hub_key).is_none()
+                {
+                    return Err(invalid_profile("Owner status requires two valid nonzero node keys"));
+                }
+                if node == expected_node || locator.host() == owner_onion.host() || hub_key == key {
+                    return Err(invalid_profile("Owner status requires a distinct Hub node, key and Onion service"));
+                }
+                let mut pins = PinnedPeers::new();
+                pin.public_key_hex = hex::encode(&hub_key);
+                pin.onion = locator.to_string();
+                pins.pin(node.clone(), hub_key)
+                    .map_err(|_| invalid_profile("Invalid pinned owner status Hub key"))?;
+                Some(ValidatedOwnerStatusHub {
+                    node,
+                    onion: locator,
+                    verifier: TranscriptWrappedVerifier::new(pins),
+                })
+            }
+            None => None,
+        };
         let mut pins = PinnedPeers::new();
         pins.pin(expected_node.clone(), key)
             .map_err(|_| invalid_profile("invalid pinned ML-DSA-65 public key"))?;
         Ok(Self {
             profile,
-            endpoint: NodeEndpoint {
-                addr,
-                expected_node,
-            },
+            direct_endpoint,
+            expected_node,
             verifier: TranscriptWrappedVerifier::new(pins),
             onion,
+            owner_status_hub,
         })
     }
 }

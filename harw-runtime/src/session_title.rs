@@ -139,7 +139,7 @@ pub async fn generate_title(
 /// [`TitleSource::Manual`], wird nichts verändert. Sonst versucht diese
 /// Funktion [`generate_title`]; bei Erfolg wird der Titel mit
 /// [`TitleSource::Model`] gesetzt
-/// ([`harw_session_store::meta::set_title`]), sonst (Modell-Fehler oder
+/// ([`harw_session_store::meta::set_automatic_title_if_unresolved`]), sonst (Modell-Fehler oder
 /// leeres Ergebnis) wird
 /// [`harw_session_store::meta::fallback_title`] der ersten Nutzernachricht
 /// mit [`TitleSource::Fallback`] gesetzt.
@@ -156,7 +156,7 @@ pub async fn generate_title(
 /// # Errors
 /// [`SessionTitleError::Store`]: der Sidecar konnte nicht gelesen/abgeleitet
 /// oder nicht geschrieben werden (siehe
-/// [`harw_session_store::meta::load_or_derive`]/[`harw_session_store::meta::set_title`]).
+/// [`harw_session_store::meta::load_or_derive`]/[`harw_session_store::meta::set_automatic_title_if_unresolved`]).
 ///
 /// # Concurrency
 /// `async fn`; die Sidecar-I/O ist synchron (kein `.await` darin), der
@@ -188,18 +188,16 @@ pub async fn ensure_title(
         first_assistant_reply: None,
     };
 
-    match generate_title(provider, model, &request).await {
-        Some(title) => Ok(meta::set_title(store_root, id, &title, TitleSource::Model)?),
-        None => {
-            let fallback = meta::fallback_title(&first_user_message);
-            Ok(meta::set_title(
-                store_root,
-                id,
-                &fallback,
-                TitleSource::Fallback,
-            )?)
-        }
-    }
+    let (title, model_generated) = match generate_title(provider, model, &request).await {
+        Some(title) => (title, true),
+        None => (meta::fallback_title(&first_user_message), false),
+    };
+    Ok(meta::set_automatic_title_if_unresolved(
+        store_root,
+        id,
+        &title,
+        model_generated,
+    )?)
 }
 
 /// Wählt Provider/Modell-Pin für die Titel-Generierung nach den internen
@@ -426,6 +424,41 @@ mod tests {
 
         assert_eq!(result.title_source, TitleSource::Model);
         assert_eq!(result.title.as_deref(), Some("Bestehender Titel"));
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_title_preserves_a_manual_rename_during_model_generation() -> TestResult {
+        struct RenamingProvider<'a> {
+            root: &'a Path,
+            session: &'a SessionId,
+        }
+        impl ModelProvider for RenamingProvider<'_> {
+            fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+                Box::pin(async move {
+                    meta::set_title(
+                        self.root,
+                        self.session,
+                        "Neuer Titel von Hand",
+                        TitleSource::Manual,
+                    )
+                    .map_err(|error| ModelError::RequestFailed(error.to_string()))?;
+                    Ok(ModelResponse::text("Verspäteter Modelltitel".to_owned()))
+                })
+            }
+        }
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-a");
+        seed_meta(temp.path(), &session, "Eine erste Nachricht")?;
+        let provider = RenamingProvider {
+            root: temp.path(),
+            session: &session,
+        };
+        let result = runtime()?
+            .block_on(ensure_title(temp.path(), &session, &provider, "test-model"))
+            .map_err(ctx("ensure_title succeeds"))?;
+        assert_eq!(result.title_source, TitleSource::Manual);
+        assert_eq!(result.title.as_deref(), Some("Neuer Titel von Hand"));
         Ok(())
     }
 

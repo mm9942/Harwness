@@ -418,3 +418,6 @@ async fn agent_tool_calls_over_the_websocket() -> TestResult {
     );
     Ok(())
 }
+
+#[path = "support/archive_checkpoint.rs"]
+mod archive_checkpoint;

@@ -42,6 +42,7 @@ const LINKS: [&[(&str, &str)]; 3] = [
     &[
         ("models", "/models"),
         ("model", "/model"),
+        ("uia_model", "/uia-model"),
         ("effort", "/effort"),
     ],
     &[("mode", "/mode"), ("permissions", "/permissions show")],
@@ -79,6 +80,7 @@ pub(crate) struct SettingsView {
     error: Option<String>,
     mutation_feedback: Option<String>,
     hidden: Vec<String>,
+    live_model_command: Option<&'static str>,
 }
 
 fn choices(index: usize) -> Vec<&'static str> {
@@ -116,6 +118,7 @@ fn label(key: &str) -> &'static str {
         "dod.triage.max_tokens" => tr("settings.dod_triage_max_tokens", "DoD triage max_tokens"),
         "models" => tr("settings.models", "Models by role"),
         "model" => tr("settings.model", "Session model"),
+        "uia_model" => tr("pickers.context_uia", "UIA model"),
         "effort" => tr("settings.effort", "Reasoning effort"),
         "mode" => tr("settings.mode", "Interaction mode"),
         "permissions" => tr("settings.permissions", "Approvals"),
@@ -182,10 +185,26 @@ impl SettingsView {
             ..Self::default()
         }
     }
+    pub(crate) fn with_live_model_command(mut self, command: &'static str) -> Self {
+        self.live_model_command = Some(command);
+        self
+    }
+
+    pub(crate) fn open_models_tab(mut self) -> Self {
+        self.category = 1;
+        self
+    }
+
     fn links(&self) -> Vec<(&'static str, &'static str)> {
         LINKS[self.category - 1]
             .iter()
             .copied()
+            .filter_map(|(key, cmd)| match (key, self.live_model_command) {
+                ("model", Some(command)) => Some((key, command)),
+                // Avoid two entries that open the same UIA-root model picker.
+                ("uia_model", Some("/uia-model")) => None,
+                _ => Some((key, cmd)),
+            })
             .filter(|(_, command)| {
                 let name = command
                     .trim_start_matches('/')
@@ -605,7 +624,11 @@ mod tests {
     }
     #[test]
     fn delegated_links_respect_hidden_commands() {
-        let mut view = SettingsView::new(&["model".to_owned(), "models".to_owned()]);
+        let mut view = SettingsView::new(&[
+            "model".to_owned(),
+            "models".to_owned(),
+            "uia-model".to_owned(),
+        ]);
         view.on_key(key(KeyCode::Tab));
         assert_eq!(
             view.on_key(key(KeyCode::Enter)),

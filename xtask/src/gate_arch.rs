@@ -916,25 +916,58 @@ pub fn evaluate_with_manifests(
     lock: &LockIndex,
     manifests: &ManifestEdges,
 ) -> GateReport {
-    let mut checked = 0usize;
-    let mut violations = Vec::new();
-    let mut used_exceptions: HashSet<(&str, &str)> = HashSet::new();
-    let mut used_tcb: HashSet<(&str, &str)> = HashSet::new();
+    let mut report = GateReport {
+        name: "arch",
+        checked: 0,
+        violations: Vec::new(),
+    };
 
     for node in &graph.crates {
-        checked += 1;
+        report.checked += 1;
         if !policy.packages.contains_key(&node.name) {
-            violations.push(format!(
+            report.violations.push(format!(
                 "{}: nicht in {POLICY_PATH} klassifiziert — jedes Paket braucht eine Schicht unter [packages] (§47)",
                 node.name
             ));
         }
     }
 
+    let by_name: HashMap<&str, &CrateNode> = graph
+        .crates
+        .iter()
+        .map(|node| (node.name.as_str(), node))
+        .collect();
+
+    check_internal_edges(graph, policy, &by_name, &mut report);
+    let used_sys = check_sys_hulls(graph, policy, lock, &by_name, &mut report);
+    check_forbidden_hulls(graph, policy, lock, manifests, &by_name, &mut report);
+
+    for name in policy.sys_allowed.keys() {
+        if !used_sys.contains(name.as_str()) {
+            report.violations.push(format!(
+                "[[sys_crates.allow]] '{name}' wird von keinem geprüften Paket erreicht — Eintrag streichen (Ratsche)"
+            ));
+        }
+    }
+
+    report
+}
+
+// Keep the layer and TCB diagnostics interleaved per edge, then report stale
+// exceptions and TCB allowlist entries in the original phase order.
+fn check_internal_edges(
+    graph: &WorkspaceGraph,
+    policy: &Policy,
+    by_name: &HashMap<&str, &CrateNode>,
+    report: &mut GateReport,
+) {
+    let mut used_exceptions: HashSet<(&str, &str)> = HashSet::new();
+    let mut used_tcb: HashSet<(&str, &str)> = HashSet::new();
+
     for node in &graph.crates {
         let from_class = policy.packages.get(&node.name);
         for dep in &node.deps {
-            checked += 1;
+            report.checked += 1;
             let (Some(from_class), Some(to_class)) = (from_class, policy.packages.get(dep)) else {
                 // Das nicht klassifizierte Paket ist oben schon gemeldet.
                 continue;
@@ -950,7 +983,7 @@ pub fn evaluate_with_manifests(
             if let Some(exception) = exception {
                 used_exceptions.insert((exception.from.as_str(), exception.to.as_str()));
                 if allowed {
-                    violations.push(format!(
+                    report.violations.push(format!(
                         "Ausnahme {} → {} ist veraltet: die Kante ist nach [rules] ohnehin erlaubt — Eintrag streichen (Ratsche; bis {}: {})",
                         exception.from, exception.to, exception.until, exception.reason
                     ));
@@ -961,40 +994,26 @@ pub fn evaluate_with_manifests(
                     .get(&from_class.layer)
                     .map(LayerRule::describe)
                     .unwrap_or_default();
-                violations.push(format!(
+                report.violations.push(format!(
                     "{} ({}) → {dep} ({}) verletzt die Schichtregel: {} darf nur auf [{permitted}] zeigen (§6)",
                     node.name, from_class.layer, to_class.layer, from_class.layer
                 ));
             }
 
             if from_class.tcb {
-                let allowlist = policy.tcb.get(&node.name);
-                if let Some(entry) = allowlist.and_then(|set| set.get(dep)) {
-                    used_tcb.insert((node.name.as_str(), entry.as_str()));
-                } else {
-                    violations.push(format!(
-                        "{} (TCB) → {dep}: nicht in [tcb.\"{}\"].allowed_internal — neue interne Abhängigkeit eines TCB-Pakets (§23)",
-                        node.name, node.name
-                    ));
-                }
+                check_tcb_edge(node, dep, policy, &mut used_tcb, report);
             }
         }
     }
 
     for exception in &policy.exceptions {
         if !used_exceptions.contains(&(exception.from.as_str(), exception.to.as_str())) {
-            violations.push(format!(
+            report.violations.push(format!(
                 "Ausnahme {} → {} ist veraltet: die Kante existiert nicht (mehr) — Eintrag streichen (Ratsche; bis {}: {})",
                 exception.from, exception.to, exception.until, exception.reason
             ));
         }
     }
-
-    let by_name: HashMap<&str, &CrateNode> = graph
-        .crates
-        .iter()
-        .map(|node| (node.name.as_str(), node))
-        .collect();
 
     for (package, allowlist) in &policy.tcb {
         // Angekündigte TCB-Pakete, die es noch nicht gibt, haben keine Kanten.
@@ -1003,13 +1022,39 @@ pub fn evaluate_with_manifests(
         }
         for dep in allowlist {
             if !used_tcb.contains(&(package.as_str(), dep.as_str())) {
-                violations.push(format!(
+                report.violations.push(format!(
                     "[tcb.\"{package}\"].allowed_internal nennt '{dep}', aber {package} hängt nicht (mehr) davon ab — Eintrag streichen (Ratsche)"
                 ));
             }
         }
     }
+}
 
+fn check_tcb_edge<'graph, 'policy>(
+    node: &'graph CrateNode,
+    dep: &str,
+    policy: &'policy Policy,
+    used_tcb: &mut HashSet<(&'graph str, &'policy str)>,
+    report: &mut GateReport,
+) {
+    let allowlist = policy.tcb.get(&node.name);
+    if let Some(entry) = allowlist.and_then(|set| set.get(dep)) {
+        used_tcb.insert((node.name.as_str(), entry.as_str()));
+    } else {
+        report.violations.push(format!(
+            "{} (TCB) → {dep}: nicht in [tcb.\"{}\"].allowed_internal — neue interne Abhängigkeit eines TCB-Pakets (§23)",
+            node.name, node.name
+        ));
+    }
+}
+
+fn check_sys_hulls<'policy>(
+    graph: &WorkspaceGraph,
+    policy: &'policy Policy,
+    lock: &LockIndex,
+    by_name: &HashMap<&str, &CrateNode>,
+    report: &mut GateReport,
+) -> HashSet<&'policy str> {
     let mut used_sys: HashSet<&str> = HashSet::new();
     for node in &graph.crates {
         let Some(class) = policy.packages.get(&node.name) else {
@@ -1018,52 +1063,83 @@ pub fn evaluate_with_manifests(
         if !policy.forbids_sys(class) {
             continue;
         }
-        let hull = sys_hull(node, &by_name, lock);
-        checked += hull.visited;
+        let hull = sys_hull(node, by_name, lock);
+        report.checked += hull.visited;
         for missing in &hull.unresolved {
-            violations.push(format!(
+            report.violations.push(format!(
                 "{}: '{missing}' hat keinen Eintrag in Cargo.lock — die *-sys-Hülle wäre unvollständig",
                 node.name
             ));
         }
         for (sys, path) in &hull.sys_crates {
             if sys.as_str() == CC {
-                // `cc` ist keine Allowlist-Ausnahme, sondern eine fest
-                // codierte: erlaubt nur, wenn *jeder* Pfad zu `cc` über
-                // `blake3` läuft (siehe CC_EXCEPTION_VIA-Doku). Dazu wird
-                // die Hülle ohne diese Zwischenstation neu gebildet — bleibt
-                // `cc` darin erreichbar, führt ein Pfad an ihr vorbei.
-                let bypass = sys_hull_excluding(node, &by_name, lock, CC_EXCEPTION_VIA);
-                if let Some(bypass_path) = bypass.sys_crates.get(sys) {
-                    violations.push(format!(
-                        "{} erreicht die C-Bauhelfer-Crate '{sys}' über {} — nicht über '{CC_EXCEPTION_VIA}', die einzig begründete Ausnahme (Tier C/A, dependency-review.md)",
-                        node.name,
-                        bypass_path.join(" → ")
-                    ));
-                }
+                check_cc_route(node, by_name, lock, sys, report);
                 continue;
             }
             if let Some((name, _)) = policy.sys_allowed.get_key_value(sys) {
                 used_sys.insert(name.as_str());
             } else {
-                let scope = if class.tcb {
-                    format!("Schicht {} / TCB", class.layer)
-                } else {
-                    format!("Schicht {}", class.layer)
-                };
-                let kind = if sys.ends_with(SYS_SUFFIX) {
-                    "-sys-Crate"
-                } else {
-                    "C-Bauhelfer-Crate"
-                };
-                violations.push(format!(
-                    "{} erreicht die {kind} '{sys}' über {} — in {scope} verboten, außer mit Begründung unter [[sys_crates.allow]] (§40)",
-                    node.name,
-                    path.join(" → ")
-                ));
+                report_forbidden_sys_crate(node, class, sys, path, report);
             }
         }
     }
+    used_sys
+}
+
+fn check_cc_route(
+    node: &CrateNode,
+    by_name: &HashMap<&str, &CrateNode>,
+    lock: &LockIndex,
+    sys: &str,
+    report: &mut GateReport,
+) {
+    // `cc` ist keine Allowlist-Ausnahme, sondern eine fest
+    // codierte: erlaubt nur, wenn *jeder* Pfad zu `cc` über
+    // `blake3` läuft (siehe CC_EXCEPTION_VIA-Doku). Dazu wird
+    // die Hülle ohne diese Zwischenstation neu gebildet — bleibt
+    // `cc` darin erreichbar, führt ein Pfad an ihr vorbei.
+    let bypass = sys_hull_excluding(node, by_name, lock, CC_EXCEPTION_VIA);
+    if let Some(bypass_path) = bypass.sys_crates.get(sys) {
+        report.violations.push(format!(
+            "{} erreicht die C-Bauhelfer-Crate '{sys}' über {} — nicht über '{CC_EXCEPTION_VIA}', die einzig begründete Ausnahme (Tier C/A, dependency-review.md)",
+            node.name,
+            bypass_path.join(" → ")
+        ));
+    }
+}
+
+fn report_forbidden_sys_crate(
+    node: &CrateNode,
+    class: &PackageClass,
+    sys: &str,
+    path: &[String],
+    report: &mut GateReport,
+) {
+    let scope = if class.tcb {
+        format!("Schicht {} / TCB", class.layer)
+    } else {
+        format!("Schicht {}", class.layer)
+    };
+    let kind = if sys.ends_with(SYS_SUFFIX) {
+        "-sys-Crate"
+    } else {
+        "C-Bauhelfer-Crate"
+    };
+    report.violations.push(format!(
+        "{} erreicht die {kind} '{sys}' über {} — in {scope} verboten, außer mit Begründung unter [[sys_crates.allow]] (§40)",
+        node.name,
+        path.join(" → ")
+    ));
+}
+
+fn check_forbidden_hulls(
+    graph: &WorkspaceGraph,
+    policy: &Policy,
+    lock: &LockIndex,
+    manifests: &ManifestEdges,
+    by_name: &HashMap<&str, &CrateNode>,
+    report: &mut GateReport,
+) {
     // Je (Paket, Name) nur eine Meldung, auch wenn mehrere Zeilen gelten.
     let mut unresolved_forbidden: BTreeSet<(&str, String)> = BTreeSet::new();
     for rule in &policy.forbidden {
@@ -1074,15 +1150,15 @@ pub fn evaluate_with_manifests(
             if !rule.applies_to(&node.name, class) {
                 continue;
             }
-            let hull = hull_matching(node, &by_name, lock, None, Some(manifests), &|name| {
+            let hull = hull_matching(node, by_name, lock, None, Some(manifests), &|name| {
                 rule.names.contains(name)
             });
-            checked += 1;
+            report.checked += 1;
             for missing in hull.unresolved {
                 unresolved_forbidden.insert((node.name.as_str(), missing));
             }
             for (name, path) in &hull.sys_crates {
-                violations.push(format!(
+                report.violations.push(format!(
                     "{} erreicht die verbotene Crate '{name}' über {} — [[forbidden_crates]]: {}",
                     node.name,
                     path.join(" → "),
@@ -1092,23 +1168,9 @@ pub fn evaluate_with_manifests(
         }
     }
     for (package, missing) in &unresolved_forbidden {
-        violations.push(format!(
+        report.violations.push(format!(
             "{package}: '{missing}' ist weder lokales Paket noch in Cargo.lock — die [[forbidden_crates]]-Hülle wäre unvollständig (fail closed)"
         ));
-    }
-
-    for name in policy.sys_allowed.keys() {
-        if !used_sys.contains(name.as_str()) {
-            violations.push(format!(
-                "[[sys_crates.allow]] '{name}' wird von keinem geprüften Paket erreicht — Eintrag streichen (Ratsche)"
-            ));
-        }
-    }
-
-    GateReport {
-        name: "arch",
-        checked,
-        violations,
     }
 }
 

@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use harw_protocol::session_wire::{PageParams, ProjectSummary, ProjectsParams};
 use harw_session_host::HostError;
 use harw_session_host::index::{
-    ProfileIndex, ProfilePage, ProfileRow, ProjectPage, ResolvedProject, ThreadOrigin,
+    ProfileIndex, ProfilePage, ProfileRow, ProfileSessionSelection, ProjectPage, ResolvedProject,
+    ThreadOrigin,
     decode_cursor, encode_cursor,
 };
-use harw_session_store::meta;
+use harw_session_store::{TranscriptStore, meta};
 use harw_types::SessionId;
 use jiff::Timestamp;
 
@@ -43,7 +44,11 @@ impl FolderProfileIndex {
         std::fs::canonicalize(&self.projects_root).ok()
     }
 
-    fn rows(&self, include_archived: bool) -> Result<Vec<ProfileRow>, HostError> {
+    fn rows(
+        &self,
+        include_archived: bool,
+        selection: ProfileSessionSelection,
+    ) -> Result<Vec<ProfileRow>, HostError> {
         let dir = match std::fs::read_dir(&self.sessions_root) {
             Ok(dir) => dir,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -61,7 +66,7 @@ impl FolderProfileIndex {
             }
             let id = SessionId::from_str(stem);
             if let Some(row) = self.build_row(&id, &item.path()) {
-                if include_archived || !row.archived {
+                if (include_archived || !row.archived) && selection.allows(&row) {
                     rows.push(row);
                 }
             }
@@ -73,6 +78,16 @@ impl FolderProfileIndex {
         let md = std::fs::symlink_metadata(jsonl).ok()?;
         if !md.file_type().is_file() {
             return None;
+        }
+        // Do not decode internal prompts to derive row titles.
+        match TranscriptStore::new(&self.sessions_root).catalog_session_purpose(id).ok()? {
+            Some(purpose) => {
+                let archived = meta::load(&self.sessions_root, id)
+                    .ok().flatten().is_some_and(|saved| saved.archived);
+                let updated_at = Timestamp::try_from(md.modified().ok()?).ok()?;
+                return ProfileRow::system_metadata(id.clone(), updated_at, archived, purpose);
+            }
+            None => {}
         }
         let session_meta = meta::peek(&self.sessions_root, id).ok()?;
         if session_meta.turns == 0 && session_meta.first_user_message.is_none() {
@@ -91,6 +106,8 @@ impl FolderProfileIndex {
         Some(ProfileRow {
             session_id: id.clone(),
             title: session_meta.display_title(),
+            stored_title: (session_meta.title_source != harw_session_store::TitleSource::Fallback)
+                .then(|| session_meta.title.clone()).flatten(),
             project_label: project_key.clone(),
             project_key,
             updated_at,
@@ -134,13 +151,21 @@ impl ProfileIndex for FolderProfileIndex {
         &self.sessions_root
     }
 
+    fn supports_dream_session_rows(&self) -> bool {
+        true
+    }
+
+    fn supports_system_session_rows(&self) -> bool {
+        true
+    }
+
     fn projects(&self, params: &ProjectsParams) -> Result<ProjectPage, HostError> {
         struct Group {
             count: u32,
             last: Timestamp,
         }
         let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-        for row in self.rows(false)? {
+        for row in self.rows(false, ProfileSessionSelection::Ordinary)? {
             let key = row.project_key.clone().unwrap_or_default();
             let group = groups.entry(key).or_insert(Group {
                 count: 0,
@@ -219,7 +244,9 @@ impl ProfileIndex for FolderProfileIndex {
     }
 
     fn page(&self, params: &PageParams) -> Result<ProfilePage, HostError> {
-        let mut rows = self.rows(params.include_archived)?;
+        let mut rows = self.rows(
+            params.include_archived, ProfileSessionSelection::from_page(params)?,
+        )?;
         if let Some(wanted) = params.project_key.as_deref() {
             if wanted.is_empty() {
                 rows.retain(|row| row.project_key.is_none());
@@ -267,11 +294,11 @@ impl ProfileIndex for FolderProfileIndex {
         let jsonl = self
             .sessions_root
             .join(format!("{}{JSONL_SUFFIX}", id.as_str()));
-        Ok(self.build_row(id, &jsonl))
+        Ok(self.build_row(id, &jsonl).filter(|row| !row.is_system()))
     }
 
     fn newest(&self, limit: usize) -> Result<Vec<ProfileRow>, HostError> {
-        let mut rows = self.rows(false)?;
+        let mut rows = self.rows(false, ProfileSessionSelection::Ordinary)?;
         sort_rows(&mut rows);
         rows.truncate(limit);
         Ok(rows)
@@ -303,6 +330,30 @@ impl ProfileIndex for FolderProfileIndex {
             return Ok(None);
         };
         if canonical.parent() != Some(parent.as_path()) {
+            return Ok(None);
+        }
+        Ok(Some(ResolvedProject {
+            project_key: project_key.to_owned(),
+            label: project_key.to_owned(),
+            project_root: canonical,
+        }))
+    }
+
+    fn supports_existing_project_assignment(&self) -> bool {
+        true
+    }
+
+    fn resolve_existing_project(&self, project_key: &str) -> Result<Option<ResolvedProject>, HostError> {
+        if !is_safe_slug(project_key) {
+            return Ok(None);
+        }
+        let Some(parent) = self.canonical_projects_root() else { return Ok(None) };
+        let target = parent.join(project_key);
+        if !std::fs::symlink_metadata(&target).is_ok_and(|md| md.file_type().is_dir()) {
+            return Ok(None);
+        }
+        let Ok(canonical) = std::fs::canonicalize(&target) else { return Ok(None) };
+        if canonical.parent() != Some(parent.as_path()) || canonical != target || !canonical.is_dir() {
             return Ok(None);
         }
         Ok(Some(ResolvedProject {
@@ -366,4 +417,40 @@ fn is_safe_slug(slug: &str) -> bool {
         && slug
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use harw_session_store::SessionPurpose;
+    use harw_types::ThreadRef;
+
+    use super::*;
+
+    #[test]
+    fn embedded_dream_metadata_is_opt_in_only()
+        -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        let id = SessionId::from_str("embedded-dream");
+        let directory = root.path().join("sessions");
+        TranscriptStore::new(&directory).ensure_session_purpose(
+            &id, &ThreadRef::from_str("gateway-dream:embedded-dream"), SessionPurpose::Dream,
+        )?;
+        let index = FolderProfileIndex::new(directory, root.path().join("projects"));
+        assert!(index.page(&PageParams::default())?.rows.is_empty());
+        assert!(index.newest(100)?.is_empty());
+        assert!(index.row(&id)?.is_none());
+        assert!(index.projects(&ProjectsParams::default())?.projects.is_empty());
+        let rows = index.page(&PageParams {
+            include_dreams: true, ..PageParams::default()
+        })?.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, id);
+        assert!(rows[0].is_dream() && rows[0].first_message.is_none());
+        let system = index.page(&PageParams {
+            include_system: true, ..PageParams::default()
+        })?.rows;
+        assert_eq!(system, rows);
+        Ok(())
+    }
 }

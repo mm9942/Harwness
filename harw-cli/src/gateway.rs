@@ -755,10 +755,7 @@ fn mount_gateway_assembly(
         home,
         cwd,
         dream_principal,
-        crate::runtime_entry::transcript_state_store(
-            sessions_root,
-            harw_runtime::dream_run::dream_thread_for_session,
-        ),
+        Arc::new(harw_runtime::dream_run::build_dream_state_store(sessions_root)),
         secret_resolver.as_ref().map(Arc::clone),
     )?;
 
@@ -1036,7 +1033,7 @@ async fn supervise(
 }
 
 /// Wartet auf `SIGINT` (Ctrl+C) oder `SIGTERM`.
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };

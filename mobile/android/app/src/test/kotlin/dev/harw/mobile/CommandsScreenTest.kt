@@ -25,6 +25,21 @@ class CommandsScreenTest {
     )
 
     @Test
+    fun composerOnlyAcceptsExactArgumentFreeReadsAdvertisedForTheCurrentSession() {
+        assertEquals(ComposerManagedRead.Status, ComposerManagedRead.parse("  /STATUS  "))
+        assertEquals(ComposerManagedRead.ModelShow, ComposerManagedRead.parse("/model  show"))
+        listOf("/model", "/model switch provider/model", "/status extra", "/status\n", "/mode set", "/shell", "/tools", "/provision", "/status;").forEach {
+            assertNull(ComposerManagedRead.parse(it))
+        }
+        val command = ComposerManagedRead.Status
+        assertEquals("status", command.fromCatalog(listOf(cmd("status")))?.name)
+        assertNull(command.fromCatalog(listOf(cmd("status", available = false))))
+        assertNull(command.fromCatalog(listOf(cmd("status").copy(remote = false))))
+        assertNull(command.fromCatalog(listOf(cmd("other", aliases = listOf("status")))))
+        assertNull(command.fromCatalog(listOf(cmd("status"), cmd("status"))))
+    }
+
+    @Test
     fun groupsInFixedOrderAndUnknownGoesToMisc() {
         val groups = groupCommands(listOf(cmd("zukunft", "future"), cmd("agent", "agents"), cmd("status", "session")))
         assertEquals(listOf("Unterhaltung", "Agenten", "Sonstiges"), groups.map { it.first })

@@ -11,6 +11,7 @@ rust-version.workspace = true
 [features]
 default = ["browser"]
 browser = ["harw-registry-defaults/browser"]
+cloud-workload-placement = ["dep:harw-placement-model"]
 
 [dependencies]
 # Native image inspection uses the production tool executor/context boundary.
@@ -74,6 +75,7 @@ harw-ops = { path = "../harw-ops" }
 # line 29 (harw-cloud-ops = { path = "../harw-cloud/harw-cloud-ops" }).
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
+harw-placement-model = { path = "../harw-placement-model", optional = true }
 harw-project-discovery = { path = "../harw-project-discovery" }
 # `SessionEvent`/`TurnEvent` fuer `new_root_session`; harw-core re-exportiert beide
 # nicht (harw-core/src/session.rs:108-109 importiert sie selbst so).

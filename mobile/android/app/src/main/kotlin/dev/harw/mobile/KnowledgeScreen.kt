@@ -3,64 +3,69 @@ package dev.harw.mobile
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import uniffi.harw_mobile_ffi.ConnectionPhase
 
-/**
- * Gedächtnis, Tagebuch, Workbench und Ziele des Servers (harwness): jeder Knopf führt den Befehl aus und zeigt das
- * Ergebnis als Karte. Nutzt dieselbe Befehlsschnittstelle wie "Befehle"; der On-Device-Host kennt diese Flächen nicht.
- */
-private val Shortcuts = listOf(
-    "Gedächtnis" to "/memory",
-    "Tagebuch (Diary)" to "/diary",
-    "Workbench" to "/workbench show",
-    "Notizen der Workbench" to "/workbench show --scope=project",
-    "Ziele" to "/goal",
-    "Plan" to "/plan",
+/** Profile-level information only. A generic manage grant is not a Knowledge-store capability. */
+private val KnowledgeSections = listOf(
+    R.string.knowledge_memory to R.string.knowledge_memory_scope,
+    R.string.knowledge_diary to R.string.knowledge_diary_scope,
+    R.string.knowledge_session_workbench to R.string.knowledge_session_workbench_scope,
+    R.string.knowledge_project_workbench to R.string.knowledge_project_workbench_scope,
+    R.string.knowledge_goals to R.string.knowledge_goals_scope,
+    R.string.knowledge_plan to R.string.knowledge_plan_scope,
 )
 
 @Composable
 internal fun KnowledgeScreen(state: WorkspaceState, connection: HarwConnection, onBack: () -> Unit) {
-    val manage = state.manage
-    LaunchedEffect(state.online, state.generation) { connection.refreshManageSupport() }
-    val running = manage.running
+    LaunchedEffect(connection, state.online, state.generation) {
+        if (state.online) connection.refreshManageSupport()
+    }
+    val availability = knowledgeAvailability(
+        hasCloudProfile = state.profile != null,
+        online = state.online,
+        connecting = state.setupPending || state.phase == ConnectionPhase.CONNECTING ||
+            state.phase == ConnectionPhase.RECONNECTING,
+        support = state.manage.support?.let { KnowledgeCloudSupport(it.manage, it.observe) },
+    )
     Column(Modifier.fillMaxSize()) {
-        HarwHeader(title = "Gedächtnis & Workbench", onBack = onBack) {}
-        val support = manage.support
-        if (support != null && !support.manage) {
-            StatusMessage(NO_MANAGE_TEXT, Modifier.padding(12.dp))
-            return@Column
-        }
+        HarwHeader(title = stringResource(R.string.settings_hub_knowledge), onBack = onBack) {}
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(
-                "Zeigt, was der Server über deine Arbeit weiß. Die Ergebnisse stammen direkt aus harwness.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            Text(stringResource(R.string.knowledge_cloud_profile), style = MaterialTheme.typography.titleSmall)
+            StatusMessage(
+                stringResource(
+                    when (availability) {
+                        KnowledgeAvailability.NoCloudProfile -> R.string.knowledge_no_profile
+                        KnowledgeAvailability.Offline -> R.string.knowledge_offline
+                        KnowledgeAvailability.Checking -> R.string.knowledge_checking
+                        KnowledgeAvailability.ManagementUnavailable -> R.string.knowledge_no_manage
+                        KnowledgeAvailability.ObserveDenied -> R.string.knowledge_no_observe
+                        KnowledgeAvailability.NotOffered -> R.string.knowledge_no_store
+                    },
+                ),
             )
-            Shortcuts.forEach { (label, line) ->
-                OutlinedButton(
-                    onClick = { connection.runCommand(null, line) },
-                    enabled = state.online && running == null,
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text(label) }
-            }
-            if (running != null) CircularProgressIndicator()
-            manage.commandsError?.let { StatusMessage(it, error = true) }
-            manage.card?.let { card ->
-                CommandResultCard(card = card, onClose = connection::clearCommandCard, modifier = Modifier.fillMaxWidth())
+            Text(stringResource(R.string.knowledge_no_scope), style = MaterialTheme.typography.bodyMedium)
+            KnowledgeSections.forEach { (label, detail) ->
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(stringResource(label), style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        stringResource(detail),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }

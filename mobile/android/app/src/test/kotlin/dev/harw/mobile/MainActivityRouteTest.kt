@@ -42,9 +42,15 @@ class MainActivityRouteTest {
     }
 
     @Test
-    fun notificationExtraIsValidated() {
-        assertEquals(DeepLink(null, "sess-1"), parseOpenSessionExtra("sess-1"))
-        assertNull(parseOpenSessionExtra("bad id"))
-        assertNull(parseOpenSessionExtra(null))
+    fun notificationTargetRequiresAnExactBackendAndScope() {
+        val expected = SessionAlertTarget(
+            SessionHomeId(SessionHomeScope(SessionHomeBackend.Cloud, "scope"), "sess-1"),
+            SessionAlertKind.TurnEnd,
+        )
+        assertEquals(expected, parseAlertTarget("sess-1", "Cloud", "scope", "TurnEnd"))
+        assertNull(parseAlertTarget("sess-1", null, null, null))
+        assertNull(parseAlertTarget("sess-1", "Other", "scope", "TurnEnd"))
+        assertNull(parseAlertTarget("sess-1", "Cloud", "bad scope", "TurnEnd"))
+        assertNull(parseAlertTarget("bad id", "Cloud", "scope", "TurnEnd"))
     }
 }

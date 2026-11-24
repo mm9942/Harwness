@@ -493,7 +493,52 @@ pub fn build_named_backend(
         model,
         sources,
         &budget::ProviderBudgetRegistry::global(),
+        BackendDispatch::Conversation,
     )
+}
+
+/// Visible effective base for the isolated one-shot route. Legacy Codex login
+/// has no stable account-consent proof in this path; the distinct ChatGPT
+/// Account API is instead supported with its registration scope.
+pub fn one_shot_effective_endpoint(provider: &harw_config::ProviderToml) -> HttpProviderResult<String> {
+    validate_endpoint_with(&provider.base_url, provider.allow_insecure_lan)?;
+    if codex::CodexRoute::from_provider(provider)?.is_some() {
+        return Err(HttpProviderError::Decode("legacy Codex login cannot authorize this one-shot task".into()));
+    }
+    Ok(provider.base_url.trim_end_matches('/').to_owned())
+}
+
+/// Builds the exact configured backend for a bounded one-shot auxiliary task.
+/// No alternate provider, account pool, or application-level resubmission.
+pub fn build_exact_one_shot_backend(
+    config: &harw_config::ResolvedConfig,
+    provider_name: &str,
+    home: &Path,
+    resolver: &dyn SecretResolver,
+    account_scope: Option<&str>,
+) -> HttpProviderResult<Box<dyn ModelProvider>> {
+    let model = config.harness.default_model.as_deref().ok_or_else(|| {
+        HttpProviderError::MissingDefault { what: "default_model".to_owned() }
+    })?;
+    let provider = config.providers.get(provider_name).filter(|provider| provider.enabled)
+        .ok_or_else(|| HttpProviderError::DefaultProviderNotFound { name: provider_name.to_owned() })?;
+    one_shot_effective_endpoint(provider)?;
+    if (provider.api == CHATGPT_PLAN_API) != account_scope.is_some() {
+        return Err(HttpProviderError::Decode("one-shot ChatGPT account scope does not match the selected route".into()));
+    }
+    let mut scoped = config.clone();
+    scoped.auth.credential_pool.clear();
+    let sources = SecretSources { env_layer: &scoped.env_layer, resolver: Some(resolver), home: Some(home), endpoint: None };
+    let (backend, _) = build_named_provider(
+        provider_name,
+        provider,
+        &scoped,
+        model,
+        sources,
+        &budget::ProviderBudgetRegistry::global(),
+        BackendDispatch::OneShot { account_scope },
+    )?;
+    Ok(backend)
 }
 
 fn build_routing_provider_with_optional_resolver(
@@ -528,7 +573,7 @@ fn build_routing_provider_with_optional_resolver(
         .filter(|(_, provider)| provider.enabled)
         .collect::<BTreeMap<_, _>>()
     {
-        match build_named_provider(name, provider, config, model, sources, budgets) {
+        match build_named_provider(name, provider, config, model, sources, budgets, BackendDispatch::Conversation) {
             Ok((backend, load_control)) => {
                 if let Some(load_control) = load_control {
                     load_controls.insert(name.to_owned(), load_control);
@@ -628,6 +673,12 @@ type NamedProviderBuild = (
     Option<std::sync::Arc<dyn ProviderLoadControl>>,
 );
 
+#[derive(Clone, Copy)]
+enum BackendDispatch<'a> {
+    Conversation,
+    OneShot { account_scope: Option<&'a str> },
+}
+
 /// Builds one named provider backend, plus its [`ProviderLoadControl`] handle
 /// when the backend supports it.
 ///
@@ -647,6 +698,7 @@ fn build_named_provider(
     default_model: &str,
     sources: SecretSources<'_>,
     budgets: &budget::ProviderBudgetRegistry,
+    dispatch: BackendDispatch<'_>,
 ) -> HttpProviderResult<NamedProviderBuild> {
     validate_endpoint_with(&provider.base_url, provider.allow_insecure_lan)?;
     let sources = SecretSources {
@@ -789,6 +841,10 @@ fn build_named_provider(
                 rate_limiter: backend.rate_limiter_handle(),
                 budgets: anthropic_budgets,
             });
+        if matches!(dispatch, BackendDispatch::OneShot { .. }) {
+            backend.force_single_dispatch()?;
+            return Ok((Box::new(backend), Some(load_control)));
+        }
         return Ok((
             Box::new(RetryingProvider::new(
                 backend,
@@ -798,7 +854,7 @@ fn build_named_provider(
         ));
     }
 
-    let http_provider = OpenAiResponsesProvider::from_named_config_with_budgets(
+    let mut http_provider = OpenAiResponsesProvider::from_named_config_with_budgets(
         provider_name,
         provider,
         config,
@@ -815,6 +871,14 @@ fn build_named_provider(
             rate_limiter: http_provider.rate_limiter_handle(),
             budgets: http_provider.budgets(),
         });
+    if let BackendDispatch::OneShot { account_scope } = dispatch {
+        http_provider.exact_once = true;
+        http_provider.one_shot_account_scope = account_scope.map(str::to_owned);
+        // Same validated configured origin; never forward the transcript via
+        // a redirect or environment proxy.
+        http_provider.client = one_shot_http_client()?;
+        return Ok((Box::new(http_provider), Some(load_control)));
+    }
     Ok((
         Box::new(RetryingProvider::new(
             http_provider,
@@ -1065,6 +1129,16 @@ pub(crate) fn http_client() -> HttpProviderResult<reqwest::Client> {
         .build()
         .map_err(HttpProviderError::ClientBuild)
 }
+
+fn one_shot_http_client() -> HttpProviderResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(HttpProviderError::ClientBuild)
+}
+
 
 /// Runde 7, Teil L8: Baut den HTTP-Client für einen konkreten Endpunkt.
 ///
@@ -1648,6 +1722,8 @@ pub struct OpenAiResponsesProvider {
     api_key: SecretString,
     codex_route: Option<codex::CodexRoute>,
     chatgpt_plan: Option<harw_oauth::chatgpt_plan::ChatGptPlanStore>,
+    exact_once: bool,
+    one_shot_account_scope: Option<String>,
     auth_header: String,
     headers: reqwest::header::HeaderMap,
     transport: Transport,
@@ -1789,6 +1865,8 @@ impl OpenAiResponsesProvider {
             api_key,
             codex_route: None,
             chatgpt_plan: None,
+            exact_once: false,
+            one_shot_account_scope: None,
             auth_header: "bearer".into(),
             headers: reqwest::header::HeaderMap::new(),
             transport,
@@ -3053,15 +3131,13 @@ fn build_responses_body(
     Ok(body)
 }
 
-/// Kürzt einen provider-gelieferten Grund auf ein unkritisches Token.
-fn bounded_reason(reason: &str) -> String {
-    reason
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        })
-        .take(MAX_STOP_REASON_CHARS)
-        .collect()
+/// Keep only short machine-readable codes. Never reformat arbitrary
+/// provider prose (which can include prompt content) into a plausible code.
+fn bounded_reason(reason: &str) -> Option<&str> {
+    let reason = reason.trim();
+    (!reason.is_empty() && reason.len() <= MAX_STOP_REASON_CHARS
+        && reason.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+        .then_some(reason)
 }
 
 /// Sammelt `refusal`-Parts der `message`-Items einer Responses-Antwort.
@@ -3081,11 +3157,12 @@ fn extract_responses_refusal(body: &Value) -> Option<String> {
 /// Projiziert eine nicht-gestreamte Responses-Antwort auf den W3-Vertrag.
 ///
 /// # Description
-/// - `status` fehlt → wie `completed`; `failed`/`cancelled` → `RequestFailed`.
+/// - An absent status means completed for older adapters. Other non-success
+///   statuses preserve available text, suppress tools, and keep a safe code.
 /// - `incomplete`: `incomplete_details.reason` `max_output_tokens` →
 ///   [`StopReason::MaxTokens`], `content_filter` → [`StopReason::ContentFilter`],
-///   sonst `Other`. Teiltext bleibt erhalten; `function_call`-Items werden
-///   verworfen (Argumente können abgeschnitten sein — nie ausführen).
+///   otherwise a safe explicit code or `IncompleteUnknown`. Partial text is kept; `function_call` items are
+///   dropped because their arguments may be incomplete.
 /// - sonst: Tool-Calls → `ToolUse`; nur Refusal-Parts → `Refusal`; Text → `EndTurn`;
 ///   gar nichts → `EmptyResponse`.
 /// - `reasoning`-Items → `OpaqueReasoning{provider, model, blocks}` (verbatim);
@@ -3094,7 +3171,7 @@ fn extract_responses_refusal(body: &Value) -> Option<String> {
 ///   dass der Provider in dieser Runde kein Reasoning geliefert hat.
 ///
 /// # Errors
-/// `RequestFailed` bei `failed`/`cancelled` oder defekten Tool-Calls;
+/// `RequestFailed` for malformed tool calls in a completed response;
 /// `EmptyResponse` bei leerer, vollständiger Antwort.
 fn interpret_responses(
     body: &Value,
@@ -3105,16 +3182,15 @@ fn interpret_responses(
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
-    if matches!(status, "failed" | "cancelled") {
-        return Err(ModelError::RequestFailed(format!(
-            "provider reported response status '{status}'"
-        )));
-    }
-    let incomplete = (status == "incomplete").then(|| {
-        body.pointer("/incomplete_details/reason")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    });
+    let non_success = status != "completed";
+    let stop_code = match status {
+        "completed" => None,
+        "incomplete" => body.pointer("/incomplete_details/reason")
+            .and_then(Value::as_str).and_then(bounded_reason),
+        "failed" | "cancelled" => body.pointer("/error/code")
+            .and_then(Value::as_str).and_then(bounded_reason).or(Some(status)),
+        _ => bounded_reason(status),
+    };
     let output = body
         .get("output")
         .and_then(Value::as_array)
@@ -3122,7 +3198,7 @@ fn interpret_responses(
         .unwrap_or_default();
     let text = extract_assistant_text(body);
     let refusal = extract_responses_refusal(body);
-    let tool_calls = if incomplete.is_some() {
+    let tool_calls = if non_success {
         let dropped = output
             .iter()
             .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
@@ -3135,17 +3211,19 @@ fn interpret_responses(
         extract_openai_tool_calls(body, Transport::Responses)
             .map_err(|error| ModelError::RequestFailed(error.to_string()))?
     };
-    let stop = match incomplete {
+    let stop = match stop_code {
         Some("max_output_tokens") => StopReason::MaxTokens,
         Some("content_filter") => StopReason::ContentFilter,
-        Some(other) => StopReason::Other(bounded_reason(other)),
+        Some("context_length_exceeded") => StopReason::ContextWindowExceeded,
+        Some("unknown") | None if non_success => StopReason::IncompleteUnknown,
+        Some(code) => StopReason::Other(code.to_owned()),
         None if !tool_calls.is_empty() => StopReason::ToolUse,
         None if text.is_none() && refusal.is_some() => StopReason::Refusal {
             detail: refusal.clone(),
         },
         None => StopReason::EndTurn,
     };
-    if incomplete.is_none() && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
+    if !non_success && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
         return Err(ModelError::EmptyResponse);
     }
 
@@ -3176,11 +3254,12 @@ fn interpret_responses(
                 blocks: replayable,
             }
         });
-    let reasoning = (!blocks.is_empty()).then(|| OpaqueReasoning {
-        provider: provider.to_owned(),
-        model: model.to_owned(),
-        blocks,
-    });
+    let reasoning =
+        (!blocks.is_empty() && !non_success).then(|| OpaqueReasoning {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            blocks,
+        });
 
     Ok((
         ModelResponse {
@@ -3250,7 +3329,13 @@ fn interpret_chat(
         .and_then(|choice| choice.pointer("/message/refusal"))
         .and_then(Value::as_str)
         .filter(|refusal| !refusal.trim().is_empty());
-    let suppress_tools = refusal.is_some() || matches!(finish, Some("length" | "content_filter"));
+    let nonstandard_stop = finish.is_some_and(|reason| {
+        !matches!(reason, "stop" | "length" | "tool_calls" | "function_call" | "content_filter")
+    });
+    let suppress_tools = refusal.is_some()
+        || nonstandard_stop
+        || matches!(finish, Some("length" | "content_filter"))
+        || body["_harw_no_explicit_finish"].as_bool() == Some(true);
     let mut tool_calls = if suppress_tools {
         let dropped = choice
             .and_then(|choice| choice.pointer("/message/tool_calls"))
@@ -3353,7 +3438,9 @@ fn interpret_chat(
         },
         _ if !tool_calls.is_empty() => StopReason::ToolUse,
         None | Some("stop" | "tool_calls" | "function_call") => StopReason::EndTurn,
-        Some(other) => StopReason::Other(bounded_reason(other)),
+        Some(other) => bounded_reason(other).map_or(StopReason::IncompleteUnknown, |code| {
+            StopReason::Other(code.to_owned())
+        }),
     };
     if !suppress_tools && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
         return Err(ModelError::EmptyResponse);
@@ -4180,10 +4267,10 @@ impl OpenAiResponsesProvider {
             return Ok(builder.headers(route.headers(&self.client).await?));
         }
         if let Some(store) = &self.chatgpt_plan {
-            let token = store
-                .access_token()
-                .await
-                .map_err(chatgpt_plan::model_auth_error)?;
+            let token = match self.one_shot_account_scope.as_deref() {
+                Some(scope) => store.access_token_for_registration(scope).await,
+                None => store.access_token().await,
+            }.map_err(chatgpt_plan::model_auth_error)?;
             return Ok(builder.bearer_auth(token.expose_secret()));
         }
         let mut builder = match self.auth_header.as_str() {
@@ -4312,6 +4399,9 @@ impl OpenAiResponsesProvider {
         if self.chatgpt_plan.is_some() {
             chatgpt_plan::prepare_body(&mut wire);
         }
+        if self.exact_once && self.transport == Transport::Responses {
+            wire["store"] = Value::Bool(false);
+        }
         // Natives SSE-Streaming (Codex streamt ohnehin, siehe oben).
         let stream_sink = request
             .stream
@@ -4404,6 +4494,7 @@ impl OpenAiResponsesProvider {
             if response.status() == reqwest::StatusCode::BAD_REQUEST
                 && self.transport == Transport::Chat
                 && !degraded_after_400
+                && !self.exact_once
                 && self.codex_route.is_none()
                 && self.chatgpt_plan.is_none()
                 && remove_optional_chat_fields(&mut wire)
@@ -4417,6 +4508,7 @@ impl OpenAiResponsesProvider {
             }
             if response.status() == reqwest::StatusCode::UNAUTHORIZED
                 && !codex_refreshed_after_401
+                && !self.exact_once
                 && let Some(route) = &self.codex_route
             {
                 codex_refreshed_after_401 = true;
@@ -4433,9 +4525,23 @@ impl OpenAiResponsesProvider {
         let retry_after_ms = header_string(response.headers(), "retry-after-ms");
         let request_id = provider_request_id(response.headers());
         let value: Value = if status.is_success() && self.codex_route.is_some() {
-            codex::read_response(response, request.stream.as_ref()).await?
+            match codex::read_response(response, request.stream.as_ref()).await? {
+                sse::NativeStreamOutcome::Completed(body) => body,
+                sse::NativeStreamOutcome::Interrupted(partial) => {
+                    budget_permit.reconcile(&partial.usage);
+                    return Ok(partial);
+                }
+            }
         } else if status.is_success() && self.chatgpt_plan.is_some() {
-            chatgpt_plan::read_response(response, stream_sink, self.stream_idle_timeout).await?
+            match chatgpt_plan::read_response(response, stream_sink, self.stream_idle_timeout)
+                .await?
+            {
+                sse::NativeStreamOutcome::Completed(body) => body,
+                sse::NativeStreamOutcome::Interrupted(partial) => {
+                    budget_permit.reconcile(&partial.usage);
+                    return Ok(partial);
+                }
+            }
         } else if status.is_success()
             && let Some(sink) = stream_sink
         {
@@ -4443,7 +4549,7 @@ impl OpenAiResponsesProvider {
                 .await?
             {
                 sse::NativeStreamOutcome::Completed(body) => body,
-                sse::NativeStreamOutcome::InterruptedChat(partial) => {
+                sse::NativeStreamOutcome::Interrupted(partial) => {
                     budget_permit.reconcile(&partial.usage);
                     // This is a partial answer, not an error eligible for
                     // transport retry and not a complete round for replay.
@@ -4618,28 +4724,48 @@ async fn read_native_stream(
     match transport {
         Transport::Chat => {
             let mut accumulator = sse::ChatStreamAccumulator::default();
-            sse::read_sse(response, Some(idle_timeout), |frame| {
+            match sse::read_sse(response, Some(idle_timeout), |frame| {
                 accumulator.push(&frame, Some(sink))
             })
-            .await?;
-            Ok(accumulator.finish())
+            .await
+            {
+                Ok(()) => Ok(accumulator.finish()),
+                Err(error @ (ModelError::Truncated { .. } | ModelError::Timeout { .. })) => {
+                    accumulator.finish_after_transport_error().ok_or(error)
+                }
+                Err(error) => Err(error),
+            }
         }
         Transport::Responses => {
             let mut terminal = None;
-            sse::read_sse(response, Some(idle_timeout), |frame| {
+            let mut partial = sse::ResponsesPartialText::default();
+            let body_read = sse::read_sse(response, Some(idle_timeout), |frame| {
                 if frame.data.trim().is_empty() || frame.data.trim() == "[DONE]" {
                     return Ok(false);
                 }
                 let event: Value = serde_json::from_str(&frame.data)?;
-                terminal = sse::responses_event(&event, Some(sink))?;
+                partial.observe(&event);
+                terminal = match partial.terminal_error(&event) {
+                    Some(failure) => Some(failure),
+                    None => sse::responses_event(&event, Some(sink))?,
+                };
                 Ok(terminal.is_some())
             })
-            .await?;
-            terminal
-                .map(sse::NativeStreamOutcome::Completed)
-                .ok_or_else(|| ModelError::Truncated {
-                    message: "response stream ended before its terminal event".into(),
-                })
+            .await;
+            match body_read {
+                Ok(()) => Ok(match terminal {
+                    Some(body) => {
+                        sse::NativeStreamOutcome::Completed(partial.retain_visible_text(body))
+                    }
+                    None => partial.into_interrupted(false),
+                }),
+                // Do not retry a response already visible to the user. Decoder
+                // errors and explicit provider failure keep their own category.
+                Err(ModelError::Truncated { .. } | ModelError::Timeout { .. }) if partial.has_text() => {
+                    Ok(partial.into_interrupted(true))
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 }

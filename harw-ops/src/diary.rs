@@ -2,13 +2,13 @@
 //! `interaction-contract.md` §2.2).
 //!
 //! # Subcommands
-//! - (bare) / `show [AgentRef] [--date=YYYY-MM-DD]` — rendert einen Tag;
+//! - (bare) / `show [AgentRef | --agent=ID] [--date=YYYY-MM-DD]` — rendert einen Tag;
 //!   ohne Angaben das eigene Tagebuch von heute (UTC).
 //! - `show [AgentRef] --from=YYYY-MM-DD [--to=YYYY-MM-DD]` — Bereichsansicht
 //!   (höchstens [`MAX_RANGE_DAYS`] Tage; `--to` fehlt → heute, `--from`
 //!   fehlt → `--to`). Nicht mit `--date` kombinierbar.
 //! - `today` — Kurzform für das eigene Tagebuch von heute.
-//! - `search <text> [--agent=<id>] [--from=…] [--to=…]` — Volltextsuche
+//! - `search <text | --query=TEXT> [--agent=<id>] [--from=…] [--to=…]` — Volltextsuche
 //!   (ohne Groß-/Kleinschreibung) über die strukturierten Einträge aller
 //!   sichtbaren Tagebücher bzw. eines Agenten; höchstens
 //!   [`MAX_SEARCH_HITS`] Treffer, die jüngsten zuerst.
@@ -55,6 +55,7 @@ use crate::knowledge_common::{
 
 /// Flags von `show`.
 const SHOW_FLAGS: &[FlagSpec] = &[
+    FlagSpec::value("agent"),
     FlagSpec::value("date"),
     FlagSpec::value("from"),
     FlagSpec::value("to"),
@@ -62,6 +63,7 @@ const SHOW_FLAGS: &[FlagSpec] = &[
 
 /// Flags von `search`.
 const SEARCH_FLAGS: &[FlagSpec] = &[
+    FlagSpec::value("query"),
     FlagSpec::value("agent"),
     FlagSpec::value("from"),
     FlagSpec::value("to"),
@@ -77,7 +79,7 @@ pub const MAX_SEARCH_HITS: usize = 50;
 const SNIPPET_CHARS: usize = 160;
 
 /// Obergrenze eines `/diary note`-Texts in Bytes.
-const MAX_DIARY_NOTE_BYTES: usize = 16 * 1024;
+pub const MAX_DIARY_NOTE_BYTES: usize = 16 * 1024;
 
 /// Argument-Container für `/diary`: rohe Tokens.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -217,16 +219,7 @@ fn show(
         Some(date) => validate_date(date)?,
         None => now.strftime("%Y-%m-%d").to_string(),
     };
-    let rest = args.positionals();
-    if rest.len() > 1 {
-        return Err(OpError::InvalidArguments(
-            "Aufruf: /diary show [agent] [--date=YYYY-MM-DD]".to_owned(),
-        ));
-    }
-    let agent = match rest.first() {
-        Some(raw) => AgentId::new(validate_agent(raw)?),
-        None => caller.agent.clone(),
-    };
+    let agent = show_agent(&args, caller)?;
     let day = diary::read_day(store, &agent, &date)
         .map_err(map_knowledge_error)?
         .filter(|artifact| caller.can_read(&artifact.frontmatter.visibility));
@@ -248,6 +241,21 @@ fn show(
     })
 }
 
+/// Accept exactly one selector, retaining the existing positional spelling.
+fn show_agent(args: &KnowledgeArgs, caller: &KnowledgeCaller) -> Result<AgentId, OpError> {
+    let explicit = args.values("agent");
+    let selected = match (explicit.as_slice(), args.positionals()) {
+        ([], []) => return Ok(caller.agent.clone()),
+        ([], [raw]) | ([raw], []) => raw.as_str(),
+        _ => {
+            return Err(OpError::InvalidArguments(
+                "Tagebuch: nur eine Agent-ID oder --agent=ID angeben".to_owned(),
+            ));
+        }
+    };
+    Ok(AgentId::new(validate_agent(selected)?))
+}
+
 /// Bereichsansicht von `show --from/--to`.
 fn show_range(
     store: &KnowledgeStore,
@@ -255,16 +263,7 @@ fn show_range(
     args: &KnowledgeArgs,
     now: jiff::Timestamp,
 ) -> Result<OpOutput, OpError> {
-    let rest = args.positionals();
-    if rest.len() > 1 {
-        return Err(OpError::InvalidArguments(
-            "Aufruf: /diary show [agent] --from=YYYY-MM-DD [--to=YYYY-MM-DD]".to_owned(),
-        ));
-    }
-    let agent = match rest.first() {
-        Some(raw) => AgentId::new(validate_agent(raw)?),
-        None => caller.agent.clone(),
-    };
+    let agent = show_agent(args, caller)?;
     let (from, to) = date_range(args, now)?;
     let days: Vec<DiaryDay> = diary::read_range(store, &agent, &from, &to)
         .map_err(map_knowledge_error)?
@@ -337,7 +336,7 @@ fn date_range(args: &KnowledgeArgs, now: jiff::Timestamp) -> Result<(String, Str
     Ok((from, to))
 }
 
-/// `/diary search <text> [--agent=…] [--from=…] [--to=…]`.
+/// `/diary search <text | --query=TEXT> [--agent=…] [--from=…] [--to=…]`.
 fn search(
     store: &KnowledgeStore,
     caller: &KnowledgeCaller,
@@ -345,11 +344,23 @@ fn search(
     now: jiff::Timestamp,
 ) -> Result<OpOutput, OpError> {
     let args = KnowledgeArgs::parse(tokens, SEARCH_FLAGS)?;
-    let query = args.positionals().join(" ");
-    let query = query.trim();
+    let explicit = args.values("query");
+    let positional;
+    let query = match explicit.as_slice() {
+        [] => {
+            positional = args.positionals().join(" ");
+            positional.trim()
+        }
+        [query] if args.positionals().is_empty() => query.trim(),
+        _ => {
+            return Err(OpError::InvalidArguments(
+                "Tagebuchsuche: nur einen Suchtext oder --query=TEXT angeben".to_owned(),
+            ));
+        }
+    };
     if query.is_empty() {
         return Err(OpError::InvalidArguments(
-            "Aufruf: /diary search <text> [--agent=<id>] [--from=YYYY-MM-DD] [--to=YYYY-MM-DD]"
+            "Aufruf: /diary search <text | --query=TEXT> [--agent=<id>] [--from=YYYY-MM-DD] [--to=YYYY-MM-DD]"
                 .to_owned(),
         ));
     }
@@ -518,7 +529,7 @@ fn validate_date(raw: &str) -> Result<String, OpError> {
             4 | 7 => c == '-',
             _ => c.is_ascii_digit(),
         });
-    if !well_formed {
+    if !well_formed || raw.parse::<jiff::civil::Date>().is_err() {
         return Err(OpError::InvalidArguments(format!(
             "ungültiges Datum '{raw}' (YYYY-MM-DD)"
         )));
@@ -586,6 +597,41 @@ mod tests {
         )
         .map_err(ctx("explicit show succeeds"))?;
         assert!(explicit.text.contains("Build grün"));
+
+        let typed = run_diary(
+            &store,
+            &AgentId::new("someone-else"),
+            &toks(&["show", "--agent=operator", date_flag.as_str()]),
+            now,
+        )
+        .map_err(ctx("explicit agent flag succeeds"))?;
+        assert_eq!(typed.data, explicit.data);
+        std::fs::remove_dir_all(store.root()).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn literal_search_cannot_switch_the_selected_agent() -> TestResult {
+        let store = temporary_store("literal-search")?;
+        let operator = AgentId::new("operator");
+        let now = noon()?;
+        let literal = "--agent=other";
+        for agent in [&operator, &AgentId::new("other")] {
+            run_diary(&store, agent, &toks(&["note", literal]), now)
+                .map_err(ctx("store searchable notes"))?;
+        }
+        let output = run_diary(
+            &store,
+            &operator,
+            &toks(&["search", "--query=--agent=other", "--agent=operator"]),
+            now,
+        )
+        .map_err(ctx("search keeps an explicit query literal"))?;
+        let data = output.data.ok_or(TestError::Missing("search data"))?;
+        let hits = data["hits"].as_array().ok_or(TestError::Missing("hits"))?;
+        assert_eq!(data["query"], literal);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["agent"], "operator");
         std::fs::remove_dir_all(store.root()).ok();
         Ok(())
     }

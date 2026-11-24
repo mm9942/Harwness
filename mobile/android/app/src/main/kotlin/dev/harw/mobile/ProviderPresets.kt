@@ -4,6 +4,12 @@ import java.net.URI
 import java.util.Locale
 import uniffi.harw_mobile_ffi.ProviderKind
 
+private const val BEDROCK_CHAT = "bedrock-chat"
+private const val OPENAI_COMPATIBLE_PATH = "/openai/v1"
+private const val VERTEX_OPENAI = "vertex-openai"
+private const val CUSTOM_PREFIX = "custom-"
+private const val PUBLISHER_MODEL_ID_HINT = "Publisher-Modell-ID."
+
 /**
  * Anbieter-Vorlagen der alten Kit-App (ProviderCatalog, 24 Zeilen), als Daten portiert.
  * Der Kern kennt nur fuenf Familien ([ProviderKind]); [kind] bildet das Protokoll darauf ab.
@@ -27,7 +33,7 @@ internal data class ProviderPreset(
             "anthropic-messages" -> ProviderKind.ANTHROPIC
             "openai-responses" -> ProviderKind.OPEN_AI
             // Azure-v1-Endpunkte (/openai/v1) nehmen den Ressourcenschluessel auch als Bearer-Token an.
-            "openai-chat", "bedrock-chat", "vertex-openai", "azure-openai-chat", "azure-foundry-chat" -> ProviderKind.OPEN_AI_COMPATIBLE
+            "openai-chat", BEDROCK_CHAT, VERTEX_OPENAI, "azure-openai-chat", "azure-foundry-chat" -> ProviderKind.OPEN_AI_COMPATIBLE
             else -> null
         }
 
@@ -42,7 +48,7 @@ internal data class ProviderPreset(
     val group: String
         get() = when {
             id in GATEWAY_IDS -> "Gateways"
-            id.startsWith("custom-") -> "Eigene"
+            id.startsWith(CUSTOM_PREFIX) -> "Eigene"
             id.startsWith("azure-") || id.startsWith("bedrock-") || id.startsWith("vertex-") -> "Cloud"
             else -> "Direkt"
         }
@@ -69,17 +75,17 @@ internal val PROVIDER_PRESETS: List<ProviderPreset> = listOf(
         "Google-Publisher-Modelle auf Gemini über die OpenAI-kompatible Chat-Completions-API.",
         true, "", "API-Schlüssel"),
     ProviderPreset("xai", "xAI", "openai-chat", "https://api.x.ai/v1", "grok-3-mini",
-        "Publisher-Modell-ID.",
+        PUBLISHER_MODEL_ID_HINT,
         "xAI-API-Stammadresse mit /v1 am Ende.",
         "xAI-Publisher-Modelle über die OpenAI-kompatible Chat-Completions-API.",
         true, "", "API-Schlüssel"),
     ProviderPreset("deepseek", "DeepSeek", "openai-chat", "https://api.deepseek.com/v1", "deepseek-chat",
-        "Publisher-Modell-ID.",
+        PUBLISHER_MODEL_ID_HINT,
         "DeepSeek-API-Stammadresse mit /v1 am Ende.",
         "DeepSeek-Publisher-Modelle über die OpenAI-kompatible Chat-Completions-API.",
         true, "", "API-Schlüssel"),
     ProviderPreset("mistral", "Mistral", "openai-chat", "https://api.mistral.ai/v1", "mistral-small-latest",
-        "Publisher-Modell-ID.",
+        PUBLISHER_MODEL_ID_HINT,
         "Mistral-API-Stammadresse mit /v1 am Ende.",
         "Mistral-Publisher-Modelle über die OpenAI-kompatible Chat-Completions-API.",
         true, "", "API-Schlüssel"),
@@ -148,7 +154,7 @@ internal val PROVIDER_PRESETS: List<ProviderPreset> = listOf(
         "Azure-AI-Foundry-Ressourcen-URL mit /anthropic oder /anthropic/v1 am Ende.",
         "Anthropic-Publisher-Modelle in Azure AI Foundry über die Anthropic-kompatible API.",
         true, "", "Azure-Ressourcen-API-Schlüssel"),
-    ProviderPreset("bedrock-chat", "Amazon Bedrock Chat", "bedrock-chat", "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1", "",
+    ProviderPreset(BEDROCK_CHAT, "Amazon Bedrock Chat", BEDROCK_CHAT, "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1", "",
         "Für Bedrocks OpenAI-kompatible API freigegebene Modell-ID des gehosteten Publisher-Modells.",
         "Bedrock-Runtime-Route /openai/v1 oder Bedrock-Mantle-Host mit .api.aws und /v1-Pfad.",
         "Verwendet einen Bedrock-API-Schlüssel als Bearer-Token. Verfügbar sind nur Modelle für die OpenAI-kompatible API; SigV4-IAM und die Converse-API werden nicht verwendet.",
@@ -158,7 +164,7 @@ internal val PROVIDER_PRESETS: List<ProviderPreset> = listOf(
         "Bedrock-Runtime-Route /openai/v1 oder Bedrock-Mantle-Host mit .api.aws und /v1-Pfad.",
         "Verwendet einen Bedrock-API-Schlüssel als Bearer-Token. Verfügbar sind nur Modelle für die OpenAI-kompatible API; SigV4-IAM und die Converse-API werden nicht verwendet.",
         true, "", "Amazon-Bedrock-API-Schlüssel"),
-    ProviderPreset("vertex-openai", "Google Vertex AI OpenAI-compatible", "vertex-openai", "https://aiplatform.googleapis.com/v1/projects/YOUR_PROJECT/locations/global/endpoints/openapi", "",
+    ProviderPreset(VERTEX_OPENAI, "Google Vertex AI OpenAI-compatible", VERTEX_OPENAI, "https://aiplatform.googleapis.com/v1/projects/YOUR_PROJECT/locations/global/endpoints/openapi", "",
         "Publisher-Modell-ID, die der OpenAI-kompatible Vertex-Endpunkt akzeptiert.",
         "Vertex-Route: /v1/projects/{project}/locations/{location}/endpoints/openapi.",
         "Publisher-Modelle auf Vertex AI. Geben Sie ein KURZLEBIGES Google-OAuth-Zugriffstoken manuell ein und erneuern Sie es nach Ablauf. Google-Anmeldung und Token-Erneuerung werden nicht angeboten.",
@@ -189,14 +195,14 @@ internal fun searchPresets(query: String, group: String): List<ProviderPreset> {
 
 /** Ordnet eine gespeicherte Route (api-Familie + Endpunkt) wieder einer Vorlage zu. */
 internal fun inferPreset(api: String, endpoint: String): ProviderPreset? {
-    val uri = parseHttps(endpoint) ?: return PROVIDER_PRESETS.firstOrNull { it.api == api && it.id.startsWith("custom-") }
+    val uri = parseHttps(endpoint) ?: return PROVIDER_PRESETS.firstOrNull { it.api == api && it.id.startsWith(CUSTOM_PREFIX) }
     val host = uri.host.lowercase(Locale.ROOT)
     val path = uri.path.orEmpty().trimEnd('/')
     PROVIDER_PRESETS.firstOrNull { p ->
-        !p.id.startsWith("custom-") && p.available && p.api == api &&
+        !p.id.startsWith(CUSTOM_PREFIX) && p.available && p.api == api &&
             parseHttps(p.endpoint)?.let { it.host.equals(host, true) && it.path.orEmpty().trimEnd('/') == path } == true
     }?.let { return it }
-    return PROVIDER_PRESETS.firstOrNull { it.api == api && it.id.startsWith("custom-") }
+    return PROVIDER_PRESETS.firstOrNull { it.api == api && it.id.startsWith(CUSTOM_PREFIX) }
 }
 
 private fun parseHttps(text: String): URI? = try {
@@ -213,13 +219,13 @@ private val VERTEX_PATH = Regex("^/v1/projects/[^/]+/locations/[^/]+/endpoints/o
 
 private fun routeAllowed(preset: ProviderPreset, host: String, path: String, port: Int): Boolean = when {
     preset.id == "huggingface" -> host == "router.huggingface.co" && path == "/v1" && (port == -1 || port == 443)
-    preset.id.startsWith("azure-openai") -> host.endsWith(".openai.azure.com") && path == "/openai/v1"
-    preset.id == "azure-foundry-chat" -> host.endsWith(".services.ai.azure.com") && path == "/openai/v1"
+    preset.id.startsWith("azure-openai") -> host.endsWith(".openai.azure.com") && path == OPENAI_COMPATIBLE_PATH
+    preset.id == "azure-foundry-chat" -> host.endsWith(".services.ai.azure.com") && path == OPENAI_COMPATIBLE_PATH
     preset.id == "azure-foundry-anthropic" ->
         host.endsWith(".services.ai.azure.com") && (path == "/anthropic" || path == "/anthropic/v1")
     preset.id.startsWith("bedrock-") ->
-        (BEDROCK_RUNTIME.matches(host) && path == "/openai/v1") || (BEDROCK_MANTLE.matches(host) && path.startsWith("/v1"))
-    preset.id == "vertex-openai" ->
+        (BEDROCK_RUNTIME.matches(host) && path == OPENAI_COMPATIBLE_PATH) || (BEDROCK_MANTLE.matches(host) && path.startsWith("/v1"))
+    preset.id == VERTEX_OPENAI ->
         (host == "aiplatform.googleapis.com" || VERTEX_HOST.matches(host)) && VERTEX_PATH.matches(path)
     else -> true
 }

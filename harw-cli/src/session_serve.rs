@@ -241,6 +241,10 @@ impl GatewayCoreFactory {
 }
 
 impl CoreSessionFactory for GatewayCoreFactory {
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        Some(self.store.as_ref())
+    }
+
     fn build(
         &self,
         session_id: &SessionId,

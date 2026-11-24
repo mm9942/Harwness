@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Product label; the virtual project is named Internal in every locale. -->
+    <string name="internal_directory_name" translatable="false">Internal</string>
+    <string name="internal_directory_subtitle">Internally generated runs</string>
+    <string name="internal_directory_category_dream">Dream</string>
+    <string name="internal_directory_category_diary">Diary</string>
+    <string name="internal_directory_category_ledger">Ledger</string>
+    <string name="internal_directory_category_memory">Memory Reconciliation</string>
+    <string name="internal_directory_category_workbench">Automatic Workbench</string>
+    <string name="internal_directory_back_projects">Back to projects</string>
+    <string name="internal_directory_disconnected">Connect this profile to see its internal runs.</string>
+    <string name="internal_directory_back">Back</string>
+    <string name="internal_directory_scope_local">Local</string>
+    <string name="internal_directory_scope_cloud">Cloud</string>
+    <string name="internal_directory_scope_title">%1$s · %2$s</string>
+    <string name="internal_directory_refresh">Refresh</string>
+    <string name="internal_directory_unsupported">This host does not yet provide a separate Internal catalog.</string>
+    <string name="internal_directory_dream_only">This host currently provides Dream runs only.</string>
+    <string name="internal_directory_load_error">Internal runs could not be loaded.</string>
+    <string name="internal_directory_last_activity">Last activity: %1$s</string>
+    <string name="internal_directory_access">Access: metadata only</string>
+    <string name="internal_directory_details_note">This shows internal metadata, not a chat transcript.</string>
+    <string name="internal_directory_empty_group">No verified runs in this category.</string>
+    <string name="internal_directory_load_more">Load more runs</string>
+    <string name="internal_directory_unknown_run">Internal run</string>
+    <string name="internal_directory_time_unavailable">Time unavailable</string>
+</resources>

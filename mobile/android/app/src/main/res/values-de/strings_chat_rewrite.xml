@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_rewrite_resolve">Vorherige Änderung prüfen oder erneut senden</string>
+    <string name="chat_rewrite_resolve_unavailable">Der vorherige Vorgang kann gerade nicht geprüft werden.</string>
+    <string name="chat_rewrite_reload">Verlauf neu laden</string>
+    <string name="chat_rewrite_forget">Änderung nicht mehr verfolgen</string>
+    <string name="chat_rewrite_forget_explanation">Damit beendest du nur die Verfolgung auf diesem Handy. Eine Änderung auf dem Host bleibt bestehen. Die alte Fassung erscheint hier möglicherweise nicht. Der Verlauf wird neu geladen, bevor du erneut bearbeiten kannst.</string>
+    <string name="chat_rewrite_forget_confirm">Nicht mehr verfolgen</string>
+    <string name="chat_rewrite_journal_unavailable">Das Handy konnte die vorherige Änderung nicht speichern oder löschen. Es wurde keine neue Änderung gesendet.</string>
+    <string name="chat_rewrite_archive_only">Die alte Fassung war zu groß für den Handy-Cache. Öffne den gespeicherten Verlauf auf dem Host.</string>
+    <string name="chat_reply_interrupted">Die Antwort wurde unterbrochen.</string>
+    <string name="chat_reply_reload">Antwort nachladen</string>
+    <string name="chat_reply_retry">Erneut versuchen</string>
+    <string name="chat_reply_stop">Antwort stoppen</string>
+    <string name="chat_reply_waiting_stop">Stoppen ist gerade nicht verfügbar</string>
+</resources>

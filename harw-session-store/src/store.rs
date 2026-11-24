@@ -61,19 +61,22 @@
 use std::fs::File;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use fs4::FileExt;
 use harw_fsutil::OpenMode;
-use harw_types::SessionId;
+use harw_types::{SessionId, ThreadRef};
 use tempfile::NamedTempFile;
 
 use crate::error::{SessionStoreError, SessionStoreResult};
 use crate::lease::{HolderKind, SessionLease};
 pub use crate::reader::MAX_RECORD_BYTES;
 use crate::reader::TranscriptReader;
-use crate::record::TranscriptRecord;
+use crate::record::{RecordKind, SessionPurpose, TranscriptRecord};
+
+/// A purpose marker is a tiny header; never scan text/history for classification.
+const SESSION_PURPOSE_READ_BYTES: u64 = 4096;
 
 /// File extension used for every session transcript.
 const TRANSCRIPT_EXT: &str = "jsonl";
@@ -210,6 +213,19 @@ impl TranscriptStore {
     /// is the only wait), then the exclusive `fs4` try-lock on
     /// `<id>.jsonl.lock`, which never blocks.
     pub fn append(&self, record: &TranscriptRecord) -> SessionStoreResult<()> {
+        self.append_positioned(record, false).map(|_| ())
+    }
+
+    /// Same durable writer; return integrity-addressed metadata only when requested.
+    pub fn append_title_item(&self, record: &TranscriptRecord)
+        -> SessionStoreResult<Option<crate::title_seed::TitleSeedLocation>>
+    {
+        self.append_positioned(record, true)
+    }
+
+    fn append_positioned(&self, record: &TranscriptRecord, locate: bool)
+        -> SessionStoreResult<Option<crate::title_seed::TitleSeedLocation>>
+    {
         let path = self.transcript_path(&record.session_id)?;
         let line = record.to_jsonl_line()?;
         ensure_record_within_limit(&record.session_id, &line)?;
@@ -219,19 +235,215 @@ impl TranscriptStore {
         let _lease = self.writer_lease(&record.session_id)?;
         let lock = lock_transcript(&path, &record.session_id)?;
 
-        let write_result = (|| -> SessionStoreResult<()> {
+        let write_result = (|| {
             reject_symlink(&path, "transcript")?;
             let mut file = open_transcript_for_append(&path)?;
             repair_open_tail(&mut file, &path)?;
+            let location = if locate && record.kind == crate::RecordKind::Item {
+                // Failure to certify an optional byte location is not a journal write failure.
+                file.metadata().ok().and_then(|meta| {
+                    crate::title_seed::TitleSeedLocation::from_line(record, meta.len(), &line)
+                })
+            } else { None };
             file.write_all(line.as_bytes())
                 .map_err(SessionStoreError::Io)?;
             file.sync_data().map_err(SessionStoreError::Io)?;
             sync_parent_directory(parent)?;
-            Ok(())
+            Ok::<_, SessionStoreError>(location)
+        })();
+        let unlock_result = FileExt::unlock(&lock).map_err(SessionStoreError::Io);
+        let location = write_result?;
+        unlock_result?;
+        Ok(location)
+    }
+
+    /// Read the typed creation-purpose marker without following symlinks,
+    /// walking the transcript, or guessing from its name, title, or messages.
+    /// Legacy and unrecognized records return `None`.
+    pub fn session_purpose(
+        &self,
+        session_id: &SessionId,
+    ) -> SessionStoreResult<Option<SessionPurpose>> {
+        let path = self.transcript_path(session_id)?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SessionStoreError::Io(error)),
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let file = open_without_following_symlinks(OpenMode::read_only(), &path)?;
+        if !file.metadata()?.is_file() {
+            return Ok(None);
+        }
+        Ok(opening_record(file)?
+            .filter(|record| record.session_id == *session_id)
+            .and_then(|record| SessionPurpose::from_opening_record(&record)))
+    }
+
+    /// Creation purpose for catalog isolation, with a narrow pre-marker Dream
+    /// compatibility path. Ordinary titles and text alone never classify a row.
+    ///
+    /// # Errors
+    /// Returns a store error if the exact regular transcript cannot be read.
+    pub fn catalog_session_purpose(
+        &self,
+        session_id: &SessionId,
+    ) -> SessionStoreResult<Option<SessionPurpose>> {
+        let typed = self.session_purpose(session_id)?;
+        if typed.is_some() || !legacy_dream_id(session_id.as_str()) {
+            return Ok(typed);
+        }
+        // The original Dream user item includes context and can exceed the
+        // marker limit. The larger read applies only to an exact producer ID.
+        const LEGACY_OPENING_LIMIT: u64 = 128 * 1024;
+        let path = self.transcript_path(session_id)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let file = match open_without_following_symlinks(OpenMode::read_only(), &path) {
+            Ok(file) if file.metadata()?.is_file() => file,
+            Ok(_) => return Ok(None),
+            Err(SessionStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let record = opening_record_bounded(file, LEGACY_OPENING_LIMIT)?;
+        Ok(record.filter(|row| legacy_dream_opening(session_id, row)).map(|_| SessionPurpose::Dream))
+    }
+
+    /// Reserve a new typed internal transcript under the same writer fences
+    /// as ordinary append. It is idempotent for the exact unmodified opening
+    /// marker, but never retroactively labels an existing untyped transcript.
+    pub fn ensure_session_purpose(
+        &self,
+        session_id: &SessionId,
+        thread: &ThreadRef,
+        purpose: SessionPurpose,
+    ) -> SessionStoreResult<()> {
+        let path = self.transcript_path(session_id)?;
+        let parent = transcript_parent(&path)?;
+        let record = TranscriptRecord::new(
+            session_id.clone(),
+            thread.clone(),
+            0,
+            jiff::Timestamp::now(),
+            RecordKind::Lifecycle,
+            purpose.opening_payload(),
+        );
+        let line = record.to_jsonl_line()?;
+        ensure_record_within_limit(session_id, &line)?;
+        if line.len() as u64 > SESSION_PURPOSE_READ_BYTES {
+            return Err(SessionStoreError::CorruptRecord {
+                detail: "session purpose opening marker exceeds its read bound".into(),
+            });
+        }
+        std::fs::create_dir_all(parent)?;
+        let _lease = self.writer_lease(session_id)?;
+        let lock = lock_transcript(&path, session_id)?;
+        let written = (|| -> SessionStoreResult<()> {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err(SessionStoreError::CorruptRecord {
+                        detail: "session purpose requires a regular transcript".into(),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(SessionStoreError::Io(error)),
+            }
+            let mut file = open_transcript_for_append(&path)?;
+            if file.metadata()?.len() != 0 {
+                file.rewind()?;
+                if opening_record(&mut file)?.is_some_and(|opening| {
+                    opening.session_id == *session_id
+                        && opening.thread == *thread
+                        && SessionPurpose::from_opening_record(&opening) == Some(purpose)
+                }) {
+                    // A prior attempt may have written the marker before its fsync failed.
+                    file.sync_data()?;
+                    return sync_parent_directory(parent);
+                }
+                return Err(SessionStoreError::CorruptRecord {
+                    detail: "existing transcript has no matching purpose opening marker".into(),
+                });
+            }
+            file.write_all(line.as_bytes())?;
+            file.sync_data()?;
+            sync_parent_directory(parent)
+        })();
+        let unlocked = FileExt::unlock(&lock).map_err(SessionStoreError::Io);
+        written?;
+        unlocked
+    }
+
+    /// Append a transaction-framed record group while holding one writer lock.
+    /// A fork may physically read an in-progress group, but must reject it
+    /// against the writer's published post-sync cursor. A begin/commit frame
+    /// makes an interrupted group distinguishable after a crash.
+    pub fn append_group(&self, records: &[TranscriptRecord]) -> SessionStoreResult<()> {
+        let Some(first) = records.first() else {
+            return Ok(());
+        };
+        let sid = &first.session_id;
+        let path = self.transcript_path(sid)?;
+        let mut lines = Vec::with_capacity(records.len());
+        for record in records {
+            if record.session_id != *sid {
+                return Err(SessionStoreError::CorruptRecord {
+                    detail: "mixed session record group".into(),
+                });
+            }
+            let line = record.to_jsonl_line()?;
+            ensure_record_within_limit(sid, &line)?;
+            lines.push(line);
+        }
+        let parent = transcript_parent(&path)?;
+        std::fs::create_dir_all(parent).map_err(SessionStoreError::Io)?;
+        let _lease = self.writer_lease(sid)?;
+        let lock = lock_transcript(&path, sid)?;
+        let write_result = (|| -> SessionStoreResult<()> {
+            reject_symlink(&path, "transcript")?;
+            let mut file = open_transcript_for_append(&path)?;
+            repair_open_tail(&mut file, &path)?;
+            for line in lines {
+                file.write_all(line.as_bytes())
+                    .map_err(SessionStoreError::Io)?;
+            }
+            file.sync_data().map_err(SessionStoreError::Io)?;
+            sync_parent_directory(parent)
         })();
         let unlock_result = FileExt::unlock(&lock).map_err(SessionStoreError::Io);
         write_result?;
         unlock_result
+    }
+
+    /// Open a bounded read horizon without any model, session or journal
+    /// lock. The opened inode and fixed byte horizon exclude later appends.
+    /// Consumers must validate their authoritative record head.
+    pub fn snapshot_reader(
+        &self,
+        sid: &SessionId,
+        max_bytes: u64,
+    ) -> SessionStoreResult<TranscriptReader> {
+        let mut reader = self.reader(sid)?;
+        reader.pin_snapshot(max_bytes)?;
+        Ok(reader)
+    }
+
+    /// Detect an append or replacement of the pinned snapshot at its path.
+    pub fn snapshot_is_current(
+        &self,
+        sid: &SessionId,
+        snapshot: &TranscriptReader,
+    ) -> SessionStoreResult<bool> {
+        let path = self.transcript_path(sid)?;
+        Ok(snapshot.matches_snapshot(&std::fs::symlink_metadata(path)?))
     }
 
     /// Cuts off a torn final JSONL line under the exclusive transcript lock.
@@ -397,6 +609,81 @@ impl TranscriptStore {
             Err(error) => return Err(SessionStoreError::Io(error)),
         }
         TranscriptReader::open(&path)
+    }
+}
+
+fn opening_record(source: impl Read) -> SessionStoreResult<Option<TranscriptRecord>> {
+    opening_record_bounded(source, SESSION_PURPOSE_READ_BYTES)
+}
+
+fn opening_record_bounded(
+    source: impl Read,
+    max_bytes: u64,
+) -> SessionStoreResult<Option<TranscriptRecord>> {
+    let mut reader = BufReader::new(source.take(max_bytes));
+    let mut line = Vec::new();
+    if reader.read_until(b'\n', &mut line)? == 0 || line.last() != Some(&b'\n') {
+        return Ok(None);
+    }
+    let record = std::str::from_utf8(&line)
+        .ok()
+        .and_then(|text| TranscriptRecord::from_jsonl_line(text).ok());
+    Ok(record)
+}
+
+// Exact historical allocation grammar of harw-ops::dream_run:
+// dream-<UTC YYYYMMDDTHHMMSS>[-2..99|-v4 UUID][-repair].
+fn legacy_dream_id(id: &str) -> bool {
+    let id = id.strip_suffix("-repair").unwrap_or(id);
+    let Some(body) = id.strip_prefix("dream-") else { return false; };
+    let Some((stamp, suffix)) = body.split_at_checked(15) else { return false; };
+    if !stamp.is_ascii() || stamp.as_bytes()[8] != b'T'
+        || !stamp.bytes().enumerate().all(|(i, ch)| i == 8 || ch.is_ascii_digit())
+    {
+        return false;
+    }
+    if suffix.is_empty() { return true; }
+    let Some(suffix) = suffix.strip_prefix('-') else { return false; };
+    if suffix.len() <= 2 {
+        return !suffix.starts_with('0') && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            && suffix.parse::<u8>().is_ok_and(|value| (2..=99).contains(&value));
+    }
+    // WorkId::new() historically produces a lowercase v4 UUID.
+    suffix.len() == 36
+        && suffix.as_bytes()[14] == b'4'
+        && matches!(suffix.as_bytes()[19], b'8' | b'9' | b'a' | b'b')
+        && suffix.bytes().enumerate().all(|(i, ch)| {
+            if matches!(i, 8 | 13 | 18 | 23) { ch == b'-' }
+            else { ch.is_ascii_digit() || matches!(ch, b'a'..=b'f') }
+        })
+}
+
+fn legacy_dream_opening(sid: &SessionId, row: &TranscriptRecord) -> bool {
+    let id = sid.as_str();
+    if row.session_id != *sid || row.sequence != 0 || row.kind != RecordKind::Item
+        || row.thread.as_str().strip_prefix("gateway-dream:") != Some(id)
+        || row.payload.get("type").and_then(serde_json::Value::as_str) != Some("user_message")
+    {
+        return false;
+    }
+    let Some(content) = row.payload.get("content").and_then(serde_json::Value::as_array)
+        else { return false; };
+    let [part] = content.as_slice() else { return false; };
+    if part.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+        return false;
+    }
+    let Some(text) = part.get("text").and_then(serde_json::Value::as_str) else { return false; };
+    // Stable, producer-written signatures, not user-entered title words.
+    if id.ends_with("-repair") {
+        text.starts_with("Deine letzte Antwort war nach dem Traum-Vertrag ungültig:\n")
+            && text.contains("\n\nLetzte Antwort (gekürzt):\n")
+            && text.contains(concat!("\n", r#"Schema: {"summary":"#))
+    } else {
+        text.strip_prefix("Du träumst (")
+            .and_then(|rest| rest.split_once("). Konsolidiere still, was zuletzt wichtig war, "))
+            .is_some_and(|(trigger, _)| !trigger.is_empty() && !trigger.contains('\n'))
+            && text.contains("\n--- letzter dauerhafter Gesprächskontext ---\n")
+            && text.ends_with("--- Ende Wissensstand ---")
     }
 }
 
@@ -754,6 +1041,59 @@ mod tests {
             RecordKind::Turn,
             serde_json::json!({ "sequence": sequence }),
         )
+    }
+
+    #[test]
+    fn purpose_marker_is_idempotent_and_cannot_reclassify_a_legacy_transcript() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(tmp.path());
+        let purpose = SessionPurpose::Dream;
+        let thread = ThreadRef::from_str("opaque-thread");
+        let fresh = SessionId::from_str("fresh-purpose");
+        let legacy = SessionId::from_str("legacy-with-dream-in-the-name");
+
+        store.ensure_session_purpose(&fresh, &thread, purpose)?;
+        store.ensure_session_purpose(&fresh, &thread, purpose)?;
+        assert_eq!(store.session_purpose(&fresh)?, Some(purpose));
+        assert_eq!(store.reader(&fresh)?.count(), 1);
+
+        let legacy_file = store.transcript_path(&legacy)?;
+        store.append(&record(legacy.as_str(), 0))?;
+        let unchanged = std::fs::read(&legacy_file)?;
+        assert!(store.ensure_session_purpose(&legacy, &thread, purpose).is_err());
+        assert_eq!(store.session_purpose(&legacy)?, None);
+        assert_eq!(std::fs::read(legacy_file)?, unchanged);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_does_not_block_a_live_writer_or_include_later_appends() -> SessionStoreResult<()> {
+        let repo = tempfile::tempdir()?;
+        let store = TranscriptStore::new(repo.path());
+        let sid = SessionId::from_str("snapshot-test");
+        let make_record = |sequence| {
+            TranscriptRecord::new(
+                sid.clone(),
+                harw_types::ThreadRef::from_str("snapshot-test-thread"),
+                sequence,
+                jiff::Timestamp::now(),
+                RecordKind::Lifecycle,
+                serde_json::json!({"marker":"test"}),
+            )
+        };
+        store.append_group(&[make_record(0)])?;
+        let _lease = SessionLease::acquire(repo.path(), &sid, HolderKind::Gateway)?;
+        let mut snapshot = store.snapshot_reader(&sid, 4096)?;
+        store.append_group(&[make_record(1)])?;
+        assert_eq!(
+            snapshot.next().transpose()?.map(|row| row.sequence),
+            Some(0)
+        );
+        assert!(snapshot.next().is_none());
+        assert!(!store.snapshot_is_current(&sid, &snapshot)?);
+        assert_eq!(store.reader(&sid)?.count(), 2);
+        assert!(store.snapshot_is_current(&sid, &store.snapshot_reader(&sid, 4096)?)?);
+        Ok(())
     }
 
     #[test]

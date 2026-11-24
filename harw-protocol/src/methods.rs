@@ -34,6 +34,7 @@ pub const METHOD_GATEWAY_TOOLS_GRANT: &str = "gateway.tools.grant";
 pub const METHOD_GATEWAY_TOOLS_NARROW: &str = "gateway.tools.narrow";
 
 // Feature `media`.
+pub const METHOD_SESSION_MEDIA_PREVIEW: &str = "session.media.preview";
 pub const METHOD_MEDIA_GET: &str = "media.get";
 
 pub const METHOD_SESSION_PROJECTS: &str = "session.projects";
@@ -41,8 +42,23 @@ pub const METHOD_SESSION_PAGE: &str = "session.page";
 pub const METHOD_SESSION_ADOPT: &str = "session.adopt";
 pub const METHOD_SESSION_CREATE_IN: &str = "session.create_in";
 pub const METHOD_SESSION_SET_PROJECT: &str = "session.set_project";
+pub const METHOD_SESSION_SET_EXISTING_PROJECT: &str = "session.set_existing_project";
 pub const METHOD_SESSION_RENAME: &str = "session.rename";
+pub const METHOD_AUTO_TITLE_SEED: &str = "session.auto_title_seed";
+pub const METHOD_AUTO_TITLE_PROBE: &str = "session.auto_title_probe";
+pub const METHOD_AUTO_TITLE_PUBLISH: &str = "session.auto_title_publish";
 pub const METHOD_SESSION_ARCHIVE: &str = "session.archive";
+pub const METHOD_ARCHIVE_CHECKPOINT_ISSUE: &str = "session.revision_checkpoint.issue";
+pub const METHOD_ARCHIVE_CHECKPOINT_DESCRIBE: &str = "session.revision_checkpoint.describe";
+pub const METHOD_ARCHIVE_CHECKPOINT_PREVIOUS: &str = "session.revision_checkpoint.previous";
+pub const METHOD_ARCHIVE_CHECKPOINT_PAGE: &str = "session.revision_checkpoint.page";
+pub const METHOD_FORK_INCLUSIVE: &str = "session.fork_inclusive";
+pub const METHOD_CLOUD_ASSISTANT_STATUS: &str = "cloud_assistant.status";
+pub const METHOD_CLOUD_ASSISTANT_PROVISION: &str = "cloud_assistant.provision";
+pub const METHOD_CLOUD_ASSISTANT_SUBMIT: &str = "cloud_assistant.submit";
+pub const METHOD_CLOUD_ASSISTANT_SUBMIT_WITH_RECALL: &str = "cloud_assistant.submit_with_recall";
+pub const METHOD_CLOUD_ASSISTANT_REVOKE: &str = "cloud_assistant.revoke";
+pub const METHOD_CLOUD_ASSISTANT_SHARED: &str = "cloud_assistant.shared";
 
 // Minor 4, feature `manage`.
 pub const METHOD_COMMANDS_LIST: &str = "commands.list";
@@ -100,8 +116,25 @@ pub const PROJECT_METHODS: &[&str] = &[
     METHOD_SESSION_ARCHIVE,
 ];
 
+/// Optional non-creating assignment, separate from the legacy project table.
+pub const EXISTING_PROJECT_ASSIGNMENT_METHODS: &[&str] = &[METHOD_SESSION_SET_EXISTING_PROJECT];
+
+/// Minor 5, feature `archive_checkpoint_v1`. Separate from base commands.
+pub const ARCHIVE_CHECKPOINT_METHODS: &[&str] = &[
+    METHOD_ARCHIVE_CHECKPOINT_ISSUE,
+    METHOD_ARCHIVE_CHECKPOINT_DESCRIBE,
+    METHOD_ARCHIVE_CHECKPOINT_PAGE,
+    METHOD_FORK_INCLUSIVE,
+];
+
+/// Minor 5, optional feature `archive_retained_rewrite_v1`.
+pub const ARCHIVE_RETAINED_REWRITE_METHODS: &[&str] = &[METHOD_ARCHIVE_CHECKPOINT_PREVIOUS];
+
 /// Feature `media`: stored prompt images. Own table.
 pub const MEDIA_METHODS: &[&str] = &[METHOD_MEDIA_GET];
+/// Separate optional V5 exact-occurrence reader.
+pub const SESSION_MEDIA_PREVIEW_METHODS: &[&str] = &[METHOD_SESSION_MEDIA_PREVIEW];
+
 
 /// Minor 4, feature `manage`: typed, allow-listed operation execution (W00 D5
 /// amendment). Own table.
@@ -163,7 +196,11 @@ mod tests {
         let mut all: Vec<&str> = SESSION_METHODS
             .iter()
             .chain(PROJECT_METHODS)
+            .chain(EXISTING_PROJECT_ASSIGNMENT_METHODS)
+            .chain(ARCHIVE_CHECKPOINT_METHODS)
+            .chain(ARCHIVE_RETAINED_REWRITE_METHODS)
             .chain(MEDIA_METHODS)
+            .chain(SESSION_MEDIA_PREVIEW_METHODS)
             .chain(MANAGE_METHODS)
             .chain(STEPUP_METHODS)
             .chain(OVERVIEW_METHODS)
@@ -218,3 +255,17 @@ mod tests {
         );
     }
 }
+
+/// Device/profile-scoped encrypted library, separately negotiated at minor 5.
+pub const METHOD_CLOUD_LIBRARY: &str = "cloud.library";
+/// Independent manual work create/receipt path, not exposed as a model tool.
+pub const METHOD_MANUAL_CLOUD_WORK: &str = "session.manual_cloud_work";
+
+/// One exact, coarse status on an independently authenticated owner Session connection.
+pub const METHOD_DIRECT_OWNER_STATUS: &str = "session.direct_owner_status";
+
+/// Exact selected placement with one-use Hub selectors on the original direct connection.
+pub const METHOD_DIRECT_OWNER_STATUS_FENCED: &str = "session.direct_owner_status_fenced";
+
+/// Create a short-lived exact Owner observation reservation on the current direct WebSocket.
+pub const METHOD_RESERVE_OWNER_OBSERVATION: &str = "session.reserve_owner_observation";

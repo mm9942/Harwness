@@ -135,21 +135,26 @@ internal data class ProviderAddRequest(
 internal fun providerAddLine(request: ProviderAddRequest, handle: String?): String? {
     if (!ProviderNamePattern.matches(request.name)) return null
     if (handle != null && !isToken(handle)) return null
-    if (request.known) {
-        val id = request.catalogId ?: return null
-        if (!isToken(id)) return null
-        val auth = when (request.auth) {
-            ManageKnownAuth.API_KEY -> "api-key"
-            ManageKnownAuth.OAUTH -> "oauth"
-            else -> return null
-        }
-        val parts = mutableListOf("/provider", "add", id, "--auth", auth, "--name", request.name)
-        if (handle != null) {
-            parts.add("--key")
-            parts.add(handle)
-        }
-        return lineOrNull(parts)
+    return if (request.known) knownProviderAddLine(request, handle) else customProviderAddLine(request, handle)
+}
+
+private fun knownProviderAddLine(request: ProviderAddRequest, handle: String?): String? {
+    val id = request.catalogId ?: return null
+    if (!isToken(id)) return null
+    val auth = when (request.auth) {
+        ManageKnownAuth.API_KEY -> "api-key"
+        ManageKnownAuth.OAUTH -> "oauth"
+        else -> return null
     }
+    val parts = mutableListOf("/provider", "add", id, "--auth", auth, "--name", request.name)
+    if (handle != null) {
+        parts.add("--key")
+        parts.add(handle)
+    }
+    return lineOrNull(parts)
+}
+
+private fun customProviderAddLine(request: ProviderAddRequest, handle: String?): String? {
     val api = request.api ?: return null
     if (api !in CUSTOM_APIS) return null
     val url = request.baseUrl ?: return null

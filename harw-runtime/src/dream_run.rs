@@ -34,7 +34,7 @@ use harw_ops::dream_run::{
     DreamFuture, DreamLauncher, DreamReasoner, DreamRunError, DreamRunOutcome, DreamRunRequest,
     DreamSettings, DreamTrigger, run_dream,
 };
-use harw_session_store::{JobStore, RecordKind, TranscriptStore};
+use harw_session_store::{JobStore, RecordKind, SessionPurpose, TranscriptStore};
 use harw_types::{AgentRole, SessionId, ThreadRef};
 use jiff::Timestamp;
 
@@ -70,6 +70,7 @@ pub fn build_dream_state_store(transcript_root: &Path) -> TranscriptStateStore {
         TranscriptStore::new(transcript_root),
         dream_thread_for_session,
     )
+    .with_creation_purpose(SessionPurpose::Dream)
 }
 
 /// Session-Wurzel eines Profils nach `[session] store_dir` (leer →
@@ -620,9 +621,12 @@ mod tests {
             .map_err(ctx("open transcript"))?
             .collect::<harw_session_store::SessionStoreResult<Vec<_>>>()
             .map_err(ctx("read transcript"))?;
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
+        assert_eq!(SessionPurpose::from_opening_record(&records[0]), Some(SessionPurpose::Dream));
+        assert_eq!(records[1].kind, RecordKind::Item);
+        assert_eq!(records[1].sequence, 1);
         assert_eq!(
-            records[0].thread,
+            records[1].thread,
             ThreadRef::from_str("gateway-dream:dream-20260718T081500")
         );
         Ok(())

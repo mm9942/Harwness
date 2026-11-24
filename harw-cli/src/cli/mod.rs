@@ -23,6 +23,7 @@ mod analyze;
 mod attach;
 mod auth;
 mod channel;
+mod cloud;
 mod completions;
 mod cycle;
 mod debug;
@@ -56,6 +57,7 @@ pub use analyze::*;
 pub use attach::*;
 pub use auth::*;
 pub use channel::*;
+pub use cloud::*;
 pub use completions::*;
 pub use cycle::*;
 pub use debug::*;
@@ -276,6 +278,12 @@ pub enum Command {
     PrReview(PrReviewArgs),
 
     // ── Dienste ─────────────────────────────────────────────────────────
+    /// Inspect a locally selected cloud workload policy; never contacts a worker.
+    Cloud {
+        /// Select an offline policy operation.
+        #[command(subcommand)]
+        action: CloudAction,
+    },
     /// Startet den Hintergrunddienst mit Agenten und Kanälen oder verwaltet seine Dienst-Einheit.
     Gateway {
         /// Dienst-Aktion; ohne Unterbefehl läuft der Dienst im Vordergrund.

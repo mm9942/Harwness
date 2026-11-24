@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="private_assistant_attempt_channel">Assistant privé</string>
+    <string name="private_assistant_attempt_running">Requête de l’assistant local en cours</string>
+    <string name="private_assistant_attempt_stop">Arrêter</string>
+    <string name="private_assistant_attempt_not_sent">Android n’a pas pu maintenir cette requête au premier plan. Rien n’a été envoyé.</string>
+    <string name="private_assistant_parked_pending">Une requête de l’assistant local est en cours. L’assistant reste verrouillé jusqu’à la fin.</string>
+    <string name="private_assistant_parked_check_unavailable">Harw ne peut pas vérifier si une requête locale est en cours. Aucune tentative de code PIN n’a été utilisée.</string>
+    <string name="private_assistant_parked_check_again">Vérifier à nouveau</string>
+</resources>

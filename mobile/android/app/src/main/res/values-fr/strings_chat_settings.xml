@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_history_archive">Archives de la conversation</string>
+    <string name="chat_history_variant_temporary">Cette version reste disponible jusqu’à la fermeture de l’application. Elle n’a pas pu être enregistrée de façon sécurisée.</string>
+    <string name="chat_history_show_retained_in_chat">Voir la version précédente dans la conversation</string>
+    <string name="chat_history_retained_readonly">Version précédente vérifiée, en lecture seule</string>
+    <string name="chat_history_return_current">Revenir à la conversation actuelle</string>
+    <string name="chat_history_retained_unavailable">Aucune version précédente complète n’a pu être vérifiée. La conversation actuelle est inchangée.</string>
+    <string name="chat_history_retained_fork_unconfirmed">La bifurcation n’est pas confirmée. Touchez le même message pour vérifier la même opération.</string>
+    <string name="chat_quick_picker_model">Modèle</string>
+    <string name="chat_quick_picker_uia_unavailable">Aucune autre UIA ne peut être choisie dans cette conversation.</string>
+    <string name="chat_quick_picker_uia_local_only">Le choix de l’UIA est réservé aux conversations locales.</string>
+    <string name="chat_quick_picker_model_unavailable">Le choix du modèle n’est pas disponible pour cette conversation.</string>
+    <string name="chat_history_partial_readonly">Seule la partie la plus récente de cette version est affichée. La bifurcation est indisponible dans cette vue partielle.</string>
+    <string name="chat_history_open_paged_archive">Ouvrir les pages des archives</string>
+    <string name="chat_owner_status_action">Vérifier le statut de l’hôte responsable</string>
+    <string name="chat_owner_status_unavailable">Impossible de vérifier le statut de l’hôte responsable.</string>
+    <string name="chat_owner_status_idle">Statut vérifié de l’hôte : inactif</string>
+    <string name="chat_owner_status_active">Statut vérifié de l’hôte : actif</string>
+    <string name="chat_owner_status_interrupted">Statut vérifié de l’hôte : interrompu</string>
+    <string name="chat_owner_status_failed">Statut vérifié de l’hôte : échec</string>
+    <string name="chat_owner_status_import_required">Importez séparément le document de profil de confiance pour configurer le statut de l’hôte responsable.</string>
+</resources>

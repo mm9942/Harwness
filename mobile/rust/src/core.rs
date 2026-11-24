@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use harw_node_transport::{LocalNode, NodeBody, empty_body};
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams, ForkFrom,
-    Cursor, DEFAULT_TAIL_ITEMS, HolderInfo, InterruptParams, PageParams, ProjectsParams,
-    MediaGetParams, RenameParams, RespondResult, SessionFrame, SetModelParams, SetProjectParams, StreamProfile, SubmitImage,
-    SubmitParams, SubmitResult, HostedState, features,
+    ApprovalRespondParams, ArchiveParams, AttachParams, ClientCaps, CreateInParams, CreateParams,
+    Cursor, DEFAULT_TAIL_ITEMS, ForkFrom, HolderInfo, HostedState, InterruptParams, MediaGetParams,
+    PageParams, ProjectsParams, RenameParams, RespondResult, SessionFrame, SetModelParams,
+    SetProjectParams, StreamProfile, SubmitImage, SubmitParams, SubmitResult, features,
 };
-use harw_protocol::{PortError, PortFuture, SessionPort};
+use harw_protocol::{PortError, PortFuture, SessionPort, TurnEvent};
 use harw_session_remote::{BackoffPolicy, ConnectOptions, RemoteError};
 use harw_types::{ApprovalId, SessionId, TurnId};
 use http::Method;
@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::backend::{Backend, BackendKind};
+use crate::diagnostics::{BaseLevel, DiagnosticLog, DiagnosticSnapshot, Domain, Level, StreamSignal};
 use crate::identity::{ValidatedProfile, restore_identity};
 use crate::listener::{CoreListener, Notifier};
 use crate::local::{LOCAL_HOST_UNAVAILABLE, open_local};
@@ -35,7 +36,15 @@ use crate::{
     SessionCursor, SessionSnapshot, SubmitOutcome, SubmitReceipt,
 };
 
+pub(crate) mod archive;
+pub(crate) mod media_preview;
+pub(crate) mod cloud_library;
+pub(crate) mod manual_cloud_work;
 pub(crate) mod route;
+mod owner_status;
+pub(crate) mod cloud_assistant;
+pub(crate) mod auto_title;
+pub(crate) mod local_assistant_sessions;
 
 use route::{Dialer, available_routes, route_label, route_plan};
 
@@ -66,6 +75,7 @@ pub struct MobileCore {
 #[derive(Default)]
 struct Shared {
     state: Mutex<CoreState>,
+    diagnostics: DiagnosticLog,
     dialer: Dialer,
     /// Ends a running backoff pause early when the network returns.
     wake: tokio::sync::Notify,
@@ -73,6 +83,8 @@ struct Shared {
     notifier: Notifier,
     /// Platform shell and file access for the on-device agent's device tools.
     device: Mutex<DeviceHandles>,
+    #[cfg(feature = "onion")]
+    owner_status_active: std::sync::OnceLock<Arc<Semaphore>>,
 }
 
 /// Platform implementations registered by Kotlin before the on-device host starts.
@@ -134,6 +146,8 @@ impl Shared {
 struct CoreState {
     profile: Option<ValidatedProfile>,
     profile_epoch: u64,
+    #[cfg(feature = "onion")]
+    owner_status_scope: CancellationToken,
     phase: ConnectionPhase,
     detail: Option<String>,
     run: Option<CancellationToken>,
@@ -143,7 +157,8 @@ struct CoreState {
     holders: HashMap<SessionId, Option<HolderInfo>>,
     detaching: HashSet<SessionId>,
     submissions: HashMap<(SessionId, String), Submission>,
-    route_preference: RoutePreference,
+    route_consent: Option<(ValidatedProfile, RoutePreference)>,
+    route_policy_epoch: u64,
     route: Option<ConnectionRoute>,
     attempt: u32,
     next_retry_at_ms: Option<u64>,
@@ -157,6 +172,8 @@ impl Default for CoreState {
         Self {
             profile: None,
             profile_epoch: 0,
+            #[cfg(feature = "onion")]
+            owner_status_scope: CancellationToken::new(),
             phase: ConnectionPhase::Disconnected,
             detail: None,
             run: None,
@@ -165,7 +182,8 @@ impl Default for CoreState {
             holders: HashMap::new(),
             detaching: HashSet::new(),
             submissions: HashMap::new(),
-            route_preference: RoutePreference::Auto,
+            route_consent: None,
+            route_policy_epoch: 0,
             route: None,
             attempt: 0,
             next_retry_at_ms: None,
@@ -176,6 +194,16 @@ impl Default for CoreState {
 }
 
 impl CoreState {
+    fn preference_for(&self, profile: &ValidatedProfile) -> RoutePreference {
+        self.route_consent.as_ref()
+            .filter(|(approved, _)| approved.same_route_authority(profile))
+            .map_or(RoutePreference::Onion, |(_, preference)| *preference)
+    }
+
+    fn active_preference(&self) -> RoutePreference {
+        self.profile.as_ref().map_or(RoutePreference::Onion, |profile| self.preference_for(profile))
+    }
+
     fn active(&self) -> Result<Arc<Link>, MobileError> {
         if self.phase == ConnectionPhase::Revoked {
             return Err(MobileError::Revoked);
@@ -271,10 +299,27 @@ impl Link {
         &self,
         request: impl Future<Output = Result<T, PortError>>,
     ) -> Result<T, MobileError> {
+        self.request_with_timeout(REQUEST_TIMEOUT, request).await
+    }
+
+    async fn request_with_timeout<T>(
+        &self,
+        timeout: Duration,
+        request: impl Future<Output = Result<T, PortError>>,
+    ) -> Result<T, MobileError> {
+        self.request_with_revocation_policy(timeout, request, true).await
+    }
+
+    async fn request_with_revocation_policy<T>(
+        &self,
+        timeout: Duration,
+        request: impl Future<Output = Result<T, PortError>>,
+        revoke_link: bool,
+    ) -> Result<T, MobileError> {
         let outcome = tokio::select! {
             biased;
             () = self.stop.cancelled() => return Err(MobileError::Disconnected),
-            result = tokio::time::timeout(REQUEST_TIMEOUT, request) => result,
+            result = tokio::time::timeout(timeout, request) => result,
         };
         let error = match outcome {
             Ok(Ok(value)) => return Ok(value),
@@ -287,7 +332,9 @@ impl Link {
                 return Err(MobileError::Revoked);
             }
             PortError::Transport(detail) => self.fail(LinkIssue::transport(detail.clone())),
-            PortError::Revoked => self.fail(LinkIssue::revoked()),
+            // A room-scoped membership denial does not revoke gateway login.
+            // Transport-confirmed revocation still takes the branch above.
+            PortError::Revoked if revoke_link => self.fail(LinkIssue::revoked()),
             _ => {}
         }
         Err(error.into())
@@ -365,6 +412,26 @@ impl MobileCore {
         }))
     }
 
+    pub fn diagnostics_snapshot(&self) -> DiagnosticSnapshot {
+        self.shared.diagnostics.snapshot()
+    }
+
+    pub fn diagnostics_clear(&self) {
+        self.shared.diagnostics.clear();
+    }
+
+    pub fn diagnostics_level(&self, domain: Domain) -> Level {
+        self.shared.diagnostics.level(domain)
+    }
+
+    pub fn diagnostics_set_level(&self, domain: Domain, level: BaseLevel) {
+        self.shared.diagnostics.set_level(domain, level);
+    }
+
+    pub fn diagnostics_enable_trace(&self, domain: Domain) {
+        self.shared.diagnostics.enable_trace(domain);
+    }
+
     pub fn enrollment(&self) -> DeviceEnrollment {
         self.enrollment.clone()
     }
@@ -398,11 +465,11 @@ impl MobileCore {
     }
 
     pub fn connect(&self, profile: ServerProfile) -> Result<(), MobileError> {
-        self.start_connection(Some(ValidatedProfile::new(profile)?))
+        self.start_connection(Some(ValidatedProfile::new(profile)?), None)
     }
 
     pub fn reconnect(&self) -> Result<(), MobileError> {
-        self.start_connection(None)
+        self.start_connection(None, None)
     }
 
     pub fn disconnect(&self) {
@@ -425,7 +492,7 @@ impl MobileCore {
     /// Signals that the platform reports a usable network again.
     /// Never resends mutating calls; never lifts a revocation.
     pub fn network_available(&self) -> Result<(), MobileError> {
-        let action = {
+        let (action, route_epoch) = {
             let mut state = self.shared.state();
             let revoked = state.apply_pending_revocation();
             let action = network_action(
@@ -440,7 +507,7 @@ impl MobileCore {
             if revoked || action != NetworkAction::Ignore {
                 self.shared.notifier.status();
             }
-            action
+            (action, state.route_policy_epoch)
         };
         match action {
             NetworkAction::Ignore => Ok(()),
@@ -448,7 +515,7 @@ impl MobileCore {
                 self.shared.wake.notify_one();
                 Ok(())
             }
-            NetworkAction::Restart => self.start_connection(None),
+            NetworkAction::Restart => self.start_connection(None, Some(route_epoch)),
         }
     }
 
@@ -463,10 +530,23 @@ impl MobileCore {
             .set_tor_directories(PathBuf::from(state_dir), PathBuf::from(cache_dir))
     }
 
-    /// Selects the route preference used by the next connect or reconnect.
-    pub fn set_route_preference(&self, preference: RoutePreference) {
-        self.shared.state().route_preference = preference;
-        self.shared.notifier.status();
+    /// Compatibility entry point. A caller with no exact profile can only
+    /// remove route permission; it cannot authorize a direct connection.
+    pub fn set_route_preference(&self, _preference: RoutePreference) {
+        self.replace_route_consent(None);
+    }
+
+    /// Set policy for one exact profile (server key, node and locators). Direct
+    /// modes require explicit caller consent; profiles cannot confer it.
+    pub fn set_profile_route_preference(
+        &self, profile: ServerProfile, preference: RoutePreference,
+    ) -> Result<(), MobileError> {
+        let profile = ValidatedProfile::new(profile)?;
+        if preference != RoutePreference::Onion {
+            route_plan(preference, &profile)?;
+        }
+        self.replace_route_consent(Some((profile, preference)));
+        Ok(())
     }
 
     pub fn status(&self) -> ConnectionStatus {
@@ -496,14 +576,14 @@ impl MobileCore {
         ConnectionStatus {
             phase,
             node_id: profile.map(|profile| profile.server_node_id.clone()),
-            endpoint: profile.map(|profile| profile.endpoint.clone()),
+            endpoint: profile.and_then(|profile| (!profile.endpoint.is_empty()).then(|| profile.endpoint.clone())),
             label: profile.map(|profile| profile.label.clone()),
             detail: state.detail.clone(),
             can_create: active_caps.is_some_and(|caps| caps.steer),
             can_submit: active_caps.is_some_and(|caps| caps.steer),
             can_approve: active_caps.is_some_and(|caps| caps.approve),
             route,
-            route_preference: state.route_preference,
+            route_preference: state.active_preference(),
             available_routes: state
                 .profile
                 .as_ref()
@@ -528,6 +608,10 @@ impl MobileCore {
     }
 
     /// True when the connected host serves the `projects` feature (wire minor 3).
+    pub fn existing_project_assignment_supported(&self) -> bool {
+        self.feature_granted(features::EXISTING_PROJECT_ASSIGNMENT_V1)
+    }
+
     pub fn projects_supported(&self) -> bool {
         self.shared
             .state()
@@ -572,6 +656,17 @@ impl MobileCore {
         })
     }
 
+    /// Whether the current scope offers redacted Dream metadata.
+    pub fn dream_session_rows_supported(&self) -> bool {
+        self.feature_granted(features::SESSION_DREAM_ROWS_V1)
+    }
+
+    /// Whether the active profile offers the dedicated internal session page.
+    pub fn system_session_rows_supported(&self) -> bool {
+        self.feature_granted(features::SESSION_SYSTEM_ROWS_V1)
+    }
+
+    #[uniffi::method(default(include_dreams = false, include_system = false))]
     pub fn list_sessions_page(
         &self,
         project_key: Option<String>,
@@ -579,10 +674,23 @@ impl MobileCore {
         include_archived: bool,
         cursor: Option<String>,
         limit: Option<u32>,
+        include_dreams: bool,
+        include_system: bool,
     ) -> Result<MobileSessionPage, MobileError> {
+        if include_system && (project_key.is_some() || include_dreams) {
+            return Err(MobileError::Denied { detail: "Invalid System session page scope".into() });
+        }
         let link = self.shared.state().active()?;
         let shared = Arc::clone(&self.shared);
         self.run(async move {
+            if include_system && (!link_supports_projects(&link)
+                || !link.backend.features().iter().any(|name| name == features::SESSION_SYSTEM_ROWS_V1))
+            {
+                return Err(MobileError::Denied { detail: "System session metadata is not supported".into() });
+            }
+            if include_dreams && !link.backend.features().iter().any(|name| name == features::SESSION_DREAM_ROWS_V1) {
+                return Err(MobileError::Denied { detail: "Dream session metadata is not supported".into() });
+            }
             if !link_supports_projects(&link) {
                 let steer = link.backend.granted().steer;
                 let sessions: Vec<MobileSession> = link
@@ -598,6 +706,8 @@ impl MobileCore {
                     project_key,
                     query,
                     include_archived,
+                    include_dreams,
+                    include_system,
                     limit,
                     cursor,
                 }))
@@ -605,8 +715,10 @@ impl MobileCore {
             {
                 let mut state = shared.state();
                 if state.same_link(&link) {
-                    for row in &result.sessions {
-                        remember_holder(&mut state, row.session_id.clone(), row.holder.clone());
+                    if !include_system {
+                        for row in &result.sessions {
+                            remember_holder(&mut state, row.session_id.clone(), row.holder.clone());
+                        }
                     }
                 }
             }
@@ -685,11 +797,7 @@ impl MobileCore {
     }
 
     /// `session.set_model`: `model` is `<provider>/<modell>`; applies from the next message of the session.
-    pub fn set_session_model(
-        &self,
-        session_id: String,
-        model: String,
-    ) -> Result<(), MobileError> {
+    pub fn set_session_model(&self, session_id: String, model: String) -> Result<(), MobileError> {
         let session_id = parse_session_id(session_id)?;
         let link = self.shared.state().active()?;
         self.run(async move {
@@ -771,9 +879,73 @@ impl MobileCore {
             let params = CreateParams {
                 workspace: None,
                 title,
-                fork_from: Some(ForkFrom { session_id: source, before_item }),
+                fork_from: Some(ForkFrom {
+                    session_id: source,
+                    before_item,
+                    displayed: None,
+                }),
             };
             let created = link.request(link.backend.port().create(params)).await?;
+            shared.notifier.sessions();
+            Ok(created.into())
+        })
+    }
+
+    /// Creates a new session from the exact conversational prefix the attached UI drew.
+    /// Over the wire only send reference IDs and hashes, never client-supplied import content.
+    pub fn fork_displayed_session(
+        &self,
+        source_session_id: String,
+        expected: SessionCursor,
+        displayed: Vec<crate::TranscriptEntry>,
+    ) -> Result<MobileSession, MobileError> {
+        use harw_protocol::session_wire::{DISPLAYED_FORK_MAX_ROWS, DisplayedForkV1};
+        let source = parse_session_id(source_session_id)?;
+        let head: Cursor = expected.into();
+        let stale = || MobileError::Denied {
+            detail: "Displayed chat changed; refresh it and try Fork again".into(),
+        };
+        if !(1..=DISPLAYED_FORK_MAX_ROWS).contains(&displayed.len()) {
+            return Err(MobileError::Denied {
+                detail: "The entire displayed prefix exceeds the fork limit; nothing was copied".into(),
+            });
+        }
+        let link = {
+            let state = self.shared.state();
+            let link = state.active()?;
+            if !link.backend.granted().steer {
+                return Err(MobileError::Denied { detail: "This device cannot create sessions".into() });
+            }
+            let attachment = state.session(&source)?;
+            attachment.require_live()?;
+            let actual = attachment.snapshot(&source, true);
+            if actual.running_turn_id.is_some()
+                || actual.head.is_none_or(|at| (at.generation, at.durable) != (head.generation, head.durable))
+            { return Err(stale()); }
+            let mut current = actual.transcript.iter();
+            for row in &displayed {
+                let exact = current.find(|candidate| candidate.id == row.id).ok_or_else(stale)?;
+                if exact.kind != row.kind || exact.text != row.text || exact.images != row.images
+                    || row.id.starts_with("mobile-")
+                { return Err(stale()); }
+            }
+            link
+        };
+        let rows = displayed_fork_rows(displayed)?;
+        let end = rows.last().ok_or_else(stale)?.item_id.clone();
+        let shared = Arc::clone(&self.shared);
+        self.run(async move {
+            if !shared.state().same_link(&link) { return Err(MobileError::Disconnected); }
+            let created = link.request(link.backend.port().create(CreateParams {
+                workspace: None, title: None,
+                fork_from: Some(ForkFrom {
+                    session_id: source.clone(), before_item: end,
+                    displayed: Some(DisplayedForkV1 { head, rows, durable_receipt: true }),
+                }),
+            })).await?;
+            if created.session_id == source || !shared.state().same_link(&link) {
+                return Err(MobileError::Disconnected);
+            }
             shared.notifier.sessions();
             Ok(created.into())
         })
@@ -804,11 +976,13 @@ impl MobileCore {
                     "This connection already has 32 open sessions",
                 ));
             }
+            let exact_stop = link.backend.features().iter().any(|f| f == features::EXACT_TURN_INTERRUPT_V1);
             let session = state.sessions.entry(id.clone()).or_default();
             if session.worker.is_none() {
                 start_attachment(&shared, session, id.clone(), link);
             }
-            let snapshot = session.snapshot(&id, true);
+            let mut snapshot = session.snapshot(&id, true);
+            snapshot.can_interrupt &= exact_stop;
             shared.notifier.session(id.as_str());
             Ok(snapshot)
         })
@@ -817,7 +991,12 @@ impl MobileCore {
     pub fn snapshot(&self, session_id: String) -> Result<SessionSnapshot, MobileError> {
         let id = parse_session_id(session_id)?;
         let state = self.shared.state();
-        Ok(state.session(&id)?.snapshot(&id, state.active().is_ok()))
+        let link = state.active().ok();
+        let mut snapshot = state.session(&id)?.snapshot(&id, link.is_some());
+        snapshot.can_interrupt &= link.is_some_and(|link| {
+            link.backend.features().iter().any(|f| f == features::EXACT_TURN_INTERRUPT_V1)
+        });
+        Ok(snapshot)
     }
 
     pub fn detach_session(&self, session_id: String) -> Result<(), MobileError> {
@@ -868,6 +1047,239 @@ impl MobileCore {
         )
     }
 
+    /// Returns only a loaded local GGUF candidate with an exact revision.
+    pub fn session_title_local_choices(&self) -> Result<Vec<crate::SessionTitleLocalChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            if let Some(model) = &link.backend.hybrid_model {
+                return model.session_title_local_choices();
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// One text-only operation on the exact loaded model. Cannot activate a route.
+    pub async fn session_title_generate_local(
+        &self,
+        choice: crate::SessionTitleLocalChoice,
+        turns: Vec<crate::SessionTitleTurn>,
+    ) -> Result<String, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            let model = link.backend.hybrid_model.clone().ok_or_else(|| {
+                session_error("Kein lokales Titelmodell geladen.")
+            })?;
+            crate::session_title::generate_local(model, link.stop.clone(), choice, turns).await
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, turns);
+            Err(session_error("Lokale Titelerstellung ist in diesem Build nicht verfügbar."))
+        }
+    }
+
+    /// The already loaded, vision-capable GGUF, if its local install is still current.
+    pub async fn local_vision_choices(&self) -> Result<Vec<crate::LocalVisionChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            if let Some(model) = link.backend.hybrid_model.clone() {
+                let runtime = self
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| internal("Runtime stopped"))?;
+                return runtime
+                    .spawn_blocking(move || model.local_vision_choices())
+                    .await
+                    .map_err(|_| internal("Local vision lookup stopped"))?;
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Describe only the user's explicit images with the named already-loaded local model.
+    pub async fn local_vision_describe(
+        &self,
+        choice: crate::LocalVisionChoice,
+        images: Vec<crate::LocalVisionImage>,
+        progress: Arc<dyn crate::LocalVisionProgress>,
+    ) -> Result<(), MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            let model = link.backend.hybrid_model.clone().ok_or_else(|| {
+                session_error("Lokale Bildanalyse ist in diesem Host nicht verfügbar.")
+            })?;
+            crate::local_vision::describe(model, link.stop.clone(), choice, images, progress).await
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, images, progress);
+            Err(session_error(
+                "Lokale Bildanalyse ist in diesem Build nicht verfügbar.",
+            ))
+        }
+    }
+
+    /// Device-configured API keys only; never uses a gateway or chat account.
+    pub fn api_image_edit_choices(&self) -> Result<Vec<crate::ApiImageEditChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            if let Some(model) = &link.backend.hybrid_model {
+                return crate::image_edit_mobile::binding::choices(model);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Sanitizes one selected source and pins its preview to this exact local host and route.
+    /// Preparing an edit never sends anything to a provider.
+    pub fn prepare_api_image_edit(
+        &self,
+        choice: crate::ApiImageEditChoice,
+        source_png: Vec<u8>,
+        instruction: String,
+    ) -> Result<Arc<crate::ApiImageEditDraft>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            let model = link
+                .backend
+                .hybrid_model
+                .as_ref()
+                .ok_or_else(crate::image_edit_mobile::unavailable)?;
+            crate::image_edit_mobile::binding::prepare(model, choice, source_png, instruction)
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, source_png, instruction);
+            Err(crate::image_edit_mobile::unavailable())
+        }
+    }
+
+    /// Send once, after explicit approval of this immutable preview and synchronous mode.
+    pub async fn confirm_api_image_edit(
+        &self,
+        draft: Arc<crate::ApiImageEditDraft>,
+        explicitly_synchronous: bool,
+    ) -> Result<crate::ApiImageEditAsset, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            let model = link
+                .backend
+                .hybrid_model
+                .clone()
+                .ok_or_else(crate::image_edit_mobile::unavailable)?;
+            let stop = link.stop.clone();
+            let runtime = self.runtime.as_ref().ok_or_else(|| internal("Runtime stopped"))?;
+            let work = runtime.spawn(async move {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => Err(MobileError::Disconnected),
+                    result = crate::image_edit_mobile::binding::confirm(model, draft, explicitly_synchronous) => result,
+                }
+            });
+            tokio_util::task::AbortOnDropHandle::new(work)
+                .await
+                .map_err(|_| internal("Image edit task stopped"))?
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (draft, explicitly_synchronous);
+            Err(crate::image_edit_mobile::unavailable())
+        }
+    }
+
+    /// Explicit on-device API route selection, independent of the chat and GGUF model.
+    pub fn api_vision_choices(&self) -> Result<Vec<crate::ApiVisionChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            if let Some(model) = &link.backend.hybrid_model {
+                return crate::hybrid::api_choices(model);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Describe exactly one approved image without the chat prompt or transcript.
+    pub async fn api_vision_describe(
+        &self,
+        choice: crate::ApiVisionChoice,
+        image: PromptImage,
+    ) -> Result<String, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            let model = link.backend.hybrid_model.clone().ok_or_else(|| {
+                session_error("Die API-Bildanalyse ist in diesem Host nicht konfiguriert")
+            })?;
+            let stop = link.stop.clone();
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| internal("Runtime stopped"))?;
+            let work = runtime.spawn(async move {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => Err(MobileError::Disconnected),
+                    result = crate::hybrid::api_describe(model, choice, image) => result,
+                }
+            });
+            tokio_util::task::AbortOnDropHandle::new(work)
+                .await
+                .map_err(|_| internal("Vision task stopped"))?
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, image);
+            Err(session_error(
+                "API-Bildanalyse ist in diesem Build nicht verfügbar",
+            ))
+        }
+    }
+
+    /// Describe exactly one approved image without the chat prompt or transcript.
+    pub async fn api_vision_observe(
+        &self,
+        choice: crate::ApiVisionChoice,
+        image: PromptImage,
+    ) -> Result<crate::ApiVisionObservation, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            let model = link.backend.hybrid_model.clone().ok_or_else(|| {
+                session_error("Die API-Bildanalyse ist in diesem Host nicht konfiguriert")
+            })?;
+            let stop = link.stop.clone();
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| internal("Runtime stopped"))?;
+            let work = runtime.spawn(async move {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => Err(MobileError::Disconnected),
+                    result = crate::hybrid::api_observe(model, choice, image) => result,
+                }
+            });
+            tokio_util::task::AbortOnDropHandle::new(work)
+                .await
+                .map_err(|_| internal("Vision task stopped"))?
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, image);
+            Err(session_error(
+                "API-Bildanalyse ist in diesem Build nicht verfügbar",
+            ))
+        }
+    }
+
     /// Sichtbare exakte Cloud-Modellrouten für ein einmaliges Opt-in, nur lokal.
     pub fn hybrid_vision_choices(&self) -> Result<Vec<crate::HybridVisionChoice>, MobileError> {
         #[cfg(feature = "local-host")]
@@ -892,10 +1304,14 @@ impl MobileCore {
         #[cfg(feature = "local-host")]
         {
             let link = self.shared.state().active()?;
-            let model = link.backend.hybrid_model.clone()
-                .ok_or_else(|| session_error("Cloud-Bildanalyse ist nur im lokalen Chat verfügbar"))?;
+            let model = link.backend.hybrid_model.clone().ok_or_else(|| {
+                session_error("Cloud-Bildanalyse ist nur im lokalen Chat verfügbar")
+            })?;
             let stop = link.stop.clone();
-            let runtime = self.runtime.as_ref().ok_or_else(|| internal("Runtime stopped"))?;
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| internal("Runtime stopped"))?;
             let work = runtime.spawn(async move {
                 tokio::select! {
                     biased;
@@ -903,13 +1319,16 @@ impl MobileCore {
                     result = crate::hybrid::reply(model, choice, images, question, progress) => result,
                 }
             });
-            tokio_util::task::AbortOnDropHandle::new(work).await
+            tokio_util::task::AbortOnDropHandle::new(work)
+                .await
                 .map_err(|_| internal("Vision task stopped"))?
         }
         #[cfg(not(feature = "local-host"))]
         {
             let _ = (choice, images, question, progress);
-            Err(session_error("Cloud-Bildanalyse ist in diesem Build nicht verfügbar"))
+            Err(session_error(
+                "Cloud-Bildanalyse ist in diesem Build nicht verfügbar",
+            ))
         }
     }
 
@@ -922,7 +1341,14 @@ impl MobileCore {
         client_message_id: String,
         images: Vec<PromptImage>,
     ) -> Result<SubmitReceipt, MobileError> {
-        self.submit_edit(session_id, text, expected_head, client_message_id, images, None)
+        self.submit_edit(
+            session_id,
+            text,
+            expected_head,
+            client_message_id,
+            images,
+            None,
+        )
     }
 
     /// Sendet `text` neu und ersetzt dabei die frühere User-Nachricht `rewind_before` samt allem danach
@@ -937,12 +1363,18 @@ impl MobileCore {
         rewind_before: Option<String>,
     ) -> Result<SubmitReceipt, MobileError> {
         if let Some(target) = &rewind_before {
-            if target.is_empty() || target.len() > 128 || !target.bytes().all(|b| b.is_ascii_graphic()) {
+            if target.is_empty()
+                || target.len() > 128
+                || !target.bytes().all(|b| b.is_ascii_graphic())
+            {
                 return Err(session_error("Ungültige Nachrichten-Id"));
             }
         }
         let id = parse_session_id(session_id)?;
-        validate_submission(&text, &client_message_id)?;
+        if rewind_before.is_some() && !images.is_empty() {
+            return Err(session_error("Exact edit reuses the original stored images"));
+        }
+        validate_submission(if rewind_before.is_some() && text.is_empty() { "retry" } else { &text }, &client_message_id)?;
         let images = validate_images(images)?;
         if !images.is_empty() && !self.supports_images() {
             return Err(MobileError::Denied {
@@ -958,7 +1390,7 @@ impl MobileCore {
                 images,
                 expected_head.into(),
                 client_message_id,
-                rewind_before,
+                SubmitRoute::Normal { rewind_before },
             )
             .await
         })
@@ -971,6 +1403,20 @@ impl MobileCore {
                 .features()
                 .iter()
                 .any(|f| f == features::IMAGES)
+        })
+    }
+
+    /// Whether the current authority negotiated exact durable prompt rewrite.
+    pub fn supports_exact_rewind(&self) -> bool {
+        self.shared.state().active().is_ok_and(|link| {
+            link.backend.features().iter().any(|f| f == features::EXACT_REWIND_V1)
+        })
+    }
+
+    /// Whether this exact link can return a matching historical rewrite receipt.
+    pub fn supports_exact_rewrite_receipts(&self) -> bool {
+        self.shared.state().active().is_ok_and(|link| {
+            link.backend.features().iter().any(|f| f == features::EXACT_REWIND_RECEIPT_V1)
         })
     }
 
@@ -994,12 +1440,10 @@ impl MobileCore {
 
     /// Ob der aktive Host gespeicherte Prompt-Bilder ausliefert (Feature `media`). Ohne Verbindung `false`.
     pub fn supports_media(&self) -> bool {
-        self.shared.state().active().is_ok_and(|link| {
-            link.backend
-                .features()
-                .iter()
-                .any(|f| f == features::MEDIA)
-        })
+        self.shared
+            .state()
+            .active()
+            .is_ok_and(|link| link.backend.features().iter().any(|f| f == features::MEDIA))
     }
 
     /// Holt ein gespeichertes Prompt-Bild (`image_ref` aus `TranscriptEntry.images`) vom Host.
@@ -1042,6 +1486,11 @@ impl MobileCore {
         let link = {
             let state = self.shared.state();
             let link = state.active()?;
+            if !link.backend.features().iter().any(|f| f == features::EXACT_TURN_INTERRUPT_V1) {
+                return Err(MobileError::Denied {
+                    detail: "This host does not support stopping an exact turn".into(),
+                });
+            }
             let session = state.session(&id)?;
             session.require_live()?;
             if !session.can_submit() || session.running_turn_id() != Some(&turn_id) {
@@ -1265,6 +1714,30 @@ impl Drop for MobileCore {
 }
 
 impl MobileCore {
+    fn replace_route_consent(&self, consent: Option<(ValidatedProfile, RoutePreference)>) {
+        let mut state = self.shared.state();
+        let prior = state.active_preference();
+        let replacing_profile = consent.as_ref().is_some_and(|(selection, _)| {
+            state.profile.as_ref().is_some_and(|active| !active.same_route_authority(selection))
+        });
+        state.route_consent = consent;
+        state.route_policy_epoch = state.route_policy_epoch.wrapping_add(1);
+        if state.profile.is_some() && (state.run.is_some() || state.retryable_failure)
+            && (replacing_profile || state.active_preference() != prior)
+        {
+            // Invalidate cached fallback plans and independent control requests
+            // before a new policy is reported to the UI.
+            state.stop("Gateway route policy changed; reconnect explicitly");
+            state.phase = ConnectionPhase::Disconnected;
+            state.retryable_failure = false;
+            state.next_retry_at_ms = None;
+            state.detail = Some("Gateway route policy changed; reconnect explicitly".into());
+            self.shared.notify_link(&state);
+            self.shared.notifier.sessions();
+        }
+        self.shared.notifier.status();
+    }
+
     fn provider_call(
         &self,
         profile: ServerProfile,
@@ -1278,7 +1751,7 @@ impl MobileCore {
             if !state
                 .profile
                 .as_ref()
-                .is_some_and(|selected| selected.same_authority(&consent))
+                .is_some_and(|selected| selected.same_route_authority(&consent))
             {
                 return Err(MobileError::InvalidProfile {
                     detail: "The selected server changed after ChatGPT authorization".into(),
@@ -1290,11 +1763,11 @@ impl MobileCore {
                 .ok_or_else(|| MobileError::InvalidProfile {
                     detail: "The selected server changed after ChatGPT authorization".into(),
                 })?;
-            (
-                link.stop.clone(),
-                state.route.unwrap_or(ConnectionRoute::Direct),
-                selected,
-            )
+            let route = state.route.ok_or(MobileError::Disconnected)?;
+            if !route_plan(state.preference_for(&selected), &selected)?.contains(&route) {
+                return Err(MobileError::Denied { detail: "Gateway route is no longer authorized".into() });
+            }
+            (link.stop.clone(), route, selected)
         };
         self.run(request_provider(
             self.shared.dialer.clone(),
@@ -1307,7 +1780,9 @@ impl MobileCore {
         ))
     }
 
-    fn start_connection(&self, profile: Option<ValidatedProfile>) -> Result<(), MobileError> {
+    fn start_connection(
+        &self, profile: Option<ValidatedProfile>, automatic_route_epoch: Option<u64>,
+    ) -> Result<(), MobileError> {
         let shared = Arc::clone(&self.shared);
         let local = self.local.clone();
         let label = self.enrollment.label.clone();
@@ -1319,22 +1794,36 @@ impl MobileCore {
                     shared.notifier.status();
                     shared.notifier.sessions();
                 }
+                if automatic_route_epoch.is_some_and(|epoch| {
+                    epoch != state.route_policy_epoch || state.phase != ConnectionPhase::Failed
+                        || !state.retryable_failure
+                }) {
+                    return Ok(());
+                }
                 let profile = profile.or_else(|| state.profile.clone()).ok_or_else(|| {
                     MobileError::InvalidProfile {
                         detail: "Select a server profile before connecting".into(),
                     }
                 })?;
-                if local.node_id() == &profile.endpoint.expected_node {
+                if local.node_id() == &profile.expected_node {
                     return Err(MobileError::InvalidProfile {
                         detail: "Server and phone must have different node identities".into(),
                     });
                 }
-                route_plan(state.route_preference, &profile)?;
+                let routes = route_plan(state.preference_for(&profile), &profile)?;
                 let same_profile = state
                     .profile
                     .as_ref()
                     .is_some_and(|old| old.same_authority(&profile));
-                if same_profile && !explicit_reconnect && state.active().is_ok() {
+                if same_profile && !explicit_reconnect && state.active().is_ok()
+                    && state.profile.as_ref().is_some_and(|previous| previous.same_route_authority(&profile))
+                    && state.route.is_some_and(|route| routes.contains(&route))
+                {
+                    #[cfg(feature = "onion")]
+                    if state.profile.as_ref().is_none_or(|old| old.profile != profile.profile) {
+                        state.owner_status_scope.cancel();
+                        state.owner_status_scope = CancellationToken::new();
+                    }
                     state.profile = Some(profile);
                     shared.notifier.status();
                     return Ok(());
@@ -1504,8 +1993,11 @@ async fn drive_connection(
         let mut options = ConnectOptions::new(&label);
         options.requested_caps = Some(ClientCaps::ALL);
         options.features = requested_features();
+        options.features.push(features::CLOUD_ASSISTANT_V1.to_owned());
+        options.features.push(features::CLOUD_ASSISTANT_RECALL_V1.to_owned());
+        options.features.push(features::CLOUD_ASSISTANT_SHARED_V1.to_owned());
         let plan = {
-            let preference = shared.state().route_preference;
+            let preference = shared.state().preference_for(&profile);
             route_plan(preference, &profile)
         };
         let routes = match plan {
@@ -1536,20 +2028,29 @@ async fn drive_connection(
         for route in routes {
             {
                 let mut state = shared.state();
+                if run.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
                 state.route = Some(route);
                 shared.notifier.status();
             }
-            let attempt = run
-                .run_until_cancelled(shared.dialer.connect_session(
-                    route,
-                    &profile,
-                    &local,
-                    options.clone(),
-                ))
-                .await;
+            let mut onion = if route == ConnectionRoute::Onion {
+                shared.diagnostics.begin_onion()
+            } else {
+                None
+            };
+            let attempt = tokio::select! {
+                biased;
+                () = run.cancelled() => None,
+                result = shared.dialer.connect_session(route, &profile, &local, options.clone()) => Some(result),
+            };
             match attempt {
                 Some(Ok(connection)) => {
-                    connected = Some(connection);
+                    if let Some(diagnostic) = &mut onion {
+                        diagnostic.connected();
+                    }
+                    connected = Some((connection, onion));
                     break;
                 }
                 Some(Err(error)) => {
@@ -1568,7 +2069,7 @@ async fn drive_connection(
         if cancelled {
             break;
         }
-        let connection = match connected {
+        let (connection, _onion_lifetime) = match connected {
             Some(connection) => connection,
             None => {
                 let detail = failure_detail(&failures);
@@ -1861,15 +2362,37 @@ fn requested_features() -> Vec<String> {
         features::COMPACT_REASONING,
         features::JOB_FRAMES,
         features::PROJECTS,
+        features::AUTO_TITLE_CAS_V1,
+        features::AUTO_TITLE_SEED_V1,
+        features::SESSION_DREAM_ROWS_V1,
+        features::SESSION_SYSTEM_ROWS_V1,
+        features::EXISTING_PROJECT_ASSIGNMENT_V1,
         features::MANAGE,
         features::STEPUP,
         features::IMAGES,
         features::MEDIA,
+        features::SESSION_MEDIA_PREVIEW_V1,
         features::OVERVIEW,
+        features::ARCHIVE_CHECKPOINT_V1,
+        features::ARCHIVE_RETAINED_REWRITE_V1,
+        features::EXACT_REWIND_V1,
+        features::EXACT_REWIND_RECEIPT_V1,
+        features::EXACT_TURN_INTERRUPT_V1,
+        features::CLOUD_LIBRARY_V1,
+        features::MANUAL_CLOUD_WORK_V1,
     ]
     .iter()
     .map(|feature| (*feature).to_owned())
     .collect()
+}
+
+fn validate_existing_project_key(key: &str) -> Result<(), MobileError> {
+    if key.is_empty() || key.len() > 128
+        || !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(MobileError::Denied { detail: "Invalid existing project identifier".into() });
+    }
+    Ok(())
 }
 
 fn link_supports_projects(link: &Link) -> bool {
@@ -1943,6 +2466,7 @@ fn legacy_session_page(
                 attached: session.attached,
                 model: session.model,
                 origin: MobileRowOrigin::Hosted,
+                purpose: crate::MobileSessionPurpose::Unknown,
                 continuable: steer,
                 reason: None,
                 holder: None,
@@ -2059,22 +2583,28 @@ async fn drive_attachment(
         {
             return;
         }
+        let mut attachment_lifetime = shared.diagnostics.begin_attachment();
+        let mut diagnostic_cursor = ack.head;
         let (next_from, refreshed) = loop {
             let envelope = match stop.run_until_cancelled(source.next()).await {
                 Some(Ok(Some(envelope))) => envelope,
                 Some(Err(PortError::Transport(detail))) if revoked_close(&detail) => {
+                    if let Some(log) = &attachment_lifetime { log.signal(StreamSignal::Revoked); }
                     link.fail(LinkIssue::revoked());
                     return;
                 }
                 Some(Err(PortError::Transport(detail))) => {
+                    if let Some(log) = &attachment_lifetime { log.signal(StreamSignal::ConnectionError); }
                     link.fail(LinkIssue::transport(detail));
                     return;
                 }
                 Some(Err(PortError::Revoked)) => {
+                    if let Some(log) = &attachment_lifetime { log.signal(StreamSignal::Revoked); }
                     link.fail(LinkIssue::revoked());
                     return;
                 }
                 Some(Err(PortError::Protocol(detail))) => {
+                    if let Some(log) = &attachment_lifetime { log.signal(StreamSignal::ProtocolError); }
                     link.fail(LinkIssue::protocol(detail));
                     return;
                 }
@@ -2083,6 +2613,8 @@ async fn drive_attachment(
                     return;
                 }
                 Some(Ok(None)) => {
+                    if let Some(log) = &attachment_lifetime { log.signal(StreamSignal::EndOfStream); }
+                    drop(attachment_lifetime.take());
                     // A frame source can end while the base connection is healthy.
                     // Kotlin still considers the window open, so its snapshot polls
                     // cannot restart a dead worker. Recover here, where the cursor
@@ -2094,7 +2626,8 @@ async fn drive_attachment(
                         end_attachment(&shared, &id, &link, "The server ended this attachment");
                         return;
                     };
-                    let Some(resume) = with_session(&shared, &id, &link, SessionState::recover_stream)
+                    let Some(resume) =
+                        with_session(&shared, &id, &link, SessionState::recover_stream)
                     else {
                         return;
                     };
@@ -2110,7 +2643,11 @@ async fn drive_attachment(
                         }
                         None => return,
                     }
-                    if stop.run_until_cancelled(tokio::time::sleep(delay)).await.is_none() {
+                    if stop
+                        .run_until_cancelled(tokio::time::sleep(delay))
+                        .await
+                        .is_none()
+                    {
                         return;
                     }
                     from = resume;
@@ -2120,7 +2657,9 @@ async fn drive_attachment(
             };
             // Merely seeing replay or handshake frames is not evidence that a
             // broken stream recovered; let three rapid replay-only EOFs stop.
-            if envelope.cursor > ack.head && !matches!(&envelope.frame, SessionFrame::Presence { .. }) {
+            if envelope.cursor > ack.head
+                && !matches!(&envelope.frame, SessionFrame::Presence { .. })
+            {
                 recovery.made_progress();
             }
             if let SessionFrame::Holder { session_id, holder } = &envelope.frame {
@@ -2134,10 +2673,37 @@ async fn drive_attachment(
             else {
                 return;
             };
+            if envelope.cursor > diagnostic_cursor {
+                diagnostic_cursor = envelope.cursor;
+                let signal = match &envelope.frame {
+                    SessionFrame::Turn(TurnEvent::TurnStarted { .. }) => Some(StreamSignal::TurnStarted),
+                    SessionFrame::Turn(TurnEvent::TurnCompleted { .. }) => Some(StreamSignal::TurnCompleted),
+                    SessionFrame::Turn(TurnEvent::TurnAborted { .. }) => Some(StreamSignal::TurnAborted),
+                    SessionFrame::Turn(TurnEvent::TurnFailed { .. }) => Some(StreamSignal::TurnFailed),
+                    SessionFrame::Turn(TurnEvent::AssistantDelta { .. }) => Some(StreamSignal::AnswerDelta),
+                    SessionFrame::Turn(TurnEvent::ReasoningDelta { .. }) => Some(StreamSignal::ReasoningDelta),
+                    _ => None,
+                };
+                if let (Some(log), Some(signal)) = (&attachment_lifetime, signal) {
+                    log.signal(signal);
+                }
+                if matches!(&action, FrameAction::Continue)
+                    && let (Some(log), SessionFrame::Turn(event)) =
+                        (&mut attachment_lifetime, &envelope.frame)
+                {
+                    log.observe_turn(event);
+                }
+            }
             match action {
                 FrameAction::Continue => {}
-                FrameAction::Reattach(cursor) => break (cursor, false),
-                FrameAction::RefreshTranscript => break (None, true),
+                FrameAction::Reattach(cursor) => {
+                    if let Some(log) = &attachment_lifetime { log.signal(StreamSignal::Reattach); }
+                    break (cursor, false)
+                }
+                FrameAction::RefreshTranscript => {
+                    if let Some(log) = &attachment_lifetime { log.signal(StreamSignal::Refresh); }
+                    break (None, true)
+                }
                 FrameAction::Revoked => {
                     link.fail(LinkIssue::revoked());
                     return;
@@ -2157,6 +2723,7 @@ async fn drive_attachment(
                 }
             }
         };
+        drop(attachment_lifetime);
         stalled = if !refreshed && from == next_from {
             stalled.saturating_add(1)
         } else {
@@ -2200,6 +2767,11 @@ fn end_attachment(shared: &Shared, id: &SessionId, link: &Arc<Link>, detail: &st
     with_session(shared, id, link, |session| session.worker_ended(detail));
 }
 
+enum SubmitRoute {
+    Normal { rewind_before: Option<String> },
+    CloudLibrary { link: Arc<Link> },
+}
+
 async fn submit(
     shared: Arc<Shared>,
     id: SessionId,
@@ -2207,40 +2779,75 @@ async fn submit(
     images: Vec<SubmitImage>,
     displayed: Cursor,
     client_message_id: String,
-    rewind_before: Option<String>,
+    route: SubmitRoute,
 ) -> Result<SubmitReceipt, MobileError> {
+    let (rewind_before, pinned_cloud_library_link) = match route {
+        SubmitRoute::Normal { rewind_before } => (rewind_before, None),
+        SubmitRoute::CloudLibrary { link } => (None, Some(link)),
+    };
     let submission_id = (id.clone(), client_message_id.clone());
     let fingerprint = {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(text.as_bytes());
+        let mut hasher = blake3::Hasher::new_derive_key("harw mobile submit receipt v2");
+        fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+            hasher.update(&(bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        if pinned_cloud_library_link.is_some() {
+            field(&mut hasher, b"cloud-library");
+        } else {
+            field(&mut hasher, b"conversation");
+        }
+        if let Some(target) = &rewind_before {
+            field(&mut hasher, b"exact-rewind");
+            field(&mut hasher, target.as_bytes());
+            hasher.update(&displayed.generation.to_be_bytes());
+            hasher.update(&displayed.durable.to_be_bytes());
+        } else {
+            field(&mut hasher, b"append");
+        }
+        field(&mut hasher, text.as_bytes());
         for image in &images {
-            hasher.update(&[0]);
-            hasher.update(image.mime.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(image.data_b64.as_bytes());
+            field(&mut hasher, image.mime.as_bytes());
+            field(&mut hasher, image.data_b64.as_bytes());
         }
         hasher.finalize()
     };
-    let (link, head, profile_epoch) = {
+    let (link, head, profile_epoch, may_resume) = {
         let mut state = shared.state();
         let link = state.active()?;
+        if pinned_cloud_library_link.as_ref().is_some_and(|expected| !Arc::ptr_eq(expected, &link)) {
+            return Err(MobileError::Denied { detail: "Cloud Library conversation changed".into() });
+        }
+        if rewind_before.is_some() && !link.backend.ack().features.iter().any(|f| f == features::EXACT_REWIND_V1) {
+            return Err(MobileError::Denied { detail: "This host cannot safely edit or retry earlier prompts".into() });
+        }
         if let Some(previous) = state.submissions.get(&submission_id) {
             if fingerprint != previous.fingerprint {
                 return Err(session_error(
                     "The submission ID is already associated with a different draft",
                 ));
             }
-            return match &previous.state {
-                SubmissionState::InFlight => Ok(SubmitReceipt::new(SubmitOutcome::InFlight)),
-                SubmissionState::Accepted(receipt) => Ok(receipt.clone()),
-                SubmissionState::Uncertain => Err(ambiguous()),
-            };
+            match &previous.state {
+                SubmissionState::InFlight => return Ok(SubmitReceipt::new(SubmitOutcome::InFlight)),
+                SubmissionState::Accepted(receipt) => return Ok(receipt.clone()),
+                SubmissionState::Uncertain if rewind_before.is_none() => return Err(ambiguous()),
+                // Exact rewrite only: an explicit retry can use the original ID and
+                // fingerprint. Where a durable receipt is negotiated, host
+                // arbitration may also resolve an already-committed old fence.
+                SubmissionState::Uncertain => {}
+            }
         }
-        let head = match state.session(&id)?.current_submission_head(displayed)? {
-            Ok(head) => head,
+        let (head, may_resume) = match state.session(&id)?.current_submission_head(displayed)? {
+            Ok(head) => (head, true),
+            // Only a receipt-aware host can safely resolve a retransmission
+            // against a stale view. Preserve the original fence on the wire.
+            Err(_) if rewind_before.is_some() && link.backend.ack().features.iter()
+                .any(|feature| feature == features::EXACT_REWIND_RECEIPT_V1) => (displayed, false),
             Err(head) => return Ok(stale(head)),
         };
-        if state.submissions.len() >= MAX_PROCESS_SUBMISSIONS {
+        if !state.submissions.contains_key(&submission_id)
+            && state.submissions.len() >= MAX_PROCESS_SUBMISSIONS
+        {
             return Err(session_error(
                 "This process has reached its submission limit",
             ));
@@ -2252,8 +2859,14 @@ async fn submit(
                 state: SubmissionState::InFlight,
             },
         );
-        (link, head, state.profile_epoch)
+        (link, head, state.profile_epoch, may_resume)
     };
+    let replacement_item_id = rewind_before.as_deref()
+        .filter(|_| link.backend.ack().features.iter()
+            .any(|feature| feature == features::EXACT_REWIND_RECEIPT_V1))
+        .map(|target| harw_protocol::session_wire::exact_rewrite_item_id(
+            &id, target, head, &client_message_id,
+        ).to_string());
     let params = SubmitParams {
         session_id: id.clone(),
         text: text.clone(),
@@ -2267,7 +2880,8 @@ async fn submit(
         .request(link.backend.port().submit(params.clone()))
         .await;
     // A host restart left the session interrupted: resume it and send once more.
-    if matches!(&result, Ok(SubmitResult::Denied { reason }) if reason.contains("session.resume"))
+    if may_resume && pinned_cloud_library_link.is_none()
+        && matches!(&result, Ok(SubmitResult::Denied { reason }) if reason.contains("session.resume"))
         && link
             .request(link.backend.port().resume(id.clone()))
             .await
@@ -2278,6 +2892,7 @@ async fn submit(
     let result = match result {
         Ok(SubmitResult::Accepted { position }) => Ok(SubmitReceipt {
             position: Some(position),
+            replacement_item_id,
             ..SubmitReceipt::new(SubmitOutcome::Accepted)
         }),
         Ok(SubmitResult::Stale { head }) => Ok(stale(head)),
@@ -2305,8 +2920,6 @@ async fn submit(
             {
                 if rewind_before.is_none() {
                     session.echo_prompt(&id, displayed, &client_message_id, text);
-                } else {
-                    session.expect_history_replace();
                 }
                 shared.notifier.session(id.as_str());
             }
@@ -2735,4 +3348,45 @@ mod route_failure_tests {
     fn max_reconnect_attempts_unchanged() {
         assert_eq!(MAX_RECONNECT_ATTEMPTS, 8);
     }
+}
+
+fn displayed_fork_rows(
+    displayed: Vec<crate::TranscriptEntry>,
+) -> Result<Vec<harw_protocol::session_wire::DisplayedForkRowV1>, MobileError> {
+    use crate::TranscriptKind;
+    use harw_protocol::session_wire::{
+        DISPLAYED_FORK_MAX_ROWS, DisplayedForkRoleV1, DisplayedForkRowV1, displayed_fork_body_v1,
+    };
+    let stale = || MobileError::Denied {
+        detail: "The displayed rows cannot be verified; nothing was copied".into(),
+    };
+    if !(1..=DISPLAYED_FORK_MAX_ROWS).contains(&displayed.len()) {
+        return Err(stale());
+    }
+    let mut ids = std::collections::HashSet::with_capacity(displayed.len());
+    let total = displayed.iter().try_fold(0usize, |bytes, entry| {
+        let bytes = bytes.checked_add(entry.text.len())?;
+        entry.images.iter().try_fold(bytes, |bytes, image| bytes.checked_add(image.len()))
+    });
+    if total.is_none_or(|bytes| bytes > 2 * 1024 * 1024) {
+        return Err(MobileError::Denied { detail: "The displayed chat exceeds the fork limit; nothing was copied".into() });
+    }
+    let mut rows = Vec::with_capacity(displayed.len());
+    for entry in displayed {
+        if entry.id.is_empty() || entry.id.starts_with("mobile-") || !ids.insert(entry.id.clone()) {
+            return Err(stale());
+        }
+        let role = match entry.kind {
+            TranscriptKind::User => DisplayedForkRoleV1::User,
+            TranscriptKind::Assistant => DisplayedForkRoleV1::Assistant,
+            _ => return Err(stale()),
+        };
+        let media = entry.images.iter().map(|reference| serde_json::from_str::<harw_protocol::MediaRef>(reference))
+            .collect::<Result<Vec<_>, _>>().map_err(|_| MobileError::Denied {
+                detail: "A displayed attachment could not be verified; nothing was copied".into(),
+            })?;
+        let wire = displayed_fork_body_v1(&entry.text, &media).map_err(|_| stale())?;
+        rows.push(DisplayedForkRowV1 { item_id: entry.id, role, body_digest: *blake3::hash(&wire).as_bytes() });
+    }
+    Ok(rows)
 }

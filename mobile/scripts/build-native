@@ -16,6 +16,13 @@ export GGML_CPU_ARM_ARCH="${GGML_CPU_ARM_ARCH:-armv8.2-a+dotprod}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$rust_dir/target}"
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
 jobs="${MOBILE_BUILD_JOBS:-2}"
+local_uia="${HARW_LOCAL_UIA:-0}"
+features=local-llama
+case "$local_uia" in
+    0) ;;
+    1) features+=,vault-uia-chat ;;
+    *) echo "HARW_LOCAL_UIA must be 0 or 1." >&2; exit 2 ;;
+esac
 cargo_network_flags=()
 if [[ "${MOBILE_OFFLINE:-0}" == 1 ]]; then
     cargo_network_flags+=(--offline)
@@ -31,9 +38,21 @@ staging=$(mktemp -d "$generated/.native.XXXXXXXX")
 trap 'rm -rf -- "$staging"' EXIT
 cd -- "$rust_dir"
 cargo ndk --target arm64-v8a --platform 28 --output-dir "$staging/jniLibs" \
-    build --lib --release --features local-llama --locked --jobs "$jobs" "${cargo_network_flags[@]}"
+    build --lib --release --features "$features" --locked --jobs "$jobs" "${cargo_network_flags[@]}"
 
 library="$staging/jniLibs/arm64-v8a/libharw_mobile_ffi.so"
+# Attest this exact staged bridge after verifying all private JNI entry points.
+# The marker is build metadata (not a runtime or cryptographic trust anchor).
+if [[ "$local_uia" == 1 ]]; then
+    shopt -s nullglob
+    readers=("$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf)
+    if [[ "${#readers[@]}" != 1 || ! -x "${readers[0]}" ]]; then
+        echo "Cannot locate the NDK llvm-readelf for Local UIA verification." >&2
+        exit 1
+    fi
+    bash "$mobile_root/scripts/verify-local-uia-bridge" "$library" "${readers[0]}"
+    sha256sum -- "$library" | awk '{ print "harw-local-uia-v2 " $1 }' > "$staging/harw-local-uia"
+fi
 cargo run --locked --jobs "$jobs" "${cargo_network_flags[@]}" --features bindgen \
     --bin uniffi-bindgen -- generate --library "$library" --language kotlin \
     --out-dir "$staging/uniffi" --no-format --metadata-no-deps
@@ -41,3 +60,8 @@ cargo run --locked --jobs "$jobs" "${cargo_network_flags[@]}" --features bindgen
 install -D -m 644 -- "$library" "$generated/jniLibs/arm64-v8a/libharw_mobile_ffi.so"
 binding=uniffi/harw_mobile_ffi/harw_mobile_ffi.kt
 install -D -m 644 -- "$staging/uniffi/$binding" "$generated/uniffi/$binding"
+if [[ "$local_uia" == 1 ]]; then
+    mv -f -- "$staging/harw-local-uia" "$generated/harw-local-uia"
+else
+    rm -f -- "$generated/harw-local-uia"
+fi

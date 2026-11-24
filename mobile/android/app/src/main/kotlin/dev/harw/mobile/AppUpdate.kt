@@ -50,6 +50,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import java.security.MessageDigest
 import kotlin.coroutines.coroutineContext
@@ -128,23 +129,15 @@ internal object AppUpdates {
             while (isActive) {
                 var conn: HttpURLConnection? = null
                 try {
-                    conn = URL("$UpdateBase/v1/events").openConnection() as HttpURLConnection
+                    conn = URI.create("$UpdateBase/v1/events").toURL().openConnection() as HttpURLConnection
                     conn.connectTimeout = 10_000
                     conn.readTimeout = 70_000
                     conn.setRequestProperty("Accept", "text/event-stream")
                     val c = conn
                     job.invokeOnCompletion { c.disconnect() }
-                    var event = ""
                     c.inputStream.bufferedReader().useLines { lines ->
                         wait = 3_000L
-                        for (line in lines) {
-                            when {
-                                line.startsWith("event:") -> event = line.removePrefix("event:").trim()
-                                line.startsWith("data:") && event == "update" ->
-                                    parseUpdate(line.removePrefix("data:").trim())?.let { consider(context, it) }
-                                line.isEmpty() -> event = ""
-                            }
-                        }
+                        consumeUpdateEvents(context, lines)
                     }
                 } catch (_: Exception) {
                 } finally {
@@ -153,6 +146,18 @@ internal object AppUpdates {
                 if (!isActive) break
                 delay(wait)
                 wait = (wait * 2).coerceAtMost(60_000L)
+            }
+        }
+    }
+
+    private fun consumeUpdateEvents(context: Context, lines: Sequence<String>) {
+        var event = ""
+        for (line in lines) {
+            when {
+                line.startsWith("event:") -> event = line.removePrefix("event:").trim()
+                line.startsWith("data:") && event == "update" ->
+                    parseUpdate(line.removePrefix("data:").trim())?.let { consider(context, it) }
+                line.isEmpty() -> event = ""
             }
         }
     }

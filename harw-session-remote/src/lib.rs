@@ -20,6 +20,7 @@
 
 pub mod alias;
 pub mod conn;
+mod owner_status;
 pub mod port;
 pub mod reconnect;
 
@@ -27,6 +28,9 @@ pub use alias::{AliasStore, HostAlias};
 pub use conn::{
     ConnectOptions, Endpoint, NodeEndpoint, RemoteConnection, RemoteFrames, connect_io,
     connect_node, connect_unix,
+};
+pub use owner_status::{
+    FencedOwnerStatusLink, OwnerStatusDevice, OwnerStatusHubLink, ReservedOwnerStatus,
 };
 pub use port::RemotePort;
 pub use reconnect::{BackoffPolicy, ResumeCursors};

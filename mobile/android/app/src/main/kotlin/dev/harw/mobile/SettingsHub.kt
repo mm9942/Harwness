@@ -7,6 +7,8 @@ import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -25,16 +27,27 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import kotlinx.coroutines.launch
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import uniffi.harw_mobile_ffi.ConnectionPhase
+import uniffi.harw_mobile_ffi.ConnectionRoute
 import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.setLocalImageConcurrency
@@ -52,12 +65,23 @@ internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route)
 internal const val UI_PREFS = "harw_ui"
 internal const val PREF_THEME = "theme" // "system" | "light" | "dark"
 internal const val PREF_SHOW_REASONING = "show_reasoning"
+internal const val PREF_SCREENSHOT_PROTECTION = "screenshot_protection"
+
+internal fun readScreenshotProtection(context: Context): Boolean =
+    context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE)
+        .getBoolean(PREF_SCREENSHOT_PROTECTION, true)
+
+internal fun writeScreenshotProtection(context: Context, enabled: Boolean) {
+    context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE)
+        .edit().putBoolean(PREF_SCREENSHOT_PROTECTION, enabled).apply()
+}
 private const val PREF_LEGACY_IMAGE_PARALLEL = "image_parallel"
-private const val PREF_LOCAL_IMAGE_CONCURRENCY = "image_concurrency"
+internal const val PREF_LOCAL_IMAGE_CONCURRENCY = "image_concurrency"
+private val visionSettingsLock = Mutex()
 
 internal fun restoredImageConcurrency(value: Any?, legacyParallel: Boolean?): Int = when {
-    value == null -> if (legacyParallel == true) 3 else 1
-    value is Int && value in 1..3 -> value
+    value == null -> if (legacyParallel == false) 1 else DefaultLocalVisionConcurrency
+    value is Int && value in LocalVisionConcurrencyRange -> value
     else -> 1
 }
 
@@ -72,20 +96,22 @@ internal fun readLocalImageConcurrency(context: Context): Int = try {
 }
 
 internal fun applyLocalImageConcurrency(value: Int): Boolean =
-    value in 1..3 && runCatching { setLocalImageConcurrency(value.toUByte()) }.getOrDefault(false)
+    value in LocalVisionConcurrencyRange && runCatching { setLocalImageConcurrency(value.toUByte()) }.getOrDefault(false)
 
 private fun writeLocalImageConcurrency(context: Context, value: Int): Boolean = try {
     context.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).edit()
         .putInt(PREF_LOCAL_IMAGE_CONCURRENCY, value)
         .remove(PREF_LEGACY_IMAGE_PARALLEL)
-        .apply()
-    true
+        .commit()
 } catch (_: RuntimeException) {
     false
 }
 
-private val THEME_CHOICES = listOf("system" to "Wie System", "light" to "Hell", "dark" to "Dunkel")
-private const val NOTIFICATION_ERROR = "Benachrichtigungseinstellungen konnten nicht geöffnet werden"
+private val THEME_CHOICES = listOf(
+    "system" to R.string.settings_hub_theme_system,
+    "light" to R.string.settings_hub_theme_light,
+    "dark" to R.string.settings_hub_theme_dark,
+)
 private const val CONFIG_READONLY_HINT = "Ändern braucht Profil Voll und Step-up"
 
 internal fun readThemePref(context: Context): String = try {
@@ -115,16 +141,27 @@ private fun writeShowReasoningPref(context: Context, value: Boolean) {
     }
 }
 
-/** Grund, warum Verwalten-Zeilen gesperrt sind; `null` = frei. */
-internal fun manageOpenBlock(state: WorkspaceState): String? = when {
-    !state.online -> "offline"
-    state.manage.support?.manage != true -> if (state.local) "Nur mit Server-Verbindung" else NO_MANAGE_TEXT
-    else -> null
+/** Grund, warum Cloud-Verwaltung nicht verfügbar ist; `null` = Lesen ist freigegeben. */
+internal fun manageOpenBlock(state: WorkspaceState): Int? {
+    val support = state.manage.support
+    return when {
+        state.local -> R.string.settings_hub_access_cloud_only
+        state.setupPending -> R.string.settings_hub_access_loading
+        state.profile == null -> R.string.settings_hub_access_no_profile
+        state.phase == ConnectionPhase.CONNECTING || state.phase == ConnectionPhase.RECONNECTING ->
+            R.string.settings_hub_access_connecting
+        state.phase == ConnectionPhase.REVOKED -> R.string.settings_hub_access_revoked
+        !state.online -> R.string.settings_hub_access_offline
+        support == null -> R.string.settings_hub_access_checking
+        !support.manage -> R.string.settings_hub_access_unavailable
+        !support.observe -> R.string.settings_hub_access_read_denied
+        else -> null
+    }
 }
 
-/** Server-Einstellungen sind nur mit Profil Voll und Step-up aenderbar. */
+/** Rohwerte lesen braucht Observe; Änderungen brauchen außerdem Control, Approve und Step-up. */
 internal fun configWritable(support: ManageSupport?): Boolean =
-    support != null && support.manage && support.stepup && support.control
+    support != null && support.manage && support.observe && support.control && support.approve && support.stepup
 
 internal fun configApplyLabel(apply: String): String = when (apply) {
     "now" -> "sofort"
@@ -132,20 +169,23 @@ internal fun configApplyLabel(apply: String): String = when (apply) {
     else -> apply
 }
 
-private fun phaseLabel(phase: ConnectionPhase): String = when (phase) {
-    ConnectionPhase.DISCONNECTED -> "Offline"
-    ConnectionPhase.CONNECTING -> "Verbindet"
-    ConnectionPhase.CONNECTED -> "Verbunden"
-    ConnectionPhase.RECONNECTING -> "Verbindet neu"
-    ConnectionPhase.FAILED -> "Fehlgeschlagen"
-    ConnectionPhase.REVOKED -> "Zugriff beendet"
-}
-
-/** Untertitel der Zeile "Verbindung": Phase und Route, nie Hostname oder Profilname. */
-internal fun connectionSubtitle(state: WorkspaceState): String {
-    val phase = phaseLabel(state.phase)
-    val route = state.activeRoute ?: return phase
-    return "$phase · ${route.name.lowercase()}"
+/** Phase and route only; never disclose the profile label or endpoint. */
+@Composable
+private fun connectionSubtitle(state: WorkspaceState): String {
+    val phase = stringResource(when (state.phase) {
+        ConnectionPhase.DISCONNECTED -> R.string.settings_hub_phase_offline
+        ConnectionPhase.CONNECTING -> R.string.settings_hub_phase_connecting
+        ConnectionPhase.CONNECTED -> R.string.settings_hub_phase_connected
+        ConnectionPhase.RECONNECTING -> R.string.settings_hub_phase_reconnecting
+        ConnectionPhase.FAILED -> R.string.settings_hub_phase_failed
+        ConnectionPhase.REVOKED -> R.string.settings_hub_access_revoked
+    })
+    val route = when (state.activeRoute) {
+        ConnectionRoute.DIRECT -> stringResource(R.string.settings_hub_route_direct)
+        ConnectionRoute.ONION -> stringResource(R.string.settings_hub_route_tor)
+        null -> return phase
+    }
+    return stringResource(R.string.settings_hub_phase_route, phase, route)
 }
 
 /** Diagnose OHNE Geheimnisse, Hostnamen, Ids: nur App-Version, Phase, Route-Art, Tor-Zustand, Features/Caps, Zaehler. */
@@ -182,166 +222,85 @@ internal fun SettingsHub(
     connection: HarwConnection,
     onBack: () -> Unit,
     onOpen: (SettingsRoute) -> Unit,
+    diagnosticsConnection: HarwConnection = connection,
+    diagnosticsLocal: Boolean = false,
 ) {
     val context = LocalContext.current
-    val manage = state.manage
-    val support = manage.support
-    LaunchedEffect(state.online, state.generation) {
-        if (state.online) {
-            connection.refreshManageSupport()
-            connection.refreshConfig()
-        }
+    val cloudBlock = manageOpenBlock(state)?.let { stringResource(it) }
+    LaunchedEffect(connection, state.online, state.generation) {
+        if (state.online) connection.refreshManageSupport()
     }
-    var theme by remember { mutableStateOf(readThemePref(context)) }
-    var showReasoning by remember { mutableStateOf(readShowReasoningPref(context)) }
-    var imageConcurrency by remember { mutableStateOf(readLocalImageConcurrency(context)) }
-    var editing by remember { mutableStateOf<ManageConfigEntry?>(null) }
-    val block = manageOpenBlock(state)
     var modelsFolderOpen by remember { mutableStateOf(false) }
+    var diagnosticsOpen by remember(diagnosticsConnection) { mutableStateOf(false) }
     var modelsFolderRevision by remember { mutableStateOf(0) }
 
     Column(Modifier.fillMaxSize()) {
-        HarwHeader(title = "Einstellungen", onBack = onBack) {}
+        HarwHeader(title = stringResource(R.string.settings_hub_title), onBack = onBack) {}
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 4.dp)) {
-            HubRow("Verbindung", connectionSubtitle(state), null) { onOpen(SettingsRoute.Connection) }
-            HubRow("Modelle & Provider", "Rollen, Provider, Modelle laden (wie /models)", block) {
-                onOpen(SettingsRoute.Models)
+            HubSection(stringResource(R.string.settings_hub_profile_section), first = true) {
+                HubRow(stringResource(R.string.settings_hub_connection), connectionSubtitle(state), null) { onOpen(SettingsRoute.Connection) }
             }
-            HubRow("Befehle", "Alle Slash-Befehle des Servers", block) { onOpen(SettingsRoute.Commands) }
-            HubRow("Gedächtnis & Workbench", "Gedächtnis, Tagebuch, Workbench und Ziele des Servers", block) { onOpen(SettingsRoute.Knowledge) }
-            HubRow("Provider (auf diesem Gerät)", "Schlüssel und Routen für den Standalone-Betrieb", null) { onOpen(SettingsRoute.Providers) }
-            HubRow("Agenten-Profile", "UI-Agenten (UIA) anlegen und aktivieren", null) { onOpen(SettingsRoute.Uias) }
-            HubRow("Agenten", "Laufende Agenten und Agentenbibliothek (Lokal und Cloud)", null) { onOpen(SettingsRoute.Agents) }
-            HubRow("Jobs", "Alle Jobs des Profils mit Verlauf (Lokal und Cloud)", null) { onOpen(SettingsRoute.Jobs) }
-            HubRow("Lokale Modelle", "GGUF-Modelle laden oder importieren", null) { onOpen(SettingsRoute.LocalModels) }
-            HubRow("Ordner für lokale Modelle", modelsFolderLabel(context, modelsFolderRevision), null) { modelsFolderOpen = true }
-            HubRow("Dateien", "Ordner dieses Geräts freigeben und durchsuchen", null) { onOpen(SettingsRoute.Files) }
-            HubRow("Termux", "Befehle in Termux ausführen", null) { onOpen(SettingsRoute.Termux) }
-            run {
-                val availableUpdate by AppUpdates.available.collectAsState()
-                var updateStatus by remember { mutableStateOf<String?>(null) }
-                val updateScope = androidx.compose.runtime.rememberCoroutineScope()
-                val subtitle = availableUpdate?.let { "Version ${it.versionName} ist verfügbar. Tippen zum Installieren." }
-                    ?: updateStatus
-                    ?: "Installiert: ${AppUpdates.installedName(context)}. Tippen, um nach Updates zu suchen."
-                HubRow("App-Update", subtitle, null) {
-                    val known = availableUpdate
-                    if (known != null) {
-                        AppUpdates.consider(context, known, force = true)
-                    } else {
-                        updateStatus = "Suche nach Updates …"
-                        updateScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                            val latest = AppUpdates.fetchLatest()
-                            if (latest == null) {
-                                updateStatus = "Keine Verbindung zum Update-Dienst."
-                            } else if (latest.versionCode > AppUpdates.installedCode(context)) {
-                                AppUpdates.consider(context, latest, force = true)
-                                updateStatus = null
-                            } else {
-                                AppUpdates.consider(context, latest)
-                                updateStatus = "Du hast die neueste Version (${AppUpdates.installedName(context)})."
-                            }
-                        }
-                    }
+            HubSection(stringResource(R.string.settings_hub_models_section)) {
+                HubRow(stringResource(R.string.settings_hub_cloud_models), stringResource(R.string.settings_hub_cloud_models_detail), cloudBlock) {
+                    onOpen(SettingsRoute.Models)
+                }
+                HubRow(stringResource(R.string.settings_hub_device_providers), stringResource(R.string.settings_hub_device_providers_detail), null) {
+                    onOpen(SettingsRoute.Providers)
+                }
+                HubRow(stringResource(R.string.settings_hub_local_models), stringResource(R.string.settings_hub_local_models_detail), null) {
+                    onOpen(SettingsRoute.LocalModels)
+                }
+                HubRow(stringResource(R.string.settings_hub_model_folder), modelsFolderLabel(context, modelsFolderRevision), null) {
+                    modelsFolderOpen = true
                 }
             }
-
-            if (support?.manage == true) {
-                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
-                SectionTitle("Server-Einstellungen")
-                val writable = configWritable(support)
-                if (!writable) {
-                    StatusMessage(CONFIG_READONLY_HINT, Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+            HubSection(stringResource(R.string.settings_hub_vision_section)) {
+                VisionDescriptionSettings(context, onConfigureProviders = { onOpen(SettingsRoute.Providers) }) {
+                    LocalImageSettings(context)
                 }
-                manage.configError?.let {
-                    StatusMessage(it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp), error = true)
-                }
-                manage.config.forEach { entry ->
-                    HubRow(
-                        title = "${entry.key} = ${entry.value}",
-                        subtitle = configApplyLabel(entry.apply),
-                        block = if (writable) null else CONFIG_READONLY_HINT,
-                        showBlock = false,
-                    ) { editing = entry }
+                ChatTitleSettings(context, loadCatalog = { loadChatTitleModelCatalog(context).forSettings() })
+            }
+            HubSection(stringResource(R.string.harw_ui_appearance_title)) {
+                HarwLanguageSetting()
+                DisplaySettings(context)
+            }
+            HubSection(stringResource(R.string.settings_hub_files_section)) {
+                HubRow(stringResource(R.string.settings_hub_files), stringResource(R.string.settings_hub_files_detail), null) {
+                    onOpen(SettingsRoute.Files)
                 }
             }
-
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
-            SectionTitle("Darstellung")
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                THEME_CHOICES.forEach { (key, label) ->
-                    FilterChip(
-                        selected = theme == key,
-                        onClick = {
-                            theme = key
-                            writeThemePref(context, key)
-                        },
-                        label = { Text(label) },
-                    )
+            HubSection(stringResource(R.string.settings_hub_tools_section)) {
+                HubRow(stringResource(R.string.settings_hub_agents), stringResource(R.string.settings_hub_agents_detail), null) {
+                    onOpen(SettingsRoute.Agents)
+                }
+                HubRow(stringResource(R.string.settings_hub_jobs), stringResource(R.string.settings_hub_jobs_detail), null) {
+                    onOpen(SettingsRoute.Jobs)
+                }
+                HubRow(stringResource(R.string.settings_hub_device_agents), stringResource(R.string.settings_hub_device_agents_detail), null) {
+                    onOpen(SettingsRoute.Uias)
+                }
+                HubRow(stringResource(R.string.settings_hub_commands), stringResource(R.string.settings_hub_commands_detail), cloudBlock) {
+                    onOpen(SettingsRoute.Commands)
+                }
+                HubRow(stringResource(R.string.settings_hub_knowledge), stringResource(R.string.settings_hub_knowledge_detail), null) {
+                    onOpen(SettingsRoute.Knowledge)
+                }
+                HubRow("Termux", stringResource(R.string.settings_hub_termux_detail), null) { onOpen(SettingsRoute.Termux) }
+            }
+            HubSection(stringResource(R.string.settings_hub_app_section)) {
+                HubRow(stringResource(R.string.settings_hub_notifications), stringResource(R.string.settings_hub_notifications_detail), null) {
+                    openNotificationSettings(context)
+                }
+                AppUpdateHubRow(context)
+                HubRow(stringResource(R.string.settings_hub_share_diagnostics), stringResource(R.string.settings_hub_share_diagnostics_detail), null) {
+                    shareDiagnostic(context, diagnosticReport(state, appVersionOf(context)))
+                }
+                HubRow(stringResource(R.string.settings_hub_debug_log), stringResource(R.string.settings_hub_debug_log_detail), null) {
+                    diagnosticsOpen = true
                 }
             }
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Denkzusammenfassungen anzeigen", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
-                Switch(
-                    checked = showReasoning,
-                    onCheckedChange = {
-                        showReasoning = it
-                        writeShowReasoningPref(context, it)
-                    },
-                )
-            }
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
-            SectionTitle("Bilder auf diesem Gerät")
-            Column(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Text("Gleichzeitige Bildbeschreibungen", style = MaterialTheme.typography.bodyLarge)
-                Text(
-                    "Gilt ab der nächsten lokalen Verarbeitung. Mehr parallele Bilder brauchen mehr Speicher und Akku.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    (1..3).forEach { count ->
-                        FilterChip(
-                            selected = imageConcurrency == count,
-                            onClick = {
-                                if (count != imageConcurrency) {
-                                    if (applyLocalImageConcurrency(count)) {
-                                        imageConcurrency = count
-                                        if (!writeLocalImageConcurrency(context, count)) {
-                                            Toast.makeText(
-                                                context,
-                                                "Bildeinstellung konnte nicht gespeichert werden",
-                                                Toast.LENGTH_SHORT,
-                                            ).show()
-                                        }
-                                    } else {
-                                        Toast.makeText(
-                                            context,
-                                            "Lokale Bildeinstellung nicht verfügbar",
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
-                                    }
-                                }
-                            },
-                            label = { Text(if (count == 1) "1 Bild" else "$count Bilder") },
-                        )
-                    }
-                }
-            }
-
-            HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
-            HubRow("Benachrichtigungen", "Systemeinstellungen der App öffnen", null) { openNotificationSettings(context) }
-            HubRow("Diagnose teilen", "Bericht ohne Geheimnisse und Adressen", null) {
-                shareDiagnostic(context, diagnosticReport(state, appVersionOf(context)))
+            HubSection(stringResource(R.string.settings_hub_advanced_section)) {
+                AdvancedCloudSettings(state, connection, cloudBlock)
             }
         }
     }
@@ -353,11 +312,233 @@ internal fun SettingsHub(
             onChanged = { modelsFolderRevision++ },
         )
     }
+    if (diagnosticsOpen) {
+        DiagnosticsPanel(diagnosticsConnection, diagnosticsLocal, onClose = { diagnosticsOpen = false })
+    }
+}
+
+@Composable
+private fun HubSection(title: String, first: Boolean = false, content: @Composable () -> Unit) {
+    if (!first) {
+        HorizontalDivider(Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.outlineVariant)
+    }
+    SectionTitle(title)
+    content()
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun DisplaySettings(context: Context) {
+    var theme by remember { mutableStateOf(readThemePref(context)) }
+    var showReasoning by remember { mutableStateOf(readShowReasoningPref(context)) }
+    var screenshotProtection by remember { mutableStateOf(readScreenshotProtection(context)) }
+    val homePrefs = remember(context) { SessionHomePreferences(context) }
+    var showSystemSessions by remember(homePrefs) { mutableStateOf(homePrefs.showSystemSessions()) }
+    FlowRow(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        THEME_CHOICES.forEach { (key, label) ->
+            FilterChip(
+                selected = theme == key,
+                onClick = {
+                    theme = key
+                    writeThemePref(context, key)
+                },
+                label = { Text(stringResource(label)) },
+            )
+        }
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(androidx.compose.ui.res.stringResource(R.string.unified_home_show_internal), style = MaterialTheme.typography.bodyLarge)
+            Text(androidx.compose.ui.res.stringResource(R.string.unified_home_internal_summary), style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(
+            checked = showSystemSessions,
+            onCheckedChange = { value ->
+                showSystemSessions = value
+                homePrefs.setShowSystemSessions(value)
+            },
+        )
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(stringResource(R.string.settings_hub_reasoning), Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+        Switch(
+            checked = showReasoning,
+            onCheckedChange = {
+                showReasoning = it
+                writeShowReasoningPref(context, it)
+            },
+        )
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(stringResource(R.string.settings_hub_screenshots), style = MaterialTheme.typography.bodyLarge)
+            Text(
+                stringResource(R.string.settings_hub_screenshots_detail),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Switch(checked = screenshotProtection, onCheckedChange = {
+            screenshotProtection = it
+            writeScreenshotProtection(context, it)
+        })
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun LocalImageSettings(context: Context) {
+    val appContext = context.applicationContext
+    val scope = rememberCoroutineScope()
+    var imageConcurrency by remember { mutableStateOf<Int?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    var notice by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(appContext) {
+        imageConcurrency = withContext(Dispatchers.IO) {
+            visionSettingsLock.withLock { readLocalImageConcurrency(appContext) }
+        }
+    }
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(stringResource(R.string.harw_local_vision_parallel_title), style = MaterialTheme.typography.bodyLarge)
+        Text(
+            stringResource(R.string.harw_local_vision_parallel_explainer),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            LocalVisionConcurrencyRange.forEach { count ->
+                FilterChip(
+                    selected = imageConcurrency == count,
+                    enabled = imageConcurrency != null && !saving,
+                    onClick = {
+                        if (imageConcurrency != null && !saving && count != imageConcurrency) {
+                            saving = true
+                            notice = null
+                            scope.launch {
+                                // Once started, finish the runtime/persistence pair even if Settings closes.
+                                val (previous, change) = withContext(Dispatchers.IO + NonCancellable) {
+                                    visionSettingsLock.withLock {
+                                        val current = readLocalImageConcurrency(appContext)
+                                        current to changeVisionConcurrency(
+                                            current,
+                                            count,
+                                            ::applyLocalImageConcurrency,
+                                            { writeLocalImageConcurrency(appContext, it) },
+                                        )
+                                    }
+                                }
+                                imageConcurrency = if (change == VisionConcurrencyChange.Applied) count else previous
+                                notice = when (change) {
+                                    VisionConcurrencyChange.Applied, VisionConcurrencyChange.Unchanged -> null
+                                    VisionConcurrencyChange.Invalid -> "Diese Bildparallelität wird nicht unterstützt."
+                                    VisionConcurrencyChange.NativeUnavailable -> "Die lokale Bildparallelität ist in diesem Build nicht verfügbar."
+                                    VisionConcurrencyChange.PersistenceFailed -> "Nicht gespeichert. Das bisherige Limit bleibt aktiv."
+                                    VisionConcurrencyChange.RestoreFailed -> "Das bisherige Limit ließ sich nicht sicher wiederherstellen. Bitte starte Harw neu und prüfe die Einstellung."
+                                }
+                                saving = false
+                            }
+                        }
+                    },
+                    label = { Text(pluralStringResource(R.plurals.harw_local_vision_parallel_images, count, count)) },
+                )
+            }
+        }
+        imageConcurrency?.let { value ->
+            Text(stringResource(R.string.harw_local_vision_parallel_requested, value), style = MaterialTheme.typography.bodySmall)
+        }
+        if (saving) Text("Wird gespeichert …", style = MaterialTheme.typography.bodySmall)
+        notice?.let { StatusMessage(it, error = true) }
+    }
+}
+
+@Composable
+private fun AppUpdateHubRow(context: Context) {
+    val availableUpdate by AppUpdates.available.collectAsState()
+    var updateStatus by remember { mutableStateOf<String?>(null) }
+    val updateScope = rememberCoroutineScope()
+    val subtitle = availableUpdate?.let { "Version ${it.versionName} ist verfügbar. Tippen zum Installieren." }
+        ?: updateStatus
+        ?: "Installiert: ${AppUpdates.installedName(context)}. Tippen, um nach Updates zu suchen."
+    HubRow(stringResource(R.string.settings_hub_updates), subtitle, null) {
+        val known = availableUpdate
+        if (known != null) {
+            AppUpdates.consider(context, known, force = true)
+        } else {
+            updateStatus = "Suche nach Updates …"
+            updateScope.launch(Dispatchers.IO) {
+                val latest = AppUpdates.fetchLatest()
+                if (latest == null) {
+                    updateStatus = "Keine Verbindung zum Update-Dienst."
+                } else if (latest.versionCode > AppUpdates.installedCode(context)) {
+                    AppUpdates.consider(context, latest, force = true)
+                    updateStatus = null
+                } else {
+                    AppUpdates.consider(context, latest)
+                    updateStatus = "Du hast die neueste Version (${AppUpdates.installedName(context)})."
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AdvancedCloudSettings(state: WorkspaceState, connection: HarwConnection, cloudBlock: String?) {
+    var expanded by remember(connection, state.generation) { mutableStateOf(false) }
+    var editing by remember(connection, state.generation, cloudBlock) { mutableStateOf<ManageConfigEntry?>(null) }
+    HubRow(
+        "Server- & TUI-Parameter",
+        "Cloud-Profil · ${if (expanded) "Ausblenden" else "Anzeigen"}",
+        null,
+    ) {
+        expanded = !expanded
+    }
+    if (!expanded) return
+
+    LaunchedEffect(connection, state.generation, cloudBlock) {
+        if (cloudBlock == null) connection.refreshConfig()
+    }
+    if (cloudBlock != null) {
+        StatusMessage(cloudBlock, Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+        return
+    }
+
+    val manage = state.manage
+    val writable = configWritable(manage.support)
+    if (!writable) {
+        StatusMessage(CONFIG_READONLY_HINT, Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+    }
+    val configError = manage.configError
+    if (configError != null) {
+        StatusMessage(configError, Modifier.padding(horizontal = 16.dp, vertical = 4.dp), error = true)
+    } else if (manage.config.isEmpty()) {
+        StatusMessage("Noch keine Serverwerte verfügbar.", Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+    }
+    manage.config.forEach { entry ->
+        HubRow(
+            title = "${entry.key} = ${entry.value}",
+            subtitle = "Cloud-Profil · Gilt ${configApplyLabel(entry.apply)}" + if (writable) "" else " · Nur lesen",
+            block = null,
+        ) { editing = entry }
+    }
 
     editing?.let { entry ->
         ConfigEditDialog(
             entry = entry,
-            enabled = manage.running == null && configWritable(support),
+            enabled = manage.running == null && manage.stepUp == null && writable,
             onDismiss = { editing = null },
             onSet = { value ->
                 connection.setConfig(entry.key, value)
@@ -371,7 +552,7 @@ internal fun SettingsHub(
     }
 }
 
-/** Untertitel der Zeile "Ordner für lokale Modelle": aktueller Pfad, Zusatz bei eigener Wahl. */
+/** Untertitel der Zeile für den Modellordner: aktueller Pfad, Zusatz bei eigener Wahl. */
 private fun modelsFolderLabel(context: Context, @Suppress("UNUSED_PARAMETER") revision: Int): String = try {
     val store = ModelStore(context)
     val custom = store.customDir()
@@ -419,7 +600,7 @@ private fun ModelsFolderDialog(context: Context, onDismiss: () -> Unit, onChange
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Ordner für lokale Modelle") },
+        title = { Text(stringResource(R.string.settings_hub_model_folder)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
@@ -469,8 +650,8 @@ private fun ModelsFolderDialog(context: Context, onDismiss: () -> Unit, onChange
 private fun SectionTitle(text: String) {
     Text(
         text,
-        Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-        style = MaterialTheme.typography.labelLarge,
+        Modifier.padding(horizontal = 16.dp, vertical = 6.dp).semantics { heading() },
+        style = MaterialTheme.typography.titleSmall,
         color = MaterialTheme.colorScheme.primary,
     )
 }
@@ -480,10 +661,9 @@ private fun HubRow(
     title: String,
     subtitle: String,
     block: String?,
-    showBlock: Boolean = true,
     onClick: () -> Unit,
 ) {
-    val locked = block != null && showBlock
+    val locked = block != null
     Column(
         Modifier
             .fillMaxWidth()
@@ -515,7 +695,7 @@ private fun ConfigEditDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "Gilt ${configApplyLabel(entry.apply)}. Änderungen brauchen Bestätigung per Biometrie.",
+                    "Cloud-Profil. Gilt ${configApplyLabel(entry.apply)}. Änderungen brauchen eine zusätzliche Gerätebestätigung.",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 if (entry.choices.isNotEmpty()) {
@@ -560,7 +740,7 @@ private fun openNotificationSettings(context: Context) {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
     } catch (_: Exception) {
-        Toast.makeText(context, NOTIFICATION_ERROR, Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, R.string.settings_hub_notifications_error, Toast.LENGTH_SHORT).show()
     }
 }
 
@@ -570,7 +750,7 @@ private fun shareDiagnostic(context: Context, report: String) {
             .setType("text/plain")
             .putExtra(Intent.EXTRA_SUBJECT, "Harw Diagnose")
             .putExtra(Intent.EXTRA_TEXT, report)
-        context.startActivity(Intent.createChooser(send, "Diagnose teilen").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        context.startActivity(Intent.createChooser(send, context.getString(R.string.settings_hub_share_diagnostics)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     } catch (_: Exception) {
         Toast.makeText(context, "Teilen nicht möglich", Toast.LENGTH_SHORT).show()
     }

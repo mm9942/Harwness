@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod projects;
+mod read_ops;
 pub use projects::FolderProfileIndex;
 
 use harw_authority::FileWriteScope;
@@ -411,6 +412,10 @@ impl LocalCoreFactory {
 }
 
 impl CoreSessionFactory for LocalCoreFactory {
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        Some(self.store.as_ref())
+    }
+
     fn build(
         &self,
         session_id: &SessionId,
@@ -676,6 +681,31 @@ impl LocalHost {
         surface: Option<ToolSurface>,
         projects_root: Option<PathBuf>,
     ) -> Result<Self, LocalHostError> {
+        Self::open_project_host(config, model, contributors, surface, projects_root, false)
+    }
+
+    /// Opens the embedded phone host with the observer-only command catalogue.
+    ///
+    /// # Errors
+    /// As [`Self::open_with_projects`].
+    pub fn open_phone_with_projects(
+        config: LocalHostConfig,
+        model: Arc<dyn ModelProvider>,
+        contributors: Vec<Arc<dyn AssemblyContributor>>,
+        surface: Option<ToolSurface>,
+        projects_root: Option<PathBuf>,
+    ) -> Result<Self, LocalHostError> {
+        Self::open_project_host(config, model, contributors, surface, projects_root, true)
+    }
+
+    fn open_project_host(
+        config: LocalHostConfig,
+        model: Arc<dyn ModelProvider>,
+        contributors: Vec<Arc<dyn AssemblyContributor>>,
+        surface: Option<ToolSurface>,
+        projects_root: Option<PathBuf>,
+        phone_read_ops: bool,
+    ) -> Result<Self, LocalHostError> {
         std::fs::create_dir_all(&config.workspace).map_err(|error| {
             LocalHostError::Setup(format!("{}: {error}", config.workspace.display()))
         })?;
@@ -704,6 +734,13 @@ impl LocalHost {
                 harw_session_host::ProfileIndex::workdir(&*index, id).ok().flatten()
             }));
         }
+        let read_ops = phone_read_ops.then(|| {
+            read_ops::PhoneReadOps::new(
+                config.owner.actor(),
+                factory.base_spec.clone(),
+                factory.session_cwd.clone(),
+            )
+        });
         let driver = CoreTurnDriver::with_factory(
             CoreDriverConfig::new(sessions_root),
             Arc::new(factory),
@@ -735,6 +772,10 @@ impl LocalHost {
             ),
         }
         .map_err(|error| LocalHostError::Host(error.to_string()))?;
+        if let Some(ops) = read_ops {
+            host.install_ops(Arc::new(ops))
+                .map_err(|error| LocalHostError::Host(error.to_string()))?;
+        }
         let library_layers = vec![config.home.clone()];
         let library: harw_session_host::overview::AgentLibrary =
             Arc::new(move || agent_library(&library_layers));
@@ -949,6 +990,219 @@ mod tests {
             features: vec![],
             requested_caps: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fork_copies_the_durable_prefix_while_the_same_source_model_is_blocked() -> TestResult {
+        use harw_protocol::session_wire::{AttachParams, ForkFrom, SubmitParams, SubmitResult};
+        use harw_protocol::{HostedState, SessionEvent, SessionFrame, StreamProfile};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct BlockingSecondRequest {
+            calls: AtomicUsize,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+
+        impl ModelProvider for BlockingSecondRequest {
+            fn respond<'a>(
+                &'a self,
+                request: harw_core::ModelRequest,
+            ) -> harw_core::ModelFuture<'a> {
+                use harw_protocol::items::{ContentPart, TurnItem};
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    if request.history.items().iter().any(|item| {
+                        matches!(item, TurnItem::UserMessage(user) if user.content.iter().any(|part| {
+                            matches!(part, ContentPart::Text { text } if text == "new running user")
+                        }))
+                    }) {
+                        self.entered.notify_one();
+                        self.release.notified().await;
+                    }
+                    Ok(harw_core::ModelResponse::text("durable answer"))
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let config = config_in(temp.path())?;
+        let transcript_store = TranscriptStore::new(&config.sessions_root());
+        let model = Arc::new(BlockingSecondRequest {
+            calls: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let host = LocalHost::open_with_projects(
+            config,
+            model.clone(),
+            Vec::new(),
+            Some(ToolSurface { allow: Vec::new() }),
+            Some(temp.path().join("projects")),
+        )?;
+        let port = host.connect_owner()?;
+        port.hello(hello()).await?;
+        let source = port.create(CreateParams::default()).await?.session_id;
+        let submit = |text: &str, head| SubmitParams {
+            session_id: source.clone(),
+            text: text.to_owned(),
+            expect_head: head,
+            client_msg_id: text.to_owned(),
+            force: false,
+            images: Vec::new(),
+            rewind_before: None,
+        };
+        let items = |id: &SessionId| -> TestResult<Vec<harw_session_store::TranscriptRecord>> {
+            let mut items = Vec::new();
+            for record in transcript_store.reader(id)? {
+                let record = record?;
+                if record.kind == harw_session_store::RecordKind::Item {
+                    items.push(record);
+                }
+            }
+            Ok(items)
+        };
+        let attach = || AttachParams {
+            session_id: source.clone(),
+            from: None,
+            profile: StreamProfile::Full,
+            tail_items: 200,
+        };
+        let (initial, mut startup) = port.attach(attach()).await?;
+        assert!(matches!(
+            port.submit(submit("first user", initial.head)).await?,
+            SubmitResult::Accepted { .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(frame) = startup.next().await? {
+                match frame.frame {
+                    SessionFrame::Session(SessionEvent::SessionError { message, .. }) => {
+                        return Err::<(), Box<dyn std::error::Error + Send + Sync>>(message.into());
+                    }
+                    SessionFrame::Turn(harw_protocol::TurnEvent::TurnCompleted { .. }) => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            Err("source attachment ended".into())
+        })
+        .await??;
+        let (before, _) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if port
+                    .list()
+                    .await?
+                    .iter()
+                    .any(|row| row.session_id == source && row.state == HostedState::Idle)
+                    && model.calls.load(Ordering::SeqCst) != 0
+                {
+                    return port
+                        .attach(AttachParams {
+                            session_id: source.clone(),
+                            from: None,
+                            profile: StreamProfile::Full,
+                            tail_items: 200,
+                        })
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "first turn did not settle: model calls = {}",
+                model.calls.load(Ordering::SeqCst)
+            )
+        })??;
+        assert!(matches!(
+            port.submit(submit("new running user", before.head)).await?,
+            SubmitResult::Accepted { .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(10), model.entered.notified())
+            .await
+            .map_err(|_| "second user turn never reached the provider")?;
+        let model_calls = model.calls.load(Ordering::SeqCst);
+        let running = items(&source)?;
+        let target = running
+            .iter()
+            .rev()
+            .find(|item| item.payload["type"] == "user_message")
+            .and_then(|item| item.payload["id"].as_str())
+            .ok_or("running user was not persisted before model")?
+            .to_owned();
+        assert!(
+            harw_session_store::head(&transcript_store, &source)?.next_sequence
+                > before.head.durable
+        );
+        let control_started = std::time::Instant::now();
+        // This factory starts a full local runtime for each fresh session.
+        // Prove the same host can create an ordinary sibling while inference
+        // is paused, then give fork only a bounded additional setup margin.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            port.create(CreateParams::default()),
+        )
+        .await
+        .map_err(|_| "ordinary fresh-session control timed out")??;
+        let control_elapsed = control_started.elapsed();
+        let result = tokio::time::timeout(
+            control_elapsed.saturating_add(Duration::from_secs(2)),
+            port.create(CreateParams {
+                fork_from: Some(ForkFrom {
+                    session_id: source.clone(),
+                    before_item: target,
+                    displayed: None,
+                }),
+                ..CreateParams::default()
+            }),
+        )
+        .await;
+        model.release.notify_one();
+        let fork = result.map_err(|_| "fork waited for the source model")??;
+        assert_ne!(fork.session_id, source);
+        let seeded = items(&fork.session_id)?;
+        assert_eq!(seeded.len(), 2);
+        assert_eq!(seeded[0].payload["type"], "user_message");
+        assert_eq!(seeded[1].payload["type"], "assistant_message");
+        assert_ne!(seeded[0].recorded_at, running[0].recorded_at);
+        assert!(
+            seeded
+                .iter()
+                .zip(&running)
+                .all(|(new, old)| new.payload == old.payload)
+        );
+        assert_eq!(
+            model.calls.load(Ordering::SeqCst),
+            model_calls,
+            "fork never invoked a model"
+        );
+        host.shutdown();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn archive_import_adapter_uses_the_actual_local_writer_without_opening_a_session() -> TestResult {
+        use harw_session_host::driver::TurnDriver as _;
+        let temp = tempfile::tempdir()?;
+        let config = config_in(temp.path())?;
+        let factory = Arc::new(config.core_factory(echo_model()));
+        let driver = CoreTurnDriver::with_factory(
+            CoreDriverConfig::new(config.sessions_root()),
+            factory.clone(),
+        )?;
+        let session = SessionId::new();
+        let binding = driver.archive_journal_binding(&session)?;
+        assert_eq!(binding.root, config.sessions_root());
+        assert_eq!(binding.thread, hosted_thread(&session));
+        assert_eq!(driver.archive_published_head(&session)?, None);
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("offline fixture");
+        factory.archive_state_store().ok_or("factory omitted its writer")?.save_history(&session, &history).await?;
+        assert_eq!(driver.archive_published_head(&session)?.map(std::num::NonZeroU64::get), Some(3));
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

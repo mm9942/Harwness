@@ -78,13 +78,16 @@ class SessionAlertTrackerTest {
     }
 
     @Test
-    fun alertNotificationIdIsStableDistinctPerKindAndAtLeast1000() {
-        val a = alertNotificationId("sess-a1", SessionAlertKind.Approval)
-        assertEquals(a, alertNotificationId("sess-a1", SessionAlertKind.Approval))
-        val t = alertNotificationId("sess-a1", SessionAlertKind.TurnEnd)
-        assertNotEquals(a, t)
-        assertTrue(a >= 1000)
-        assertTrue(t >= 1000)
-        assertTrue(alertNotificationId("sess-a2", SessionAlertKind.Approval) >= 1000)
+    fun notificationTagsSeparateBackendsProfilesSessionsAndKinds() {
+        val scoped = SessionHomeId(SessionHomeScope(SessionHomeBackend.Cloud, "profile-a"), "sess-a1")
+        val approval = SessionAlertTarget(scoped, SessionAlertKind.Approval)
+        val original = approval.notificationTag()
+        assertEquals(original, approval.copy().notificationTag())
+        assertNotEquals(original, approval.copy(kind = SessionAlertKind.TurnEnd).notificationTag())
+        assertNotEquals(original, approval.copy(id = scoped.copy(sessionId = "sess-a2")).notificationTag())
+        val differentProfile = scoped.copy(scope = scoped.scope.copy(profileId = "profile-b"))
+        assertNotEquals(original, approval.copy(id = differentProfile).notificationTag())
+        val local = scoped.copy(scope = scoped.scope.copy(backend = SessionHomeBackend.Local))
+        assertNotEquals(original, approval.copy(id = local).notificationTag())
     }
 }

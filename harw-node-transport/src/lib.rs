@@ -27,6 +27,7 @@ pub mod client;
 pub mod error;
 pub mod handshake;
 pub mod identity;
+mod owner_process_channel;
 pub mod server;
 pub mod tls;
 pub mod upgrade;
@@ -49,8 +50,9 @@ pub use handshake::{
 };
 pub use identity::{
     ENROLLMENT_PROOF_DOMAIN, LocalNode, ML_DSA_65_PUBLIC_KEY_LEN, ML_DSA_65_SIGNATURE_LEN, NodeIdentity, NodeSigner,
-    NodeVerifier, PinnedPeers, SignFuture, enrollment_proof_message,
+    NodeVerifier, PinnedPeers, SignFuture, enrollment_proof_message, node_key_fingerprint,
 };
+pub use owner_process_channel::{OwnerProcessChannelBinding, owner_process_channel_binding_of};
 pub use server::{NodeTransportServer, ServerOptions, ServerTlsStream};
 pub use tls::TLS_EXPORTER_LABEL;
 pub use upgrade::{

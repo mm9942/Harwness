@@ -907,13 +907,13 @@ const DIARY: &[HintEntry] = &[
     ),
     HintEntry::new(
         "show",
-        "[agent] [--date=YYYY-MM-DD | --from=… [--to=…]]",
+        "[agent | --agent=ID] [--date=YYYY-MM-DD | --from=… [--to=…]]",
         "commands.subcommand.diary.show",
         "Show entries for a day or date range",
     ),
     HintEntry::new(
         "search",
-        "<text> [--agent=<id>] [--from=…] [--to=…]",
+        "<text | --query=TEXT> [--agent=ID] [--from=…] [--to=…]",
         "commands.subcommand.diary.search",
         "Search diaries",
     ),

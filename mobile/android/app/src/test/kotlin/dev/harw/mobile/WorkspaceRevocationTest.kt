@@ -21,8 +21,8 @@ class WorkspaceRevocationTest {
         val view = SessionSnapshot(
             sessionId = "session-a", head = null, online = true,
             canSubmit = true, canApprove = true, canInterrupt = false,
-            runningTurnId = null,
-            transcript = listOf(TranscriptEntry("message-1", TranscriptKind.USER, "Private message", null, emptyList())),
+            runningTurnId = null, lastTurnInterrupted = false,
+            transcript = listOf(TranscriptEntry("message-1", TranscriptKind.USER, "Private message", null, emptyList(), null)),
             liveText = "Private reply", liveReasoning = "Private reasoning display", approvals = emptyList(), lastFailure = null,
             lastSyncMillis = null, detail = null,
             agents = emptyList(), jobs = emptyList(), reasoning = emptyList(), finished = emptyList(),

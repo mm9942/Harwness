@@ -1431,6 +1431,23 @@ fn test_agent_skills_and_plugins_pass_hyphen_arguments_through() -> TestResult {
 }
 
 #[test]
+fn test_diary_search_keeps_literal_after_option_terminator() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw", "knowledge", "diary", "search", "--agent", "root", "--", "--from=example",
+    ])
+    .map_err(ctx("typed diary search parses"))?;
+    assert!(matches!(
+        cli.command,
+        Some(Command::Knowledge {
+            action: KnowledgeAction::Diary {
+                action: DiaryAction::Search { text, agent, from: None, to: None }
+            }
+        }) if text == "--from=example" && agent.as_deref() == Some("root")
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_knowledge_memory_proposals_and_index_parse() -> TestResult {
     let memory = Cli::try_parse_from(["harw", "knowledge", "memory", "search", "rust --tief"])
         .map_err(ctx("`harw knowledge memory search ...` sollte parsen"))?;
@@ -3316,5 +3333,38 @@ fn hidden_commands_and_aliases_are_listed_explicitly() -> TestResult {
             .filter(|error| error.kind() == clap::error::ErrorKind::DisplayHelp)
             .ok_or_else(|| TestError::Unexpected(format!("`{target}` ist kein Befehl")))?;
     }
+    Ok(())
+}
+
+#[test]
+fn gateway_control_requires_one_unambiguous_target_and_named_session_action() -> TestResult {
+    let cli = Cli::try_parse_from([
+        "harw", "gateway", "control", "--host", "own-cloud", "sessions", "--internal",
+    ])
+    .map_err(ctx("parse owned host internal page"))?;
+    let Some(Command::Gateway {
+        action: Some(GatewayAction::Control(control)),
+        ..
+    }) = cli.command
+    else {
+        return Err(TestError::Unexpected("not a gateway control command".into()));
+    };
+    assert_eq!(control.host.as_deref(), Some("own-cloud"));
+    assert!(matches!(
+        control.action,
+        GatewayControlAction::Sessions { internal: true, .. }
+    ));
+    assert!(Cli::try_parse_from([
+        "harw", "gateway", "control", "--host", "own-cloud", "--socket", "/run/harw.sock", "inspect",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "harw", "gateway", "control", "sessions", "--internal", "--project", "mine",
+    ])
+    .is_err());
+    assert!(Cli::try_parse_from([
+        "harw", "gateway", "control", "create-empty",
+    ])
+    .is_err());
     Ok(())
 }

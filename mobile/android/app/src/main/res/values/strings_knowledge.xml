@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="knowledge_cloud_profile">Cloud profile</string>
+    <string name="knowledge_no_profile">No Cloud profile is configured.</string>
+    <string name="knowledge_offline">The Cloud profile is offline.</string>
+    <string name="knowledge_checking">Checking the connection and read permission.</string>
+    <string name="knowledge_no_manage">This gateway does not offer mobile management.</string>
+    <string name="knowledge_no_observe">This device has no read permission for mobile management.</string>
+    <string name="knowledge_no_store">Connected, but the gateway does not expose scoped Knowledge reads here.</string>
+    <string name="knowledge_no_scope">This Settings screen is not attached to a chat or project. To inspect existing data, open the corresponding session or project in the Harw terminal UI. Nothing is loaded here.</string>
+    <string name="knowledge_memory">Memory</string>
+    <string name="knowledge_memory_scope">No scoped mobile memory reader is available.</string>
+    <string name="knowledge_diary">Diary</string>
+    <string name="knowledge_diary_scope">There is no mobile diary reader in this view.</string>
+    <string name="knowledge_session_workbench">Session workbench</string>
+    <string name="knowledge_session_workbench_scope">Session workbench data requires an attached session and a supported reader.</string>
+    <string name="knowledge_project_workbench">Project workbench</string>
+    <string name="knowledge_project_workbench_scope">Project workbench data requires an authorized project and a supported reader.</string>
+    <string name="knowledge_goals">Goals</string>
+    <string name="knowledge_goals_scope">Goal data requires an authorized planning scope and a connected goal store.</string>
+    <string name="knowledge_plan">Plan</string>
+    <string name="knowledge_plan_scope">Plan data requires an authorized planning scope and a connected plan store.</string>
+</resources>

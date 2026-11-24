@@ -146,7 +146,41 @@ impl NodeTransportServer {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
         F: Future<Output = ()>,
     {
-        Ok(self.serve_loop(listener, service, shutdown, true).await?)
+        self.serve_upgradable_gated(listener, service, shutdown, || true)
+            .await
+    }
+
+    /// Like [`Self::serve_upgradable`], with a synchronous admission predicate
+    /// evaluated before taking a transport slot and again before a queued task
+    /// starts a handshake. Refused sockets close without a protocol response.
+    ///
+    /// This gates new handshake starts; it does not cancel handshakes or HTTP
+    /// connections already admitted. The application still owns request-time
+    /// authorization. The predicate receives no untrusted connection data.
+    ///
+    /// # Errors
+    /// Listener failures ([`UpgradeError::Transport`]).
+    pub async fn serve_upgradable_gated<S, B, F, G>(
+        &self,
+        listener: TcpListener,
+        service: S,
+        shutdown: F,
+        admit: G,
+    ) -> Result<(), UpgradeError>
+    where
+        S: tower_service::Service<Request<Incoming>, Response = Response<B>>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+        F: Future<Output = ()>,
+        G: Fn() -> bool + Clone + Send + 'static,
+    {
+        Ok(self.serve_loop(listener, service, shutdown, true, admit).await?)
     }
 }
 

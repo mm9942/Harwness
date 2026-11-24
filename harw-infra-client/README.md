@@ -6,8 +6,15 @@ layer **I**, crypto masterplan v2 §11, §24, §34 H4).
 | Client | Daemon | Default socket |
 |---|---|---|
 | `AuthHubClient` | Auth/Crypto Hub | `/run/harw/infra/secure.sock` |
-| `NetworkControlClient` (skeleton) | NetSec local control API | `/run/harw/infra/network.sock` |
+| `NetworkControlClient` (health and metadata) | NetSec local control API | `/run/harw/infra/network.sock` |
+| `OwnerEpochClient` (Linux) | Opt-in NetSec live activation and daemon incarnation read | Explicit, operator-controlled socket + peer UID |
 | `SecurityHubClient` (skeleton) | SecurityHub | `/run/harw/infra/security.sock` |
+
+`OwnerEpochClient::active_epoch` keeps the existing v1 behavior.
+`active_authority` uses only v2 to return a typed, peer-checked observation
+for the selected node and refuses to fall back to an epoch without an
+incarnation. Callers must independently select the node and configure a
+trusted local socket; results do not themselves grant ownership or routing.
 
 Socket layout follows `docs/architecture/crypto-drift-report.md` D1/D2.
 

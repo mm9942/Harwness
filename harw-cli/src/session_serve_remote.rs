@@ -57,6 +57,45 @@
 //! itself takes the node, verifier and listener as parameters so the chain is
 //! tested over a real loopback socket with in-process keys.
 //!
+//! # Optional direct owner status
+//! `HARW_DIRECT_OWNER_STATUS_INSTANCE` is a startup-only operator setting.
+//! When absent, direct owner status is not offered. Its validated value labels
+//! this SessionHost instance; it is not a process key or remote Hub proof.
+//! Bootstrap pins the actual AuthHub node and the newly opened host's native
+//! epoch. The independent direct listener still verifies the exact originating
+//! device, key, current membership and creator-bound session on every read.
+//! The optional `direct-owner-placement` build feature and explicit
+//! `HARW_DIRECT_OWNER_PLACEMENT=1` additionally require private
+//! `owner-placement-hub.toml` in the remote ingress directory:
+//! its independently selected Hub `onion_locator` (v3 service with port)
+//! or explicit `loopback_address` (literal loopback SocketAddr, laboratory only),
+//! `node_id` and `public_key_hex` plus the process's `owner_epoch` and separate
+//! `process_public_key_hex` (both public keys lowercase hex). The operator
+//! supplies the matching one-incarnation 32-byte ML-DSA-65 process seed
+//! as the fixed private systemd credential `harw-owner-observe-ml-dsa-65`.
+//! The Hub must be pinned in the actual node transport but is not a device.
+//! Onion requires the actual owner Onion ingress; its backing TCP listener
+//! will not issue proof reservations or serve proofs. No route fallback.
+//! The dedicated Arti client bootstraps independently of scoped requests;
+//! an unready client or an exceeded proof deadline fails closed.
+//! An optional bounded list of `[[report_assignments]]` names already
+//! authorized exact `tenant`, `session` and Hub `generation` rows for this
+//! configured incarnation. The local host record is verified before
+//! sending; the Hub must still have the independently provisioned row.
+//! Omit the list to send no report. Nothing auto-assigns or migrates ownership.
+//!
+//! # Isolated private remote writer (Linux, opt-in)
+//!
+//! `HARW_PRIVATE_REMOTE_WRITER=1` selects a new remote-only namespace under
+//! `<profile>/session-host/remote/private-writer-v1`. The fixed writer lock is
+//! held from before recovery until process exit, including listener shutdown.
+//! It guards hosted records, transcripts and approvals, not other profile
+//! stores such as media. A pre-existing unmarked or partially initialized
+//! directory fails closed. No automatic import, legacy migration, cloud
+//! custody, provider linking, sharing or Hub status/report is enabled.
+//! This is local exclusion for cooperating processes in a protected deployment,
+//! not proof that another account, host or legacy writer has been fenced.
+//!
 //! # Live owner policy
 //!
 //! Registry rights and retained creator identities are revalidated every
@@ -90,7 +129,7 @@ use harw_session_host::driver::TurnDriver;
 use harw_session_host::index::{ProfileIndex, ProfileShare, ShareMode, ShareSettings};
 use harw_session_host::{DurableApprovals, DurableTranscripts, HostConfig, SessionHost, ToolHost};
 use harw_session_ws::WsLimits;
-use harw_types::{ApprovalActor, DeviceId, PermissionTier};
+use harw_types::{ApprovalActor, DeviceId, NodeId, PermissionTier};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -98,6 +137,18 @@ use tokio::task::JoinHandle;
 use crate::profile_index::{FsProfileIndex, IndexOptions};
 use crate::session_listener::SharePlan;
 use crate::session_serve::{GatewayCoreFactory, SessionCwdResolver, private_dir};
+
+#[cfg(all(unix, feature = "direct-owner-placement"))]
+mod owner_placement;
+
+#[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+mod writer_namespace;
+
+#[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+mod writer_creation;
+
+#[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+mod writer_readiness_lane;
 
 /// Directory below the profile's session-host state that belongs to the
 /// remote ingress.
@@ -118,6 +169,26 @@ pub(crate) fn remote_state_dir(home: &Path) -> Result<PathBuf, String> {
         .join(crate::session_serve::STATE_DIR_NAME)
         .join(REMOTE_DIR_NAME))
 }
+/// Export exact historical creation evidence for the active profile, locally.
+#[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+pub(crate) fn export_private_writer_creation(home: &Path, tenant: &str, session: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let remote = remote_state_dir(home)?;
+    let tenant = harw_types::TenantId::parse(tenant).map_err(|_| "invalid tenant")?;
+    let session = harw_types::SessionId::parse(session).map_err(|_| "invalid session")?;
+    let receipt = writer_namespace::read_committed(&remote, |state, namespace| {
+        let receipt = harw_session_host::owner_creation::read_owner_creation_receipt(state, &tenant, &session)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "no matching durable row and creation receipt for the exact session"))?;
+        if receipt.claims().namespace_id != namespace {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "receipt belongs to a different namespace"));
+        }
+        Ok(receipt)
+    }).map_err(|error| format!("private writer creation evidence unavailable: {error}"))?;
+    let mut output = std::io::stdout().lock();
+    serde_json::to_writer(&mut output, &receipt).map_err(|error| format!("creation receipt output: {error}"))?;
+    output.write_all(b"\n").map_err(|error| format!("creation receipt output: {error}"))
+}
+
 /// Hosted sessions' transcripts and approvals below the remote directory.
 const SESSIONS_DIR_NAME: &str = "sessions";
 /// Actor of remote sessions when no approving device is configured: no
@@ -146,10 +217,82 @@ pub struct RemoteServeConfig {
     /// Sharing of the profile's own sessions (`[session_listener]
     /// share_*`). Default off: the remote host keeps its private store.
     pub share: SharePlan,
+    /// Optional, operator-configured custody paths. Snapshotted by the gateway
+    /// launcher; never supplied by a session client.
+    pub(crate) cloud_keys: CloudServiceKeys,
     /// Digest of the exact owner pin file used to build the transport verifier.
     pub(crate) peer_pins_digest: Option<[u8; 32]>,
+    /// Explicit owner-process label from the trusted service environment.
+    pub(crate) direct_owner_status_instance: Option<DirectOwnerStatusInstance>,
+    /// Explicit scoped owner-to-Hub verifier selection. Default off.
+    pub(crate) direct_owner_placement: bool,
+    /// Opt in to an isolated, process-guarded private remote writer store.
+    pub(crate) private_remote_writer: bool,
+    /// Explicit startup opt-in to dedicated evidence for fresh private creates.
+    pub(crate) private_writer_creation_receipts: bool,
+    /// Separate, opted-in co-located Unix proof-only endpoint.
+    pub(crate) private_writer_readiness: bool,
+    /// The launcher must have selected the actual Onion inlet for owner proof.
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    pub(crate) owner_onion_ingress: bool,
     #[cfg(test)]
     injected_peer_trust: bool,
+}
+
+/// Owner startup configuration; never taken from a peer, request, or report.
+#[derive(Clone, Debug)]
+pub(crate) struct DirectOwnerStatusInstance(String);
+
+impl DirectOwnerStatusInstance {
+    pub(crate) fn from_gateway_environment() -> Result<Option<Self>, String> {
+        const ENV: &str = "HARW_DIRECT_OWNER_STATUS_INSTANCE";
+        let Some(raw) = std::env::var_os(ENV) else {
+            return Ok(None);
+        };
+        let valid = raw.to_str().filter(|value| {
+            !value.is_empty() && value.len() <= 255 && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        });
+        let Some(value) = valid else {
+            return Err(format!("{ENV} must be a nonempty owner instance label (max 255 ASCII letters, digits, -, _, . or :)"));
+        };
+        Ok(Some(Self(value.to_owned())))
+    }
+}
+
+pub(crate) fn direct_owner_placement_requested() -> Result<bool, String> {
+    match std::env::var_os("HARW_DIRECT_OWNER_PLACEMENT") {
+        None => Ok(false),
+        Some(value) if value.to_str() == Some("0") => Ok(false),
+        Some(value) if value.to_str() == Some("1") && cfg!(all(unix, feature = "direct-owner-placement")) => Ok(true),
+        Some(value) if value.to_str() == Some("1") => Err("direct owner placement needs a build with the direct-owner-placement feature".into()),
+        Some(_) => Err("HARW_DIRECT_OWNER_PLACEMENT must be 0 or 1".into()),
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CloudServiceKeys {
+    library: Option<PathBuf>,
+    assistant: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for CloudServiceKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudServiceKeys")
+            .field("library_configured", &self.library.is_some())
+            .field("assistant_configured", &self.assistant.is_some())
+            .finish()
+    }
+}
+
+impl CloudServiceKeys {
+    pub(crate) fn from_gateway_environment() -> Self {
+        Self {
+            library: std::env::var_os("HARW_CLOUD_LIBRARY_KEY_FILE").map(PathBuf::from),
+            assistant: std::env::var_os("HARW_CLOUD_ASSISTANT_KEY_FILE").map(PathBuf::from),
+        }
+    }
 }
 
 struct AccountLink {
@@ -209,6 +352,42 @@ impl harw_node_listener::ProviderLink for AccountLink {
     }
 }
 
+pub(crate) fn private_remote_writer_requested() -> Result<bool, String> {
+    const ENV: &str = "HARW_PRIVATE_REMOTE_WRITER";
+    match std::env::var_os(ENV) {
+        None => Ok(false),
+        Some(value) if value.to_str() == Some("0") => Ok(false),
+        Some(value) if value.to_str() == Some("1") && cfg!(all(target_os = "linux", feature = "direct-owner-placement")) => Ok(true),
+        Some(value) if value.to_str() == Some("1") =>
+            Err(format!("{ENV} needs Linux and the direct-owner-placement build feature")),
+        Some(_) => Err(format!("{ENV} must be 0 or 1")),
+    }
+}
+
+pub(crate) fn private_writer_creation_receipts_requested() -> Result<bool, String> {
+    const ENV: &str = "HARW_PRIVATE_WRITER_CREATE_RECEIPTS";
+    match std::env::var_os(ENV) {
+        None => Ok(false),
+        Some(value) if value.to_str() == Some("0") => Ok(false),
+        Some(value) if value.to_str() == Some("1") && cfg!(all(target_os = "linux", feature = "direct-owner-placement")) => Ok(true),
+        Some(value) if value.to_str() == Some("1") =>
+            Err(format!("{ENV} needs Linux and the direct-owner-placement build feature")),
+        Some(_) => Err(format!("{ENV} must be 0 or 1")),
+    }
+}
+
+pub(crate) fn private_writer_readiness_requested() -> Result<bool, String> {
+    const ENV: &str = "HARW_PRIVATE_WRITER_READINESS";
+    match std::env::var_os(ENV) {
+        None => Ok(false),
+        Some(value) if value.to_str() == Some("0") => Ok(false),
+        Some(value) if value.to_str() == Some("1") && cfg!(all(target_os = "linux", feature = "direct-owner-placement")) => Ok(true),
+        Some(value) if value.to_str() == Some("1") =>
+            Err(format!("{ENV} needs Linux and the direct-owner-placement build feature")),
+        Some(_) => Err(format!("{ENV} must be 0 or 1")),
+    }
+}
+
 impl RemoteServeConfig {
     /// Conservative defaults: observer sandbox, nobody approves.
     #[must_use]
@@ -222,7 +401,15 @@ impl RemoteServeConfig {
             provider_link_device: None,
             revocation_poll: Duration::from_secs(5),
             share: SharePlan::off(),
+            cloud_keys: CloudServiceKeys::default(),
             peer_pins_digest: None,
+            direct_owner_status_instance: None,
+            direct_owner_placement: false,
+            private_remote_writer: false,
+            private_writer_creation_receipts: false,
+            private_writer_readiness: false,
+            #[cfg(all(unix, feature = "direct-owner-placement"))]
+            owner_onion_ingress: false,
             #[cfg(test)]
             injected_peer_trust: false,
         }
@@ -315,6 +502,44 @@ pub(crate) fn read_peer_pins(path: &Path) -> Result<String, String> {
     if text.len() > POLICY_MAX_BYTES {
         return Err("remote peer pins exceed their read limit".into());
     }
+    validate_peer_pin_text(text)
+}
+
+/// Stronger, path-bound trust source for the optional two-peer status command.
+/// Ordinary attach retains its existing policy-file compatibility.
+#[cfg(feature = "onion")]
+pub(crate) fn read_private_peer_pins(directory: &Path) -> Result<String, String> {
+    use std::fs::File;
+    use std::os::{fd::AsFd as _, unix::fs::MetadataExt as _};
+    let unavailable = || "Fenced owner status: private profile peer pins unavailable".to_owned();
+    let dir = File::from(harw_fsutil::open_dir_nofollow(directory).map_err(|_| unavailable())?);
+    harw_fsutil::ensure_owned_directory(&dir).map_err(|_| unavailable())?;
+    if dir.metadata().map_err(|_| unavailable())?.mode() & 0o077 != 0 {
+        return Err(unavailable());
+    }
+    let name = Path::new(crate::session_listener::PEERS_FILE);
+    let file = harw_fsutil::open_beneath(dir.as_fd(), name, harw_fsutil::OpenMode::read_only())
+        .map_err(|_| unavailable())?;
+    harw_fsutil::ensure_private_regular(&file).map_err(|_| unavailable())?;
+    let before = file.metadata().map_err(|_| unavailable())?;
+    if before.nlink() != 1 || before.len() > POLICY_MAX_BYTES as u64 {
+        return Err(unavailable());
+    }
+    let mut text = String::new();
+    (&file).take(POLICY_MAX_BYTES as u64 + 1).read_to_string(&mut text)
+        .map_err(|_| unavailable())?;
+    let after = file.metadata().map_err(|_| unavailable())?;
+    if text.len() as u64 != before.len() || after.len() != before.len()
+        || after.nlink() != 1 || after.ctime() != before.ctime()
+        || after.ctime_nsec() != before.ctime_nsec()
+        || !harw_fsutil::same_file_at(dir.as_fd(), name, &file).map_err(|_| unavailable())?
+    {
+        return Err(unavailable());
+    }
+    validate_peer_pin_text(text).map_err(|_| unavailable())
+}
+
+fn validate_peer_pin_text(text: String) -> Result<String, String> {
     let (peers, skipped) = crate::session_listener::parse_peers(&text);
     let lines = text
         .lines()
@@ -387,6 +612,9 @@ impl PeerPolicyGate {
 struct PolicyIdentityMapper {
     mapper: RegistryIdentityMapper,
     pins: Arc<PeerPolicyGate>,
+    // The optional pinned Hub handshakes only for its fixed proof route;
+    // a later registry edit must not make it a normal device connection.
+    proof_only_hub: Option<NodeId>,
 }
 
 impl IdentityMapper for PolicyIdentityMapper {
@@ -395,7 +623,7 @@ impl IdentityMapper for PolicyIdentityMapper {
         peer: &harw_node_transport::AuthenticatedPeer,
         connection: harw_session_host::ConnectionId,
     ) -> harw_node_listener::MapFuture<'_> {
-        if !self.pins.current() {
+        if self.proof_only_hub.as_ref() == Some(&peer.node_id) || !self.pins.current() {
             return Box::pin(async { Err(harw_node_listener::ListenerError::UnknownPeer) });
         }
         let fingerprint = self.pins.fingerprints.get(peer.node_id.as_str()).copied();
@@ -423,6 +651,10 @@ pub struct RemoteIngress {
     addr: SocketAddr,
     intake: harw_node_listener::StreamIntake,
     guards: Vec<Box<dyn std::any::Any + Send + Sync>>,
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    pending_owner_reporter: Option<owner_placement::ConfiguredOwnerReporter>,
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    owner_reporter: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for RemoteIngress {
@@ -453,6 +685,14 @@ impl RemoteIngress {
         self.guards.push(guard);
     }
 
+    /// Start reporting only after the configured owner inlet is installed.
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    pub(crate) fn start_owner_reporter(&mut self) {
+        if let Some(reporter) = self.pending_owner_reporter.take() {
+            self.owner_reporter = Some(tokio::spawn(reporter.run(self.task.abort_handle(), self.shutdown.subscribe())));
+        }
+    }
+
     /// Stops accepting, closes live connections and waits for the listener.
     pub async fn shutdown(self) {
         let Self {
@@ -461,10 +701,16 @@ impl RemoteIngress {
             watcher,
             addr,
             guards,
+            #[cfg(all(unix, feature = "direct-owner-placement"))]
+            owner_reporter,
             ..
         } = self;
-        drop(guards);
         let _ = shutdown.send(true);
+        drop(guards);
+        #[cfg(all(unix, feature = "direct-owner-placement"))]
+        if let Some(reporter) = owner_reporter {
+            let _ = reporter.await;
+        }
         if let Err(error) = watcher.await {
             tracing::error!(%error, "remote revocation watcher failed");
         }
@@ -489,10 +735,29 @@ pub async fn start_remote(
     verifier: Arc<dyn NodeVerifier>,
     listener: TcpListener,
 ) -> Result<RemoteIngress, String> {
+    if config.private_writer_readiness && (!config.private_writer_creation_receipts || !config.private_remote_writer) {
+        return Err("private writer readiness requires the isolated writer and its creation receipts".into());
+    }
+    if config.private_writer_creation_receipts && !config.private_remote_writer {
+        return Err("private writer creation receipts require the isolated private remote writer".into());
+    }
+    if config.private_remote_writer {
+        if !matches!(config.share.mode, ShareMode::Off)
+            || config.direct_owner_placement || config.direct_owner_status_instance.is_some()
+            || config.cloud_keys.library.is_some() || config.cloud_keys.assistant.is_some()
+            || config.provider_link_device.is_some()
+        {
+            return Err("private remote writer cannot share or expose placement, cloud custody, or provider linking".into());
+        }
+        #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+        writer_namespace::acquire(&config.remote_dir()).map_err(|error| error.to_string())?;
+        #[cfg(not(all(target_os = "linux", feature = "direct-owner-placement")))]
+        return Err("private remote writer unavailable in this build".into());
+    }
     let share = open_share(config)?;
     let sessions_root = transcript_root(config, share.as_ref())?;
     let factory = GatewayCoreFactory::new(
-        model,
+        Arc::clone(&model),
         &sessions_root,
         config.home.clone(),
         config.cwd.clone(),
@@ -514,7 +779,60 @@ pub async fn start_remote(
         CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), Arc::new(factory))
             .and_then(|driver| driver.with_media_root(&config.home.join("media")))
             .map_err(|error| format!("remote session driver: {error}"))?;
-    start_remote_composed(config, share, Arc::new(driver), local, verifier, listener).await
+    start_remote_composed(config, share, Arc::new(driver), Some(model), local, verifier, listener).await
+}
+
+struct GatewayAssistantModel(Arc<dyn ModelProvider>);
+
+impl harw_session_host::cloud_assistant::CloudAssistantModel for GatewayAssistantModel {
+    fn answer<'a>(
+        &'a self,
+        turns: &'a [harw_protocol::session_wire::CloudAssistantTurn],
+        text: &'a str,
+    ) -> harw_session_host::driver::DriverFuture<'a, String> {
+        use harw_core::{ConversationHistory, model::{ModelRequest, StopReason}};
+        use harw_session_host::HostError;
+
+        let mut history = ConversationHistory::new();
+        // The scoped store already budgeted the union of selected and recent
+        // pairs. Trimming again here would drop an explicitly recalled pair.
+        for turn in turns {
+            history.push_user_text(&turn.text);
+            history.push_assistant_text(&turn.answer, None);
+        }
+        history.push_user_text(text);
+        let request = ModelRequest::new(
+            harw_extension_api::LoadedInstructions {
+                system_prompt: "You are the Harw Cloud Assistant, not a coding agent. Reply in the user's language. You have no tools, file access, local device state or ability to act outside this conversation. Never claim to have performed an external action.".into(),
+                fragments: Vec::new(),
+            },
+            Vec::new(),
+            history,
+            Vec::new(),
+        ).with_max_output_tokens(Some(1024));
+        Box::pin(async move {
+            let response = self.0.respond(request).await.map_err(|_| {
+                HostError::Driver("Cloud Assistant model request failed".into())
+            })?;
+            if !response.tool_calls.is_empty() {
+                return Err(HostError::Driver("Cloud Assistant does not execute tools".into()));
+            }
+            let stopped = match response.stop {
+                StopReason::EndTurn | StopReason::StopSequence => None,
+                StopReason::ContentFilter | StopReason::Refusal { .. } =>
+                    Some("Cloud Assistant reply stopped by provider policy"),
+                StopReason::MaxTokens => Some("Cloud Assistant reply reached the provider output limit"),
+                StopReason::ContextWindowExceeded => Some("Cloud Assistant model context limit exceeded"),
+                StopReason::StreamInterrupted => Some("Cloud Assistant provider stream interrupted"),
+                _ => Some("Cloud Assistant model did not finish the reply"),
+            };
+            if let Some(reason) = stopped {
+                return Err(HostError::Driver(reason.into()));
+            }
+            response.message.filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| HostError::Driver("Cloud Assistant model returned no text".into()))
+        })
+    }
 }
 
 /// Like [`start_remote`] around an injected `driver` (tests use a fake one).
@@ -528,8 +846,11 @@ pub async fn start_remote_with_driver(
     verifier: Arc<dyn NodeVerifier>,
     listener: TcpListener,
 ) -> Result<RemoteIngress, String> {
+    if config.private_remote_writer || config.private_writer_creation_receipts || config.private_writer_readiness {
+        return Err("private remote writer requires the production factory".into());
+    }
     let share = open_share(config)?;
-    start_remote_composed(config, share, driver, local, verifier, listener).await
+    start_remote_composed(config, share, driver, None, local, verifier, listener).await
 }
 
 /// Transcript and approval root: the profile store when sharing, otherwise
@@ -538,6 +859,9 @@ fn transcript_root(
     config: &RemoteServeConfig,
     share: Option<&SharedProfile>,
 ) -> Result<PathBuf, String> {
+    if config.private_remote_writer {
+        return private_writer_paths(config).map(|(_, sessions)| sessions);
+    }
     match share {
         Some(shared) => Ok(shared.sessions_root.clone()),
         None => {
@@ -548,19 +872,115 @@ fn transcript_root(
     }
 }
 
+fn private_writer_paths(config: &RemoteServeConfig) -> Result<(PathBuf, PathBuf), String> {
+    #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+    {
+        writer_namespace::active_paths(&config.remote_dir()).map_err(|error| error.to_string())
+    }
+    #[cfg(not(all(target_os = "linux", feature = "direct-owner-placement")))]
+    {
+        let _ = config;
+        Err("private remote writer unavailable in this build".into())
+    }
+}
+
+/// Install each optional capability only after custody and profile scope are
+/// validated. A bad key cannot turn a healthy gateway into an outage or cause
+/// a fallback to plaintext, another service's key, or the local host.
+fn mount_cloud_services(
+    config: &RemoteServeConfig,
+    host: &SessionHost,
+    assistant_model: Option<Arc<dyn ModelProvider>>,
+) {
+    let CloudServiceKeys { library, assistant } = &config.cloud_keys;
+    if library.is_none() && assistant.is_none() {
+        return;
+    }
+    if library.as_ref().is_some_and(|path| Some(path) == assistant.as_ref()) {
+        tracing::warn!("Cloud Library and Assistant unavailable: configure distinct credential files");
+        return;
+    }
+
+    // The listener's state directory was selected by the gateway launcher.
+    // If the active-profile selector moved since then, never combine the
+    // old state directory with another profile's encryption context.
+    let profile = harw_home::active_profile_name(&config.home);
+    let valid_profile = harw_home::profile_dir(&config.home, &profile)
+        .ok()
+        .filter(|dir| dir.join(crate::session_serve::STATE_DIR_NAME) == config.state_dir);
+    let Some(profile_dir) = valid_profile else {
+        tracing::warn!("Cloud Library and Assistant unavailable: active profile does not match listener state");
+        return;
+    };
+
+    if let Some(path) = library {
+        if host.install_cloud_library(&profile_dir, path).is_ok() {
+            tracing::info!("Cloud Library available to eligible enrolled remote devices");
+        } else {
+            tracing::warn!("Cloud Library unavailable: cannot open private store and credential");
+        }
+    }
+    if let Some(path) = assistant {
+        let Some(model) = assistant_model else {
+            tracing::warn!("Cloud Assistant unavailable: no gateway model is configured");
+            return;
+        };
+        let root = config.remote_dir().join("cloud-assistant-v1");
+        let backend = private_dir(&root).ok().and_then(|()| {
+            harw_session_host::cloud_assistant::CloudAssistant::open(
+                root, path, profile, Arc::new(GatewayAssistantModel(model)),
+            ).ok()
+        });
+        if backend.is_some_and(|backend| host.install_cloud_assistant(Arc::new(backend)).is_ok()) {
+            tracing::info!("Cloud Assistant available to eligible enrolled remote devices");
+        } else {
+            tracing::warn!("Cloud Assistant unavailable: cannot open private store and credential");
+        }
+    }
+}
+
 async fn start_remote_composed(
     config: &RemoteServeConfig,
     share: Option<SharedProfile>,
     driver: Arc<dyn TurnDriver>,
+    assistant_model: Option<Arc<dyn ModelProvider>>,
     local: LocalNode,
     verifier: Arc<dyn NodeVerifier>,
     listener: TcpListener,
 ) -> Result<RemoteIngress, String> {
     let remote_dir = config.remote_dir();
-    let sessions_root = transcript_root(config, share.as_ref())?;
-    // Host records stay in the remote directory in both modes.
-    let host_dir = remote_dir.join("host");
-    private_dir(&host_dir)?;
+    if config.direct_owner_placement && (config.direct_owner_status_instance.is_none()
+        || !cfg!(all(unix, feature = "direct-owner-placement")))
+    {
+        return Err("fenced direct status requires an explicit owner instance and the direct-owner-placement feature".into());
+    }
+    let addr = listener
+        .local_addr()
+        .map_err(|error| format!("remote listener address: {error}"))?;
+    let pins = Arc::new(PeerPolicyGate::open(config)?);
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    let placement_authority = config
+        .direct_owner_status_instance.as_ref()
+        .filter(|_| config.direct_owner_placement)
+        .map(|instance| owner_placement::ConfiguredPlacementAuthority::open(
+            &remote_dir, local.clone(), Arc::clone(&pins), &instance.0, addr, config.owner_onion_ingress,
+        ))
+        .transpose()?;
+    let (host_dir, sessions_root) = if config.private_remote_writer {
+        if share.is_some() {
+            return Err("private remote writer cannot share the profile store".into());
+        }
+        private_writer_paths(config)?
+    } else {
+        let sessions_root = transcript_root(config, share.as_ref())?;
+        let host_dir = remote_dir.join("host");
+        private_dir(&host_dir)?;
+        (host_dir, sessions_root)
+    };
+    #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+    let creation_authority = config.private_writer_creation_receipts
+        .then(|| writer_creation::open(&remote_dir, &local))
+        .transpose()?;
     let transcripts = DurableTranscripts::open(&sessions_root)
         .map_err(|error| format!("remote transcripts: {error}"))?;
     // Only the host's own records: profile sessions may have live writers.
@@ -597,6 +1017,15 @@ async fn start_remote_composed(
         ),
     };
     let host = Arc::new(host.map_err(|error| format!("remote host: {error}"))?);
+    #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+    if let Some((authority, namespace)) = creation_authority {
+        let remote = remote_dir.clone();
+        let guarded = Arc::new(move || writer_namespace::active_namespace_id(&remote).ok() == Some(namespace));
+        host.install_owner_creation_authority(authority, guarded)
+            .map_err(|error| format!("private writer creation authority: {error}"))?;
+    }
+    // Both services remain exclusive to this authenticated node ingress.
+    mount_cloud_services(config, &host, assistant_model);
     // Management ops only with a shared profile (contract K-W3c WR-7).
     if manage {
         host.install_ops(Arc::new(crate::session_ops::HostedOps::open(config.home.clone())?))
@@ -615,21 +1044,80 @@ async fn start_remote_composed(
         )))
         .map_err(|error| format!("remote overview: {error}"))?;
     }
-    let addr = listener
-        .local_addr()
-        .map_err(|error| format!("remote listener address: {error}"))?;
+    #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+    let readiness = config.private_writer_readiness.then(|| {
+        writer_readiness_lane::prepare(host.as_ref().clone(), &remote_dir, &local)
+    }).transpose()?;
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    let proof_hub = placement_authority.as_ref().map(|(authority, _)| authority.hub_node().clone());
+    #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+    let proof_hub = proof_hub.or_else(|| readiness.as_ref().map(|lane| lane.hub().clone()));
+    let authenticated_local_node = local.node_id().clone();
     let server = NodeTransportServer::new(local, verifier, ServerOptions::default())
         .map_err(|error| format!("node transport: {error}"))?;
-    let pins = Arc::new(PeerPolicyGate::open(config)?);
     // Validate bounded owner policy before accepting authenticated connections.
-    DeviceRegistry::new(&remote_dir)
+    let devices = DeviceRegistry::new(&remote_dir)
         .scan_bounded(POLICY_MAX_BYTES)
         .map_err(|error| format!("remote device policy: {error}"))?;
+    #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+    if let Some(lane) = &readiness
+        && (!devices.rejected.is_empty() || devices.records.iter().any(|row| &row.node_id == lane.hub()))
+    {
+        return Err("the proof-only Hub must not appear in the session device registry".into());
+    }
+    if config.direct_owner_status_instance.is_some()
+        && (pins.expected.is_none() || !pins.current() || !devices.rejected.is_empty()
+            || !devices.records.iter().any(|row| {
+                !row.revoked && pins.fingerprints.get(row.node_id.as_str())
+                    .is_some_and(|fingerprint| *fingerprint != [0; 32])
+            }))
+    {
+        return Err("direct owner status requires verified peer pins and an active enrolled device".into());
+    }
+    // Current membership is host-internal metadata, not a new admission path.
+    // Bind the authority to the exact mounted ingress, not a mutable active selector.
+    match crate::admin::membership::Registry::open(remote_dir.clone()) {
+        Ok(resolver) => host.install_user_memberships(Arc::new(resolver))
+            .map_err(|error| format!("remote membership composition: {error}"))?,
+        Err(_) if config.direct_owner_status_instance.is_some() => {
+            return Err("direct owner status requires the current user membership authority".into());
+        }
+        Err(_) => tracing::warn!("Current user membership lookup unavailable"),
+    }
     let mapper: Arc<dyn IdentityMapper> = Arc::new(PolicyIdentityMapper {
         mapper: RegistryIdentityMapper::new(&remote_dir),
         pins: Arc::clone(&pins),
+        #[cfg(all(unix, feature = "direct-owner-placement"))]
+        proof_only_hub: proof_hub,
+        #[cfg(not(all(unix, feature = "direct-owner-placement")))]
+        proof_only_hub: None,
     });
     let node_listener = NodeListener::new(server, Arc::clone(&host), mapper, WsLimits::default());
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    let mut pending_owner_reporter = None;
+    let node_listener = if let Some(instance) = &config.direct_owner_status_instance {
+        // This is the exact newly opened host, not a configured epoch or a
+        // remote report. OwnerProcessPin resolves this host's native epoch.
+        let pin = Arc::new(host.pin_owner_process(authenticated_local_node.as_str(), &instance.0)
+            .map_err(|_| "direct owner status could not bind the local SessionHost".to_owned())?);
+        #[cfg(all(unix, feature = "direct-owner-placement"))]
+        let node_listener = if let Some((authority, custody)) = placement_authority {
+            if devices.records.iter().any(|row| !row.revoked && &row.node_id == authority.hub_node()) {
+                return Err("the pinned Root-Hub node must not be enrolled as an owner device".into());
+            }
+            let proof = authority.compose_proof(&host, custody)?;
+            let selected_ingress = authority.ingress();
+            pending_owner_reporter = authority.reporter(Arc::clone(&pin));
+            host.install_direct_owner_placement_authority(Arc::new(authority))
+                .map_err(|_| "could not mount the pinned direct owner placement authority".to_owned())?;
+            node_listener.with_owner_observe_proof(proof, selected_ingress)
+        } else {
+            node_listener
+        };
+        node_listener.with_direct_owner_status(pin)
+    } else {
+        node_listener
+    };
     let node_listener = match &config.provider_link_device {
         Some(owner) => node_listener.with_provider_link(Arc::new(AccountLink {
             owner: owner.clone(),
@@ -655,6 +1143,11 @@ async fn start_remote_composed(
             tracing::warn!(%error, "remote session ingress ended with an error");
         }
     });
+    let mut guards: Vec<Box<dyn std::any::Any + Send + Sync>> = Vec::new();
+    #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+    if let Some(lane) = readiness {
+        guards.push(Box::new(lane.start(task.abort_handle(), shutdown.subscribe())));
+    }
     Ok(RemoteIngress {
         host: host.as_ref().clone(),
         shutdown,
@@ -662,7 +1155,11 @@ async fn start_remote_composed(
         watcher,
         addr,
         intake,
-        guards: Vec::new(),
+        guards,
+        #[cfg(all(unix, feature = "direct-owner-placement"))]
+        pending_owner_reporter,
+        #[cfg(all(unix, feature = "direct-owner-placement"))]
+        owner_reporter: None,
     })
 }
 
@@ -893,6 +1390,148 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn fixture_key(path: &Path, data: &[u8]) -> TestResult {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(path)?.write_all(data)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn provision_cloud_fixture(
+        home: &Path, phone: &TestNode, tenant: &TenantId, library_bytes: &[u8],
+    ) -> TestResult<RemoteServeConfig> {
+        let profile = harw_home::profile_dir(home, &harw_home::active_profile_name(home))?;
+        let mut config = RemoteServeConfig::new(
+            &profile.join(crate::session_serve::STATE_DIR_NAME), home, home,
+        );
+        config.cloud_keys = CloudServiceKeys {
+            library: Some(home.join("library-fixture.key")),
+            assistant: Some(home.join("assistant-fixture.key")),
+        };
+        fixture_key(&home.join("library-fixture.key"), library_bytes)?;
+        fixture_key(&home.join("assistant-fixture.key"), &[29; 32])?;
+        private_dir(&config.remote_dir())?;
+        enroll(&config, phone, tenant)?;
+        let key: String = phone.identity.public_key.iter().map(|byte| format!("{byte:02x}")).collect();
+        let pins = format!("{}|{key}\n", phone.id.as_str());
+        std::fs::write(config.remote_dir().join(crate::session_listener::PEERS_FILE), &pins)?;
+        config.peer_pins_digest = Some(*blake3::hash(pins.as_bytes()).as_bytes());
+        Ok(config)
+    }
+
+    #[cfg(unix)]
+    fn cloud_fixture_options() -> ConnectOptions {
+        use harw_protocol::session_wire::features;
+        let mut options = ConnectOptions::new("cloud-service-fixture");
+        options.features = vec![features::CLOUD_LIBRARY_V1.into(), features::CLOUD_ASSISTANT_V1.into()];
+        options
+    }
+
+    #[cfg(unix)]
+    async fn dial_cloud_fixture(
+        addr: SocketAddr, gateway: &TestNode, phone: &TestNode,
+    ) -> TestResult<RemotePort> {
+        let connection = connect_node(
+            NodeEndpoint { addr, expected_node: gateway.id.clone() },
+            &phone.local,
+            &pinned(&gateway.identity)?,
+            cloud_fixture_options(),
+        ).await?;
+        Ok(RemotePort::new(connection))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cloud_services_mount_on_enrolled_node_only_and_reopen_committed_data() -> TestResult {
+        use crate::session_serve::{SessionServeConfig, start_shared};
+        use harw_protocol::cloud_library::{CloudLibraryCommandV1, CloudLibraryReplyV1};
+        use harw_protocol::session_wire::{CloudAssistantStatus, CloudAssistantSubmit, features};
+        let home = tempfile::tempdir()?;
+        let gateway = node("cloud-fixture-gateway", 1)?;
+        let phone = node("cloud-fixture-client", 2)?;
+        let tenant = TenantId::try_from_str("cloud-fixture")?;
+        let config = provision_cloud_fixture(home.path(), &phone, &tenant, &[17; 32])?;
+        let model = harw_core::RecordingModelProvider::with_response("fixture answer");
+        let start = || async {
+            start_remote_composed(
+                &config, None, Arc::new(NoopDriver), Some(Arc::new(model.clone())),
+                gateway.local.clone(), Arc::new(pinned(&phone.identity)?),
+                TcpListener::bind("127.0.0.1:0").await?,
+            ).await.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
+        };
+        let ingress = start().await?;
+        let peer = dial_cloud_fixture(ingress.addr(), &gateway, &phone).await?;
+        let flags = &peer.connection().hello_ack().features;
+        assert!(flags.iter().any(|flag| flag == features::CLOUD_LIBRARY_V1));
+        assert!(flags.iter().any(|flag| flag == features::CLOUD_ASSISTANT_V1));
+
+        let unix = start_shared(
+            &SessionServeConfig::for_profile(home.path(), home.path(), home.path(), None, None),
+            ingress.host.clone(), tenant.clone(),
+        ).await?;
+        let desktop = RemotePort::new(harw_session_remote::connect_unix(
+            unix.socket().to_owned(), cloud_fixture_options(),
+        ).await?);
+        assert!(desktop.connection().hello_ack().features.is_empty());
+        assert!(desktop.cloud_assistant_status().await.is_err());
+        assert!(desktop.cloud_library(CloudLibraryCommandV1::List).await.is_err());
+        drop(desktop);
+
+        let count = peer.cloud_library(CloudLibraryCommandV1::List).await?;
+        assert!(matches!(count, CloudLibraryReplyV1::Snapshot { revision: 0, assets } if assets.is_empty()));
+        let imported = peer.cloud_library(CloudLibraryCommandV1::Import {
+            expected_revision: 0, name: "fixture inset".into(),
+            data_b64: "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAAAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AAA//2Q==".into(),
+        }).await?;
+        assert!(matches!(imported, CloudLibraryReplyV1::Updated { revision: 1 }));
+        assert_eq!(peer.cloud_assistant_status().await?.status, CloudAssistantStatus::Unprovisioned);
+        assert_eq!(peer.cloud_assistant_provision().await?.status, CloudAssistantStatus::Ready);
+        let submit = || CloudAssistantSubmit { client_message_id: "fixture-message".into(), text: "fixture question".into() };
+        assert_eq!(peer.cloud_assistant_submit(submit()).await?.turns[0].answer, "fixture answer");
+        assert_eq!(model.recorded().len(), 1);
+        let request = model.last().ok_or("missing provider request")?;
+        assert!(request.tools.is_empty() && request.context.is_empty() && request.identity.is_none());
+        drop(peer);
+        unix.shutdown().await;
+        ingress.shutdown().await;
+
+        let ingress = start().await?;
+        let peer = dial_cloud_fixture(ingress.addr(), &gateway, &phone).await?;
+        let count = peer.cloud_library(CloudLibraryCommandV1::List).await?;
+        assert!(matches!(count, CloudLibraryReplyV1::Snapshot { revision: 1, assets } if assets.len() == 1 && assets[0].name == "fixture inset"));
+        assert_eq!(peer.cloud_assistant_submit(submit()).await?.turns[0].answer, "fixture answer");
+        assert_eq!(model.recorded().len(), 1, "retry must use the committed reply");
+        drop(peer);
+        ingress.shutdown().await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_library_key_leaves_other_gateway_capabilities_available() -> TestResult {
+        use harw_protocol::session_wire::features;
+        let home = tempfile::tempdir()?;
+        let gateway = node("cloud-bad-key-gateway", 3)?;
+        let phone = node("cloud-bad-key-client", 4)?;
+        let tenant = TenantId::try_from_str("cloud-fixture")?;
+        let config = provision_cloud_fixture(home.path(), &phone, &tenant, &[19; 31])?;
+        let ingress = start_remote_composed(
+            &config, None, Arc::new(NoopDriver), Some(Arc::new(harw_core::RecordingModelProvider::new())),
+            gateway.local.clone(), Arc::new(pinned(&phone.identity)?),
+            TcpListener::bind("127.0.0.1:0").await?,
+        ).await?;
+        let peer = dial_cloud_fixture(ingress.addr(), &gateway, &phone).await?;
+        let flags = &peer.connection().hello_ack().features;
+        assert!(flags.iter().any(|flag| flag == features::CLOUD_ASSISTANT_V1));
+        assert!(!flags.iter().any(|flag| flag == features::CLOUD_LIBRARY_V1));
+        assert!(peer.list().await?.is_empty());
+        drop(peer);
+        ingress.shutdown().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn remote_start_repairs_torn_transcript_for_its_host_record() -> TestResult {
         use harw_session_host::record::{HostedSessionRecord, RecordStore};
@@ -909,7 +1548,10 @@ mod tests {
             session_id: id.clone(),
             tenant: None,
             owner_principal: "operator".to_owned(),
+            fresh_human_origin: false,
             creator_execution: None,
+            manual_cloud_work_receipt: None,
+            exact_rewrites: Vec::new(),
             workspace: None,
             title: None,
             created_at: now,

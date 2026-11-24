@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-apk=${1:?usage: verify-apk /path/to/Harw.apk}
+require_uia=0
+if [[ "${1:-}" == --require-local-uia ]]; then
+    require_uia=1
+    shift
+fi
+apk=${1:?usage: verify-apk [--require-local-uia] /path/to/Harw.apk}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
 build_tools="$sdk/build-tools/${MOBILE_BUILD_TOOLS:-37.0.0}"
 "$build_tools/apksigner" verify --verbose --print-certs "$apk"
@@ -27,6 +33,9 @@ staged=$(mktemp)
 trap 'rm -f -- "$staged"' EXIT
 while IFS= read -r library; do
     unzip -p "$apk" "$library" > "$staged"
+    if [[ "$require_uia" == 1 && "$library" == lib/arm64-v8a/libharw_mobile_ffi.so ]]; then
+        bash "$script_dir/verify-local-uia-bridge" "$staged"
+    fi
     # Android maps each PT_LOAD segment separately. ZIP alignment alone checks only the container.
     readelf -lW "$staged" | awk '$1 == "LOAD" { print $NF }' | (
         segments=0

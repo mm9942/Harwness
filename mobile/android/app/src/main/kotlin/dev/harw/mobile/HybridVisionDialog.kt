@@ -50,8 +50,10 @@ internal fun HybridVisionDialog(
     var error by remember { mutableStateOf<String?>(null) }
     val phase = remember { MutableStateFlow(false) }
     val text = remember { MutableStateFlow("") }
+    val results = remember { MutableStateFlow<Map<Int, Boolean>>(emptyMap()) }
     val localStarted by phase.collectAsState()
     val partial by text.collectAsState()
+    val imageResults by results.collectAsState()
     val busy = job != null
     fun close() {
         job?.cancel()
@@ -75,8 +77,8 @@ internal fun HybridVisionDialog(
                 Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text("Nur die ausgewählten neuen Bilder und eine neutrale Bildfrage gehen an den angegebenen Anbieter. Dein Entwurfstext, der Chatverlauf und die endgültige Antwort bleiben auf dem Gerät.")
-                Text("Der Anbieter verarbeitet Bilder nach seinen Regeln. Abbrechen holt bereits gesendete Bilder nicht zurück. Die Antwort wird nicht als Chatnachricht gespeichert.")
+                Text("Jedes ausgewählte neue Bild geht mit derselben neutralen Bildfrage als eigene parallele Anfrage an den angegebenen Anbieter. Dein Entwurfstext, der Chatverlauf und die endgültige Antwort bleiben auf dem Gerät.")
+                Text("Der Anbieter verarbeitet Bilder nach seinen Regeln. Abbrechen holt bereits gesendete Bilder nicht zurück. Jede Analyse kann Kosten verursachen. Die Antwort wird nicht als Chatnachricht gespeichert.")
                 val available = choices
                 if (available == null && error == null) LinearProgressIndicator()
                 if (available?.isEmpty() == true) {
@@ -115,6 +117,16 @@ internal fun HybridVisionDialog(
                     LinearProgressIndicator()
                     Text(if (localStarted) "Qwen schreibt die Antwort auf diesem Gerät …" else "Bilder werden beim gewählten Anbieter analysiert …")
                 }
+                if (started) {
+                    images.filterIndexed { index, _ -> index in selected }.forEachIndexed { index, image ->
+                        val status = when (imageResults[index]) {
+                            true -> "Beschrieben"
+                            false -> "Fehlgeschlagen"
+                            null -> if (busy) "Läuft …" else "Nicht abgeschlossen"
+                        }
+                        Text("${image.label}: $status")
+                    }
+                }
                 error?.let { Text(it) }
                 (finalText ?: partial.takeIf { it.isNotEmpty() })?.let { answer ->
                     SelectionContainer { Text(answer) }
@@ -131,6 +143,9 @@ internal fun HybridVisionDialog(
                         if (approved.isEmpty() || started) return@TextButton
                         started = true
                         val progress = object : HybridVisionProgress {
+                            override fun onCloudResult(index: UByte, success: Boolean) {
+                                results.update { it + (index.toInt() to success) }
+                            }
                             override fun onLocalStart() { phase.value = true }
                             override fun onLocalText(delta: String) {
                                 text.update { (it + delta).take(32_768) }

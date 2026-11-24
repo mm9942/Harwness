@@ -92,6 +92,17 @@ pub struct Entry {
     pub kind: EntryKind,
     /// Stored images of a user message (from `ContentPart::Media`), in order.
     pub media: Vec<harw_protocol::MediaRef>,
+    /// Typed presentation when the flattened user row would contain an image marker.
+    /// The existing flattened text stays unchanged for exact displayed-fork proofs.
+    pub user_presentation: Option<UserPresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPresentation {
+    /// Authored text only, including any literal image-marker lines.
+    pub text: String,
+    /// Count of typed media parts, including legacy parts without a stored reference.
+    pub image_count: u32,
 }
 
 impl Entry {
@@ -227,6 +238,7 @@ impl SessionView {
     /// Add the chat entry of `item` unless one with its key exists.
     fn item(&mut self, item: &TurnItem) {
         let mut media = Vec::new();
+        let mut user_presentation = None;
         let (key, kind) = match item {
             TurnItem::UserMessage(m) => {
                 media = m
@@ -237,7 +249,21 @@ impl SessionView {
                         _ => None,
                     })
                     .collect();
-                (m.id.as_str(), EntryKind::User(text_of(&m.content)))
+                let flat = text_of(&m.content);
+                let image_count = m.content.iter().filter(|part| {
+                    matches!(part, ContentPart::Media { .. } | ContentPart::ImageUrl { .. })
+                }).count();
+                if image_count != 0 || flat.split('\n').any(|line| line == "[image]") {
+                    let authored = m.content.iter().filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    }).collect::<Vec<_>>().join("\n");
+                    user_presentation = Some(UserPresentation {
+                        text: authored,
+                        image_count: u32::try_from(image_count).unwrap_or(u32::MAX),
+                    });
+                }
+                (m.id.as_str(), EntryKind::User(flat))
             }
             TurnItem::AssistantMessage(m) => {
                 // The full message replaces the partial text shown so far.
@@ -272,6 +298,7 @@ impl SessionView {
             key: key.to_owned(),
             kind,
             media,
+            user_presentation,
         });
         if self.transcript.len() > KEEP_TRANSCRIPT {
             self.transcript.remove(0);

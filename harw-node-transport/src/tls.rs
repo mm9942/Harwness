@@ -35,6 +35,9 @@ use crate::handshake::CHANNEL_BINDING_LEN;
 /// RFC 5705 / RFC 8446 §7.5 exporter label for the channel binding.
 pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-harw-node-transport-v1";
 
+/// Domain-separated from the exporter used by the node handshake itself.
+const OWNER_PROCESS_EXPORTER_LABEL: &[u8] = b"EXPORTER-harw-owner-process-observe-v1";
+
 /// SNI-free placeholder name; never used for authentication.
 const SERVER_NAME: &str = "harw-node.invalid";
 
@@ -107,6 +110,27 @@ pub(crate) fn client_channel_binding(
     conn: &ClientConnection,
 ) -> Result<[u8; CHANNEL_BINDING_LEN], TransportError> {
     Ok(conn.export_keying_material([0u8; CHANNEL_BINDING_LEN], TLS_EXPORTER_LABEL, None)?)
+}
+
+// Call only after the pinned application-level node handshake has completed.
+pub(crate) fn server_owner_process_exporter(
+    conn: &ServerConnection,
+) -> Result<[u8; CHANNEL_BINDING_LEN], TransportError> {
+    Ok(conn.export_keying_material(
+        [0u8; CHANNEL_BINDING_LEN],
+        OWNER_PROCESS_EXPORTER_LABEL,
+        None,
+    )?)
+}
+
+pub(crate) fn client_owner_process_exporter(
+    conn: &ClientConnection,
+) -> Result<[u8; CHANNEL_BINDING_LEN], TransportError> {
+    Ok(conn.export_keying_material(
+        [0u8; CHANNEL_BINDING_LEN],
+        OWNER_PROCESS_EXPORTER_LABEL,
+        None,
+    )?)
 }
 
 /// Checks the TLS 1.3 handshake signature made with the server's raw public

@@ -144,7 +144,7 @@ install_termux_dependencies() {
   if is_termux; then
     # Prefer Termux's native Android toolchain over any rustup binaries.
     local termux_bin="${PREFIX:-}/bin"
-    [ -n "${PREFIX:-}" ] && [ -d "$termux_bin" ] || die "Termux PREFIX/bin is unavailable"
+    [[ -n "${PREFIX:-}" && -d "$termux_bin" ]] || die "Termux PREFIX/bin is unavailable"
     export PATH="$termux_bin:$HOME/.cargo/bin:$PATH"
     for tool in cargo rustc; do [ -x "$termux_bin/$tool" ] || missing+=("$tool"); done
     for tool in make cc pkg-config cmake git; do command -v "$tool" >/dev/null 2>&1 || missing+=("$tool"); done

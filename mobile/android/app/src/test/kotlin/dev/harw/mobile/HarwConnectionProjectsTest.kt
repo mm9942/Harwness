@@ -7,6 +7,7 @@ import org.junit.Test
 import uniffi.harw_mobile_ffi.MobileHolder
 import uniffi.harw_mobile_ffi.MobileHolderKind
 import uniffi.harw_mobile_ffi.MobileRowOrigin
+import uniffi.harw_mobile_ffi.MobileSessionPurpose
 import uniffi.harw_mobile_ffi.MobileSessionRow
 import uniffi.harw_mobile_ffi.MobileSessionState
 
@@ -16,6 +17,7 @@ class HarwConnectionProjectsTest {
         turns = 1uL, state = MobileSessionState.IDLE, attached = 0u, model = null,
         origin = MobileRowOrigin.HOSTED, continuable = true, reason = null, holder = holder,
         lastOrigin = null, firstMessage = null,
+        purpose = MobileSessionPurpose.UNKNOWN,
     )
 
     @Test

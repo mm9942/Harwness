@@ -26,7 +26,24 @@ path = "src/main.rs"
 default = []
 # Tor onion ingress of the session listener (embedded arti =0.48.0 via harw-onion/service).
 # Build the gateway with: cargo build -p harw-cli --features onion --bin harw
-onion = ["dep:harw-onion", "harw-onion/service"]
+onion = ["dep:harw-onion", "harw-onion/service", "harw-cloud-gateway?/hub-owner-onion"]
+# Optional exact Root-Hub placement and owner process proof. Default-off at startup.
+direct-owner-placement = [
+    "dep:harw-cloud-gateway",
+    "harw-cloud-gateway/hub-owner-placement-listener",
+    "harw-cloud-gateway/hub-owner-process-custody",
+    "harw-cloud-gateway/hub-owner-readiness",
+    "harw-session-host/owner-creation-receipts",
+    "dep:aws-lc-rs",
+]
+# Explicit Linux-only, loopback owner-status Hub. Never starts with the normal gateway.
+owner-placement-hub = [
+    "direct-owner-placement",
+    "harw-cloud-gateway/hub-owner-netsec",
+    "harw-cloud-gateway/hub-owner-placement-listener",
+    "harw-cloud-gateway/hub-owner-create-receipt",
+]
+owner-placement-hub-onion = ["owner-placement-hub", "onion", "harw-cloud-gateway/hub-owner-onion"]
 # jemalloc als globaler Allokator nur auf ausdrücklichen Wunsch (G-067): auf
 # Kerneln mit 16K-Seiten (RPi 5, `PAGESIZE=16384`) kann ein auf 4K-Systemen
 # gebautes jemalloc abstürzen. Ohne Feature gilt der System-Allokator.
@@ -156,7 +173,7 @@ harw-web = { path = "../harw-web" }
 # Ermittelt die eigene UID für `harw_web::authz::StaticUidTierMap` — dieselbe
 # Crate wie `harw-web`s eigenes `SO_PEERCRED`, hier nur das `process`-Feature
 # für `rustix::process::getuid` statt `net`.
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["process", "fs"] }
 # Bottom-up-Befund: `harw-observe-prom`/`harw-observe-otlp` hatten null
 # Produktionskonsumenten. `src/observe.rs` ist die eine Kompositionsstelle,
 # die einen `RoutingSink` (Vorgabe: nur der immer aktive File-Sink) um sie
@@ -165,7 +182,7 @@ rustix = { workspace = true, features = ["process"] }
 harw-observe-file = { path = "../harw-observe-file" }
 harw-observe-prom = { path = "../harw-observe-prom" }
 harw-observe-otlp = { path = "../harw-observe-otlp" }
-harw-runtime = { path = "../harw-runtime" }
+harw-runtime = { path = "../harw-runtime", features = ["cloud-workload-placement"] }
 harw-protocol = { path = "../harw-protocol" }
 # W00 S09: `harw attach` connects through the session client (SessionPort).
 harw-session-remote = { path = "../harw-session-remote" }
@@ -201,7 +218,11 @@ harw-session-ws = { path = "../harw-session-ws" }
 # `harw kill` (src/main.rs::run_kill): reicht alle Argumente an killer durch.
 # killer braucht pidfd und ist deshalb Linux-only; auf anderen Systemen meldet
 # `harw kill` einen Fehler (Exit-Code 2).
+[target.'cfg(unix)'.dependencies]
+harw-cloud-gateway = { path = "../harw-cloud/harw-cloud-gateway", optional = true, features = ["hub-owner-process-proof", "hub-owner-local-host"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 harw-killer = { path = "../harw-killer" }
 # Sandboxed verify for the work driver (`src/verify_sandbox.rs`): the
 # Bubblewrap backends (feature `bwrap`) next to the Landlock trampoline.

@@ -31,6 +31,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+# Ephemeral daemon-incarnation marker for the protected v2 owner read only.
+getrandom = { version = "0.4.2", features = ["std"] }
 # Atomic state writes (tempfile + fsync + rename) and the single-writer lock,
 # the same crates and versions `harw-session-store`/`harw-job-store` use.
 tempfile = { workspace = true }

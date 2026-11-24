@@ -26,10 +26,11 @@ use std::time::SystemTime;
 use harw_protocol::session_wire::{PageParams, ProjectSummary, ProjectsParams};
 use harw_session_host::HostError;
 use harw_session_host::index::{
-    ProfileIndex, ProfilePage, ProfileRow, ProjectPage, ResolvedProject, ThreadOrigin,
+    ProfileIndex, ProfilePage, ProfileRow, ProfileSessionSelection, ProjectPage, ResolvedProject,
+    ThreadOrigin,
     decode_cursor, encode_cursor,
 };
-use harw_session_store::meta;
+use harw_session_store::{TranscriptStore, meta};
 use harw_types::SessionId;
 use jiff::Timestamp;
 
@@ -193,6 +194,36 @@ impl FsProfileIndex {
         meta_mtime: Option<SystemTime>,
         origin: ThreadOrigin,
     ) -> Entry {
+        // System metadata is constructed without consulting or deriving any
+        // first-message preview. Other internal purposes stay fully hidden.
+        match TranscriptStore::new(&self.sessions_root).catalog_session_purpose(id) {
+            Ok(Some(purpose)) => {
+                let archived = meta::load(&self.sessions_root, id)
+                    .ok().flatten().is_some_and(|saved| saved.archived);
+                let updated_at = Timestamp::try_from(sig.0).unwrap_or(Timestamp::UNIX_EPOCH);
+                let row = ProfileRow::system_metadata(id.clone(), updated_at, archived, purpose);
+                let visible = row.is_some() && self.options.since.is_none_or(|since| updated_at >= since);
+                return Entry {
+                    jsonl_sig: sig,
+                    meta_mtime,
+                    origin,
+                    row,
+                    project_root: None,
+                    visible,
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Entry {
+                    jsonl_sig: sig,
+                    meta_mtime,
+                    origin,
+                    row: None,
+                    project_root: None,
+                    visible: false,
+                };
+            }
+        }
         let Ok(session_meta) = meta::peek(&self.sessions_root, id) else {
             return Entry {
                 jsonl_sig: sig,
@@ -220,6 +251,8 @@ impl FsProfileIndex {
         let row = ProfileRow {
             session_id: id.clone(),
             title: session_meta.display_title(),
+            stored_title: (session_meta.title_source != harw_session_store::TitleSource::Fallback)
+                .then(|| session_meta.title.clone()).flatten(),
             project_key,
             project_label,
             updated_at,
@@ -240,13 +273,18 @@ impl FsProfileIndex {
     }
 
     /// Sichtbare Zeilen (optional ohne Archivierte), unsortiert.
-    fn visible_rows(&self, include_archived: bool) -> Result<Vec<ProfileRow>, HostError> {
+    fn visible_rows(
+        &self,
+        include_archived: bool,
+        selection: ProfileSessionSelection,
+    ) -> Result<Vec<ProfileRow>, HostError> {
         Ok(self
             .scan()?
             .into_iter()
             .filter(|(_, entry)| entry.visible)
             .filter_map(|(_, entry)| entry.row.clone())
             .filter(|row| include_archived || !row.archived)
+            .filter(|row| selection.allows(row))
             .collect())
     }
 
@@ -305,6 +343,14 @@ impl ProfileIndex for FsProfileIndex {
         &self.sessions_root
     }
 
+    fn supports_dream_session_rows(&self) -> bool {
+        true
+    }
+
+    fn supports_system_session_rows(&self) -> bool {
+        true
+    }
+
     fn projects(&self, params: &ProjectsParams) -> Result<ProjectPage, HostError> {
         let entries = self.scan()?;
         struct Group {
@@ -319,7 +365,7 @@ impl ProfileIndex for FsProfileIndex {
             let Some(row) = entry.row.as_ref().filter(|_| entry.visible) else {
                 continue;
             };
-            if row.archived {
+            if row.archived || row.is_system() {
                 continue;
             }
             let key = row.project_key.clone().unwrap_or_default();
@@ -416,7 +462,9 @@ impl ProfileIndex for FsProfileIndex {
     }
 
     fn page(&self, params: &PageParams) -> Result<ProfilePage, HostError> {
-        let mut rows = self.visible_rows(params.include_archived)?;
+        let mut rows = self.visible_rows(
+            params.include_archived, ProfileSessionSelection::from_page(params)?,
+        )?;
         if let Some(wanted) = params.project_key.as_deref() {
             if wanted.is_empty() {
                 rows.retain(|row| row.project_key.is_none());
@@ -462,11 +510,12 @@ impl ProfileIndex for FsProfileIndex {
         Ok(self
             .refresh(&mut cache, id)
             .filter(|entry| entry.visible)
-            .and_then(|entry| entry.row.clone()))
+            .and_then(|entry| entry.row.clone())
+            .filter(|row| !row.is_system()))
     }
 
     fn newest(&self, limit: usize) -> Result<Vec<ProfileRow>, HostError> {
-        let mut rows = self.visible_rows(false)?;
+        let mut rows = self.visible_rows(false, ProfileSessionSelection::Ordinary)?;
         sort_rows(&mut rows);
         rows.truncate(limit);
         Ok(rows)
@@ -499,6 +548,37 @@ impl ProfileIndex for FsProfileIndex {
             project_key: project_key.to_owned(),
             label: label_for(Some(&canonical), project_key),
             project_root: canonical,
+        }))
+    }
+
+    fn supports_existing_project_assignment(&self) -> bool {
+        true
+    }
+
+    fn resolve_existing_project(&self, project_key: &str) -> Result<Option<ResolvedProject>, HostError> {
+        if project_key.is_empty() {
+            return Ok(None);
+        }
+        let mut selected_root: Option<PathBuf> = None;
+        for (_, entry) in self.scan()? {
+            let Some(row) = entry.row.as_ref().filter(|row| entry.visible && !row.archived) else { continue };
+            if row.project_key.as_deref() != Some(project_key) {
+                continue;
+            }
+            let Some(root) = entry.project_root.as_deref() else { continue };
+            let Ok(canonical) = std::fs::canonicalize(root) else { return Ok(None) };
+            if !canonical.is_dir() || canonical.as_path() != root || !self.within_share_roots(&canonical)
+                || harw_home::project::project_key(&canonical) != project_key
+                || selected_root.as_ref().is_some_and(|current| current != &canonical)
+            {
+                return Ok(None);
+            }
+            selected_root = Some(canonical);
+        }
+        Ok(selected_root.map(|root| ResolvedProject {
+            project_key: project_key.to_owned(),
+            label: label_for(Some(&root), project_key),
+            project_root: root,
         }))
     }
 
@@ -642,6 +722,7 @@ mod tests {
 
     use harw_session_store::record::{RecordKind, TranscriptRecord};
     use harw_session_store::store::TranscriptStore;
+    use harw_session_store::SessionPurpose;
     use harw_types::ThreadRef;
 
     use super::*;
@@ -708,6 +789,156 @@ mod tests {
             first: Some("hallo welt"),
             ..Spec::default()
         }
+    }
+
+    #[test]
+    fn typed_internal_sessions_are_not_in_pages_or_counts_but_legacy_stays_visible() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let store = TranscriptStore::new(root.path());
+        let internal = SessionId::from_str("opaque-internal");
+        let thread = ThreadRef::from_str("internal-typed-test");
+        store.ensure_session_purpose(&internal, &thread, SessionPurpose::Dream)?;
+        write_meta(root.path(), internal.as_str(), &visible_spec())?;
+
+        let adversarial_looking = Spec {
+            title: Some("Dream"),
+            thread: "gateway-dream:legacy-history",
+            ..visible_spec()
+        };
+        write_session(root.path(), "dream-looking-title", &adversarial_looking)?;
+        write_session(root.path(), "regular-user-session", &visible_spec())?;
+
+        let index = open(root.path());
+        let rows = all(&index)?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.session_id.as_str() == "dream-looking-title"));
+        assert!(rows.iter().any(|row| row.session_id.as_str() == "regular-user-session"));
+        assert!(index.row(&internal)?.is_none());
+        assert_eq!(index.projects(&ProjectsParams::default())?.projects[0].session_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn dream_opt_in_accepts_only_typed_or_exact_legacy_provenance_before_pagination() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let disk = TranscriptStore::new(root.path());
+        let typed = SessionId::from_str("typed-dream");
+        disk.ensure_session_purpose(&typed, &ThreadRef::from_str("typed"), SessionPurpose::Dream)?;
+        let other = SessionId::from_str("typed-internal");
+        disk.ensure_session_purpose(&other, &ThreadRef::from_str("typed"), SessionPurpose::Internal)?;
+        let legacy = SessionId::from_str("dream-20261123T193501-2");
+        let lookalike = SessionId::from_str("dream-20261123T193502");
+        let fake_content = SessionId::from_str("dream-20261123T193503");
+        let prompt = format!(
+            "Du träumst (manuell). Konsolidiere still, was zuletzt wichtig war, und schlage vor.\n--- letzter dauerhafter Gesprächskontext ---\n{}\n--- Ende Wissensstand ---",
+            "private context ".repeat(750),
+        );
+        for (id, thread, text) in [
+            (&legacy, format!("gateway-dream:{legacy}"), prompt.as_str()),
+            (&lookalike, format!("gateway-dream:{legacy}"), prompt.as_str()),
+            (&fake_content, format!("gateway-dream:{fake_content}"), "ordinary user content"),
+        ] {
+            let record = TranscriptRecord::new(
+                id.clone(), ThreadRef::from_str(thread), 0, Timestamp::now(), RecordKind::Item,
+                serde_json::json!({
+                    "type": "user_message", "id": "first",
+                    "content": [{"type": "text", "text": text}],
+                }),
+            );
+            disk.append(&record)?;
+            write_meta(root.path(), id.as_str(), &Spec { title: Some("Dream"), ..visible_spec() })?;
+        }
+        let index = open(root.path());
+        let defaults = index.page(&PageParams { limit: Some(2), ..PageParams::default() })?;
+        assert_eq!(defaults.rows.len(), 2);
+        assert!(defaults.next_cursor.is_none());
+        assert!(defaults.rows.iter().all(|row| !row.is_dream()));
+        assert!(index.row(&typed)?.is_none());
+        assert!(index.row(&legacy)?.is_none());
+        assert_eq!(index.newest(200)?.len(), 2);
+        assert_eq!(index.projects(&ProjectsParams::default())?.projects[0].session_count, 2);
+
+        let mut cursor = None;
+        let mut rows = Vec::new();
+        loop {
+            let next = index.page(&PageParams {
+                limit: Some(1), include_dreams: true, cursor, ..PageParams::default()
+            })?;
+            rows.extend(next.rows);
+            let Some(next) = next.next_cursor else { break; };
+            assert!(rows.len() < 5, "page cursor did not advance");
+            cursor = Some(next);
+        }
+        let dreams: Vec<_> = rows.iter().filter(|row| row.is_dream()).collect();
+        assert_eq!(dreams.len(), 2);
+        assert!(dreams.iter().any(|row| row.session_id == typed));
+        assert!(dreams.iter().any(|row| row.session_id == legacy));
+        assert!(dreams.iter().all(|row| row.first_message.is_none() && row.title == "Dream"));
+        assert!(!rows.iter().any(|row| row.session_id == other));
+        let project = index.page(&PageParams {
+            project_key: Some(String::new()), include_dreams: true, ..PageParams::default()
+        })?;
+        assert!(project.rows.iter().all(|row| !row.is_dream()));
+        Ok(())
+    }
+
+    #[test]
+    fn system_virtual_project_never_spends_a_page_on_ordinary_chats() -> TestResult {
+        use harw_session_host::index::SystemSessionCategory;
+        let root = tempfile::tempdir()?;
+        let store = TranscriptStore::new(root.path());
+        let categories = [
+            ("typed-dream", SessionPurpose::Dream, SystemSessionCategory::Dream),
+            ("typed-diary", SessionPurpose::Diary, SystemSessionCategory::Diary),
+            ("typed-ledger", SessionPurpose::Ledger, SystemSessionCategory::Ledger),
+            ("typed-reconciliation", SessionPurpose::MemoryReconciliation,
+                SystemSessionCategory::MemoryReconciliation),
+            ("typed-workbench", SessionPurpose::AutomaticWorkbench,
+                SystemSessionCategory::AutomaticWorkbench),
+        ];
+        for (id, purpose, _) in categories {
+            store.ensure_session_purpose(&SessionId::from_str(id), &ThreadRef::from_str("fixture-system"), purpose)?;
+        }
+        let generic = SessionId::from_str("unclassified-internal");
+        store.ensure_session_purpose(&generic, &ThreadRef::from_str("fixture-internal"), SessionPurpose::Internal)?;
+        let future = TranscriptRecord::new(
+            SessionId::from_str("future-internal"), ThreadRef::from_str("fixture-future"),
+            0, Timestamp::now(), RecordKind::Lifecycle,
+            serde_json::json!({"marker": "harw_session_purpose", "version": 1, "purpose": "future"}),
+        );
+        store.append(&future)?;
+        for index in 0..7 {
+            write_session(root.path(), &format!("regular-{index}"), &Spec { title: Some("Diary"), ..visible_spec() })?;
+        }
+        let index = open(root.path());
+        let ordinary = index.page(&PageParams::default())?;
+        assert_eq!(ordinary.rows.len(), 7);
+        assert!(ordinary.rows.iter().all(|row| !row.is_system()));
+        let old = index.page(&PageParams { include_dreams: true, ..PageParams::default() })?;
+        assert_eq!(old.rows.len(), 8);
+        assert_eq!(old.rows.iter().filter(|row| row.is_system()).count(), 1);
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = index.page(&PageParams {
+                include_system: true, limit: Some(2), cursor, ..PageParams::default()
+            })?;
+            assert!(page.rows.iter().all(|row| row.first_message.is_none() && row.is_system()));
+            seen.extend(page.rows);
+            let Some(next) = page.next_cursor else { break; };
+            assert!(seen.len() < 5, "System cursor did not advance");
+            cursor = Some(next);
+        }
+        assert_eq!(seen.len(), categories.len());
+        for (id, _, category) in categories {
+            assert!(seen.iter().any(|row| row.session_id.as_str() == id && row.system_category() == Some(category)));
+            assert!(index.row(&SessionId::from_str(id))?.is_none());
+        }
+        assert_eq!(index.projects(&ProjectsParams::default())?.projects[0].session_count, 7);
+        assert!(index.page(&PageParams {
+            include_system: true, project_key: Some("system".into()), ..PageParams::default()
+        }).is_err());
+        Ok(())
     }
 
     fn open(root: &Path) -> FsProfileIndex {

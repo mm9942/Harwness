@@ -151,6 +151,19 @@ impl TranscriptSource for DurableTranscripts {
         self.inner.read_from(session, from_sequence, limit)
     }
 
+    fn fork_prefix(
+        &self,
+        session: &SessionId,
+        before: &str,
+        committed_head: u64,
+    ) -> Result<Vec<harw_protocol::items::TurnItem>, HostError> {
+        self.inner.fork_prefix(session, before, committed_head)
+    }
+
+    fn canonical_floor(&self, session: &SessionId, head: u64) -> Result<u64, HostError> {
+        self.inner.canonical_floor(session, head)
+    }
+
     fn head(&self, session: &SessionId) -> Result<u64, HostError> {
         self.inner.head(session)
     }

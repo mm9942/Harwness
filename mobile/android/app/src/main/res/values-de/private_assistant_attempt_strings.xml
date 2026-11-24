@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="private_assistant_attempt_channel">Privater Assistent</string>
+    <string name="private_assistant_attempt_running">Lokale Assistenten-Anfrage läuft</string>
+    <string name="private_assistant_attempt_stop">Stopp</string>
+    <string name="private_assistant_attempt_not_sent">Android konnte diese Anfrage nicht im Vordergrund halten. Es wurde nichts gesendet.</string>
+    <string name="private_assistant_parked_pending">Eine lokale Assistenten-Anfrage läuft noch. Der Assistent bleibt bis zum Ende gesperrt.</string>
+    <string name="private_assistant_parked_check_unavailable">Harw konnte nicht prüfen, ob noch eine lokale Anfrage läuft. Es wurde kein PIN-Versuch verbraucht.</string>
+    <string name="private_assistant_parked_check_again">Erneut prüfen</string>
+</resources>

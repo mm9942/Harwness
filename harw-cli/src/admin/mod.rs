@@ -14,6 +14,7 @@
 mod account;
 mod audit;
 mod enroll;
+pub(crate) mod membership;
 mod totp;
 mod web;
 
@@ -46,6 +47,7 @@ pub(crate) fn run(g: &GlobalArgs, action: AdminAction) -> Result<(), String> {
         AdminAction::Totp { disable } => totp_cmd(&home, &config, disable),
         AdminAction::Status => status(&home, &config),
         AdminAction::Serve => web::serve(&home, &config),
+        AdminAction::Membership { action } => membership::run(&home, action),
         AdminAction::OnionRotate { yes } => onion_rotate(&home, &config, yes),
     }
 }

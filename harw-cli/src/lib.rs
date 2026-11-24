@@ -39,6 +39,7 @@ mod device_cmd;
 mod auto_build;
 mod chat;
 mod cli;
+mod cloud_policy_cmd;
 mod completions;
 mod connect;
 mod cycle_cmd;
@@ -48,6 +49,13 @@ mod dod_cmd;
 mod cleanup_cmd;
 pub mod embedded_uia;
 mod gateway;
+mod gateway_control_cmd;
+#[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+mod owner_creation_readiness;
+#[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+mod owner_creation_verify;
+#[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+mod owner_hub;
 mod home;
 mod job_worker;
 mod jobs_cmd;
@@ -618,7 +626,12 @@ pub fn main_entry() -> ExitCode {
         return ExitCode::from(2);
     }
     let tui_active = starts_tui(&cli);
-    let logging = load_logging_section(cli.global.home.clone(), tui_active).unwrap_or_default();
+    let logging = if matches!(&cli.command, Some(Command::Cloud { .. })) {
+        // Offline policy inspection reads only its explicit file, not the home.
+        harw_config::LoggingSection::default()
+    } else {
+        load_logging_section(cli.global.home.clone(), tui_active).unwrap_or_default()
+    };
     let rust_log = std::env::var("RUST_LOG").ok();
     let settings = TracingSettings {
         directive: resolve_log_directive(
@@ -717,6 +730,7 @@ fn command_label(command: Option<&Command>) -> String {
             Command::Tool { .. } => "tool",
             Command::Cleanup { .. } => "cleanup",
             Command::PrReview(_) => "pr-review",
+            Command::Cloud { .. } => "cloud",
             Command::Gateway { .. } => "gateway",
             Command::Serve { .. } => "serve",
             Command::Web { .. } => "web",
@@ -801,7 +815,8 @@ fn reject_misplaced_session_flags(
 ///
 /// # Description
 /// JSON liefern `harw session list|show`, `harw jobs …`, `harw cycle …`,
-/// `harw skill …`, `harw dod …`, `harw tool …`, `harw knowledge memory|proposals` und
+/// `harw skill …`, `harw dod …`, `harw tool …`, `harw cloud policy …`,
+/// `harw knowledge memory|proposals` und
 /// `harw agent skills|plugins`; diese
 /// Befehle (und `provider`) prüfen ihre Unterfälle selbst. Jeder andere
 /// Befehl bricht mit `--json` ab, statt stillschweigend Text auszugeben.
@@ -827,6 +842,11 @@ fn reject_unsupported_json(command: Option<&Command>, global: &GlobalArgs) -> Re
             | Command::Agent { .. }
             | Command::Device { .. }
             | Command::Node { .. }
+            | Command::Cloud { .. }
+            | Command::Gateway {
+                action: Some(cli::GatewayAction::Control(_)),
+                ..
+            }
             | Command::Provider { .. }
             // PL-97 D3: jede `harw dod`-Aktion liefert eine JSON-Form.
             | Command::Dod { .. }
@@ -963,6 +983,33 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             lifecycle::health(home_override)
         }
         Some(Command::Gateway {
+            action: Some(cli::GatewayAction::Control(args)),
+            ..
+        }) => gateway_control_cmd::run(&global, args),
+        #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+        Some(Command::Gateway {
+            action: Some(cli::GatewayAction::OwnerCreationReceipt { tenant, session }),
+            ..
+        }) => {
+            let home = home::resolve_home(home_override)?;
+            session_serve_remote::export_private_writer_creation(&home, &tenant, &session)
+        }
+        #[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+        Some(Command::Gateway {
+            action: Some(cli::GatewayAction::VerifyOwnerCreationReceipt { pin, tenant, session }),
+            ..
+        }) => owner_creation_verify::run(&pin, &tenant, &session),
+        #[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+        Some(Command::Gateway {
+            action: Some(cli::GatewayAction::VerifyOwnerCreationReadiness { pin, tenant, session }),
+            ..
+        }) => owner_creation_readiness::run(&pin, &tenant, &session),
+        #[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+        Some(Command::Gateway {
+            action: Some(cli::GatewayAction::OwnerPlacementHub { config }),
+            ..
+        }) => owner_hub::run(home_override, &config),
+        Some(Command::Gateway {
             action: Some(action),
             ..
         }) => lifecycle::gateway_service(home_override, action),
@@ -1001,7 +1048,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Project { action }) => project_trust::run(home_override, action),
         Some(Command::Config { action }) => settings::run(home_override, action),
         Some(Command::Provider { action }) => provider_cmd::run(&global, action),
-        Some(Command::Model { action }) => models::run(home_override, action),
+        Some(Command::Model { action }) => models::run(&global, action),
         Some(Command::Agent { action }) => agent_cmd::run(&global, action),
         Some(Command::Knowledge { action }) => knowledge_cmd::run(&global, action),
         Some(Command::Jobs { action }) => jobs_cmd::run(&global, action),
@@ -1047,6 +1094,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Tailscale { action }) => tailscale_cmd::run(action),
         Some(Command::Device { action }) => device_cmd::run(&global, action),
         Some(Command::Node { action }) => node_cmd::run(&global, action),
+        Some(Command::Cloud { action }) => cloud_policy_cmd::run(&global, action),
         Some(Command::Admin { action }) => admin::run(&global, action),
         Some(Command::Update {
             check,
@@ -1069,7 +1117,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => {
             legacy_hint("catalog", "model catalog");
-            models::run(home_override, Some(ModelsAction::Catalog { refresh }))
+            models::run(&global, Some(ModelsAction::Catalog { refresh }))
         }
         Some(Command::Sandbox { action }) => sandbox_cmd::run(action),
         Some(Command::BugReport {
@@ -1130,9 +1178,30 @@ fn run_startup_migrations(
     home_override: Option<PathBuf>,
 ) -> Result<(), String> {
     let layers = match command {
+        // The dedicated Hub does not read or migrate ordinary application config.
+        #[cfg(all(target_os = "linux", feature = "direct-owner-placement"))]
+        Some(Command::Gateway {
+            action: Some(cli::GatewayAction::OwnerCreationReceipt { .. }),
+            ..
+        }) => return Ok(()),
+        #[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+        Some(Command::Gateway {
+            action: Some(cli::GatewayAction::VerifyOwnerCreationReceipt { .. }
+                | cli::GatewayAction::VerifyOwnerCreationReadiness { .. }),
+            ..
+        }) => return Ok(()),
+        #[cfg(all(target_os = "linux", feature = "owner-placement-hub"))]
+        Some(Command::Gateway {
+            action: Some(cli::GatewayAction::OwnerPlacementHub { .. }),
+            ..
+        }) => return Ok(()),
         // Der Modell-Katalog und der Wissensindex lesen keine Konfiguration.
         Some(
             Command::Attach(_)
+            | Command::Gateway {
+                action: Some(cli::GatewayAction::Control(_)),
+                ..
+            }
             | Command::Model {
                 action: Some(ModelsAction::Catalog { .. }),
             }
@@ -1202,6 +1271,8 @@ fn run_startup_migrations(
             | Command::Completions(_)
             | Command::Device { .. }
             | Command::Node { .. }
+            // Offline cloud policy inspection reads no Harwness configuration.
+            | Command::Cloud { .. }
             | Command::Admin { .. }
             | Command::Tailscale { .. }
             | Command::Update { .. }

@@ -13,7 +13,6 @@ import java.util.Base64
 internal class SiwcFailure(message: String) : Exception(message)
 
 internal data class SiwcIdentity(val subject: String, val email: String?)
-internal data class SiwcRegistration(val clientId: String, val subject: String)
 
 internal class SiwcTokens(
     val clientId: String,
@@ -64,17 +63,7 @@ internal fun validateSiwcIdentity(
 
         val claims = SiwcJson.fromJson(decoder.decode(jwt[1]).decodeToString(throwOnInvalidSequence = true), JsonObject::class.java)
         require(claims.string("iss") == SiwcIssuer && siwcEqual(nonce, claims.string("nonce")))
-        val audience = claims.get("aud")
-        if (audience.isJsonArray) {
-            val values = audience.asJsonArray.map {
-                require(it.isJsonPrimitive && it.asJsonPrimitive.isString)
-                it.asString
-            }
-            require(clientId in values && (values.size == 1 || claims.string("azp") == clientId))
-        } else {
-            require(claims.string("aud") == clientId)
-        }
-        require(!claims.has("azp") || claims.string("azp") == clientId)
+        requireSiwcAudience(claims, clientId)
         val current = now.epochSecond
         require(requireNotNull(claims.integer("exp")) > current)
         require(!claims.has("iat") || requireNotNull(claims.integer("iat")) <= current + 60)
@@ -88,4 +77,18 @@ internal fun validateSiwcIdentity(
     } catch (_: Exception) {
         throw SiwcFailure("OpenAI’s ID token could not be verified for this sign-in.")
     }
+}
+
+private fun requireSiwcAudience(claims: JsonObject, clientId: String) {
+    val audience = requireNotNull(claims.get("aud"))
+    if (audience.isJsonArray) {
+        val values = audience.asJsonArray.map {
+            require(it.isJsonPrimitive && it.asJsonPrimitive.isString)
+            it.asString
+        }
+        require(clientId in values && (values.size == 1 || claims.string("azp") == clientId))
+    } else {
+        require(claims.string("aud") == clientId)
+    }
+    require(!claims.has("azp") || claims.string("azp") == clientId)
 }

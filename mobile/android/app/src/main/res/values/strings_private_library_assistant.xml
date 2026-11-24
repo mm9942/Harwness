@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="private_library_assistant_text_only">Private Library images stay here. A saved description can be added as text to the private Assistant draft when available.</string>
+    <string name="private_library_assistant_picture_description">Use description in private Assistant</string>
+    <string name="private_library_assistant_description_consent">Add the saved description of “%1$s” to this private Assistant draft? This adds text only. The image stays in the Library and nothing is sent until you press Send.</string>
+    <string name="private_library_assistant_stage_description">Add text to draft</string>
+    <string name="private_library_assistant_description_missing">This item no longer has a saved description. Nothing was added.</string>
+    <string name="private_library_assistant_draft_unavailable">The private Assistant draft is unavailable or too long. Nothing was added.</string>
+    <string name="private_library_assistant_draft_heading">Description from my private Library (text only, no image):</string>
+    <string name="private_library_assistant_photo_intro">A photo can be attached to the private Assistant on this device. A saved description can also be added as text only.</string>
+    <string name="private_library_assistant_attach_photo">Attach photo to private Assistant</string>
+    <string name="private_library_assistant_photo_consent">Attach “%1$s” to this draft? When you press Send, only your on-device vision model will see this photo. Nothing is uploaded.</string>
+    <string name="private_library_assistant_stage_photo">Attach to draft</string>
+    <string name="private_library_assistant_photo_draft">Attached photo: %1$s</string>
+    <string name="private_library_assistant_remove_photo">Remove photo</string>
+    <string name="private_library_assistant_photo_in_turn">Private Library photo used · on device</string>
+    <string name="private_library_assistant_photo_changed">The photo or Library changed. Remove the attachment and select the photo again. Nothing was sent.</string>
+    <string name="private_library_assistant_photo_model_required">This photo needs a compatible on-device vision model and its projector. Nothing was sent.</string>
+    <string name="private_library_assistant_photo_invalid">The local vision model cannot read this photo. Nothing was sent.</string>
+    <string name="private_library_assistant_open_photo">View private photo</string>
+    <string name="private_library_assistant_photo_unavailable">The app could not open the original photo for this turn. If it was removed or changed, no other photo is shown.</string>
+    <string name="private_library_assistant_close_photo">Close</string>
+    <string name="private_library_assistant_turn_interrupted">An earlier turn did not finish. Its question and partial answer were not saved. Type your question again to retry.</string>
+    <string name="private_library_assistant_turn_attempt_unknown">The app could not verify the previous attempt. Check the saved conversation before sending again.</string>
+</resources>

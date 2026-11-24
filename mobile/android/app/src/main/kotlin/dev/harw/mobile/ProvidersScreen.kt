@@ -51,6 +51,7 @@ import uniffi.harw_mobile_ffi.ValidationOutcome
 import uniffi.harw_mobile_ffi.providerDefaults
 
 private const val MAX_SHOWN_MODELS = 50
+private const val CHATGPT_DIRECT_LABEL = "ChatGPT direkt"
 
 private val KIND_CHOICES = listOf(
     ProviderKind.ANTHROPIC to "Claude (Anthropic)",
@@ -239,7 +240,7 @@ internal fun ProvidersScreen(
                                     },
                                 ) { Text("Schlüssel eintragen") }
                                 if (route.kind == ProviderKind.OPEN_AI) {
-                                    OutlinedButton(onClick = { mode = ProviderMode.ChatGpt }) { Text("ChatGPT direkt") }
+                                    OutlinedButton(onClick = { mode = ProviderMode.ChatGpt }) { Text(CHATGPT_DIRECT_LABEL) }
                                     OutlinedButton(onClick = { mode = ProviderMode.Codex }) { Text("Codex") }
                                 }
                                 if (route.kind == ProviderKind.ANTHROPIC) {
@@ -439,7 +440,7 @@ internal fun ProvidersScreen(
 }
 
 private enum class ProviderMode(val label: String) {
-    ChatGpt("ChatGPT direkt"),
+    ChatGpt(CHATGPT_DIRECT_LABEL),
     Api("API"),
     Device("Auf diesem Gerät"),
     Codex("Codex"),
@@ -453,7 +454,7 @@ private fun ModeInfo(mode: ProviderMode, onOpenConnection: () -> Unit, onOpenLoc
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             when (mode) {
                 ProviderMode.ChatGpt -> {
-                    Text("ChatGPT direkt", style = MaterialTheme.typography.titleMedium)
+                    Text(CHATGPT_DIRECT_LABEL, style = MaterialTheme.typography.titleMedium)
                     Text(
                         "Verbinde dein ChatGPT-Konto direkt mit harw. Verfügbare Modelle und Nutzung richten sich nach " +
                             "deinem verbundenen Konto und Abo. Die Anmeldung läuft über den verbundenen harw-Server " +

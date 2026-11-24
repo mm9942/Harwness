@@ -329,6 +329,59 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
             Ok(params) => encode(id, port.hello(params).await),
             Err(response) => *response,
         },
+        harw_protocol::methods::METHOD_RESERVE_OWNER_OBSERVATION => {
+            match serde_json::from_value::<SessionRef>(params) {
+                Ok(params) => encode(id, port.reserve_owner_observation(params.session_id).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid observation reservation request"),
+            }
+        }
+        harw_protocol::methods::METHOD_DIRECT_OWNER_STATUS_FENCED => {
+            match serde_json::from_value::<harw_protocol::owner_placement::FencedDirectOwnerStatus>(params) {
+                Ok(params) => encode(id, port.fenced_direct_owner_status(params).await),
+                // The selectors and rejected fields are never echoed.
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid fenced owner status request"),
+            }
+        }
+        harw_protocol::methods::METHOD_DIRECT_OWNER_STATUS => {
+            match serde_json::from_value::<SessionRef>(params) {
+                Ok(params) => encode(id, port.direct_owner_status(params.session_id).await),
+                // Do not echo a rejected selector or unexpected fields.
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid owner status request"),
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_STATUS
+        | harw_protocol::methods::METHOD_CLOUD_ASSISTANT_PROVISION
+        | harw_protocol::methods::METHOD_CLOUD_ASSISTANT_REVOKE => {
+            if !is_empty_params(&params) {
+                error_response(id, error_codes::INVALID_PARAMS, "Cloud Assistant takes no selector")
+            } else {
+                let result = match method.as_str() {
+                    harw_protocol::methods::METHOD_CLOUD_ASSISTANT_STATUS => port.cloud_assistant_status().await,
+                    harw_protocol::methods::METHOD_CLOUD_ASSISTANT_PROVISION => port.cloud_assistant_provision().await,
+                    _ => port.cloud_assistant_revoke().await,
+                };
+                encode(id, result)
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SUBMIT => {
+            match serde_json::from_value::<harw_protocol::session_wire::CloudAssistantSubmit>(params) {
+                Ok(params) => encode(id, port.cloud_assistant_submit(params).await),
+                // Never echo invalid fields or request text in a wire error.
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid Cloud Assistant message"),
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SUBMIT_WITH_RECALL => {
+            match serde_json::from_value::<harw_protocol::session_wire::CloudAssistantRecallSubmit>(params) {
+                Ok(params) => encode(id, port.cloud_assistant_submit_with_recall(params).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid Cloud Assistant recall request"),
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SHARED => {
+            match serde_json::from_value::<harw_protocol::session_wire::CloudAssistantSharedCommandV1>(params) {
+                Ok(input) => encode(id, port.cloud_assistant_shared(input).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid shared Cloud Assistant operation"),
+            }
+        }
         METHOD_SESSION_LIST => {
             if is_empty_params(&params) {
                 encode(
@@ -358,6 +411,48 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
             ),
             Err(response) => *response,
         },
+        harw_protocol::methods::METHOD_ARCHIVE_CHECKPOINT_ISSUE => {
+            match decode::<harw_protocol::session_wire::ArchiveCheckpointIssueV1>(&id, params) {
+                Ok(params) => encode(id, port.archive_checkpoint_issue(params).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_ARCHIVE_CHECKPOINT_DESCRIBE => {
+            match decode::<harw_protocol::session_wire::ArchiveCheckpointDescribeV1>(&id, params) {
+                Ok(params) => encode(id, port.archive_checkpoint_describe(params).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_ARCHIVE_CHECKPOINT_PREVIOUS => {
+            match decode::<harw_protocol::session_wire::ArchiveCheckpointPreviousV1>(&id, params) {
+                Ok(params) => encode(id, port.archive_checkpoint_previous(params).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_ARCHIVE_CHECKPOINT_PAGE => {
+            match decode::<harw_protocol::session_wire::ArchiveCheckpointPageV1>(&id, params) {
+                Ok(params) => encode(id, port.archive_checkpoint_page(params).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_MANUAL_CLOUD_WORK => {
+            match decode::<harw_protocol::session_wire::ManualCloudWorkCommandV1>(&id, params) {
+                Ok(command) => encode(id, port.manual_cloud_work(command).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_LIBRARY => {
+            match decode::<harw_protocol::cloud_library::CloudLibraryCommandV1>(&id, params) {
+                Ok(command) => encode(id, port.cloud_library(command).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_FORK_INCLUSIVE => {
+            match decode::<harw_protocol::session_wire::ForkInclusiveV1>(&id, params) {
+                Ok(params) => encode(id, port.fork_inclusive(params).await),
+                Err(response) => *response,
+            }
+        }
         METHOD_TURN_SUBMIT => match decode::<SubmitParams>(&id, params) {
             Ok(params) => encode(id, port.submit(params).await),
             Err(response) => *response,
@@ -394,6 +489,12 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
             Ok(params) => encode(id, port.projects(params).await),
             Err(response) => *response,
         },
+        harw_protocol::methods::METHOD_SESSION_MEDIA_PREVIEW => {
+            match decode::<harw_protocol::session_wire::SessionMediaPreviewV1>(&id, params) {
+                Ok(params) => encode(id, port.session_media_preview(params).await),
+                Err(response) => *response,
+            }
+        }
         METHOD_MEDIA_GET => match decode::<MediaGetParams>(&id, params) {
             Ok(params) => encode(id, port.media_get(params).await),
             Err(response) => *response,
@@ -414,6 +515,30 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
             Ok(params) => encode(id, port.set_project(params).await),
             Err(response) => *response,
         },
+        harw_protocol::methods::METHOD_SESSION_SET_EXISTING_PROJECT => {
+            match serde_json::from_value::<SetProjectParams>(params) {
+                Ok(params) => encode(id, port.set_existing_project(params).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid existing project assignment"),
+            }
+        }
+        harw_protocol::methods::METHOD_AUTO_TITLE_PROBE => {
+            match serde_json::from_value::<harw_protocol::session_wire::AutoTitleSession>(params) {
+                Ok(scope) => encode(id, port.auto_title_probe(scope).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid automatic title scope"),
+            }
+        }
+        harw_protocol::methods::METHOD_AUTO_TITLE_SEED => {
+            match serde_json::from_value::<harw_protocol::session_wire::AutoTitleSession>(params) {
+                Ok(scope) => encode(id, port.auto_title_seed(scope).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid automatic title scope"),
+            }
+        }
+        harw_protocol::methods::METHOD_AUTO_TITLE_PUBLISH => {
+            match serde_json::from_value::<harw_protocol::session_wire::AutoTitlePublish>(params) {
+                Ok(params) => encode(id, port.auto_title_publish(params).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid automatic title request"),
+            }
+        }
         METHOD_SESSION_RENAME => match decode::<RenameParams>(&id, params) {
             Ok(params) => encode(id, port.rename(params).await),
             Err(response) => *response,

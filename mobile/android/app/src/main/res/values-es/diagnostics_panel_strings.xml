@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_diagnostics_title_local">Registro de depuración · Local</string>
+    <string name="harw_diagnostics_title_cloud">Registro de depuración · Nube</string>
+    <string name="harw_diagnostics_clipboard_label">Registro de depuración de Harw</string>
+    <string name="harw_diagnostics_privacy">Solo se conserva mientras la aplicación está en ejecución. No incluye mensajes, imágenes, credenciales ni direcciones de servidores. No se comparte nada automáticamente.</string>
+    <string name="harw_diagnostics_unavailable">El registro de depuración de esta conexión no está disponible.</string>
+    <string name="harw_diagnostics_failed">No se pudo leer ni cambiar el registro de depuración.</string>
+    <string name="harw_diagnostics_domain_chat">Chat</string>
+    <string name="harw_diagnostics_domain_stream">Streaming</string>
+    <string name="harw_diagnostics_domain_onion">Onion</string>
+    <string name="harw_diagnostics_level_off">Desactivado</string>
+    <string name="harw_diagnostics_level_error">Error</string>
+    <string name="harw_diagnostics_level_warn">Advertencia</string>
+    <string name="harw_diagnostics_level_info">Info</string>
+    <string name="harw_diagnostics_level_debug">Depuración</string>
+    <string name="harw_diagnostics_trace_enable">Activar la traza durante 10 minutos</string>
+    <string name="harw_diagnostics_trace_extend">Prolongar la traza · activa en la última actualización</string>
+    <string name="harw_diagnostics_refreshing">Actualizando…</string>
+    <string name="harw_diagnostics_counts">Entradas: %1$s · descartadas: %2$s</string>
+    <string name="harw_diagnostics_empty">Todavía no hay entradas en los niveles seleccionados.</string>
+    <string name="harw_diagnostics_refresh">Actualizar</string>
+    <string name="harw_diagnostics_clear">Borrar</string>
+    <string name="harw_diagnostics_copy">Copiar</string>
+    <string name="harw_diagnostics_copy_failed">No se pudo copiar el registro de depuración.</string>
+    <string name="harw_diagnostics_close">Cerrar</string>
+</resources>

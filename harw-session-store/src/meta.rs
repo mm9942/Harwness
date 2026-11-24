@@ -651,13 +651,80 @@ pub fn set_title(
 ) -> SessionStoreResult<SessionMeta> {
     let _lock = MetaLock::acquire(root, id)?;
     let mut meta = load_or_derive_unlocked(root, id)?;
+    apply_title(&mut meta, title, source);
+    save_unlocked(root, &meta)?;
+    Ok(meta)
+}
+
+/// Speichert ein Ergebnis der automatischen Titelvergabe nur, solange der
+/// Titel noch nicht manuell gesetzt oder bereits vom Modell bestimmt wurde.
+/// Prüfung und Schreiben teilen dieselbe Sperre wie eine manuelle Umbenennung.
+///
+/// # Errors
+/// Wie [`load_or_derive`] und [`save`].
+pub fn set_automatic_title_if_unresolved(
+    root: &Path,
+    id: &SessionId,
+    title: &str,
+    model_generated: bool,
+) -> SessionStoreResult<SessionMeta> {
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = load_or_derive_unlocked(root, id)?;
+    if matches!(meta.title_source, TitleSource::Manual | TitleSource::Model) {
+        return Ok(meta);
+    }
+    let source = if model_generated {
+        TitleSource::Model
+    } else {
+        TitleSource::Fallback
+    };
+    apply_title(&mut meta, title, source);
+    save_unlocked(root, &meta)?;
+    Ok(meta)
+}
+
+/// Strict compare-and-set for a model result from an interactive client.
+/// Never writes over any stored title, even a fallback or a blank manual title.
+/// Uses the same sidecar lock as ordinary rename and TUI title changes.
+///
+/// # Errors
+/// Storage/lock errors and invalid title content are returned to the caller.
+pub fn set_model_title_if_untitled(
+    root: &Path,
+    id: &SessionId,
+    title: &str,
+) -> SessionStoreResult<Option<SessionMeta>> {
+    let title = normalize_whitespace(title);
+    if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS || title.chars().any(char::is_control) {
+        return Err(SessionStoreError::CorruptRecord { detail: "invalid generated session title".into() });
+    }
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = match load(root, id)? {
+        Some(meta) => meta,
+        None => match std::fs::symlink_metadata(meta_path(root, id)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                SessionMeta::fresh(id.clone(), Timestamp::now())
+            }
+            Err(error) => return Err(SessionStoreError::Io(error)),
+            Ok(_) => return Err(SessionStoreError::CorruptRecord {
+                detail: "Cannot prove untitled session metadata".to_owned(),
+            }),
+        },
+    };
+    if meta.title.is_some() || meta.title_source != TitleSource::None {
+        return Ok(None);
+    }
+    apply_title(&mut meta, &title, TitleSource::Model);
+    save_unlocked(root, &meta)?;
+    Ok(Some(meta))
+}
+
+fn apply_title(meta: &mut SessionMeta, title: &str, source: TitleSource) {
     meta.title = Some(truncate_chars(
         &normalize_whitespace(title),
         MAX_TITLE_CHARS,
     ));
     meta.title_source = source;
-    save_unlocked(root, &meta)?;
-    Ok(meta)
 }
 
 /// Setzt die Projekt-Zuordnung einer Session (`cwd`, `project_root`,
@@ -1168,6 +1235,35 @@ mod tests {
         assert!(!title.contains("  "));
         assert!(!title.starts_with(' ') && !title.ends_with(' '));
         assert_eq!(title.chars().count(), MAX_TITLE_CHARS);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_title_does_not_overwrite_manual_or_model_title() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let manual = SessionId::from_str("manual-title-race");
+        let model = SessionId::from_str("two-automatic-title-jobs");
+
+        set_title(temp.path(), &manual, "My title", TitleSource::Manual)?;
+        let manual_meta =
+            set_automatic_title_if_unresolved(temp.path(), &manual, "Late model result", true)?;
+        assert_eq!(manual_meta.title.as_deref(), Some("My title"));
+        assert_eq!(manual_meta.title_source, TitleSource::Manual);
+
+        set_title(
+            temp.path(),
+            &model,
+            "Readable fallback",
+            TitleSource::Fallback,
+        )?;
+        let improved =
+            set_automatic_title_if_unresolved(temp.path(), &model, "First model result", true)?;
+        assert_eq!(improved.title.as_deref(), Some("First model result"));
+        assert_eq!(improved.title_source, TitleSource::Model);
+        let retained =
+            set_automatic_title_if_unresolved(temp.path(), &model, "Late fallback", false)?;
+        assert_eq!(retained.title.as_deref(), Some("First model result"));
+        assert_eq!(retained.title_source, TitleSource::Model);
         Ok(())
     }
 

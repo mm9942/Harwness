@@ -30,6 +30,7 @@ fn profile_checks_version_endpoint_and_public_pin() -> Result<(), MobileError> {
         server_public_key_hex: enrollment.public_key_hex,
         onion: None,
         admin_url: None,
+        owner_status_hub: None,
     };
     assert_eq!(parse_server_profile(profile_json(&profile))?, profile);
     profile.server_public_key_hex.pop();
@@ -292,11 +293,13 @@ impl HostFixture {
             server_public_key_hex: server.public_key_hex,
             onion: None,
             admin_url: None,
+            owner_status_hub: None,
         };
         let listener = tokio::spawn(async move {
             let _ = node_listener.serve(socket, std::future::pending()).await;
         });
         let core = MobileCore::new(phone.private_key, "Phone".into())?;
+        core.set_profile_route_preference(profile.clone(), RoutePreference::Direct)?;
         Ok(Self {
             core,
             profile,
@@ -341,6 +344,7 @@ async fn wrong_pin_never_establishes_a_session_connection() -> TestResult {
     wrong.server_public_key_hex = generate_identity("Other server".into())?
         .enrollment
         .public_key_hex;
+    fixture.core.set_profile_route_preference(wrong.clone(), RoutePreference::Direct)?;
     assert!(matches!(
         fixture.core.connect(wrong),
         Err(MobileError::Connect { .. })
@@ -350,6 +354,7 @@ async fn wrong_pin_never_establishes_a_session_connection() -> TestResult {
         fixture.core.list_sessions(),
         Err(MobileError::Disconnected)
     ));
+    fixture.core.set_profile_route_preference(fixture.profile.clone(), RoutePreference::Direct)?;
     fixture.core.connect(fixture.profile.clone())?;
     assert!(fixture.core.list_sessions()?.is_empty());
     Ok(())
@@ -699,6 +704,7 @@ fn host_profile(onion: Option<&str>) -> Result<ServerProfile, MobileError> {
         server_public_key_hex: enrollment.public_key_hex,
         onion: onion.map(str::to_owned),
         admin_url: None,
+        owner_status_hub: None,
     })
 }
 
@@ -808,9 +814,10 @@ fn tor_storage_must_be_absolute_and_is_created_private() -> TestResult {
     core.set_tor_directories(s, c)?;
     let status = core.status();
     assert!(status.tor.is_none());
-    assert_eq!(status.route_preference, RoutePreference::Auto);
+    assert_eq!(status.route_preference, RoutePreference::Onion);
+    // This old, unbound API cannot broaden the default policy.
     core.set_route_preference(RoutePreference::Direct);
-    assert_eq!(core.status().route_preference, RoutePreference::Direct);
+    assert_eq!(core.status().route_preference, RoutePreference::Onion);
     Ok(())
 }
 
@@ -832,7 +839,7 @@ async fn session_runs_end_to_end_over_a_non_tcp_stream() -> TestResult {
     let validated = crate::identity::ValidatedProfile::new(fixture.profile.clone())?;
     let connection = harw_session_remote::conn::connect_node_over(
         client_io,
-        &validated.endpoint.expected_node,
+        &validated.expected_node,
         &local,
         &validated.verifier,
         ConnectOptions::new("Phone"),
@@ -878,8 +885,9 @@ async fn onion_only_preference_fails_on_tor_setup_and_never_dials_direct() -> Te
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_preference_falls_back_to_direct_and_says_so() -> TestResult {
     let fixture = HostFixture::start().await?;
-    fixture.core.set_route_preference(RoutePreference::Auto);
-    fixture.core.connect(with_onion(&fixture.profile))?;
+    let profile = with_onion(&fixture.profile);
+    fixture.core.set_profile_route_preference(profile.clone(), RoutePreference::Auto)?;
+    fixture.core.connect(profile)?;
     let status = fixture.core.status();
     assert_eq!(status.phase, ConnectionPhase::Connected);
     assert_eq!(status.route, Some(ConnectionRoute::Direct));
@@ -899,8 +907,9 @@ async fn auto_preference_falls_back_to_direct_and_says_so() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_preference_never_touches_tor() -> TestResult {
     let fixture = HostFixture::start().await?;
-    fixture.core.set_route_preference(RoutePreference::Direct);
-    fixture.core.connect(with_onion(&fixture.profile))?;
+    let profile = with_onion(&fixture.profile);
+    fixture.core.set_profile_route_preference(profile.clone(), RoutePreference::Direct)?;
+    fixture.core.connect(profile)?;
     let status = fixture.core.status();
     assert_eq!(status.phase, ConnectionPhase::Connected);
     assert_eq!(status.route, Some(ConnectionRoute::Direct));

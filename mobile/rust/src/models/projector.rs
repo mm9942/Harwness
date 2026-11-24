@@ -6,9 +6,18 @@
 //! the language model (architecture family and embedding size).
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
-use super::*;
+use super::{
+    GGUF_MAGIC, LocalModel, MODEL_SUFFIX, ModelFileState, VisionAddon, catalog_entries, checked_dir,
+    ends_with_model_suffix, exists, file_len, find_local, internal, remove_if_present, remove_staging,
+    rename_error, sanitize_model_name, sidecar_name, staging_path, strip_model_suffix, sync_dir,
+    valid_model_name, vision_entries, vision_path_in,
+};
+use crate::MobileError;
 
 const MAP_FILE: &str = ".harw-projectors.json";
 const MAP_TMP_FILE: &str = ".harw-projectors.json.tmp";

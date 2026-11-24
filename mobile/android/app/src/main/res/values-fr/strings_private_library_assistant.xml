@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="private_library_assistant_text_only">Les images restent dans la bibliothèque privée. Vous pouvez ajouter une description enregistrée au brouillon de l’assistant privé.</string>
+    <string name="private_library_assistant_picture_description">Utiliser la description dans l’assistant privé</string>
+    <string name="private_library_assistant_description_consent">Ajouter au brouillon de cet assistant privé la description enregistrée de « %1$s » ? L’image reste dans la bibliothèque. Le texte est traité uniquement quand vous appuyez sur Envoyer.</string>
+    <string name="private_library_assistant_stage_description">Ajouter le texte au brouillon</string>
+    <string name="private_library_assistant_description_missing">Cet élément ne possède plus de description enregistrée. Rien n’a été ajouté.</string>
+    <string name="private_library_assistant_draft_unavailable">Le brouillon de l’assistant privé est indisponible ou trop long. Rien n’a été ajouté.</string>
+    <string name="private_library_assistant_draft_heading">Description provenant de ma bibliothèque privée (texte uniquement, sans image) :</string>
+    <string name="private_library_assistant_photo_intro">Vous pouvez joindre une photo à l’assistant privé de cet appareil ou ajouter une description enregistrée sous forme de texte.</string>
+    <string name="private_library_assistant_attach_photo">Joindre la photo à l’assistant privé</string>
+    <string name="private_library_assistant_photo_consent">Joindre « %1$s » à ce brouillon ? Votre modèle de vision local ne verra la photo qu’après avoir appuyé sur Envoyer. Rien ne sera téléversé.</string>
+    <string name="private_library_assistant_stage_photo">Joindre au brouillon</string>
+    <string name="private_library_assistant_photo_draft">Photo jointe : %1$s</string>
+    <string name="private_library_assistant_remove_photo">Retirer la photo</string>
+    <string name="private_library_assistant_photo_in_turn">Photo de la bibliothèque privée · traitée sur l’appareil</string>
+    <string name="private_library_assistant_photo_changed">La photo ou la bibliothèque a changé. Retirez la pièce jointe et sélectionnez la photo à nouveau. Rien n’a été envoyé.</string>
+    <string name="private_library_assistant_photo_model_required">La photo nécessite un modèle de vision local compatible et son projecteur. Rien n’a été envoyé.</string>
+    <string name="private_library_assistant_photo_invalid">Le modèle local ne peut pas lire cette photo. Rien n’a été envoyé.</string>
+    <string name="private_library_assistant_open_photo">Voir la photo privée</string>
+    <string name="private_library_assistant_photo_unavailable">Impossible d’ouvrir la photo d’origine de ce message. Si elle a été supprimée ou modifiée, aucune autre photo ne sera affichée.</string>
+    <string name="private_library_assistant_close_photo">Fermer</string>
+    <string name="private_library_assistant_turn_interrupted">Une réponse précédente a été interrompue. La question et la réponse partielle n’ont pas été enregistrées. Saisissez à nouveau votre question pour réessayer.</string>
+    <string name="private_library_assistant_turn_attempt_unknown">Impossible de vérifier la tentative précédente. Consultez la conversation enregistrée avant de renvoyer votre question.</string>
+</resources>

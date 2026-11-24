@@ -113,6 +113,20 @@ pub(crate) fn render_prompt(
     Ok(chatml_prompt(input))
 }
 
+/// A GGUF template error can include input text. Do not log or return that
+/// diagnostic on the private room path, and do not silently change templates.
+pub(crate) fn render_private_prompt(
+    template: Option<&str>,
+    input: &RenderInput<'_>,
+) -> Result<String, LlamaError> {
+    match template.filter(|text| !text.trim().is_empty()) {
+        None => Ok(chatml_prompt(input)),
+        Some(source) => render_jinja(source, input)
+            .ok().filter(|prompt| !prompt.trim().is_empty())
+            .ok_or_else(|| LlamaError::Generate("private chat template failed".into())),
+    }
+}
+
 fn tool_call_markup(call: &ChatToolCall) -> String {
     let body = json!({ "name": call.name, "arguments": call.arguments });
     format!("<tool_call>\n{body}\n</tool_call>")

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="local_pin_restart">Reiniciar la configuración del PIN</string>
+    <string name="local_pin_restart_confirm_detail">Harw puede verificar que la configuración fallida no creó ninguna bóveda recuperable. Elige un PIN en una nueva configuración. Los archivos existentes no se eliminan. Si la verificación falla, Harw no reiniciará la configuración.</string>
+    <string name="local_pin_restart_confirm">Empezar una nueva configuración</string>
+    <string name="local_pin_restart_not_confirmed">Harw no pudo confirmar el reinicio. No se eliminó ninguna bóveda existente. Abre el asistente de nuevo para comprobar el estado actual de la configuración.</string>
+    <string name="local_pin_setup_failed">No se pudo completar la configuración del PIN local. No se restableció nada. Código de diagnóstico: %1$s.</string>
+    <string name="local_pin_assistant_handoff_failed">El paso del PIN terminó, pero el asistente local no pudo abrir su sesión privada. Vuelve a abrir el asistente y usa tu PIN actual. No se restableció nada. Código de diagnóstico: %1$s.</string>
+    <string name="local_pin_copy_diagnostic">Copiar el código de diagnóstico</string>
+    <string name="local_pin_copy_diagnostic_failed">No se pudo copiar el código. Puedes usar el que aparece arriba.</string>
+</resources>

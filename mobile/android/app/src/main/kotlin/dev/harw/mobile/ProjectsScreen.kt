@@ -38,6 +38,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import android.icu.text.RelativeDateTimeFormatter
+import java.text.NumberFormat
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import java.util.Locale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -63,6 +71,55 @@ internal fun MobileProject.displayLabel(): String = when {
     projectKey == NoProjectKey -> NoProjectLabel
     label.isNotBlank() -> label
     else -> projectKey
+}
+
+/** Labels in emitted project rows; server/user project names remain unchanged. */
+@Composable
+internal fun projectDisplayLabel(project: MobileProject): String =
+    if (project.projectKey == NoProjectKey) stringResource(R.string.directory_no_project)
+    else project.displayLabel()
+
+private fun ProjectSort.directoryLabel(): Int = when (this) {
+    ProjectSort.Recent -> R.string.directory_sort_recent
+    ProjectSort.Name -> R.string.directory_sort_name
+    ProjectSort.Count -> R.string.directory_sort_count
+}
+
+@Composable
+private fun directoryLocale(): Locale =
+    LocalConfiguration.current.locales[0] ?: Locale.getDefault()
+
+@Composable
+private fun localizedSessionCount(count: UInt, active: UInt): String {
+    val formatter = NumberFormat.getIntegerInstance(directoryLocale())
+    val base = pluralStringResource(
+        R.plurals.directory_session_count,
+        count.coerceAtMost(Int.MAX_VALUE.toUInt()).toInt(),
+        formatter.format(count.toLong()),
+    )
+    return if (active == 0u) base else
+        stringResource(R.string.directory_active_count, base, formatter.format(active.toLong()))
+}
+
+@Composable
+private fun localizedLastActivity(rfc3339: String, nowMillis: Long): String {
+    val millis = parseActivityMillis(rfc3339) ?: return stringResource(R.string.directory_activity_unknown)
+    val minutes = (nowMillis - millis).coerceAtLeast(0L) / 60_000L
+    if (minutes < 1L) return stringResource(R.string.directory_activity_now)
+    val locale = directoryLocale()
+    val relative = RelativeDateTimeFormatter.getInstance(locale)
+    val last = RelativeDateTimeFormatter.Direction.LAST
+    return when {
+        minutes < 60L -> relative.format(minutes.toDouble(), last, RelativeDateTimeFormatter.RelativeUnit.MINUTES)
+        minutes < 24L * 60L -> relative.format((minutes / 60L).toDouble(), last, RelativeDateTimeFormatter.RelativeUnit.HOURS)
+        minutes < 7L * 24L * 60L -> relative.format((minutes / (24L * 60L)).toDouble(), last, RelativeDateTimeFormatter.RelativeUnit.DAYS)
+        else -> {
+            val date = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM)
+                .withLocale(locale)
+                .format(Instant.ofEpochMilli(millis).atZone(ZoneOffset.UTC))
+            stringResource(R.string.directory_activity_date, date)
+        }
+    }
 }
 
 /** RFC-3339-Zeit in UTC-Millisekunden, `null` bei unlesbarem Wert. */
@@ -108,11 +165,15 @@ internal fun <T> groupByMonth(
  * Suche ueber Label, Pfadhinweis und Schluessel (ohne Gross-/Kleinschreibung, getrimmt; leer = alles).
  * Das Pseudo-Projekt "Ohne Projekt" matcht ebenfalls ueber seinen Anzeigenamen.
  */
-internal fun filterProjects(projects: List<MobileProject>, query: String): List<MobileProject> {
+internal fun filterProjects(
+    projects: List<MobileProject>,
+    query: String,
+    noProjectLabel: String = NoProjectLabel,
+): List<MobileProject> {
     val needle = query.trim().lowercase()
     if (needle.isEmpty()) return projects
     return projects.filter { p ->
-        p.displayLabel().lowercase().contains(needle) ||
+        (if (p.projectKey == NoProjectKey) noProjectLabel else p.displayLabel()).lowercase().contains(needle) ||
             p.label.lowercase().contains(needle) ||
             (p.pathHint?.lowercase()?.contains(needle) == true) ||
             (p.projectKey != NoProjectKey && p.projectKey.lowercase().contains(needle))
@@ -180,20 +241,23 @@ internal fun ProjectsScreen(
     var query by rememberSaveable { mutableStateOf("") }
     var sortMenu by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<MobileProject?>(null) }
-    val visible = remember(projects, query, sort, names) { filterProjects(orderProjects(projects, sort, names), query) }
+    val noProjectLabel = stringResource(R.string.directory_no_project)
+    val visible = remember(projects, query, sort, names, noProjectLabel) {
+        filterProjects(orderProjects(projects, sort, names), query, noProjectLabel)
+    }
     renaming?.let { project ->
         var text by remember(project.projectKey) { mutableStateOf(names[project.projectKey] ?: project.displayLabel()) }
         AlertDialog(
             onDismissRequest = { renaming = null },
-            title = { Text("Projekt umbenennen") },
+            title = { Text(stringResource(R.string.directory_rename_project)) },
             text = {
-                OutlinedTextField(value = text, onValueChange = { text = it }, singleLine = true, label = { Text("Name") })
+                OutlinedTextField(value = text, onValueChange = { text = it }, singleLine = true, label = { Text(stringResource(R.string.directory_name)) })
             },
-            confirmButton = { TextButton(onClick = { onRename(project.projectKey, text); renaming = null }, enabled = text.isNotBlank()) { Text("Speichern") } },
+            confirmButton = { TextButton(onClick = { onRename(project.projectKey, text); renaming = null }, enabled = text.isNotBlank()) { Text(stringResource(R.string.directory_save)) } },
             dismissButton = {
                 Row {
-                    if (names.containsKey(project.projectKey)) TextButton(onClick = { onRename(project.projectKey, null); renaming = null }) { Text("Zurücksetzen") }
-                    TextButton(onClick = { renaming = null }) { Text("Abbrechen") }
+                    if (names.containsKey(project.projectKey)) TextButton(onClick = { onRename(project.projectKey, null); renaming = null }) { Text(stringResource(R.string.directory_reset)) }
+                    TextButton(onClick = { renaming = null }) { Text(stringResource(R.string.directory_cancel)) }
                 }
             },
         )
@@ -205,7 +269,7 @@ internal fun ProjectsScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                "Projekte",
+                stringResource(R.string.directory_projects),
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
@@ -213,27 +277,30 @@ internal fun ProjectsScreen(
                 overflow = TextOverflow.Ellipsis,
             )
             androidx.compose.foundation.layout.Box {
-                TextButton(onClick = { sortMenu = true }) { Text(sort.label) }
+                TextButton(onClick = { sortMenu = true }) { Text(stringResource(sort.directoryLabel())) }
                 DropdownMenu(expanded = sortMenu, onDismissRequest = { sortMenu = false }) {
                     ProjectSort.values().forEach { option ->
                         DropdownMenuItem(
-                            text = { Text(if (option == sort) "✓ ${option.label}" else option.label) },
+                            text = {
+                                val label = stringResource(option.directoryLabel())
+                                Text(if (option == sort) stringResource(R.string.directory_sort_selected, label) else label)
+                            },
                             onClick = { sortMenu = false; onSort(option) },
                         )
                     }
                 }
             }
             if (onNewProject != null) {
-                TextButton(onClick = onNewProject, enabled = online) { Text("Neues Projekt") }
+                TextButton(onClick = onNewProject, enabled = online) { Text(stringResource(R.string.directory_new_project)) }
             }
-            IconButton(onClick = onRefresh, enabled = online) { Icon(Icons.Outlined.Refresh, "Projekte aktualisieren") }
+            IconButton(onClick = onRefresh, enabled = online) { Icon(Icons.Outlined.Refresh, stringResource(R.string.directory_refresh_projects)) }
         }
         OutlinedTextField(
             value = query,
             onValueChange = { query = it },
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
             singleLine = true,
-            label = { Text("Projekte suchen") },
+            label = { Text(stringResource(R.string.directory_search_projects)) },
         )
         when {
             projects.isEmpty() -> Box(Modifier.fillMaxSize().padding(12.dp), contentAlignment = Alignment.Center) {
@@ -244,7 +311,7 @@ internal fun ProjectsScreen(
                     ) {
                         CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
                         Text(
-                            "Projekte werden geladen…",
+                            stringResource(R.string.directory_projects_loading),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyMedium,
                         )
@@ -253,23 +320,23 @@ internal fun ProjectsScreen(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        StatusMessage("Projekte konnten nicht geladen werden: $error", error = true)
-                        if (online) TextButton(onClick = onRefresh) { Text("Erneut versuchen") }
+                        StatusMessage(stringResource(R.string.directory_projects_load_error, error), error = true)
+                        if (online) TextButton(onClick = onRefresh) { Text(stringResource(R.string.directory_retry)) }
                     }
-                    !online -> DirectoryEmpty("Keine Verbindung. Projekte erscheinen, sobald das Handy verbunden ist.")
-                    else -> DirectoryEmpty("Noch keine Projekte. Sessions erscheinen hier, sobald sie geteilt werden.")
+                    !online -> DirectoryEmpty(stringResource(R.string.directory_projects_offline))
+                    else -> DirectoryEmpty(stringResource(R.string.directory_projects_empty))
                 }
             }
             visible.isEmpty() -> Box(Modifier.fillMaxSize().padding(12.dp), contentAlignment = Alignment.Center) {
-                DirectoryEmpty("Kein Projekt passt zu „${query.trim()}“.")
+                DirectoryEmpty(stringResource(R.string.directory_projects_no_match, query.trim()))
             }
             else -> LazyColumn(
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 9.dp, bottom = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                error?.let { message -> item { StatusMessage("Aktualisieren fehlgeschlagen: $message", error = true) } }
+                error?.let { message -> item { StatusMessage(stringResource(R.string.directory_projects_refresh_error, message), error = true) } }
                 if (online && !canCreate) {
-                    item { StatusMessage("Dieses Gerät darf keine Sessions anlegen.") }
+                    item { StatusMessage(stringResource(R.string.directory_create_denied)) }
                 }
                 if (suggestion != null) {
                     item(key = "suggestion") {
@@ -279,13 +346,13 @@ internal fun ProjectsScreen(
                             color = MaterialTheme.colorScheme.surfaceContainerLow,
                         ) {
                             Column(Modifier.fillMaxWidth().padding(13.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text("Diese Chats scheinen zusammenzugehören", style = MaterialTheme.typography.titleSmall)
+                                Text(stringResource(R.string.directory_suggestion), style = MaterialTheme.typography.titleSmall)
                                 suggestion.titles.take(4).forEach {
                                     Text("• $it", style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 }
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    TextButton(onClick = { onAcceptSuggestion(suggestion) }) { Text("Projekt „${suggestion.name}“ anlegen") }
-                                    TextButton(onClick = { onDismissSuggestion(suggestion) }) { Text("Nicht jetzt") }
+                                    TextButton(onClick = { onAcceptSuggestion(suggestion) }) { Text(stringResource(R.string.directory_suggestion_create, suggestion.name)) }
+                                    TextButton(onClick = { onDismissSuggestion(suggestion) }) { Text(stringResource(R.string.directory_not_now)) }
                                 }
                             }
                         }
@@ -293,7 +360,7 @@ internal fun ProjectsScreen(
                 }
                 items(visible, key = { it.projectKey }) { project ->
                     ProjectRow(
-                        label = names[project.projectKey] ?: project.displayLabel(),
+                        label = names[project.projectKey] ?: projectDisplayLabel(project),
                         onRename = if (project.projectKey == NoProjectKey) null else ({ renaming = project }),
                         project = project,
                         nowMillis = nowMillis,
@@ -308,7 +375,7 @@ internal fun ProjectsScreen(
 }
 
 @Composable
-private fun ProjectRow(
+internal fun ProjectRow(
     label: String,
     onRename: (() -> Unit)?,
     project: MobileProject,
@@ -337,15 +404,18 @@ private fun ProjectRow(
                 project.pathHint?.takeIf { it.isNotBlank() }?.let {
                     Text(it, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
-                val detail = sessionCountText(project.sessionCount, project.activeCount) +
-                    " · " + lastActivityText(project.lastActivity, nowMillis)
+                val detail = stringResource(
+                    R.string.directory_project_summary,
+                    localizedSessionCount(project.sessionCount, project.activeCount),
+                    localizedLastActivity(project.lastActivity, nowMillis),
+                )
                 Text(detail, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (onRename != null) {
-                IconButton(onClick = onRename) { Icon(Icons.Outlined.Edit, "Projekt umbenennen", Modifier.size(18.dp)) }
+                IconButton(onClick = onRename) { Icon(Icons.Outlined.Edit, stringResource(R.string.directory_rename_project), Modifier.size(18.dp)) }
             }
             IconButton(onClick = onNewSession, enabled = canCreate) {
-                Icon(Icons.Outlined.Add, "Neue Session in ${project.displayLabel()}", Modifier.size(20.dp))
+                Icon(Icons.Outlined.Add, stringResource(R.string.directory_new_session_in, label), Modifier.size(20.dp))
             }
         }
     }

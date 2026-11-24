@@ -9,6 +9,7 @@
 //! des lokalen Hosts.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -224,7 +225,7 @@ impl UiaStore {
         // Nur eigene Profile (Praefix) loeschen, nie fremde Agentenordner.
         let own = dir
             .file_name()
-            .and_then(|n| n.to_str())
+            .and_then(OsStr::to_str)
             .is_some_and(|n| n.starts_with(DIR_PREFIX));
         if !own {
             return Err(rejected(

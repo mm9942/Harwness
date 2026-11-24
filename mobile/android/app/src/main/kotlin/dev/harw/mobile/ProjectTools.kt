@@ -74,7 +74,7 @@ internal fun suggestProject(rows: List<MobileSessionRow>, dismissed: Set<String>
     return ProjectSuggestion(
         name = best.key.replaceFirstChar { it.uppercase() },
         sessionIds = group.map { it.sessionId },
-        titles = group.map { it.title?.takeIf { t -> t.isNotBlank() } ?: it.firstMessage.orEmpty().take(40) },
+        titles = group.map { it.displayTitle() },
     )
 }
 

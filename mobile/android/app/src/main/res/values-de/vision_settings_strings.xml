@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_vision_settings_default_title">Standard für neue Bildbeschreibungen</string>
+    <string name="harw_vision_settings_mode_local">Lokal</string>
+    <string name="harw_vision_settings_mode_api">API</string>
+    <string name="harw_vision_settings_default_explanation">Legt fest, welcher Dialog im Chat geöffnet wird. Bilder werden erst nach deiner Bestätigung verarbeitet oder gesendet.</string>
+    <string name="harw_vision_settings_hide_api_settings">API-Einstellungen einklappen</string>
+    <string name="harw_vision_settings_show_api_settings">Optionale API-Routen konfigurieren</string>
+    <string name="harw_vision_settings_api_routes_failed">Die API-Bildrouten konnten nicht gelesen werden.</string>
+    <string name="harw_vision_settings_api_routes_empty">Keine unterstützte Route mit API-Schlüssel und bildfähigem Modell eingerichtet.</string>
+    <string name="harw_vision_settings_choose_api_route">API-Anbieter oder Route wählen</string>
+    <string name="harw_vision_settings_choose_api_model">API-Modell wählen</string>
+    <string name="harw_vision_settings_api_preselection">Vorauswahl: %1$s · %2$s\n%3$s</string>
+    <string name="harw_vision_settings_no_preselection">Ohne verifizierte Vorauswahl musst du Route und Modell im Dialog wählen.</string>
+    <string name="harw_vision_settings_local_api_alternative_title">Optionale API-Alternative nach lokaler Analyse</string>
+    <string name="harw_vision_settings_api_failure_alternative_title">Optionale Alternative nach einem API-Fehler</string>
+    <string name="harw_vision_settings_confirm_new_selection">Ohne neue Bildauswahl und Bestätigung wird nichts gesendet.</string>
+    <string name="harw_vision_settings_choose_alternative_route">Alternative Route wählen</string>
+    <string name="harw_vision_settings_choose_alternative_model">Alternatives Modell wählen</string>
+    <string name="harw_vision_settings_remove_api_alternative">API-Alternative entfernen</string>
+    <string name="harw_vision_settings_manage_device_providers">Anbieter auf diesem Gerät verwalten</string>
+    <string name="harw_vision_settings_api_parallelism">Gleichzeitige API-Anfragen: %1$d</string>
+    <string name="harw_vision_settings_api_parallelism_detail">Gilt nur für neue API-Bildanalysen. Anbieterlimits können die wirksame Parallelität senken.</string>
+    <string name="harw_vision_settings_local_preferred_model">Bevorzugtes lokales Bildmodell</string>
+    <string name="harw_vision_settings_local_model_loaded">%1$s · geladen</string>
+    <string name="harw_vision_settings_local_model_installed">%1$s · installiert</string>
+    <string name="harw_vision_settings_local_model_unavailable">Derzeit nicht verfügbar: %1$s</string>
+    <string name="harw_vision_settings_local_no_preference">Keine lokale Modellpräferenz</string>
+    <string name="harw_vision_settings_local_models_unreadable">Installierte Modelle konnten nicht gelesen werden.</string>
+    <string name="harw_vision_settings_local_no_compatible_projector">Kein vollständig installiertes Bildmodell mit kompatiblem Projektor gefunden.</string>
+    <string name="harw_vision_settings_local_offer_loaded_alternative">Anderes bereits geladenes, kompatibles Modell als lokale Alternative anbieten</string>
+    <string name="harw_vision_settings_local_current_effective">Aktuell geladen: %1$s · höchstens %2$d gleichzeitig</string>
+    <string name="harw_vision_settings_local_alternative_effective">Lokale Alternative: %1$s · höchstens %2$d gleichzeitig</string>
+    <string name="harw_vision_settings_local_effective_unavailable">Die Wahl ändert kein Chatmodell und lädt kein Modell. Das wirksame Limit erscheint erst bei einem geladenen Modell.</string>
+    <string name="harw_vision_settings_api_alternative_checking">API-Alternative wird geprüft …</string>
+    <string name="harw_vision_settings_api_alternative_saved">Gespeicherte API-Alternative: %1$s · %2$s</string>
+    <string name="harw_vision_settings_api_alternative_new_selection">Neue Auswahl mit dieser API-Alternative</string>
+    <string name="harw_vision_settings_api_choose_manually">API-Route manuell wählen</string>
+    <string name="harw_vision_settings_api_alternative_privacy">Keine Übernahme lokaler Bilder. Du wählst Bilder neu aus und bestätigst das Senden getrennt.</string>
+    <string name="harw_vision_settings_observed_parallelism">%1$s · %2$s: %3$d parallele Anfragen in drei vollständigen Stapeln ohne Drosselung beobachtet. Das ist keine Kapazitätsgarantie.</string>
+    <string name="harw_vision_settings_apply_observed_parallelism">%1$d als API-Standard übernehmen</string>
+</resources>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cloud_assistant_recall_clear">Clear selection</string>
+    <string name="cloud_assistant_recall_choose">Select earlier exchanges for this message</string>
+    <string name="cloud_assistant_recall_disclosure">Choose up to four exchanges (8 KiB total). For this message only, the provider configured on your gateway receives those exchanges alongside the recent conversation.</string>
+    <string name="cloud_assistant_recall_include">Include this exchange</string>
+    <string name="cloud_assistant_recall_count">%1$d of %2$d exchanges selected for this message</string>
+    <string name="cloud_assistant_recall_send">Send with selected exchanges</string>
+</resources>

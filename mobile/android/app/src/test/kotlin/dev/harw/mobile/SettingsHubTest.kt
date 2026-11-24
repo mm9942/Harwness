@@ -48,14 +48,16 @@ class SettingsHubTest {
 
     @Test
     fun imageConcurrencyPrefMigratesBooleanAndPreservesTwo() {
-        assertEquals(1, restoredImageConcurrency(null, null))
+        assertEquals(3, restoredImageConcurrency(null, null))
         assertEquals(1, restoredImageConcurrency(null, false))
         assertEquals(3, restoredImageConcurrency(null, true))
         assertEquals(1, restoredImageConcurrency(1, true))
         assertEquals(2, restoredImageConcurrency(2, false))
         assertEquals(3, restoredImageConcurrency(3, false))
         assertEquals(1, restoredImageConcurrency(0, true))
-        assertEquals(1, restoredImageConcurrency(4, true))
+        assertEquals(4, restoredImageConcurrency(4, true))
+        assertEquals(5, restoredImageConcurrency(5, true))
+        assertEquals(1, restoredImageConcurrency(6, true))
         assertEquals(1, restoredImageConcurrency("3", true))
     }
 

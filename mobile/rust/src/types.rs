@@ -2,7 +2,7 @@ use harw_protocol::session_wire::{
     CatalogLive, CatalogModel as WireCatalogModel, CatalogProvider, CatalogResult, CatalogRole,
     CommandEffect, CommandEntry, CommandHint, CommandOrigin, CommandsListResult, ConfigEntry,
     HolderInfo, HolderKind, HostedState, LastOrigin, ProjectSummary, ProviderAuthKind,
-    ReadOnlyReason, RowOrigin, SecretPutResult, SessionRow, ShareInfo, ShareMode,
+    ReadOnlyReason, RowOrigin, SecretPutResult, SessionRow, SessionRowPurpose, ShareInfo, ShareMode,
 };
 use harw_protocol::{Cursor, PortError};
 use harw_types::PermissionTier;
@@ -28,6 +28,9 @@ pub struct DeviceEnrollment {
 pub struct ServerProfile {
     pub version: u32,
     pub label: String,
+    /// Optional direct locator. Empty or omitted when this profile only publishes an onion route.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[uniffi(default = "")]
     pub endpoint: String,
     pub server_node_id: String,
     pub server_public_key_hex: String,
@@ -40,6 +43,28 @@ pub struct ServerProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[uniffi(default = None)]
     pub admin_url: Option<String>,
+    /// Independently provisioned private status-only Hub trust; never used for ordinary connection routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
+    pub owner_status_hub: Option<OwnerStatusHubPin>,
+}
+
+/// An explicit second v3 Onion service and independent node public key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerStatusHubPin {
+    pub node_id: String,
+    pub public_key_hex: String,
+    pub onion: String,
+}
+
+/// Coarse read-only result. This is not an attachment or control grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileOwnerStatus {
+    Idle,
+    Active,
+    Interrupted,
+    Failed,
 }
 
 /// Public enrollment fields plus the proof-of-possession signature for the admin service.
@@ -54,11 +79,11 @@ pub struct AdminEnrollmentProof {
 /// Which network route a connection preference allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum RoutePreference {
-    /// Onion first when the profile has one, else direct.
+    /// Explicit per-profile permission: onion first, with direct fallback when configured.
     Auto,
-    /// Tor (.onion) only; fails when the profile has no onion route.
+    /// Default: Tor (.onion) only; never resolves or dials the direct locator.
     Onion,
-    /// Direct TCP only.
+    /// Explicit per-profile permission: direct TCP only.
     Direct,
 }
 
@@ -176,6 +201,8 @@ pub struct SessionSnapshot {
     pub can_approve: bool,
     pub can_interrupt: bool,
     pub running_turn_id: Option<String>,
+    /// An acknowledged root turn abort or host-restart interruption.
+    pub last_turn_interrupted: bool,
     pub transcript: Vec<TranscriptEntry>,
     pub live_text: Option<String>,
     pub live_reasoning: Option<String>,
@@ -213,6 +240,14 @@ pub struct TranscriptEntry {
     pub tool_state: Option<MobileToolState>,
     /// Opaque references (JSON) to the stored images of a user message; pass one to `media_thumbnail`.
     pub images: Vec<String>,
+    /// Kept separate from the flattened text required by displayed-fork proofs.
+    pub user_presentation: Option<UserTranscriptPresentation>,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct UserTranscriptPresentation {
+    pub text: String,
+    pub image_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -322,6 +357,9 @@ pub struct SubmitReceipt {
     pub position: Option<u32>,
     pub head: Option<SessionCursor>,
     pub detail: Option<String>,
+    /// Exact canonical target to wait for in the transcript. Admission alone
+    /// never proves the target has been durably written.
+    pub replacement_item_id: Option<String>,
 }
 
 impl SubmitReceipt {
@@ -331,6 +369,7 @@ impl SubmitReceipt {
             position: None,
             head: None,
             detail: None,
+            replacement_item_id: None,
         }
     }
 }
@@ -471,6 +510,17 @@ pub enum MobileReadOnlyReason {
     Unknown,
 }
 
+/// Verified purpose only. Older hosts and ordinary rows use Unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileSessionPurpose {
+    Dream,
+    Diary,
+    Ledger,
+    MemoryReconciliation,
+    AutomaticWorkbench,
+    Unknown,
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MobileSessionRow {
     pub session_id: String,
@@ -482,6 +532,7 @@ pub struct MobileSessionRow {
     pub attached: u32,
     pub model: Option<String>,
     pub origin: MobileRowOrigin,
+    pub purpose: MobileSessionPurpose,
     pub continuable: bool,
     pub reason: Option<MobileReadOnlyReason>,
     pub holder: Option<MobileHolder>,
@@ -618,6 +669,14 @@ impl From<SessionRow> for MobileSessionRow {
             attached: row.attached,
             model: row.model,
             origin: row.origin.into(),
+            purpose: match row.purpose {
+                SessionRowPurpose::Dream => MobileSessionPurpose::Dream,
+                SessionRowPurpose::Diary => MobileSessionPurpose::Diary,
+                SessionRowPurpose::Ledger => MobileSessionPurpose::Ledger,
+                SessionRowPurpose::MemoryReconciliation => MobileSessionPurpose::MemoryReconciliation,
+                SessionRowPurpose::AutomaticWorkbench => MobileSessionPurpose::AutomaticWorkbench,
+                SessionRowPurpose::Unknown => MobileSessionPurpose::Unknown,
+            },
             continuable: row.continuable,
             reason: row.reason.map(Into::into),
             holder: row.holder.map(Into::into),
@@ -1140,6 +1199,7 @@ mod tests {
             attached: 3,
             model: Some("model-x".to_owned()),
             origin: RowOrigin::Profile,
+            purpose: SessionRowPurpose::Unknown,
             continuable: false,
             reason: Some(ReadOnlyReason::ShareReadOnly),
             holder: Some(HolderInfo {

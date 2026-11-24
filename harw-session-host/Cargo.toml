@@ -8,7 +8,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+owner-creation-receipts = ["dep:aws-lc-rs"]
+
 [dependencies]
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 harw-protocol = { path = "../harw-protocol" }
 harw-types = { path = "../harw-types" }
 harw-session-store = { path = "../harw-session-store" }
@@ -16,6 +20,10 @@ harw-job-core = { path = "../harw-job-core" }
 harw-fsutil = { path = "../harw-fsutil" }
 harw-media = { path = "../harw-media" }
 base64 = "0.23.1"
+blake3 = { version = "1.8.7", features = ["zeroize"] }
+chacha20poly1305 = "0.11.0"
+crypt_guard = { workspace = true }
+zeroize = "1.9.0"
 # R18 D-A: gateway tool host. Executors and their vocabulary (`harw-tools`),
 # the gateway-side sandbox authority (`harw-authority`: `SandboxSpec`,
 # `ensure_child_of`) and the process sandbox probe (`harw-sandbox`:

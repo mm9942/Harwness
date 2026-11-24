@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="private_library_assistant_text_only">Bilder bleiben in der privaten Library. Eine vorhandene Beschreibung kannst du als Text zum Entwurf des privaten Assistenten hinzufügen.</string>
+    <string name="private_library_assistant_picture_description">Beschreibung im privaten Assistenten verwenden</string>
+    <string name="private_library_assistant_description_consent">Die gespeicherte Beschreibung von „%1$s“ zum Entwurf dieses privaten Assistenten hinzufügen? Das Bild bleibt in der Library. Erst wenn du auf Senden tippst, wird der Text verarbeitet.</string>
+    <string name="private_library_assistant_stage_description">Text zum Entwurf hinzufügen</string>
+    <string name="private_library_assistant_description_missing">Zu diesem Bild ist keine Beschreibung mehr gespeichert. Es wurde nichts hinzugefügt.</string>
+    <string name="private_library_assistant_draft_unavailable">Der private Entwurf ist nicht verfügbar oder zu lang. Es wurde nichts hinzugefügt.</string>
+    <string name="private_library_assistant_draft_heading">Beschreibung aus meiner privaten Library (nur Text, kein Bild):</string>
+    <string name="private_library_assistant_photo_intro">Du kannst ein Bild an den privaten Assistenten auf diesem Gerät anhängen oder eine gespeicherte Beschreibung als reinen Text hinzufügen.</string>
+    <string name="private_library_assistant_attach_photo">Bild an privaten Assistenten anhängen</string>
+    <string name="private_library_assistant_photo_consent">„%1$s“ an diesen Entwurf anhängen? Erst beim Senden sieht dein lokales Bildmodell dieses Bild. Es wird nichts hochgeladen.</string>
+    <string name="private_library_assistant_stage_photo">An Entwurf anhängen</string>
+    <string name="private_library_assistant_photo_draft">Angehängtes Bild: %1$s</string>
+    <string name="private_library_assistant_remove_photo">Bild entfernen</string>
+    <string name="private_library_assistant_photo_in_turn">Bild aus privater Library · auf dem Gerät verarbeitet</string>
+    <string name="private_library_assistant_photo_changed">Das Bild oder die Library hat sich geändert. Entferne den Anhang und wähle das Bild erneut aus. Es wurde nichts gesendet.</string>
+    <string name="private_library_assistant_photo_model_required">Dieses Bild benötigt ein kompatibles lokales Bildmodell samt Projektor. Es wurde nichts gesendet.</string>
+    <string name="private_library_assistant_photo_invalid">Das lokale Bildmodell kann dieses Bild nicht lesen. Es wurde nichts gesendet.</string>
+    <string name="private_library_assistant_open_photo">Privates Bild ansehen</string>
+    <string name="private_library_assistant_photo_unavailable">Das Originalbild zu dieser Nachricht ließ sich nicht öffnen. Wurde es gelöscht oder geändert, wird kein anderes Bild angezeigt.</string>
+    <string name="private_library_assistant_close_photo">Schließen</string>
+    <string name="private_library_assistant_turn_interrupted">Eine frühere Antwort wurde unterbrochen. Die Frage und die Teilantwort wurden nicht gespeichert. Gib deine Frage erneut ein, um es noch einmal zu versuchen.</string>
+    <string name="private_library_assistant_turn_attempt_unknown">Der letzte Versuch konnte nicht geprüft werden. Sieh vor dem erneuten Senden im gespeicherten Verlauf nach.</string>
+</resources>

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_route_settings_title">Connection route</string>
+    <string name="harw_route_onion">Onion only</string>
+    <string name="harw_route_direct">Direct IP only</string>
+    <string name="harw_route_auto">Tor first, then direct IP</string>
+    <string name="harw_route_direct_address">Direct IP: %1$s</string>
+    <string name="harw_route_onion_address">Onion: %1$s</string>
+    <string name="harw_route_hint_onion_only">Onion-only profile. There is no saved direct IP and Harw never falls back to a direct connection.</string>
+    <string name="harw_route_hint_no_onion">This profile has no Onion address. Harw will not connect until you import an Onion address or explicitly allow Direct IP for this profile.</string>
+    <string name="harw_route_hint_onion">Onion only. Harw will not use the saved direct IP, even if Tor cannot connect.</string>
+    <string name="harw_route_hint_direct">Direct IP only. Traffic goes to this profile’s saved IP without Tor.</string>
+    <string name="harw_route_hint_auto">Harw tries Onion first and can use the saved direct IP if Tor fails. This applies only to this exact profile.</string>
+    <string name="harw_route_consent_title">Allow a direct connection?</string>
+    <string name="harw_route_consent_direct">Connect to %1$s directly over its saved IP, without Tor. The server and the network path may see your IP. This choice is saved only for this exact profile.</string>
+    <string name="harw_route_consent_auto">Try Onion for %1$s first. If it fails, Harw may connect directly using the saved IP. That can reveal your IP to the server and network path. This choice is saved only for this exact profile.</string>
+    <string name="harw_route_consent_confirm">Allow for this profile</string>
+    <string name="harw_route_profile_changed">The saved profile changed. Review the new profile before choosing a route.</string>
+    <string name="harw_route_save_failed">The route choice could not be saved.</string>
+    <string name="harw_route_unavailable">The selected route is not available in this profile. No other route was used.</string>
+</resources>

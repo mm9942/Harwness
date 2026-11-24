@@ -92,6 +92,8 @@ pub struct ProviderStore {
     home: AppHome,
     secrets: KeystoreSecretResolver,
     write_lock: Mutex<()>,
+    #[cfg(feature = "local-host")]
+    image_edit_owner: Arc<()>,
 }
 
 #[uniffi::export]
@@ -104,6 +106,184 @@ impl ProviderStore {
     ) -> Result<Arc<Self>, MobileError> {
         let home = AppHome::open(std::path::Path::new(&files_dir))?;
         Ok(Arc::new(Self::from_parts(home, keystore)))
+    }
+
+    /// Opaque preference scope, not a path, route, or credential.
+    pub fn api_vision_profile_key(&self) -> String {
+        blake3::hash(self.home.profile_dir().as_os_str().as_encoded_bytes())
+            .to_hex()
+            .to_string()
+    }
+
+    /// App-configured, exact supported API routes, with no connection or model turn.
+    pub fn api_vision_choices(&self) -> Result<Vec<crate::ApiVisionChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            crate::hybrid::api_choices_for(&self.home, &self.secrets)
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    /// One visibly approved image only; no session ID, text, or transcript is accepted.
+    pub async fn api_vision_observe(
+        &self,
+        choice: crate::ApiVisionChoice,
+        image: crate::PromptImage,
+    ) -> Result<crate::ApiVisionObservation, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            static RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+                std::sync::OnceLock::new();
+            let runtime = RUNTIME.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("harw-api-vision")
+                    .enable_all()
+                    .build()
+                    .ok()
+            }).as_ref().ok_or_else(|| internal("Vision runtime is unavailable"))?;
+            let home = self.home.clone();
+            let secrets = self.secrets.clone();
+            let job = runtime.spawn(async move {
+                crate::hybrid::api_observe_for(&home, &secrets, choice, image).await
+            });
+            tokio_util::task::AbortOnDropHandle::new(job)
+                .await
+                .map_err(|_| internal("Vision request was stopped"))?
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, image);
+            Err(internal("Vision is not available in this build"))
+        }
+    }
+
+    /// Reads configured title routes without contacting providers or changing chat defaults.
+    pub fn session_title_api_choices(&self) -> Result<Vec<crate::SessionTitleApiChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            crate::session_title::api_choices(&self.home, &self.secrets)
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    /// One exact configured text backend, with no local or alternate route fallback.
+    pub async fn session_title_generate_api(
+        &self,
+        choice: crate::SessionTitleApiChoice,
+        turns: Vec<crate::SessionTitleTurn>,
+    ) -> Result<String, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            static RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+                std::sync::OnceLock::new();
+            let runtime = RUNTIME.get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1).thread_name("harw-session-title").enable_all().build().ok()
+            }).as_ref().ok_or_else(|| internal("Title runtime unavailable"))?;
+            let home = self.home.clone();
+            let secrets = self.secrets.clone();
+            let job = runtime.spawn(async move {
+                crate::session_title::generate_api(&home, &secrets, choice, turns).await
+            });
+            tokio_util::task::AbortOnDropHandle::new(job).await
+                .map_err(|_| internal("Title task stopped"))?
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, turns);
+            Err(internal("Title generation is unavailable in this build"))
+        }
+    }
+
+    /// Device-owned, explicitly configured image editor, independent of any chat transport.
+    pub fn api_image_edit_choices(&self) -> Result<Vec<crate::ApiImageEditChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            crate::image_edit_mobile::binding::choices_for(&self.home, &self.secrets)
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Immutable preview only; never contacts the API.
+    pub fn prepare_api_image_edit(
+        &self,
+        choice: crate::ApiImageEditChoice,
+        source_png: Vec<u8>,
+        instruction: String,
+    ) -> Result<Arc<crate::ApiImageEditDraft>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            use crate::image_edit_mobile::binding::{EditOwner, prepare_for};
+            prepare_for(
+                &self.home,
+                &self.secrets,
+                EditOwner::Store(Arc::downgrade(&self.image_edit_owner)),
+                choice,
+                source_png,
+                instruction,
+            )
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (choice, source_png, instruction);
+            Err(crate::image_edit_mobile::unavailable())
+        }
+    }
+
+    /// No chat, gateway or host argument. Same exact preview and credential only.
+    pub async fn confirm_api_image_edit(
+        &self,
+        draft: Arc<crate::ApiImageEditDraft>,
+        explicitly_synchronous: bool,
+    ) -> Result<crate::ApiImageEditAsset, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            use crate::image_edit_mobile::binding::{EditOwner, confirm_for};
+            static RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+                std::sync::OnceLock::new();
+            let runtime = RUNTIME
+                .get_or_init(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .thread_name("harw-api-image-edit")
+                        .enable_all()
+                        .build()
+                        .ok()
+                })
+                .as_ref()
+                .ok_or_else(crate::image_edit_mobile::unavailable)?;
+            let home = self.home.clone();
+            let secrets = self.secrets.clone();
+            let owner = self.image_edit_owner.clone();
+            let work = runtime.spawn(async move {
+                confirm_for(
+                    &home,
+                    &secrets,
+                    EditOwner::Store(Arc::downgrade(&owner)),
+                    draft,
+                    explicitly_synchronous,
+                )
+                .await
+            });
+            tokio_util::task::AbortOnDropHandle::new(work)
+                .await
+                .map_err(|_| internal("Image edit request was stopped"))?
+        }
+        #[cfg(not(feature = "local-host"))]
+        {
+            let _ = (draft, explicitly_synchronous);
+            Err(crate::image_edit_mobile::unavailable())
+        }
     }
 
     /// Paths and active selection of the app home.
@@ -417,6 +597,8 @@ impl ProviderStore {
             home,
             secrets: KeystoreSecretResolver::new(keystore),
             write_lock: Mutex::new(()),
+            #[cfg(feature = "local-host")]
+            image_edit_owner: Arc::new(()),
         }
     }
 
@@ -903,6 +1085,51 @@ pub(crate) fn build_model_provider(
     Ok(Arc::from(provider))
 }
 
+impl ProviderStore {
+    fn model_file(&self, route_id: &str, model: &str) -> std::path::PathBuf {
+        let safe: String = format!("{route_id}--{model}")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+            .collect();
+        self.home.home().join("models").join(format!("{safe}.toml"))
+    }
+
+    /// Writes missing model files with their known context window (128k
+    /// fallback). Existing windows change only when explicitly overridden.
+    fn ensure_model_files(&self, route_id: &str, provider: &ProviderToml, force: Option<u64>) {
+        let dir = self.home.home().join("models");
+        if crate::home::create_private_dir(&dir).is_err() {
+            return;
+        }
+        for model in &provider.models {
+            let path = self.model_file(route_id, model);
+            if force.is_none() && path.exists() {
+                continue;
+            }
+            let window = force.unwrap_or_else(|| {
+                #[cfg(feature = "local-host")]
+                if provider.api == API_OPENAI_CHAT
+                    && let Some(limits) = harw_provider_http::azure_foundry_chat_token_limits(
+                        route_id,
+                        &provider.base_url,
+                        model,
+                    )
+                {
+                    return u64::from(limits.context_window);
+                }
+                128_000
+            });
+            let mut table = toml::Table::new();
+            table.insert("id".into(), toml::Value::String(model.clone()));
+            table.insert("provider".into(), toml::Value::String(route_id.to_owned()));
+            table.insert("context_window".into(), toml::Value::Integer(window as i64));
+            if let Ok(rendered) = toml::to_string(&table) {
+                let _ = write_private_atomic(&path, rendered.as_bytes());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1293,51 +1520,6 @@ mod tests {
             assert!(keystore.stored("route-local").is_none());
             assert!(store.home().active_route()?.is_none());
             Ok(())
-        }
-    }
-}
-
-impl ProviderStore {
-    fn model_file(&self, route_id: &str, model: &str) -> std::path::PathBuf {
-        let safe: String = format!("{route_id}--{model}")
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
-            .collect();
-        self.home.home().join("models").join(format!("{safe}.toml"))
-    }
-
-    /// Writes missing model files with their known context window (128k
-    /// fallback). Existing windows change only when explicitly overridden.
-    fn ensure_model_files(&self, route_id: &str, provider: &ProviderToml, force: Option<u64>) {
-        let dir = self.home.home().join("models");
-        if crate::home::create_private_dir(&dir).is_err() {
-            return;
-        }
-        for model in &provider.models {
-            let path = self.model_file(route_id, model);
-            if force.is_none() && path.exists() {
-                continue;
-            }
-            let window = force.unwrap_or_else(|| {
-                #[cfg(feature = "local-host")]
-                if provider.api == API_OPENAI_CHAT
-                    && let Some(limits) = harw_provider_http::azure_foundry_chat_token_limits(
-                        route_id,
-                        &provider.base_url,
-                        model,
-                    )
-                {
-                    return u64::from(limits.context_window);
-                }
-                128_000
-            });
-            let mut table = toml::Table::new();
-            table.insert("id".into(), toml::Value::String(model.clone()));
-            table.insert("provider".into(), toml::Value::String(route_id.to_owned()));
-            table.insert("context_window".into(), toml::Value::Integer(window as i64));
-            if let Ok(rendered) = toml::to_string(&table) {
-                let _ = write_private_atomic(&path, rendered.as_bytes());
-            }
         }
     }
 }

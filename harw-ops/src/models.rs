@@ -481,15 +481,12 @@ fn render_show(
             .to_owned()
     };
 
-    let mut lines = vec![
-        format!(
-            "Live (diese Sitzung): {} / {}",
-            cell(live_provider),
-            cell(live_model)
-        ),
-        String::new(),
-        format_line(headers),
-    ];
+    let heading = if live_provider.is_some() || live_model.is_some() {
+        format!("Live (diese Sitzung): {} / {}", cell(live_provider), cell(live_model))
+    } else {
+        "Konfigurierte Modellwahl".to_owned()
+    };
+    let mut lines = vec![heading, String::new(), format_line(headers)];
     for line in &table {
         lines.push(format_line([
             line[0].as_str(),
@@ -771,12 +768,14 @@ async fn models(ctx: &OpContext, args: ModelsArgs) -> Result<OpOutput, OpError> 
                 }
             }
         }
-        "show" | "list" => {
+        "show" | "list" | "profile" => {
             let config = crate::provider::resolved_config(ctx)?;
             let rows = harw_config::resolve_role_models(&config);
-            let snapshot = ctx
-                .service::<SharedSessionController>()
-                .map(|controller| controller.snapshot());
+            // The local shell has no real chat controller. The remote allowlist
+            // does not expose this profile-only presentation verb.
+            let snapshot = if action == "profile" { None } else {
+                ctx.service::<SharedSessionController>().map(|controller| controller.snapshot())
+            };
             let live_provider = snapshot
                 .as_ref()
                 .and_then(|snap| snap.active_provider.as_deref());

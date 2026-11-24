@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="internal_directory_subtitle">Intern erzeugte Läufe</string>
+    <string name="internal_directory_category_dream">Traum</string>
+    <string name="internal_directory_category_diary">Tagebuch</string>
+    <string name="internal_directory_category_ledger">Protokoll</string>
+    <string name="internal_directory_category_memory">Speicherabgleich</string>
+    <string name="internal_directory_category_workbench">Automatische Werkbank</string>
+    <string name="internal_directory_back_projects">Zurück zu den Projekten</string>
+    <string name="internal_directory_disconnected">Verbinde dieses Profil, um seine internen Läufe anzuzeigen.</string>
+    <string name="internal_directory_back">Zurück</string>
+    <string name="internal_directory_scope_local">Lokal</string>
+    <string name="internal_directory_scope_cloud">Cloud</string>
+    <string name="internal_directory_scope_title">%1$s · %2$s</string>
+    <string name="internal_directory_refresh">Aktualisieren</string>
+    <string name="internal_directory_unsupported">Dieser Host bietet noch keine separate Liste für interne Läufe.</string>
+    <string name="internal_directory_dream_only">Dieser Host bietet bisher nur Traumläufe an.</string>
+    <string name="internal_directory_load_error">Interne Läufe konnten nicht geladen werden.</string>
+    <string name="internal_directory_last_activity">Letzte Aktivität: %1$s</string>
+    <string name="internal_directory_access">Zugriff: nur Metadaten</string>
+    <string name="internal_directory_details_note">Hier werden interne Metadaten angezeigt, kein Chatverlauf.</string>
+    <string name="internal_directory_empty_group">Keine bestätigten Läufe in dieser Kategorie.</string>
+    <string name="internal_directory_load_more">Weitere Läufe laden</string>
+    <string name="internal_directory_unknown_run">Interner Lauf</string>
+    <string name="internal_directory_time_unavailable">Zeit nicht verfügbar</string>
+</resources>

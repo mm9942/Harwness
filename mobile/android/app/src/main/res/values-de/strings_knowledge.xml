@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="knowledge_cloud_profile">Cloud-Profil</string>
+    <string name="knowledge_no_profile">Kein Cloud-Profil eingerichtet.</string>
+    <string name="knowledge_offline">Das Cloud-Profil ist nicht verbunden.</string>
+    <string name="knowledge_checking">Verbindung und Leserechte werden geprüft.</string>
+    <string name="knowledge_no_manage">Dieses Gateway bietet keine mobile Verwaltung an.</string>
+    <string name="knowledge_no_observe">Dieses Gerät hat keine Leserechte für die mobile Verwaltung.</string>
+    <string name="knowledge_no_store">Verbunden. Das Gateway stellt hier aber keine Wissensdaten für einen bestimmten Chat oder ein Projekt bereit.</string>
+    <string name="knowledge_no_scope">Diese Einstellungen sind nicht an einen Chat oder ein Projekt gebunden. Öffne die entsprechende Sitzung oder das Projekt in der Harw-Terminaloberfläche, um vorhandene Daten anzusehen. Hier werden keine Daten geladen.</string>
+    <string name="knowledge_memory">Gedächtnis</string>
+    <string name="knowledge_memory_scope">Es gibt keine mobile Leseansicht für das Gedächtnis eines bestimmten Bereichs.</string>
+    <string name="knowledge_diary">Tagebuch</string>
+    <string name="knowledge_diary_scope">Diese Ansicht kann keine Tagebucheinträge laden.</string>
+    <string name="knowledge_session_workbench">Workbench der Sitzung</string>
+    <string name="knowledge_session_workbench_scope">Benötigt eine geöffnete Sitzung und eine unterstützte Leseansicht.</string>
+    <string name="knowledge_project_workbench">Workbench des Projekts</string>
+    <string name="knowledge_project_workbench_scope">Benötigt ein freigegebenes Projekt und eine unterstützte Leseansicht.</string>
+    <string name="knowledge_goals">Ziele</string>
+    <string name="knowledge_goals_scope">Benötigt einen freigegebenen Planungsbereich und einen angebundenen Zielspeicher.</string>
+    <string name="knowledge_plan">Plan</string>
+    <string name="knowledge_plan_scope">Benötigt einen freigegebenen Planungsbereich und einen angebundenen Planspeicher.</string>
+</resources>

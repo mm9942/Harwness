@@ -177,6 +177,17 @@ mod stub {
         ) -> Result<GenerateStats, LlamaError> {
             Err(LlamaError::Unavailable)
         }
+
+        pub(crate) fn generate_compact_vision(
+            &self,
+            prompt: &str,
+            images: &[&[u8]],
+            sampling: &SamplingParams,
+            should_stop: &dyn Fn() -> bool,
+            on_text: &mut dyn FnMut(&str),
+        ) -> Result<GenerateStats, LlamaError> {
+            self.generate(prompt, images, sampling, should_stop, on_text)
+        }
     }
 }
 
@@ -186,6 +197,7 @@ mod real {
     use std::path::Path;
     use std::sync::{Mutex, OnceLock, PoisonError};
 
+    use llama_cpp_2::context::LlamaContext;
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
@@ -195,6 +207,7 @@ mod real {
         MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
     };
     use llama_cpp_2::sampling::LlamaSampler;
+    use llama_cpp_2::token::LlamaToken;
 
     use super::{EngineConfig, FinishReason, GenerateStats, SamplingParams, StopFilter, default_threads};
     use crate::error::LlamaError;
@@ -358,15 +371,47 @@ mod real {
             should_stop: &dyn Fn() -> bool,
             on_text: &mut dyn FnMut(&str),
         ) -> Result<GenerateStats, LlamaError> {
+            self.generate_with_limits(
+                prompt, images, sampling, should_stop, on_text,
+                (self.n_ctx, self.n_batch, self.n_threads),
+            )
+        }
+
+        /// Short caption-only contexts. Ordinary chat and private image turns
+        /// keep their original context, batch size and CPU threading.
+        pub(crate) fn generate_compact_vision(
+            &self,
+            prompt: &str,
+            images: &[&[u8]],
+            sampling: &SamplingParams,
+            should_stop: &dyn Fn() -> bool,
+            on_text: &mut dyn FnMut(&str),
+        ) -> Result<GenerateStats, LlamaError> {
+            self.generate_with_limits(
+                prompt, images, sampling, should_stop, on_text,
+                (self.n_ctx.min(2048), self.n_batch.min(128), 1),
+            )
+        }
+
+        fn generate_with_limits(
+            &self,
+            prompt: &str,
+            images: &[&[u8]],
+            sampling: &SamplingParams,
+            should_stop: &dyn Fn() -> bool,
+            on_text: &mut dyn FnMut(&str),
+            limits: (u32, u32, i32),
+        ) -> Result<GenerateStats, LlamaError> {
+            let (context_size, batch_size, threads) = limits;
             let vocab = self.model.vocab();
-            let n_ctx = self.n_ctx as usize;
+            let n_ctx = context_size as usize;
             let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(self.n_ctx))
-                .with_n_batch(self.n_batch)
-                .with_n_ubatch(self.n_batch)
-                .with_n_threads(self.n_threads)
-                .with_n_threads_batch(self.n_threads);
-            let mut batch = LlamaBatch::new(self.n_batch as usize, 1);
+                .with_n_ctx(NonZeroU32::new(context_size))
+                .with_n_batch(batch_size)
+                .with_n_ubatch(batch_size)
+                .with_n_threads(threads)
+                .with_n_threads_batch(threads);
+            let mut batch = LlamaBatch::new(batch_size as usize, 1);
 
             let (mut ctx, mut pos, mut logits_index, prompt_tokens);
             if images.is_empty() {
@@ -383,27 +428,14 @@ mod real {
                     .model
                     .new_context(self.backend, ctx_params)
                     .map_err(generate_error)?;
-                // Prompt prefill in batches; only the very last token needs logits.
-                let last = tokens.len() - 1;
-                pos = 0_i32;
-                for chunk in tokens.chunks(self.n_batch as usize) {
-                    if should_stop() {
-                        return Ok(GenerateStats {
-                            prompt_tokens: tokens.len() as u64,
-                            completion_tokens: 0,
-                            finish: FinishReason::Cancelled,
-                        });
-                    }
-                    batch.clear();
-                    for token in chunk {
-                        let index = pos as usize;
-                        batch
-                            .add(*token, pos, &[0], index == last)
-                            .map_err(generate_error)?;
-                        pos += 1;
-                    }
-                    ctx.decode(&mut batch).map_err(generate_error)?;
-                }
+                let Some(next_pos) = prefill_text(&mut ctx, &mut batch, &tokens, batch_size, should_stop)? else {
+                    return Ok(GenerateStats {
+                        prompt_tokens,
+                        completion_tokens: 0,
+                        finish: FinishReason::Cancelled,
+                    });
+                };
+                pos = next_pos;
                 logits_index = batch.n_tokens() - 1;
             } else {
                 let vision = self.vision.as_ref().ok_or_else(|| {
@@ -453,30 +485,12 @@ mod real {
                 // Encodes the images and decodes text and image chunks in order;
                 // the logits of the last token are kept (index -1).
                 pos = chunks
-                    .eval_chunks(&mut vision, &mut ctx, 0, 0, self.n_batch as i32, true)
+                    .eval_chunks(&mut vision, &mut ctx, 0, 0, batch_size as i32, true)
                     .map_err(|e| LlamaError::Generate(format!("image prefill failed: {e}")))?;
                 logits_index = -1;
             }
 
-            let mut sampler = if sampling.temperature <= 0.0 {
-                LlamaSampler::greedy()
-            } else {
-                let mut chain = Vec::new();
-                // Wiederholungsbremse: kleine Modelle (4B) laufen sonst in Schleifen ("Ich schau kurz ...").
-                chain.push(LlamaSampler::penalties(self.model.n_vocab(), 256, 1.08, 0.0, 0.4));
-                if sampling.top_k > 0 {
-                    chain.push(LlamaSampler::top_k(sampling.top_k));
-                }
-                if sampling.top_p > 0.0 && sampling.top_p < 1.0 {
-                    chain.push(LlamaSampler::top_p(sampling.top_p, 1));
-                }
-                if sampling.min_p > 0.0 {
-                    chain.push(LlamaSampler::min_p(sampling.min_p, 1));
-                }
-                chain.push(LlamaSampler::temp(sampling.temperature));
-                chain.push(LlamaSampler::dist(sampling.seed));
-                LlamaSampler::chain_simple(chain)
-            };
+            let mut sampler = self.sampler(sampling);
 
             let mut decoder = Utf8Stream::default();
             let mut stop_filter = StopFilter::default();
@@ -513,6 +527,54 @@ mod real {
             };
             Ok(GenerateStats { prompt_tokens, completion_tokens: generated, finish })
         }
+
+        fn sampler(&self, sampling: &SamplingParams) -> LlamaSampler {
+            if sampling.temperature <= 0.0 {
+                return LlamaSampler::greedy();
+            }
+            // Repetition penalty keeps small models from getting stuck in loops.
+            let mut chain = vec![LlamaSampler::penalties(self.model.n_vocab(), 256, 1.08, 0.0, 0.4)];
+            if sampling.top_k > 0 {
+                chain.push(LlamaSampler::top_k(sampling.top_k));
+            }
+            if sampling.top_p > 0.0 && sampling.top_p < 1.0 {
+                chain.push(LlamaSampler::top_p(sampling.top_p, 1));
+            }
+            if sampling.min_p > 0.0 {
+                chain.push(LlamaSampler::min_p(sampling.min_p, 1));
+            }
+            chain.push(LlamaSampler::temp(sampling.temperature));
+            chain.push(LlamaSampler::dist(sampling.seed));
+            LlamaSampler::chain_simple(chain)
+        }
+    }
+
+    // Prompt prefill in batches; only the last token needs logits. The caller has checked
+    // that tokens is nonempty. None means cancelled before a subsequent batch.
+    fn prefill_text(
+        ctx: &mut LlamaContext<'_>,
+        batch: &mut LlamaBatch<'_>,
+        tokens: &[LlamaToken],
+        batch_size: u32,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<Option<i32>, LlamaError> {
+        let last = tokens.len() - 1;
+        let mut pos = 0_i32;
+        for chunk in tokens.chunks(batch_size as usize) {
+            if should_stop() {
+                return Ok(None);
+            }
+            batch.clear();
+            for token in chunk {
+                let index = pos as usize;
+                batch
+                    .add(*token, pos, &[0], index == last)
+                    .map_err(generate_error)?;
+                pos += 1;
+            }
+            ctx.decode(batch).map_err(generate_error)?;
+        }
+        Ok(Some(pos))
     }
 
     /// Loads the projector; the reason when it cannot be used.

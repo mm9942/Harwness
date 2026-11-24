@@ -73,6 +73,33 @@ impl AuthHubClient {
         }
     }
 
+    /// Linux-only client for an explicitly provisioned local AuthHub.
+    /// The kernel-reported UID is checked immediately after connect, before
+    /// writing any HTTP data (including the optional bearer token).
+    ///
+    /// The absolute socket path and its trusted, operator-managed ancestry
+    /// must be selected independently of remote inputs.
+    ///
+    /// # Errors
+    /// Refuses a relative socket path.
+    #[cfg(target_os = "linux")]
+    pub fn new_uid_pinned(
+        socket: impl Into<PathBuf>,
+        expected_peer_uid: u32,
+        token: Option<BearerToken>,
+        options: ClientOptions,
+    ) -> Result<Self, InfraClientError> {
+        let socket = socket.into();
+        if !socket.is_absolute() {
+            return Err(InfraClientError::Protocol("pinned AuthHub socket must be absolute"));
+        }
+        Ok(Self {
+            transport: Arc::new(
+                UdsTransport::new(socket, token, options).pin_local_peer_uid(expected_peer_uid),
+            ),
+        })
+    }
+
     /// The configured socket path.
     pub fn socket_path(&self) -> &Path {
         self.transport.socket()

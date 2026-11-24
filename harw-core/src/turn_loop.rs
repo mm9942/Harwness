@@ -761,10 +761,20 @@ pub struct TurnControl {
     // Bucht jeden Werkzeugaufruf vor seiner Ausführung (siehe
     // `crate::tool_call_meter`); Klone teilen denselben Meter.
     tool_call_meter: Option<Arc<dyn ToolCallMeter>>,
+    // The host receives a signal only after the complete rewind frame is durable.
+    history_replaced: Option<Arc<dyn Fn() + Send + Sync>>,
+    rewind_media: Option<Arc<RewindMediaCheck>>,
+    rewrite_replacement_id: Option<harw_types::ItemId>,
+    // Only the trusted hosted driver sets source provenance; not model metadata.
+    title_seed_human: Option<bool>,
+    title_seed_pending: bool,
     // PL-100 Phase 4 (B22): DoD-Taint dieses Turns (siehe
     // `crate::dod_taint`); Klone teilen denselben Zustand.
     dod_taint: crate::dod_taint::DodTaint,
 }
+
+/// Trusted hosted source check; never receives a client-supplied reference.
+pub type RewindMediaCheck = dyn Fn(&harw_protocol::MediaRef) -> bool + Send + Sync;
 
 impl std::fmt::Debug for TurnControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -798,8 +808,42 @@ impl TurnControl {
             meter: Arc::new(Mutex::new(TurnMeter::default())),
             token_budget: None,
             tool_call_meter: None,
+            history_replaced: None,
+            rewind_media: None,
+            rewrite_replacement_id: None,
+            title_seed_human: None,
+            title_seed_pending: false,
             dod_taint: crate::dod_taint::DodTaint::new(),
         }
+    }
+
+    /// Mark the origin of an actual hosted user input. The durable store still
+    /// refuses legacy, imported, forked, and otherwise uninitialized sessions.
+    #[must_use]
+    pub fn with_hosted_title_source(mut self, human: bool) -> Self {
+        self.title_seed_human = Some(human);
+        self
+    }
+
+    /// Installs the hosted driver's post-commit notification for an exact history edit.
+    #[must_use]
+    pub fn with_history_replaced(mut self, notify: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.history_replaced = Some(notify);
+        self
+    }
+
+    /// Uses the canonical replacement identity derived by the hosted driver.
+    #[must_use]
+    pub fn with_rewrite_replacement_id(mut self, id: Option<harw_types::ItemId>) -> Self {
+        self.rewrite_replacement_id = id;
+        self
+    }
+
+    /// Verifies target-owned stored prompt media before replacing history.
+    #[must_use]
+    pub fn with_rewind_media_check(mut self, check: Arc<RewindMediaCheck>) -> Self {
+        self.rewind_media = Some(check);
+        self
     }
 
     /// Der DoD-Taint dieses Turns (PL-100 Phase 4, Bedrohung B22).
@@ -3889,33 +3933,83 @@ pub async fn run_turn_durable(
     run_turn_with_approvals(session, model, store, Some(approvals), input).await
 }
 
-/// Schneidet den Verlauf vor der User-Nachricht `target` ab und ersetzt ihn dauerhaft (Rewind).
-/// Nur im Zustand Idle/Failed; ein unbekanntes Ziel ist ein Fehler und ändert nichts.
-async fn rewind_history_before(
+/// Rewind and the replacement prompt are one durable frame. Publish the in-memory
+/// change only after the durable writer accepts it, then continue the one turn.
+async fn replace_prompt(
     session: &mut AgentSession,
     store: &dyn StateStore,
     target: &str,
+    text: String,
+    images: Vec<harw_protocol::MediaRef>,
+    media_check: Option<Arc<RewindMediaCheck>>,
+    replacement_id: Option<harw_types::ItemId>,
 ) -> CoreResult<()> {
+    use harw_protocol::items::{ContentPart, TurnItem, UserMessageItem};
+    if !images.is_empty() {
+        return Err(CoreError::TurnRejected("rewind reuses stored media, not client image payloads".to_owned()));
+    }
     if !matches!(
         session.state(),
         crate::session::SessionState::Idle | crate::session::SessionState::Failed(_)
     ) {
-        return Err(CoreError::TurnRejected(
-            "rewind needs an idle session".to_owned(),
-        ));
+        return Err(CoreError::TurnRejected("rewind needs an idle session".to_owned()));
     }
-    let Some(index) = session.history().items().iter().position(|item| {
-        matches!(item, harw_protocol::items::TurnItem::UserMessage(m) if m.id.as_str() == target)
-    }) else {
-        return Err(CoreError::TurnRejected(
-            "rewind target is not a user message of this session".to_owned(),
-        ));
+    let mut history = if session.history().is_empty() {
+        store.load_history(session.id()).await
+            .map_err(|error| state_store_error(error, "rewind history load"))?
+    } else {
+        session.history().clone()
     };
-    session.history_mut().truncate(index);
-    store
-        .save_history(session.id(), session.history())
-        .await
-        .map_err(|error| CoreError::TurnRejected(format!("rewind could not be saved: {error}")))?;
+    let mut matches = history.items().iter().enumerate().filter_map(|(index, item)| {
+        matches!(item, harw_protocol::items::TurnItem::UserMessage(m) if m.id.as_str() == target)
+            .then_some(index)
+    });
+    let index = matches.next().ok_or_else(|| CoreError::TurnRejected(
+        "rewind target is not a user message of this session".to_owned()
+    ))?;
+    if matches.next().is_some() {
+        return Err(CoreError::TurnRejected("rewind target is ambiguous".to_owned()));
+    }
+    let original = match &history.items()[index] {
+        TurnItem::UserMessage(user) => user,
+        _ => return Err(CoreError::TurnRejected("rewind target changed".to_owned())),
+    };
+    if original.content.is_empty() || original.content.iter().any(|part| matches!(part, ContentPart::ImageUrl { .. })) {
+        return Err(CoreError::TurnRejected("rewind target contains unavailable prompt media".to_owned()));
+    }
+    let refs = original.content.iter().filter_map(|part| match part {
+        ContentPart::Media { media, .. } => Some(media.clone()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    if !refs.is_empty() {
+        let check = media_check.ok_or_else(|| CoreError::TurnRejected(
+            "rewind cannot verify the original stored images".to_owned(),
+        ))?;
+        let intact = tokio::task::spawn_blocking(move || refs.iter().all(|reference| check(reference)))
+            .await.unwrap_or(false);
+        if !intact {
+            return Err(CoreError::TurnRejected("rewind original images are unavailable".to_owned()));
+        }
+    }
+    let content = if text.is_empty() {
+        original.content.clone()
+    } else {
+        let mut retained = original.content.iter().filter(|part| matches!(part, ContentPart::Media { .. }))
+            .cloned().collect::<Vec<_>>();
+        retained.push(ContentPart::Text { text });
+        retained
+    };
+    let id = replacement_id.unwrap_or_default();
+    if history.items().iter().any(|item| {
+        matches!(item, TurnItem::UserMessage(user) if user.id == id)
+    }) {
+        return Err(CoreError::TurnRejected("rewind replacement identity already exists".to_owned()));
+    }
+    history.truncate(index);
+    history.extend([TurnItem::UserMessage(UserMessageItem { id, content })]);
+    store.save_history_with_rewind_boundary(session.id(), &history, Some(target)).await
+        .map_err(|error| state_store_error(error, "rewind history save"))?;
+    *session.history_mut() = history;
     Ok(())
 }
 
@@ -3924,10 +4018,23 @@ async fn run_turn_with_approvals(
     model: &dyn ModelProvider,
     store: &dyn StateStore,
     approvals: Option<&ApprovalStore>,
-    input: TurnInput,
+    mut input: TurnInput,
 ) -> CoreResult<TurnOutcome> {
     if let Some(target) = input.rewind_before.as_deref() {
-        rewind_history_before(session, store, target).await?;
+        let text = input.user_text.take().ok_or_else(|| CoreError::TurnRejected(
+            "rewind requires an explicit edit or retry prompt".to_owned(),
+        ))?;
+        if !text.is_empty() && text.trim().is_empty() {
+            return Err(CoreError::TurnRejected("rewind edit is blank".to_owned()));
+        }
+        replace_prompt(
+            session, store, target, text, std::mem::take(&mut input.user_images),
+            input.control.rewind_media.clone(),
+            input.control.rewrite_replacement_id.clone(),
+        ).await?;
+        if let Some(notify) = &input.control.history_replaced {
+            notify();
+        }
     }
     let handle = session
         .try_start_turn()
@@ -3944,7 +4051,7 @@ async fn run_turn_with_approvals(
     // bekommt die Vorgabe-Grenzen der Session (aus dem Budget des Laufs,
     // `AgentSession::with_default_turn_limits`); explizit gesetzte Grenzen
     // haben Vorrang.
-    let control = match session.default_turn_limits() {
+    let mut control = match session.default_turn_limits() {
         Some(limits) if *input.control.limits() == TurnLimits::unlimited() => {
             input.control.clone().with_limits(limits)
         }
@@ -3981,16 +4088,30 @@ async fn run_turn_with_approvals(
             }
         };
         *session.history_mut() = history;
-        // Versehentlich mehrfach gesendete, identische Nachrichten bleiben nur einmal.
-        if session.history_mut().dedupe_consecutive_user_messages() > 0 {
-            let _ = store.save_history(session.id(), session.history()).await;
-        }
         // PL-97 H7: wie `hydrate_from_store` auch den Skill-Injektor.
         session.restore_skill_injector_from_store(store).await;
     }
 
     // User-Input in den Verlauf spielen und persistieren.
     if has_user_input {
+        if let Some(human) = control.title_seed_human {
+            // Actual UserMessage rows only; the fourth is enough to disqualify any incomplete
+            // first-three index. Let canonical persistence proceed even if its optional index fails.
+            let preceding_users = session.history().items().iter()
+                .filter(|item| matches!(item, TurnItem::UserMessage(_)))
+                .take(4)
+                .count();
+            control.title_seed_pending = match store.begin_title_seed(
+                &ctx.session_id, &ctx.turn_id, human, preceding_users,
+            ).await {
+                Ok(pending) => pending,
+                Err(_) => {
+                    tracing::warn!("optional title source admission was not confirmed");
+                    false
+                }
+            };
+            session.set_active_turn_control(control.clone());
+        }
         let text = input.user_text.unwrap_or_default();
         if input.user_images.is_empty() {
             session.history_mut().push_user_text(text);
@@ -3999,12 +4120,14 @@ async fn run_turn_with_approvals(
                 .history_mut()
                 .push_user_message(text, input.user_images);
         }
-        let persisted = if session.history_mut().dedupe_consecutive_user_messages() > 0 {
-            // Doppelt gesendet: nur eine Fassung bleibt, der Verlauf wird ersetzt statt angehängt.
-            store
-                .save_history(session.id(), session.history())
-                .await
-                .map_err(|error| state_store_error(error, "history save"))
+        // Request replay is handled by the transport's submission ID. Equal
+        // content is not equal identity: collapsing legitimately repeated
+        // messages destroys the durable anchors used by fork/edit/retry.
+        let persisted = if control.title_seed_pending {
+            match persist_title_seed_last(session, store).await {
+                Ok(location) => { bind_title_user(store, &ctx, location).await; Ok(()) }
+                Err(error) => Err(error),
+            }
         } else {
             persist_last(session, store).await
         };
@@ -4019,7 +4142,9 @@ async fn run_turn_with_approvals(
     // nach dem Einspielen des User-Inputs, damit die Schätzung den vollen,
     // aktuellen Verlauf sieht. `resume_after_child`/`resume_after_approval`
     // laufen nicht durch diese Funktion und sind damit keine Auftragsgrenze.
-    maybe_hard_compact_at_turn_start(session, model, store).await;
+    if input.rewind_before.is_none() {
+        maybe_hard_compact_at_turn_start(session, model, store).await;
+    }
 
     notify_turn_start(
         session,
@@ -4029,7 +4154,9 @@ async fn run_turn_with_approvals(
         },
     );
 
+    let title_seed_pending = control.title_seed_pending;
     let result = drive_turn(session, model, store, approvals, &ctx, handle, control).await;
+    if title_seed_pending { settle_title_seed_failure(store, &ctx, &result).await; }
     if let Err(error) = &result {
         transition_after_turn_failure(session, &ctx, error);
     }
@@ -4266,7 +4393,9 @@ async fn resume_after_child_with_approvals(
         .active_turn_control()
         .cloned()
         .unwrap_or_else(TurnControl::new);
+    let title_seed_pending = control.title_seed_pending;
     let result = drive_turn(session, model, store, approvals, &ctx, handle, control).await;
+    if title_seed_pending { settle_title_seed_failure(store, &ctx, &result).await; }
     if let Err(error) = &result {
         transition_after_turn_failure(session, &ctx, error);
     }
@@ -4372,6 +4501,7 @@ async fn resume_after_approval_with_store(
     // (dieselbe Scope-Regel wie bei Closures), nicht die Funktion, sodass
     // genau ein `Result` unten geprüft und — im Fehlerfall genau einmal — die
     // Übergangsfunktion aufgerufen wird, bevor es zurückgegeben wird.
+    let title_seed_pending = control.title_seed_pending;
     let outcome: CoreResult<TurnOutcome> = async {
         match resolution {
             ApprovalResolution::Reject { reason } => {
@@ -4728,6 +4858,7 @@ async fn resume_after_approval_with_store(
     }
     .await;
 
+    if title_seed_pending { settle_title_seed_failure(store, &ctx, &outcome).await; }
     if let Err(error) = &outcome {
         transition_after_turn_failure(session, &ctx, error);
     }
@@ -4833,6 +4964,7 @@ async fn drive_turn(
     // Werkzeug-Budget (Kind): Aufrufe einer Antwort über dem Rest werden
     // nicht ausgeführt; nach der Runde mit den erlaubten endet der Turn.
     let mut over_tool_budget: Option<(Vec<ToolCall>, String)> = None;
+    let final_title_location;
 
     loop {
         if let Some((calls, message)) = over_tool_budget.take() {
@@ -5171,7 +5303,12 @@ async fn drive_turn(
         // Defense in depth: provider adapters should already remove partial
         // tools and reasoning on an interrupted stream. Never persist or
         // execute either even if an alternative adapter returned them.
-        if matches!(response.stop, crate::model::StopReason::StreamInterrupted) {
+        if matches!(
+            response.stop,
+            crate::model::StopReason::StreamInterrupted
+                | crate::model::StopReason::StreamTransportInterrupted
+                | crate::model::StopReason::IncompleteUnknown
+        ) {
             response.tool_calls.clear();
             response.reasoning = None;
         }
@@ -5216,6 +5353,7 @@ async fn drive_turn(
             );
         }
 
+        let mut title_location = None;
         if let Some(text) = response.message {
             let phase = if response.tool_calls.is_empty() {
                 Some(harw_types::MessagePhase::FinalAnswer)
@@ -5224,7 +5362,13 @@ async fn drive_turn(
             };
             let text_for_event = text.clone();
             session.history_mut().push_assistant_text(text, phase);
-            persist_last(session, store).await?;
+            if control.title_seed_pending && response_had_no_tool_calls &&
+                matches!(&response_stop, crate::model::StopReason::EndTurn | crate::model::StopReason::StopSequence)
+            {
+                title_location = persist_title_seed_last(session, store).await?;
+            } else {
+                persist_last(session, store).await?;
+            }
             emit(
                 session,
                 TurnEvent::ItemAdded {
@@ -5240,14 +5384,21 @@ async fn drive_turn(
             );
         }
 
-        if matches!(response_stop, crate::model::StopReason::StreamInterrupted) {
+        let unreliable_end = match &response_stop {
+            crate::model::StopReason::StreamInterrupted => Some(ModelStopOutcome::StreamInterrupted),
+            crate::model::StopReason::StreamTransportInterrupted => Some(ModelStopOutcome::StreamTransportInterrupted),
+            crate::model::StopReason::IncompleteUnknown => Some(ModelStopOutcome::IncompleteUnknown),
+            crate::model::StopReason::Other(code) => Some(ModelStopOutcome::ProviderStopCode(code.clone())),
+            _ => None,
+        };
+        if let Some(stop) = unreliable_end {
             return finish_model_stop(
                 session,
                 store,
                 handle,
                 total_usage,
                 pending_guard_hint.clone(),
-                ModelStopOutcome::StreamInterrupted,
+                stop,
             )
             .await;
         }
@@ -5293,7 +5444,11 @@ async fn drive_turn(
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        ModelStopOutcome::Limit,
+                        if response_stop == crate::model::StopReason::ContextWindowExceeded {
+                            ModelStopOutcome::ContextLimit
+                        } else {
+                            ModelStopOutcome::OutputLimit
+                        },
                     )
                     .await;
                 }
@@ -5382,7 +5537,11 @@ async fn drive_turn(
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        ModelStopOutcome::Limit,
+                        if response_stop == crate::model::StopReason::ContextWindowExceeded {
+                            ModelStopOutcome::ContextLimit
+                        } else {
+                            ModelStopOutcome::OutputLimit
+                        },
                     )
                     .await;
                 }
@@ -5414,7 +5573,10 @@ async fn drive_turn(
                     // (die TUI liefert sie nur der UIA-Wurzel).
                     match await_background_results(session, store, &control).await? {
                         BackgroundWait::Delivered => continue,
-                        BackgroundWait::Idle => break,
+                        BackgroundWait::Idle => {
+                            final_title_location = title_location;
+                            break;
+                        }
                         // Abbruch oder Budget-Ende während des Wartens ist
                         // kein Erfolg: ehrlich abbrechen (die Kinder wurden
                         // mit abgebrochen).
@@ -6131,6 +6293,13 @@ async fn drive_turn(
     // `Completed`. Der `?`-Aufrufer (`run_turn_with_approvals` &co.) fängt den
     // Fehler bereits über `transition_after_turn_failure` ab.
     session.complete_turn(handle, total_usage)?;
+    if control.title_seed_pending &&
+        store.finish_title_seed(&ctx.session_id, &ctx.turn_id, true, final_title_location).await.is_err()
+    {
+        // A pending record left by ambiguous I/O blocks future title evidence.
+        // Never fail or replay the already-completed inference because of optional indexing.
+        tracing::warn!("title source completion was not confirmed");
+    }
     Ok(TurnOutcome::Completed)
 }
 
@@ -7056,8 +7225,12 @@ async fn cancel_turn(
 }
 
 enum ModelStopOutcome {
-    Limit,
+    OutputLimit,
+    ContextLimit,
+    IncompleteUnknown,
+    ProviderStopCode(String),
     StreamInterrupted,
+    StreamTransportInterrupted,
     ContentFiltered,
     Refused { detail: Option<String> },
 }
@@ -7065,7 +7238,7 @@ enum ModelStopOutcome {
 /// Beendet einen Turn nach einem Provider-Stop-Grund, der kein reguläres
 /// Turn-Ende ist ([`StopReason::MaxTokens`] nach ausgeschöpften
 /// Auto-Continuations, [`StopReason::ContextWindowExceeded`],
-/// [`StopReason::StreamInterrupted`], [`StopReason::Refusal`],
+/// [`StopReason::StreamInterrupted`], [`StopReason::IncompleteUnknown`], [`StopReason::Refusal`],
 /// [`StopReason::ContentFilter`]).
 ///
 /// # Beschreibung
@@ -7089,17 +7262,49 @@ async fn finish_model_stop(
     stop: ModelStopOutcome,
 ) -> CoreResult<TurnOutcome> {
     let (outcome, incomplete) = match stop {
-        ModelStopOutcome::Limit => (
+        ModelStopOutcome::OutputLimit => (
             TurnOutcome::Truncated,
             Some((
-                "Antwort unvollständig: Das Ausgabe- oder Kontextlimit wurde erreicht.".to_owned(),
+                "Antwort unvollständig: Das Ausgabelimit des Anbieters wurde erreicht.".to_owned(),
                 true,
             )),
         ),
+        ModelStopOutcome::ContextLimit => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Das Kontextfenster des Modells wurde überschritten.".to_owned(),
+                true,
+            )),
+        ),
+        ModelStopOutcome::IncompleteUnknown => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Der Anbieter meldete ein unvollständiges Ergebnis. Die Ursache ist unbekannt.".to_owned(),
+                false,
+            )),
+        ),
+        ModelStopOutcome::ProviderStopCode(code) => {
+            let code = code.trim();
+            let valid = !code.is_empty() && code.len() <= 64
+                && code.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+            let message = if valid {
+                format!("Antwort unvollständig: Der Anbieter hat die Antwort mit dem Statuscode {code} beendet.")
+            } else {
+                "Antwort unvollständig: Der Anbieter hat die Antwort beendet, aber keinen verständlichen Grund übermittelt.".to_owned()
+            };
+            (TurnOutcome::Truncated, Some((message, false)))
+        }
         ModelStopOutcome::StreamInterrupted => (
             TurnOutcome::Truncated,
             Some((
                 "Antwort unvollständig: Der Antwortstream endete vor der Abschlussmeldung. Die Ursache ist unbekannt.".to_owned(),
+                false,
+            )),
+        ),
+        ModelStopOutcome::StreamTransportInterrupted => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Die Übertragung der Anbieterantwort wurde unterbrochen oder hat zu lange keine Daten geliefert.".to_owned(),
                 false,
             )),
         ),
@@ -7721,6 +7926,35 @@ async fn persist_last(session: &AgentSession, store: &dyn StateStore) -> CoreRes
         tracing::debug!(records_written = 0u64, "transcript.persist");
     }
     Ok(())
+}
+
+async fn persist_title_seed_last(
+    session: &AgentSession, store: &dyn StateStore,
+) -> CoreResult<Option<harw_session_store::title_seed::TitleSeedLocation>> {
+    let Some(item) = session.history().last() else { return Ok(None); };
+    store.save_title_seed_item(session.id(), item).await
+        .map_err(|error| state_store_error(error, "persistence"))
+}
+
+async fn bind_title_user(
+    store: &dyn StateStore, ctx: &TurnInputContext,
+    user: Option<harw_session_store::title_seed::TitleSeedLocation>,
+) {
+    if store.attach_title_seed_user(&ctx.session_id, &ctx.turn_id, user).await.is_err() {
+        tracing::warn!("title source user origin was not confirmed");
+    }
+}
+
+async fn settle_title_seed_failure(
+    store: &dyn StateStore, ctx: &TurnInputContext, result: &CoreResult<TurnOutcome>,
+) {
+    let known_not_completed = !matches!(result,
+        Ok(TurnOutcome::Completed | TurnOutcome::AwaitingApproval { .. } | TurnOutcome::AwaitingChild { .. }));
+    if known_not_completed &&
+        store.finish_title_seed(&ctx.session_id, &ctx.turn_id, false, None).await.is_err()
+    {
+        tracing::warn!("title source terminal state was not confirmed");
+    }
 }
 
 fn state_store_error(error: StateStoreError, operation_name: &str) -> CoreError {
@@ -14139,6 +14373,39 @@ mod tests {
                 .pop_front();
             Box::pin(async move { next.ok_or(crate::model::ModelError::EmptyResponse) })
         }
+    }
+
+    #[tokio::test]
+    async fn exact_retry_replaces_the_selected_prompt_without_deduping_intentional_repetition() -> TestResult {
+        let mut session = make_session(StubToolProvider::with_names(&[]), SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let prefix = session.history_mut().push_user_text("same words");
+        let target = session.history_mut().push_user_text("same words");
+        let suffix = session.history_mut().push_user_text("must not reach model");
+        store.save_history(session.id(), session.history()).await.map_err(ctx("save fixture"))?;
+        let checkpoint_notice = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer = checkpoint_notice.clone();
+        let model = RecordingModel::new(vec![crate::model::ModelResponse::text("new answer")]);
+        let input = TurnInput::user("")
+            .with_rewind_before(Some(target.as_str().into()))
+            .with_control(TurnControl::new().with_history_replaced(Arc::new(move || {
+                observer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })));
+        let outcome = run_turn(&mut session, &model, &store, input).await.map_err(ctx("run retry"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        assert_eq!(checkpoint_notice.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let requests = model.take_requests();
+        assert_eq!(requests.len(), 1);
+        let users = requests[0].items.iter().filter_map(|item| match item {
+            TurnItem::UserMessage(prompt) => Some(prompt),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].id, prefix);
+        assert_ne!(users[1].id, target);
+        assert_ne!(users[1].id, suffix);
+        assert!(matches!(&users[1].content[..], [harw_protocol::items::ContentPart::Text { text }] if text == "same words"));
+        Ok(())
     }
 
     #[tokio::test]

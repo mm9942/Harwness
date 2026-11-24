@@ -1,6 +1,6 @@
 'use strict';
 for(const button of document.querySelectorAll('[data-copy]')){
- button.addEventListener('click',async()=>{const target=document.getElementById(button.dataset.copy);if(!target)return;try{await navigator.clipboard.writeText(target.textContent);button.textContent='Copied';setTimeout(()=>button.textContent='Copy',1800)}catch{button.textContent='Select to copy';const range=document.createRange();range.selectNodeContents(target);const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range)}});
+ button.addEventListener('click',async()=>{const target=document.getElementById(button.dataset.copy);if(!target){return;}try{await navigator.clipboard.writeText(target.textContent);button.textContent='Copied';setTimeout(()=>button.textContent='Copy',1800)}catch{button.textContent='Select to copy';const range=document.createRange();range.selectNodeContents(target);const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range)}});
 }
 const list=document.getElementById('crate-list');
 if(list){
@@ -19,5 +19,5 @@ if(list){
  function render(){const q=search.value.trim().toLowerCase(),d=domain.value;const visible=crates.filter(c=>(d==='all'||c.domain===d)&&(c.name.includes(q)||c.summary.toLowerCase().includes(q)));list.innerHTML=visible.length?visible.map(c=>`<button type="button" class="crate-item" data-crate="${esc(c.name)}" aria-pressed="${c.name===selected}">${esc(c.name)}<small>L${c.level} · ${esc(c.domain)} · ${c.consumers.length} direct consumers</small></button>`).join(''):'<p class="empty-list">No matching packages. Try another name or domain.</p>';document.getElementById('result-count').textContent=`${visible.length} / ${crates.length}`;}
  document.addEventListener('click',event=>{const button=event.target.closest('[data-crate]');if(button)show(button.dataset.crate,true)});
  search.addEventListener('input',render);domain.addEventListener('change',render);
- fetch('/crates.json').then(r=>{if(!r.ok)throw Error('Unavailable');return r.json()}).then(data=>{crates=data;const hash=decodeURIComponent(location.hash.slice(1));if(crates.some(c=>c.name===hash))selected=hash;render();show(selected)}).catch(()=>{list.innerHTML='<p class="empty-list">Package data could not be loaded. Reload this page to try again.</p>';detail.innerHTML='<h2>The architecture overview is available below.</h2>';document.getElementById('result-count').textContent='Unavailable';});
+ fetch('/crates.json').then(r=>{if(!r.ok)throw new Error('Unavailable');return r.json()}).then(data=>{crates=data;const hash=decodeURIComponent(location.hash.slice(1));if(crates.some(c=>c.name===hash))selected=hash;render();show(selected)}).catch(()=>{list.innerHTML='<p class="empty-list">Package data could not be loaded. Reload this page to try again.</p>';detail.innerHTML='<h2>The architecture overview is available below.</h2>';document.getElementById('result-count').textContent='Unavailable';});
 }

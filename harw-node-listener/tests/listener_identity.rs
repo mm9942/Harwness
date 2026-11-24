@@ -1,5 +1,5 @@
 //! Identity mapping and upgrade ordering (S08, W00 D4, ID-01..ID-05).
-//! Driven over in-memory duplex streams; no TCP, no node transport.
+//! Identity mapping uses in-memory streams; transport admission also covers TCP.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use harw_node_transport::{
     UpgradeError, UpgradedIo, empty_body,
 };
 use harw_protocol::methods::METHOD_SESSION_HELLO;
-use harw_protocol::session_wire::HelloAck;
+use harw_protocol::session_wire::{GatewayListenerInfo, HelloAck, ListenerKind};
 use harw_protocol::{ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireMessage};
 use harw_session_host::approvals::MemoryApprovals;
 use harw_session_host::driver::{
@@ -396,6 +396,7 @@ type IntakeWs = WebSocketStream<UpgradedIo>;
 struct Rig {
     _dir: tempfile::TempDir,
     listener: Arc<NodeListener>,
+    host: Arc<SessionHost>,
     gateway: TestNode,
     enrolled: TestNode,
     unknown: TestNode,
@@ -424,15 +425,17 @@ impl Rig {
             ServerOptions::default(),
         )?;
         let mapper: Arc<dyn IdentityMapper> = Arc::new(RegistryIdentityMapper::new(dir.path()));
+        let host = open_host(dir.path())?;
         let listener = Arc::new(NodeListener::new(
             server,
-            open_host(dir.path())?,
+            Arc::clone(&host),
             mapper,
             WsLimits::default(),
         ));
         Ok(Self {
             _dir: dir,
             listener,
+            host,
             gateway,
             enrolled,
             unknown,
@@ -448,7 +451,17 @@ impl Rig {
         tokio::sync::oneshot::Sender<()>,
         JoinHandle<Result<(), ListenerError>>,
     )> {
-        let tcp = TcpListener::bind("127.0.0.1:0").await?;
+        self.start_serve_on(TcpListener::bind("127.0.0.1:0").await?)
+            .await
+    }
+
+    async fn start_serve_on(
+        &self,
+        tcp: TcpListener,
+    ) -> TestResult<(
+        tokio::sync::oneshot::Sender<()>,
+        JoinHandle<Result<(), ListenerError>>,
+    )> {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let listener = Arc::clone(&self.listener);
         let task = tokio::spawn(async move {
@@ -458,9 +471,22 @@ impl Rig {
                 })
                 .await
         });
-        // `serve` registers the listener before its first await.
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.host.listener_enabled("node") != Some(true) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         Ok((stop, task))
+    }
+
+    fn set_ingress_enabled(&self, address: std::net::SocketAddr, enabled: bool) {
+        self.host.register_listener(GatewayListenerInfo {
+            name: "node".into(),
+            kind: ListenerKind::Node,
+            address: address.to_string(),
+            enabled,
+        });
     }
 
     /// Dial the intake over a duplex stream as `client`: `Ok(Ok(ws))` when
@@ -581,11 +607,43 @@ async fn serve_shutdown_closes_the_intake_websocket() -> TestResult {
 }
 
 #[tokio::test]
-async fn intake_without_a_running_serve_answers_503() -> TestResult {
+async fn unregistered_intake_closes_without_a_node_handshake() -> TestResult {
     let rig = Rig::new()?;
-    let refused = rig.dial(&rig.enrolled).await?;
-    assert_eq!(refused.err(), Some(503));
+    assert!(rig.dial(&rig.enrolled).await.is_err());
     assert!(rig.listener.handler().live().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_ingress_refuses_tcp_and_intake_before_authentication() -> TestResult {
+    let rig = Rig::new()?;
+    let tcp = TcpListener::bind("127.0.0.1:0").await?;
+    let address = tcp.local_addr()?;
+    let (_stop, _task) = rig.start_serve_on(tcp).await?;
+    rig.set_ingress_enabled(address, false);
+
+    // Connect without sending an HTTP request: a late 503 is not sufficient.
+    let connect_tcp = || {
+        NodeTransportClient::connect(
+            address,
+            &rig.enrolled.local,
+            &rig.gateway.id,
+            &rig.client_verifier,
+        )
+    };
+    let disabled_tcp = tokio::time::timeout(Duration::from_secs(5), connect_tcp()).await?;
+    assert!(disabled_tcp.is_err());
+    assert!(rig.dial(&rig.enrolled).await.is_err());
+    assert!(rig.listener.handler().live().is_empty());
+
+    rig.set_ingress_enabled(address, true);
+    let transport = tokio::time::timeout(Duration::from_secs(5), connect_tcp()).await??;
+    drop(transport);
+    let mut ws = rig
+        .dial(&rig.enrolled)
+        .await?
+        .map_err(|status| format!("upgrade refused with {status}"))?;
+    session_hello(&mut ws).await?;
     Ok(())
 }
 

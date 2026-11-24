@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_rewrite_resolve">Check or retry previous edit</string>
+    <string name="chat_rewrite_resolve_unavailable">The previous operation cannot be checked right now.</string>
+    <string name="chat_rewrite_reload">Reload conversation</string>
+    <string name="chat_rewrite_forget">Stop tracking this edit</string>
+    <string name="chat_rewrite_forget_explanation">This only stops tracking the previous request on this phone. It does not undo an edit on the host, and the previous version may not appear here. The conversation will reload before you can make another edit.</string>
+    <string name="chat_rewrite_forget_confirm">Stop tracking</string>
+    <string name="chat_rewrite_journal_unavailable">The phone could not save or clear the previous edit. No new edit was sent.</string>
+    <string name="chat_rewrite_archive_only">The old version was too large for the phone cache. Use the retained history on the host.</string>
+    <string name="chat_reply_interrupted">The reply was interrupted.</string>
+    <string name="chat_reply_reload">Reload reply</string>
+    <string name="chat_reply_retry">Retry reply</string>
+    <string name="chat_reply_stop">Stop reply</string>
+    <string name="chat_reply_waiting_stop">Stopping is currently unavailable</string>
+</resources>

@@ -76,7 +76,7 @@ class H(BaseHTTPRequestHandler):
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
                     idle = 0
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except OSError:
             pass
         self.close_connection = True
 

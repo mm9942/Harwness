@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_slash_title">Comandos del chat</string>
+    <string name="chat_slash_ok">Aceptar</string>
+    <string name="chat_slash_help">Usa /export o /transcript para guardar los mensajes de este chat. El botón Comandos muestra las acciones disponibles en el servidor.</string>
+    <string name="chat_slash_unknown">Comando desconocido. Usa /help para ver los comandos disponibles o empieza con una frase para escribir al agente. No se envió ningún mensaje.</string>
+    <string name="chat_slash_export_needs_chat">Abre un chat existente antes de usar /export. No se envió ningún mensaje.</string>
+    <string name="chat_slash_export_wait">Espera a que termine la carga del chat y se complete la respuesta.</string>
+    <string name="chat_slash_export_current_version">Cambia a la versión actual del chat antes de exportarlo.</string>
+    <string name="chat_slash_export_changed">El chat activo o su conexión cambió. No se guardó el historial.</string>
+    <string name="chat_slash_export_saved">Historial guardado.</string>
+    <string name="chat_slash_export_failed">No se pudo guardar el historial. Prueba con otro destino.</string>
+    <string name="chat_slash_export_user">Usuario</string>
+    <string name="chat_slash_export_agent">Agente</string>
+    <string name="chat_slash_export_images">[%1$d imágenes no incluidas]</string>
+    <string name="chat_slash_export_empty">No hay mensajes visibles para exportar.</string>
+    <string name="chat_slash_export_too_large">El historial visible es demasiado grande para una sola exportación.</string>
+    <string name="chat_slash_host_loading">Cargando los comandos de este chat…</string>
+    <string name="chat_slash_host_unavailable">Este comando no está disponible para este chat o esta conexión. No se ha enviado ningún mensaje.</string>
+    <string name="chat_slash_host_run">Ejecutar comando</string>
+    <string name="chat_slash_host_discover">Explora los comandos de solo lectura disponibles. Al seleccionar uno no se ejecuta.</string>
+    <string name="chat_slash_host_filter">Filtrar comandos</string>
+    <string name="chat_slash_host_no_match">Ningún comando de solo lectura coincide. No se ha enviado ningún mensaje.</string>
+    <string name="chat_slash_host_all">Mostrar todos los comandos</string>
+</resources>

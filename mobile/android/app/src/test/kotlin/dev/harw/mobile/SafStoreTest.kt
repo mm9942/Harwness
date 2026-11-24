@@ -1,8 +1,11 @@
 package dev.harw.mobile
 
+import java.io.ByteArrayInputStream
 import java.security.MessageDigest
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -39,6 +42,15 @@ class SafStoreTest {
         assertEquals("a/b", normalizeSafPath("a/b/"))
         assertInvalid("a//", "empty segment")
         assertInvalid("/", "absolute path")
+    }
+
+    @Test
+    fun boundedReadKeepsExactLimitAndRejectsOverflowAcrossChunks() {
+        val exact = ByteArray(64 * 1024 + 7) { it.toByte() }
+        assertArrayEquals(exact, readSafBytes(ByteArrayInputStream(exact), exact.size.toLong()))
+        assertThrows(DeviceException.TooLarge::class.java) {
+            readSafBytes(ByteArrayInputStream(exact), exact.size.toLong() - 1L)
+        }
     }
 
     @Test

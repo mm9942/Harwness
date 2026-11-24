@@ -42,6 +42,7 @@ Agents and knowledge
   agent uia-new | list [QUERY] | skills [ARGS…] | plugins [ARGS…]
   knowledge index [build [--source docs|knowledge] [--force] | status]
             | memory [ARGS…] | proposals [ARGS…]
+            | diary today | diary show … | diary search … | diary agents | diary note
   jobs list [FILTER] | show ID | approve ID [--note TEXT]
        | deny ID [--reason TEXT] | cancel ID | retry ID
   cycle list [STATE [--limit N]] | status ID | stop ID [--reason TEXT]
@@ -349,7 +350,7 @@ error.
   keys are the column headers.
 - **Single values** (e.g. `harw session show ID`) become an object.
 - **Operations** (`harw jobs …`, `harw cycle …`, `harw agent skills|plugins`,
-  `harw knowledge memory|proposals`) return their structured data where
+  `harw knowledge memory|diary|proposals`) return their structured data where
   available, otherwise `{"text": "…"}` with the text output.
 - **`harw dod …`** prints one object per action (the same structure as the
   `/dod` command and the `dod.*` model tools; service actions report the
@@ -629,6 +630,22 @@ permanently.
 
 `--bottom-up` and `--top-down` are mutually exclusive with each other and
 with `--order`; combining them is a parse error.
+
+## Local diary (`harw knowledge diary`)
+
+These commands use the same active local profile and access rules as TUI
+`/diary`. They do not contact a model or a Gateway. Days use UTC. Without
+`--agent`, `show` reads your own diary; `search` searches all visible diaries
+unless you specify an agent. `note` always appends to your own diary and
+reads the text from standard input until EOF (UTF-8, at most 16 KiB), so
+the note does not need to appear in the command line.
+
+```bash
+harw knowledge diary today
+harw knowledge diary show --agent root --from 2026-11-20 --to 2026-11-24
+harw --json knowledge diary search --agent root -- "--from=example"
+harw knowledge diary note < note.txt
+```
 
 ## Examples
 

@@ -73,6 +73,8 @@ pub use key::{
     CreatedKey, KeyContext, KeyDescription, KeyProfile, KeyRef, KeyRefError, KeyState,
     MAX_KEY_NAME_LEN, PublicKeyBytes, WrappedKey,
 };
+#[cfg(target_os = "linux")]
+pub use network::{OwnerActivationObservation, OwnerEpochClient};
 pub use network::{DEFAULT_NETWORK_SOCKET, NetworkControlClient};
 pub use posture::{
     DisplayId, DodPosture, DodPostureStatus, InstructionId, Posture, PostureFinding, PostureId,

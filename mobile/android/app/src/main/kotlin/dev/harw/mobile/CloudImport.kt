@@ -132,29 +132,10 @@ internal fun CloudImportCard(
             } else {
                 if (catalog.providers.isEmpty()) StatusMessage("Keine Provider auf dem Server.")
                 catalog.providers.forEach { provider ->
-                    val blocker = importBlocker(provider)
-                    val target = freeRouteId(provider.name, taken)
-                    val models = importModels(catalog, provider)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(
-                            checked = provider.name in selected,
-                            enabled = blocker == null && !busy,
-                            onCheckedChange = { on -> selected = if (on) selected + provider.name else selected - provider.name },
-                        )
-                        Column(Modifier.weight(1f)) {
-                            Text(provider.name, style = MaterialTheme.typography.titleSmall)
-                            Text("${provider.api} · ${provider.baseUrl.ifBlank { "keine URL" }}", style = MaterialTheme.typography.bodySmall)
-                            Text(
-                                if (models.isEmpty()) "Keine Modelle im Katalog" else "${models.size} Modelle, Standard ${models.first()}",
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                            if (blocker != null) {
-                                Text(blocker, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                            } else if (target != provider.name) {
-                                Text("Name lokal vergeben – wird als „$target“ angelegt", style = MaterialTheme.typography.bodySmall)
-                            }
-                        }
-                    }
+                    CloudImportProviderRow(
+                        catalog, provider, taken, checked = provider.name in selected, busy = busy,
+                        onCheckedChange = { on -> selected = if (on) selected + provider.name else selected - provider.name },
+                    )
                 }
                 Button(
                     enabled = !busy && selected.isNotEmpty(),
@@ -162,31 +143,7 @@ internal fun CloudImportCard(
                         val picks = catalog.providers.filter { it.name in selected }
                         busy = true
                         scope.launch {
-                            val used = taken.toMutableSet()
-                            val lines = mutableListOf<String>()
-                            for (provider in picks) {
-                                val kind = kindForCatalogApi(provider.api) ?: continue
-                                val id = freeRouteId(provider.name, used)
-                                val models = importModels(catalog, provider)
-                                val route = ProviderRoute(
-                                    id = id,
-                                    kind = kind,
-                                    baseUrl = provider.baseUrl,
-                                    defaultModel = models.firstOrNull().orEmpty(),
-                                    hasSecret = false,
-                                    active = false,
-                                )
-                                try {
-                                    withContext(Dispatchers.IO) { store.importRoute(route, models) }
-                                    addImportedRoute(context, id)
-                                    used += id
-                                    lines += "„${provider.name}“ importiert als $id – Schlüssel fehlt"
-                                } catch (e: Exception) {
-                                    lines += "„${provider.name}“ nicht importiert: " +
-                                        friendlyProviderError((e as? uniffi.harw_mobile_ffi.MobileException)?.message ?: "Fehler")
-                                }
-                            }
-                            report = lines
+                            report = importSelectedRoutes(context, store, catalog, picks, taken)
                             selected = emptySet()
                             busy = false
                             onImported()
@@ -197,4 +154,68 @@ internal fun CloudImportCard(
             report.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
         }
     }
+}
+
+@Composable
+private fun CloudImportProviderRow(
+    catalog: CloudCatalog,
+    provider: CloudProvider,
+    taken: Set<String>,
+    checked: Boolean,
+    busy: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    val blocker = importBlocker(provider)
+    val target = freeRouteId(provider.name, taken)
+    val models = importModels(catalog, provider)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(checked = checked, enabled = blocker == null && !busy, onCheckedChange = onCheckedChange)
+        Column(Modifier.weight(1f)) {
+            Text(provider.name, style = MaterialTheme.typography.titleSmall)
+            Text("${provider.api} · ${provider.baseUrl.ifBlank { "keine URL" }}", style = MaterialTheme.typography.bodySmall)
+            Text(
+                if (models.isEmpty()) "Keine Modelle im Katalog" else "${models.size} Modelle, Standard ${models.first()}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (blocker != null) {
+                Text(blocker, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            } else if (target != provider.name) {
+                Text("Name lokal vergeben – wird als „$target“ angelegt", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+private suspend fun importSelectedRoutes(
+    context: Context,
+    store: ProviderStore,
+    catalog: CloudCatalog,
+    providers: List<CloudProvider>,
+    taken: Set<String>,
+): List<String> {
+    val used = taken.toMutableSet()
+    val lines = mutableListOf<String>()
+    for (provider in providers) {
+        val kind = kindForCatalogApi(provider.api) ?: continue
+        val id = freeRouteId(provider.name, used)
+        val models = importModels(catalog, provider)
+        val route = ProviderRoute(
+            id = id,
+            kind = kind,
+            baseUrl = provider.baseUrl,
+            defaultModel = models.firstOrNull().orEmpty(),
+            hasSecret = false,
+            active = false,
+        )
+        try {
+            withContext(Dispatchers.IO) { store.importRoute(route, models) }
+            addImportedRoute(context, id)
+            used += id
+            lines += "„${provider.name}“ importiert als $id – Schlüssel fehlt"
+        } catch (e: Exception) {
+            lines += "„${provider.name}“ nicht importiert: " +
+                friendlyProviderError((e as? uniffi.harw_mobile_ffi.MobileException)?.message ?: "Fehler")
+        }
+    }
+    return lines
 }

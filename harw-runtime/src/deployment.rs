@@ -20,6 +20,11 @@
 
 use std::fmt;
 
+#[cfg(feature = "cloud-workload-placement")]
+pub mod cloud_compile_handoff;
+#[cfg(feature = "cloud-workload-placement")]
+pub mod cloud_placement;
+
 /// Ein montierbarer Dienst, grob nach Autoritätsklasse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Service {

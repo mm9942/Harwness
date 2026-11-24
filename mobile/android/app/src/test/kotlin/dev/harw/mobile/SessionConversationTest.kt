@@ -40,23 +40,23 @@ class SessionConversationTest {
     }
 
     @Test
-    fun archivedFirstPromptForksAtCurrentBoundaryButLaterOldPromptsDoNot() {
-        fun user(id: String, text: String = id) = TranscriptEntry(id, TranscriptKind.USER, text, null, emptyList())
+    fun originalHistoricalIdsRemainSelectableThroughTheLaterRows() {
+        fun user(id: String, text: String = id) = TranscriptEntry(id, TranscriptKind.USER, text, null, emptyList(), null)
         val current = listOf(user("prefix"), user("replacement"), user("current-later"))
         val archived = listOf(user("old-id", "Old prompt"), user("old-later"))
         val ui = VersionsUi(
             versions = mapOf("prefix" to listOf(ChatVersion(archived))),
             viewing = mapOf("prefix" to 0),
             onView = { _, _ -> },
-            onEdit = { _, _, _, _ -> },
+            onEdit = { _, _, _ -> },
         )
         val (shown, firstArchived) = applyViewing(current, ui)
         assertEquals("old-id", shown[1].id)
         assertEquals("Old prompt", shown[1].text)
-        assertEquals("prefix", forkBoundaryId(current, shown, 0, firstArchived))
-        assertEquals("replacement", forkBoundaryId(current, shown, 1, firstArchived))
-        assertNull(forkBoundaryId(current, shown, 2, firstArchived))
-        assertEquals("current-later", forkBoundaryId(current, current, 2, Int.MAX_VALUE))
+        assertEquals("prefix", selectedForkRow(shown, 0, firstArchived)?.selected?.itemId)
+        assertEquals("old-id", selectedForkRow(shown, 1, firstArchived)?.selected?.itemId)
+        assertEquals("old-later", selectedForkRow(shown, 2, firstArchived)?.selected?.itemId)
+        assertEquals("current-later", selectedForkRow(current, 2, Int.MAX_VALUE)?.selected?.itemId)
     }
 
     @Test

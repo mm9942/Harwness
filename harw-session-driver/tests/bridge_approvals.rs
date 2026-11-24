@@ -300,9 +300,11 @@ impl Rig {
             images: Vec::new(),
             client_msg_id: "msg-1".to_owned(),
             submitted_by: "tester".to_owned(),
+            title_seed_human: false,
             actor: operator(),
             origin: ConnectionId::next(),
             rewind_before: None,
+            rewrite_replacement_id: None,
         }
     }
 

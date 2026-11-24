@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_attachment_source_title">Bild anhängen</string>
+    <string name="chat_attachment_source_disclosure">Wähle die Bildquelle. Erst wenn du die Chatnachricht sendest, wird ein Bild übertragen.</string>
+    <string name="chat_attachment_gallery">Gerätegalerie</string>
+    <string name="chat_attachment_gallery_releases_library">Beim Öffnen der Galerie wird die vorgemerkte Auswahl aus der Cloud Library verworfen.</string>
+    <string name="chat_attachment_gallery_decode_failed">Ein Bild konnte nicht gelesen oder nicht klein genug gemacht werden.</string>
+    <string name="chat_attachment_gallery_open_failed">Die Gerätegalerie konnte nicht geöffnet werden.</string>
+    <string name="chat_attachment_library">Cloud Library</string>
+    <string name="chat_attachment_library_disclosure">Die Auswahl sendet noch nichts. Harw lädt genau dieses Bild, wenn du die Nachricht in diesem Cloud-Chat sendest.</string>
+    <string name="chat_attachment_library_search">Nach Name oder Beschreibung suchen</string>
+    <string name="chat_attachment_library_no_match">Keine passenden Bilder.</string>
+    <string name="chat_attachment_library_unavailable">Die Cloud Library ist für diesen Chat gerade nicht verfügbar.</string>
+    <string name="chat_attachment_library_empty">Keine Bilder in dieser Cloud Library.</string>
+    <string name="chat_attachment_library_selected">Cloud Library: %1$s ausgewählt</string>
+    <string name="chat_attachment_library_loading">%1$s wird für diese Nachricht geladen …</string>
+    <string name="chat_attachment_remove">Entfernen</string>
+    <string name="chat_media_close_picker">Schließen</string>
+</resources>

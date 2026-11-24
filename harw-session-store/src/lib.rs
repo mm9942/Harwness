@@ -40,6 +40,7 @@ pub mod reader;
 pub mod record;
 pub mod retention;
 pub mod store;
+pub mod title_seed;
 
 pub use approval::{ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, DEFAULT_APPROVAL_TTL};
 pub use child_lease::{ChildLeaseCompletionRecord, ChildLeaseRecord, ChildLeaseStore};
@@ -62,5 +63,5 @@ pub use lease::{
 };
 pub use meta::{LastOrigin, SESSION_META_VERSION, SessionMeta, TitleSource};
 pub use reader::TranscriptReader;
-pub use record::{RecordKind, TranscriptRecord};
+pub use record::{RecordKind, SessionPurpose, TranscriptRecord};
 pub use store::TranscriptStore;

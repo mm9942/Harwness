@@ -25,26 +25,31 @@ pub(crate) fn route_plan(
     preference: RoutePreference,
     profile: &ValidatedProfile,
 ) -> Result<Vec<ConnectionRoute>, MobileError> {
-    match preference {
-        RoutePreference::Auto if profile.onion.is_some() => {
-            // Tor bevorzugt (stabile, dauerhafte .onion-Identität); direkt nur als Rückfall.
-            Ok(vec![ConnectionRoute::Onion, ConnectionRoute::Direct])
-        }
-        RoutePreference::Auto | RoutePreference::Direct => Ok(vec![ConnectionRoute::Direct]),
-        RoutePreference::Onion if profile.onion.is_some() => Ok(vec![ConnectionRoute::Onion]),
-        RoutePreference::Onion => Err(MobileError::InvalidProfile {
-            detail: "This server profile has no Tor (.onion) route".into(),
-        }),
-    }
+    let routes = match preference {
+        RoutePreference::Onion => profile.onion.as_ref()
+            .map(|_| vec![ConnectionRoute::Onion])
+            .ok_or_else(|| MobileError::InvalidProfile {
+                detail: "Tor-only: this profile has no .onion locator; direct connection is disabled".into(),
+            })?,
+        RoutePreference::Direct => profile.direct_endpoint.as_ref()
+            .map(|_| vec![ConnectionRoute::Direct])
+            .ok_or_else(|| MobileError::InvalidProfile {
+                detail: "This profile has no configured direct endpoint".into(),
+            })?,
+        RoutePreference::Auto => available_routes(profile),
+    };
+    Ok(routes)
 }
 
-/// Routes the profile offers, onion first.
+/// Routes the profile advertises, onion first. This is not permission to dial direct.
 pub(crate) fn available_routes(profile: &ValidatedProfile) -> Vec<ConnectionRoute> {
     let mut routes = Vec::with_capacity(2);
     if profile.onion.is_some() {
         routes.push(ConnectionRoute::Onion);
     }
-    routes.push(ConnectionRoute::Direct);
+    if profile.direct_endpoint.is_some() {
+        routes.push(ConnectionRoute::Direct);
+    }
     routes
 }
 
@@ -139,7 +144,9 @@ impl Dialer {
     ) -> Result<RemoteConnection, RemoteError> {
         match route {
             ConnectionRoute::Direct => {
-                connect_node(profile.endpoint.clone(), local, &profile.verifier, options).await
+                let direct = profile.direct_endpoint.clone()
+                    .ok_or_else(|| RemoteError::Connect("no configured direct endpoint".into()))?;
+                connect_node(direct, local, &profile.verifier, options).await
             }
             ConnectionRoute::Onion => {
                 let stream = self
@@ -150,7 +157,7 @@ impl Dialer {
                     options.limits.hello_timeout.max(ONION_HELLO_TIMEOUT);
                 harw_session_remote::conn::connect_node_over(
                     stream,
-                    &profile.endpoint.expected_node,
+                    &profile.expected_node,
                     local,
                     &profile.verifier,
                     options,
@@ -169,19 +176,18 @@ impl Dialer {
         local: &LocalNode,
     ) -> Result<NodeTransportClient, MobileError> {
         let connected = match route {
-            ConnectionRoute::Direct => NodeTransportClient::connect(
-                profile.endpoint.addr,
-                local,
-                &profile.endpoint.expected_node,
-                &profile.verifier,
-            )
-            .await
-            .map_err(drop),
+            ConnectionRoute::Direct => {
+                let direct = profile.direct_endpoint.as_ref().ok_or_else(|| MobileError::InvalidProfile {
+                    detail: "This profile has no configured direct endpoint".into(),
+                })?;
+                NodeTransportClient::connect(direct.addr, local, &profile.expected_node, &profile.verifier)
+                    .await.map_err(drop)
+            },
             ConnectionRoute::Onion => match self.dial_onion(profile).await {
                 Ok(stream) => NodeTransportClient::connect_over(
                     stream,
                     local,
-                    &profile.endpoint.expected_node,
+                    &profile.expected_node,
                     &profile.verifier,
                     &onion_transport_options(),
                 )
@@ -209,6 +215,24 @@ impl Dialer {
             .dial(locator, ONION_DIAL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    /// Prepare both explicitly selected status destinations on one existing
+    /// device's Arti client. No route planning, direct address, or retry.
+    #[cfg(feature = "onion")]
+    pub(super) async fn dial_owner_status_pair(
+        &self,
+        owner: &harw_onion::OnionLocator,
+        hub: &harw_onion::OnionLocator,
+    ) -> Result<(harw_onion::OnionStream, harw_onion::OnionStream), MobileError> {
+        let unavailable = || MobileError::Connect {
+            detail: "Could not reach both pinned Onion services for owner status".into(),
+        };
+        let client = self.tor_client().map_err(|_| unavailable())?;
+        tokio::try_join!(
+            client.dial(owner, ONION_DIAL_TIMEOUT),
+            client.dial(hub, ONION_DIAL_TIMEOUT),
+        ).map_err(|_| unavailable())
     }
 
     /// Without Tor support there is no stream; the placeholder type is never produced.
@@ -240,7 +264,7 @@ impl Dialer {
     }
 }
 
-fn onion_transport_options() -> ClientOptions {
+pub(super) fn onion_transport_options() -> ClientOptions {
     ClientOptions {
         handshake_timeout: ONION_HANDSHAKE_TIMEOUT,
         ..ClientOptions::default()

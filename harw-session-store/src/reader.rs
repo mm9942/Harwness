@@ -9,7 +9,7 @@
 use std::fs::File;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{SessionStoreError, SessionStoreResult};
@@ -25,6 +25,8 @@ pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 pub struct TranscriptReader {
     /// Buffered transcript stream, retained so record terminators can be checked.
     reader: BufReader<File>,
+    snapshot_remaining: Option<u64>,
+    snapshot_metadata: Option<std::fs::Metadata>,
 }
 
 impl TranscriptReader {
@@ -52,15 +54,84 @@ impl TranscriptReader {
         };
         Ok(Self {
             reader: BufReader::new(file),
+            snapshot_remaining: None,
+            snapshot_metadata: None,
         })
+    }
+
+    /// Pin the byte horizon of this already opened inode. Callers check the
+    /// authoritative record head after replay; this does not fence writers.
+    pub(crate) fn pin_snapshot(&mut self, max_bytes: u64) -> SessionStoreResult<()> {
+        let file = self.reader.get_mut();
+        let metadata = file.metadata()?;
+        let bytes = metadata.len();
+        if bytes > max_bytes {
+            return Err(SessionStoreError::CorruptRecord {
+                detail: "transcript exceeds snapshot byte limit".into(),
+            });
+        }
+        if bytes != 0 {
+            file.seek(SeekFrom::Start(bytes - 1))?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
+            if last != [b'\n'] {
+                return Err(SessionStoreError::CorruptRecord {
+                    detail: "unterminated final JSONL record".into(),
+                });
+            }
+            file.seek(SeekFrom::Start(0))?;
+        }
+        self.snapshot_remaining = Some(bytes);
+        self.snapshot_metadata = Some(metadata);
+        Ok(())
+    }
+
+    pub(crate) fn matches_snapshot(&self, metadata: &std::fs::Metadata) -> bool {
+        let Some(original) = &self.snapshot_metadata else {
+            return false;
+        };
+        if !metadata.is_file()
+            || metadata.len() != original.len()
+            || metadata
+                .modified()
+                .ok()
+                .zip(original.modified().ok())
+                .is_none_or(|(at, old)| at != old)
+        {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if original.dev() != metadata.dev()
+                || original.ino() != metadata.ino()
+                || original.ctime() != metadata.ctime()
+                || original.ctime_nsec() != metadata.ctime_nsec()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn read_line_bounded(&mut self) -> SessionStoreResult<Option<String>> {
         let mut bytes = Vec::new();
 
         loop {
+            if self.snapshot_remaining == Some(0) && bytes.is_empty() {
+                return Ok(None);
+            }
             let buffer = self.reader.fill_buf()?;
+            let limit = self
+                .snapshot_remaining
+                .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+            let buffer = &buffer[..buffer.len().min(limit)];
             if buffer.is_empty() {
+                if self.snapshot_remaining.is_some_and(|n| n != 0) {
+                    return Err(SessionStoreError::CorruptRecord {
+                        detail: "transcript snapshot became shorter".into(),
+                    });
+                }
                 return if bytes.is_empty() {
                     Ok(None)
                 } else {
@@ -85,6 +156,9 @@ impl TranscriptReader {
 
             bytes.extend_from_slice(&buffer[..consumed]);
             self.reader.consume(consumed);
+            if let Some(remaining) = self.snapshot_remaining.as_mut() {
+                *remaining -= consumed as u64;
+            }
             if newline.is_some() {
                 return String::from_utf8(bytes).map(Some).map_err(|error| {
                     SessionStoreError::from(std::io::Error::new(

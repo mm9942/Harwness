@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -309,7 +310,7 @@ internal class ModelImport(context: Context, private val store: ModelStore) {
                 is ImportVerdict.Verified, is ImportVerdict.Unverified -> Unit
             }
             onProgress(ImportProgress(ImportPhase.Replacing, 0, 1))
-            val originalDeleted = if (foreign != null) deleteOriginal(foreign) else false
+            val originalDeleted = foreign != null && deleteOriginal(foreign)
             val model = commit(dir, staged, check)
             if (model == null) {
                 discard(dir, staged)
@@ -396,8 +397,13 @@ internal class ModelImport(context: Context, private val store: ModelStore) {
         try {
             discardImport(dir.path, staged)
         } catch (e: Exception) {
-            File(dir, staged).delete()
-            File(dir, staged + SidecarSuffix).delete()
+            val payload = File(dir, staged)
+            val sidecar = File(dir, staged + SidecarSuffix)
+            val payloadRemains = !payload.delete() && payload.exists()
+            val sidecarRemains = !sidecar.delete() && sidecar.exists()
+            if (payloadRemains || sidecarRemains) {
+                Log.w("HarwModelImport", "Staged model cleanup incomplete")
+            }
         }
     }
 }

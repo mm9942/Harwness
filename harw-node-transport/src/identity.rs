@@ -14,9 +14,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aws_lc_rs::signature::{ML_DSA_65, UnparsedPublicKey};
-use harw_types::NodeId;
+use harw_types::{ContentDigest, NodeId};
 use serde::{Deserialize, Serialize};
 
+use crate::authhub_signer::wrap_transcript;
 use crate::error::{PinError, SignerError, VerifyError};
 
 /// Length of a raw (FIPS 204) ML-DSA-65 public key.
@@ -24,6 +25,15 @@ pub const ML_DSA_65_PUBLIC_KEY_LEN: usize = 1952;
 
 /// Length of an ML-DSA-65 signature.
 pub const ML_DSA_65_SIGNATURE_LEN: usize = 3309;
+
+/// Canonical full fingerprint of an enrolled raw ML-DSA-65 public key.
+/// Rejects malformed length and the all-zero placeholder. A digest of
+/// supplied bytes is an expected comparison value, not channel evidence.
+#[must_use]
+pub fn node_key_fingerprint(public_key: &[u8]) -> Option<[u8; 32]> {
+    (public_key.len() == ML_DSA_65_PUBLIC_KEY_LEN && public_key.iter().any(|&b| b != 0))
+        .then(|| *ContentDigest::of(public_key).as_bytes())
+}
 
 /// The public identity of one node.
 ///
@@ -97,6 +107,75 @@ pub trait NodeVerifier: Send + Sync {
     /// Verifies `signature` over `transcript` under the key pinned for `node`.
     fn verify(&self, node: &NodeId, transcript: &[u8], signature: &[u8])
     -> Result<(), VerifyError>;
+
+    /// Supply the transport's sealed verifier rather than attesting to an
+    /// external verification result. Custom verifiers normally leave this
+    /// unsupported; they may still authenticate ordinary connections.
+    /// Returning a sealed verifier selects its actual verification rules
+    /// for the pinned handshake, not any custom `verify` implementation.
+    #[doc(hidden)]
+    fn sealed_peer_verifier(&self) -> Option<SealedPeerVerifier<'_>> {
+        None
+    }
+}
+
+/// A borrowed library verifier whose key selection and ML-DSA verification
+/// are both performed inside this crate. There is no public constructor
+/// that accepts a verdict or a fingerprint.
+#[doc(hidden)]
+pub struct SealedPeerVerifier<'a> {
+    pins: &'a PinnedPeers,
+    wrapped: bool,
+}
+
+impl SealedPeerVerifier<'_> {
+    pub(crate) fn with_transcript_wrapper(mut self) -> Option<Self> {
+        // A wrapper recognises the raw handshake domain. Do not collapse
+        // arbitrarily nested wrappers to a different verification policy.
+        if self.wrapped {
+            return None;
+        }
+        self.wrapped = true;
+        Some(self)
+    }
+
+    pub(crate) fn verify_and_fingerprint(
+        &self,
+        node: &NodeId,
+        transcript: &[u8],
+        signature: &[u8],
+    ) -> Result<[u8; 32], VerifyError> {
+        let wrapped;
+        let input = if self.wrapped {
+            wrapped =
+                wrap_transcript(transcript).map_err(|_| VerifyError::BadSignature(node.clone()))?;
+            wrapped.as_slice()
+        } else {
+            transcript
+        };
+        let verifying_key = self.pins.verify_key(node, input, signature)?;
+        // Hash the exact borrowed raw key that just passed verification,
+        // not a second lookup or a digest supplied by the peer.
+        node_key_fingerprint(verifying_key).ok_or_else(|| VerifyError::BadSignature(node.clone()))
+    }
+}
+
+/// Verify once and, only on the sealed path, remember the exact verifying key.
+pub(crate) fn verify_peer_signature(
+    verifier: &dyn NodeVerifier,
+    node: &NodeId,
+    transcript: &[u8],
+    signature: &[u8],
+) -> Result<Option<[u8; 32]>, VerifyError> {
+    if let Some(sealed) = verifier.sealed_peer_verifier() {
+        // A refusal here is definitive; never try an alternate verifier.
+        sealed.verify_and_fingerprint(node, transcript, signature).map(Some)
+    } else {
+        // Preserve ordinary handshake use with a custom verifier, but such
+        // a verification result cannot mint an owner-process witness.
+        verifier.verify(node, transcript, signature)?;
+        Ok(None)
+    }
 }
 
 /// The local node: its public identity plus the signer for its private key.
@@ -187,6 +266,24 @@ impl PinnedPeers {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    fn verify_key(
+        &self,
+        node: &NodeId,
+        transcript: &[u8],
+        signature: &[u8],
+    ) -> Result<&[u8], VerifyError> {
+        let Some(key) = self.keys.get(node) else {
+            return Err(VerifyError::UnknownPeer(node.clone()));
+        };
+        if signature.len() != ML_DSA_65_SIGNATURE_LEN {
+            return Err(VerifyError::BadSignature(node.clone()));
+        }
+        UnparsedPublicKey::new(&ML_DSA_65, key.as_slice())
+            .verify(transcript, signature)
+            .map_err(|_| VerifyError::BadSignature(node.clone()))?;
+        Ok(key.as_slice())
+    }
 }
 
 impl fmt::Debug for PinnedPeers {
@@ -210,14 +307,13 @@ impl NodeVerifier for PinnedPeers {
         transcript: &[u8],
         signature: &[u8],
     ) -> Result<(), VerifyError> {
-        let Some(key) = self.keys.get(node) else {
-            return Err(VerifyError::UnknownPeer(node.clone()));
-        };
-        if signature.len() != ML_DSA_65_SIGNATURE_LEN {
-            return Err(VerifyError::BadSignature(node.clone()));
-        }
-        UnparsedPublicKey::new(&ML_DSA_65, key.as_slice())
-            .verify(transcript, signature)
-            .map_err(|_| VerifyError::BadSignature(node.clone()))
+        self.verify_key(node, transcript, signature).map(|_| ())
+    }
+
+    fn sealed_peer_verifier(&self) -> Option<SealedPeerVerifier<'_>> {
+        Some(SealedPeerVerifier {
+            pins: self,
+            wrapped: false,
+        })
     }
 }

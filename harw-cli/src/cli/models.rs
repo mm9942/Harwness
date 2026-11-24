@@ -61,6 +61,16 @@ pub enum ModelsAction {
         #[command(subcommand)]
         action: Option<InternalAction>,
     },
+    /// Dieselbe Rollenauflösung und Modellwahl wie der Chat-Befehl /models.
+    Roles {
+        #[command(subcommand)]
+        action: Option<RoleModelAction>,
+    },
+    /// Bildverständnis-Modell dieses Profils anzeigen oder bewusst auswählen.
+    Image {
+        #[command(subcommand)]
+        action: Option<ImageModelAction>,
+    },
     /// Setzt das globale Standardmodell.
     Default {
         /// Modell-ID, wie in `models/<id>.toml` deklariert.
@@ -73,6 +83,42 @@ pub enum ModelsAction {
         #[arg(long)]
         refresh: bool,
     },
+}
+
+/// Feste Argumentstruktur für die profilweite Rollenwahl.
+#[derive(Debug, Subcommand)]
+pub enum RoleModelAction {
+    /// Zeigt Rollen, Quellen und Reasoning-Gewicht ohne laufende Chat-Sitzung.
+    Show,
+    /// Setzt ein Modell für eine bestimmte Rolle in diesem Profil.
+    Set {
+        #[arg(value_name = "ROLE")]
+        role: String,
+        #[arg(value_name = "MODEL")]
+        target: String,
+        /// Optionales Gewicht für eine Rolle mit eigener Reasoning-Konfiguration.
+        #[arg(long, value_name = "LEVEL")]
+        effort: Option<String>,
+    },
+    /// Entfernt die explizite Modellwahl dieser Rolle.
+    Reset {
+        #[arg(value_name = "ROLE")]
+        role: String,
+    },
+}
+
+/// Bildverständnis ist nicht allgemeine Textmodellwahl oder Bildgenerierung.
+#[derive(Debug, Subcommand)]
+pub enum ImageModelAction {
+    /// Zeigt die gespeicherte Wahl bzw. den aufgelösten Standard.
+    Show,
+    /// Wählt ein Modell mit bestätigtem Bild-Input.
+    Set {
+        #[arg(value_name = "MODEL")]
+        target: String,
+    },
+    /// Entfernt die explizite Wahl ohne einen Anbieter einzusetzen.
+    Reset,
 }
 
 /// Aktionen des `harw model internal`-Subcommands.

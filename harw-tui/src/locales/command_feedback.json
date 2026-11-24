@@ -71,6 +71,18 @@
     "vi": "Ghi chú trống: nhập nội dung sau “#”.",
     "hi": "नोट खाली है: “#” के बाद पाठ लिखें।"
   },
+  "command_feedback.models_settings_operator": {
+    "en": "Model settings require operator access.",
+    "de": "Modelleinstellungen erfordern Operator-Rechte.",
+    "es": "Los ajustes de modelos requieren acceso de operador.",
+    "fr": "Les réglages des modèles nécessitent des droits d’opérateur.",
+    "pt": "As configurações de modelos exigem acesso de operador.",
+    "ja": "モデル設定にはオペレーター権限が必要です。",
+    "zh-CN": "模型设置需要操作员权限。",
+    "ko": "모델 설정에는 운영자 권한이 필요합니다.",
+    "vi": "Cài đặt mô hình yêu cầu quyền điều hành.",
+    "hi": "मॉडल सेटिंग के लिए ऑपरेटर अनुमति चाहिए।"
+  },
   "command_feedback.pick_usage": {
     "en": "Usage: /models pick <role> — known roles: {roles}",
     "de": "Nutzung: /models pick <role> — bekannte Rollen: {roles}",

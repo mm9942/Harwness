@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Read-only admission of one signed Android client for the GitHub release.
+
+The receipt and its SHA-256 pin must come from an independently verified,
+trusted builder/device-test record, not from an untrusted artifact bundle or
+from this APK. This tool verifies agreement with that evidence; it does not
+prove how the APK was built or perform installs. Nothing is uploaded or signed.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+APK_ID = "dev.harw.mobile"
+MAX_RECEIPT_BYTES = 32_768
+GRADLE_FILE = "mobile/android/app/build.gradle.kts"
+HERE = Path(__file__).resolve().parent
+
+
+def command(args):
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise ValueError(f"{Path(args[0]).name} validation failed ({result.returncode})")
+    return result.stdout
+
+
+def full_hex(value, size, label):
+    if not isinstance(value, str) or re.fullmatch(f"[0-9a-f]{{{size}}}", value) is None:
+        raise ValueError(f"{label} must be {size} lowercase hexadecimal digits")
+    return value
+
+
+def git_version(sha):
+    resolved = command(["git", "rev-parse", "--verify", f"{sha}^{{commit}}"]).strip()
+    if resolved != sha:
+        raise ValueError("source commit is not the exact checked repository commit")
+    gradle = command(["git", "show", f"{sha}:{GRADLE_FILE}"])
+    names = re.findall(
+        r'^\s*versionName\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?)"\s*$',
+        gradle, re.M,
+    )
+    codes = re.findall(r"^\s*versionCode\s*=\s*([1-9][0-9]{0,9})\s*$", gradle, re.M)
+    if len(names) != 1 or len(codes) != 1:
+        raise ValueError("cannot prove one Android version at the source commit")
+    return names[0], codes[0]
+
+
+def inspect_apk(apk):
+    sdk = Path(os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or Path.home() / "Android/Sdk")
+    tools = sdk / "build-tools" / os.environ.get("MOBILE_BUILD_TOOLS", "37.0.0")
+    certs = command([str(tools / "apksigner"), "verify", "--verbose", "--print-certs", str(apk)])
+    badging = command([str(tools / "aapt"), "dump", "badging", str(apk)])
+    count = re.findall(r"^Number of signers: ([0-9]+)\s*$", certs, re.M)
+    signers = re.findall(
+        r"^(?:V[0-9]+(?:\.[0-9]+)? )?Signer(?: #([0-9]+))?:? certificate SHA-256 digest: ([a-fA-F0-9]{64})\s*$",
+        certs, re.M,
+    )
+    hashes = {value.lower() for _, value in signers}
+    if count != ["1"] or len(hashes) != 1 or any(index not in ("", "1") for index, _ in signers):
+        raise ValueError("expected exactly one signer and one release certificate")
+    package = re.findall(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'(?: |$)", badging, re.M)
+    if len(package) != 1:
+        raise ValueError("cannot prove one APK package and version")
+    abis = re.findall(r"^native-code:\s*(.*?)\s*$", badging, re.M)
+    if abis != ["'arm64-v8a'"]:
+        raise ValueError("expected arm64-v8a as the only APK ABI")
+    name, code, version = package[0]
+    return name, version, code, next(iter(hashes))
+
+
+def read_receipt(path, expected):
+    with path.open("rb") as stream:
+        blob = stream.read(MAX_RECEIPT_BYTES + 1)
+    if len(blob) > MAX_RECEIPT_BYTES:
+        raise ValueError("device/build receipt is too large")
+    if hashlib.sha256(blob).hexdigest() != expected:
+        raise ValueError("receipt checksum differs from independently verified pin")
+
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key in receipt")
+            result[key] = value
+        return result
+
+    try:
+        body = json.loads(blob, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid device/build receipt JSON") from error
+    if not isinstance(body, dict) or type(body.get("schema")) is not int or body["schema"] != 1:
+        raise ValueError("unsupported device/build receipt schema")
+    return body
+
+
+def file_digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def admit(apk, receipt, receipt_sha, commit, signer_sha, predecessor_sha):
+    full_hex(receipt_sha, 64, "receipt SHA-256")
+    full_hex(commit, 40, "source commit")
+    full_hex(signer_sha, 64, "trusted signer SHA-256")
+    full_hex(predecessor_sha, 64, "trusted predecessor APK SHA-256")
+    expected = read_receipt(receipt, receipt_sha)
+    if expected.get("source_commit") != commit:
+        raise ValueError("receipt source commit does not match the release candidate")
+    digest = file_digest(apk)
+    if expected.get("apk_sha256") != digest:
+        raise ValueError("APK checksum does not match verified evidence")
+    smoke = expected.get("smoke")
+    if not isinstance(smoke, dict) or any(
+        smoke.get(field) != "passed"
+        for field in ("clean_install_and_launch", "in_place_update_and_launch", "update_data_retention")
+    ):
+        raise ValueError("device smoke evidence missing: clean install, in-place update, or data retention")
+    if any(
+        smoke.get(field) != "passed"
+        for field in ("local_assistant_reply", "local_library_persistence")
+    ):
+        raise ValueError("device smoke evidence missing: Local Assistant or Library")
+    if smoke.get("update_from_apk_sha256") != predecessor_sha or digest == predecessor_sha:
+        raise ValueError("device smoke did not use the trusted predecessor")
+    expected_version, expected_code = git_version(commit)
+    name, version, code, actual_signer = inspect_apk(apk)
+    if name != APK_ID:
+        raise ValueError("unexpected APK package identifier")
+    if (version, code) != (expected_version, expected_code):
+        raise ValueError("APK version does not match the source commit")
+    if actual_signer != signer_sha:
+        raise ValueError("APK signer does not match the pinned release certificate")
+    if apk.name != f"Harw-{version}-build{code}-ARM64.apk":
+        raise ValueError("unexpected release APK filename")
+    return f"{digest}  {apk.name}\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apk", type=Path, required=True)
+    parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--receipt-sha256", required=True)
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--signer-sha256", required=True)
+    parser.add_argument("--predecessor-sha256", required=True)
+    args = parser.parse_args()
+    apk = args.apk.absolute()
+    try:
+        if apk.is_symlink() or not apk.is_file():
+            raise ValueError("APK must be a staged regular, non-symlink file")
+        sidecar = admit(apk, args.receipt, args.receipt_sha256, args.commit,
+                        args.signer_sha256, args.predecessor_sha256)
+        # Check the JNI symbols of the exact signed APK too, not just evidence
+        # of the pre-package native build. Keep tool output off the sidecar.
+        command(["bash", str(HERE / "verify-apk"), "--require-local-uia", str(apk)])
+        if file_digest(apk) != sidecar.split(" ", 1)[0]:
+            raise ValueError("APK checksum changed during verification")
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"APK admission refused: {error}\n")
+    sys.stdout.write(sidecar)
+
+
+if __name__ == "__main__":
+    main()

@@ -27,6 +27,10 @@ import kotlinx.coroutines.withContext
 import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ApprovalOutcome
 import uniffi.harw_mobile_ffi.CloudCatalog
+import uniffi.harw_mobile_ffi.MobileCloudAssistantSharedCommand
+import uniffi.harw_mobile_ffi.MobileCloudAssistantSharedSnapshot
+import uniffi.harw_mobile_ffi.MobileCloudAssistantSharedStatus
+import uniffi.harw_mobile_ffi.MobileCloudAssistantSnapshot
 import uniffi.harw_mobile_ffi.ChatgptProviderCredential
 import uniffi.harw_mobile_ffi.ChatgptProviderStatus
 import uniffi.harw_mobile_ffi.ConnectionPhase
@@ -42,6 +46,7 @@ import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.MobileCore
 import uniffi.harw_mobile_ffi.MobileException
 import uniffi.harw_mobile_ffi.MobileHolder
+import uniffi.harw_mobile_ffi.MobileOwnerStatus
 import uniffi.harw_mobile_ffi.MobileProject
 import uniffi.harw_mobile_ffi.MobileSession
 import uniffi.harw_mobile_ffi.MobileSessionRow
@@ -56,10 +61,6 @@ import uniffi.harw_mobile_ffi.TorBootstrap
 import uniffi.harw_mobile_ffi.generateIdentity
 import uniffi.harw_mobile_ffi.signAdminEnrollment
 import uniffi.harw_mobile_ffi.parseServerProfile
-
-/** ONION needs an onion route; without one the preference falls back to AUTO. */
-internal fun normalizedPreference(preference: RoutePreference, hasOnion: Boolean): RoutePreference =
-    if (preference == RoutePreference.ONION && !hasOnion) RoutePreference.AUTO else preference
 
 internal enum class NetworkSignal { None, Nudge, Restart }
 
@@ -89,6 +90,7 @@ internal data class ManageState(
     val running: String? = null,
     val card: ManageCard? = null,
     val catalog: CloudCatalog? = null,
+    val catalogSessionId: String? = null,
     val catalogError: String? = null,
     val known: List<ManageKnownProvider> = emptyList(),
     val knownError: String? = null,
@@ -134,6 +136,7 @@ internal data class WorkspaceState(
     val setupError: String? = null,
     val sessions: List<MobileSession> = emptyList(),
     val sessionsLoaded: Boolean = false,
+    val sessionSummariesGeneration: Long? = null,
     val listError: String? = null,
     val creating: Boolean = false,
     val generation: Long? = null,
@@ -145,7 +148,7 @@ internal data class WorkspaceState(
     val forgetting: Boolean = false,
     val cleanupError: String? = null,
     val chatgpt: ChatgptAccountState = ChatgptAccountState(),
-    val routePreference: RoutePreference = RoutePreference.AUTO,
+    val routePreference: RoutePreference = DefaultProfileRoutePreference,
     val activeRoute: ConnectionRoute? = null,
     val tor: TorBootstrap? = null,
     val attempt: UInt = 0u,
@@ -153,6 +156,8 @@ internal data class WorkspaceState(
     val projectsSupported: Boolean = false,
     val projects: List<MobileProject> = emptyList(),
     val projectsLoaded: Boolean = false,
+    val projectSummariesGeneration: Long? = null,
+    val existingProjectAssignment: Boolean = false,
     val projectsError: String? = null,
     val projectsLegacy: Boolean = false,
     val projectsShare: MobileShareInfo? = null,
@@ -175,10 +180,13 @@ internal data class WorkspaceState(
         stopping = false,
         sessions = emptyList(),
         sessionsLoaded = false,
+        sessionSummariesGeneration = null,
         listError = null,
         projectsSupported = false,
         projects = emptyList(),
         projectsLoaded = false,
+        projectSummariesGeneration = null,
+        existingProjectAssignment = false,
         projectsError = null,
         projectsLegacy = false,
         projectsShare = null,
@@ -206,7 +214,7 @@ internal data class WorkspaceState(
         val cleared = if (forgetRequired) this else clearSessions()
         return cleared.copy(
             profile = null,
-            routePreference = RoutePreference.AUTO,
+            routePreference = DefaultProfileRoutePreference,
             deviceNodeId = null,
             phase = ConnectionPhase.DISCONNECTED,
             detail = "Removing saved phone setup.",
@@ -293,6 +301,16 @@ internal fun ProjectSessionsState.applyChange(change: ProjectChange): ProjectSes
 /** Maps a submit receipt to the draft outcome; BUSY keeps the draft so the user can retry later. */
 internal fun busyDraftMessage(detail: String?): String = detail?.takeUnless { it.isBlank() } ?: "Die Session ist gerade belegt."
 
+/** The transient mobile echo has not been assigned a durable host item ID. */
+internal fun isDurableRewriteItemId(id: String): Boolean =
+    id.length in 1..128 && !id.startsWith("mobile-") && id.all { it in '!'..'~' }
+
+internal fun SessionCursor.hasSameRewriteBoundary(other: SessionCursor): Boolean =
+    generation == other.generation && durable == other.durable
+
+internal fun SessionCursor.isAfterRewriteBoundary(other: SessionCursor): Boolean =
+    generation > other.generation || generation == other.generation && durable > other.durable
+
 internal data class DraftAttempt(
     val text: String,
     val head: SessionCursor,
@@ -333,12 +351,16 @@ internal fun ChatgptAccountState.canStartSignIn(): Boolean = linked == false && 
 
 internal sealed interface DraftResult {
     data object Accepted : DraftResult
+    /** Exact host-issued future canonical item identity; queue admission by itself is not a commit. */
+    data class ExactAccepted(val replacementItemId: String) : DraftResult
     data class Rejected(val error: String, val ambiguous: Boolean = false) : DraftResult
 }
 
 /** Process owner. Public commands and state transitions run on Main; storage and UniFFI calls run on IO. */
 /** Gemeinsame Sperre: Cloud- und Lokal-Verbindung lesen/erzeugen dieselbe Geraeteidentitaet. */
 private val SharedStorageLock = Mutex()
+
+private const val ArchiveControllerLimit = 16
 
 /** Eine Verbindung zu genau einem Backend: Gateway (Cloud) oder On-Device-Host ([localBackend]). */
 internal class HarwConnection(private val context: Context, private val localBackend: Boolean = false) {
@@ -350,7 +372,10 @@ internal class HarwConnection(private val context: Context, private val localBac
     private val store by lazy { DeviceStore(context) }
     private val storageLock = SharedStorageLock
     private val coreLock = Mutex()
+    private val ownerStatusRead = Mutex()
     private var core: MobileCore? = null
+    private var archiveCore: MobileCore? = null
+    private val archiveControllers = LinkedHashMap<ArchiveScope, ArchiveForkController>()
     private var lifecycle = 0L
     private var connectJob: Job? = null
     private var presenceJob: Job? = null
@@ -396,11 +421,12 @@ internal class HarwConnection(private val context: Context, private val localBac
                 return@launch
             }
             try {
-                val (hasSavedSetup, profile) = withContext(Dispatchers.IO) {
-                    val (saved, document) = storageLock.withLock { store.hasSavedSetup() to store.readProfile() }
-                    saved to document?.let(::parseServerProfile)
+                val (hasSavedSetup, profile, preference) = withContext(Dispatchers.IO) {
+                    storageLock.withLock {
+                        val profile = store.readProfile()?.let(::parseServerProfile)
+                        Triple(store.hasSavedSetup(), profile, loadRoutePreference(profile))
+                    }
                 }
-                val preference = normalizedPreference(loadRoutePreference(), profile?.onion != null)
                 change {
                     it.copy(profile = profile, routePreference = preference, hasSavedSetup = hasSavedSetup, setupPending = false, cleanupError = null)
                 }
@@ -429,7 +455,7 @@ internal class HarwConnection(private val context: Context, private val localBac
         change { it.copy(setupNotice = "Device enrollment saved.") }
     }
 
-    fun importProfile(uri: Uri) = importProfileDocument("Import profile") {
+    fun importProfile(uri: Uri) = importProfileDocument("Import profile", allowOwnerStatusHub = true) {
         checkNotNull(context.contentResolver.openInputStream(uri)) {
             "The selected document is unavailable."
         }.use(::readProfileDocument)
@@ -449,28 +475,51 @@ internal class HarwConnection(private val context: Context, private val localBac
         onPreview(image)
     }
 
-    private fun importProfileDocument(operation: String, read: () -> String): Boolean {
+    private fun importProfileDocument(
+        operation: String,
+        allowOwnerStatusHub: Boolean = false,
+        read: () -> String,
+    ): Boolean {
         val current = state.value
         if (current.hasConnection || current.stopping || !current.canSetUp) return false
-        setup(operation) { applyProfileDocument(withContext(Dispatchers.IO) { read() }, "Profile imported.") }
+        setup(operation) {
+            applyProfileDocument(withContext(Dispatchers.IO) { read() }, "Profile imported.", allowOwnerStatusHub)
+        }
         return true
     }
 
-    private suspend fun applyProfileDocument(document: String, notice: String) {
+    private suspend fun applyProfileDocument(
+        document: String,
+        notice: String,
+        allowOwnerStatusHub: Boolean = false,
+    ) {
         val profile = withContext(Dispatchers.IO) { parseServerProfile(document) }
-        withContext(Dispatchers.IO) { storageLock.withLock { store.saveProfile(document) } }
+        // Neither the enrollment server's reply nor a pairing QR can
+        // appoint a second trust anchor for this profile.
+        require(allowOwnerStatusHub || profile.ownerStatusHub == null) {
+            context.getString(R.string.chat_owner_status_import_required)
+        }
+        if (profile.routePreferenceKey() != state.value.profile?.routePreferenceKey()) stopRetainedCloudDial()
+        val preference = withContext(Dispatchers.IO) {
+            storageLock.withLock {
+                store.saveProfile(document)
+                loadRoutePreference(profile)
+            }
+        }
         val replaced = profile.windowKey() != state.value.profile?.windowKey()
         if (replaced) opened.clear()
         change {
             it.copy(
                 profile = profile,
-                routePreference = normalizedPreference(it.routePreference, profile.onion != null),
+                routePreference = preference,
+                activeRoute = null,
+                tor = null,
                 hasSavedSetup = true,
                 setupNotice = notice,
                 phase = ConnectionPhase.DISCONNECTED,
                 detail = null,
                 sessions = if (replaced) emptyList() else it.sessions,
-                sessionsLoaded = if (replaced) false else it.sessionsLoaded,
+                sessionsLoaded = !replaced && it.sessionsLoaded,
                 windows = if (replaced) emptyMap() else it.windows,
                 listError = null,
             )
@@ -490,6 +539,7 @@ internal class HarwConnection(private val context: Context, private val localBac
     fun startAdminEnrollment(input: String, openBrowser: (android.net.Uri) -> Unit) = setup("Admin-Einrichtung") {
         val base = normalizeAdminUrl(input)
             ?: error("Die Admin-Adresse muss mit https:// beginnen und darf keine Zugangsdaten enthalten.")
+        val requestStartedAt = System.currentTimeMillis()
         val request = withContext(Dispatchers.IO) {
             val seed = storageLock.withLock {
                 store.loadOrGenerateIdentity { generateIdentity(DeviceLabel).privateKey }
@@ -505,15 +555,29 @@ internal class HarwConnection(private val context: Context, private val localBac
                     .put("signature_hex", proof.signatureHex)
                     .toString()
                 val reply = adminJsonCall("$base/api/enroll", body)
-                AdminRequest(reply.getString("req"), reply.optString("fingerprint"), base)
+                val remaining = if (reply.has("expires_in")) reply.optLong("expires_in", -1L)
+                    else AdminServerTtlSeconds // Legacy gateways may omit the receipt lifetime.
+                check(remaining in 1..AdminServerTtlSeconds) {
+                    "Die Admin-Anfrage ist abgelaufen oder der Admin-Dienst hat eine ungültige Frist geliefert."
+                }
+                AdminRequest(reply.getString("req"), reply.optString("fingerprint"), base, remaining)
             } finally {
                 seed.fill(0)
             }
         }
         check(AdminRequestPattern.matches(request.id)) { "Der Admin-Dienst hat eine ungültige Anfrage-ID geliefert." }
+        val sameRequest = adminPrefs.getString(AdminPrefReq, null) == request.id &&
+            adminPrefs.getString(AdminPrefBase, null) == request.base
+        val originalStartedAt = if (sameRequest) adminPrefs.getLong(AdminPrefAt, requestStartedAt)
+            else requestStartedAt
+        val deadline = adminCallbackDeadline(requestStartedAt, request.remainingSeconds)
+        val originalDeadline = if (sameRequest) adminPrefs.getLong(
+            AdminPrefDeadline, originalStartedAt + AdminRequestMaxAgeMs,
+        ) else deadline
         adminPrefs.edit()
             .putString(AdminPrefReq, request.id)
-            .putLong(AdminPrefAt, System.currentTimeMillis())
+            .putLong(AdminPrefAt, originalStartedAt)
+            .putLong(AdminPrefDeadline, minOf(deadline, originalDeadline))
             .putString(AdminPrefBase, request.base)
             .apply()
         change {
@@ -524,13 +588,15 @@ internal class HarwConnection(private val context: Context, private val localBac
 
     /**
      * Nimmt den Rückweg `harw://profile?req=<id>&data=<base64url>` an. Der Link ist unvertraute
-     * Eingabe: er wird nur akzeptiert, wenn die Anfrage-ID zur offenen, höchstens 15 Minuten alten
-     * Anfrage dieses Telefons passt; das Profil läuft danach durch denselben Parser wie jeder Import.
+     * Eingabe: er muss zur offenen Anfrage dieses Telefons und seiner ursprünglichen Frist passen;
+     * das Profil läuft danach durch denselben Parser wie jeder Import.
      */
     fun installAdminProfile(req: String?, data: String?, onInstalled: () -> Unit) {
         val pending = adminPrefs.getString(AdminPrefReq, null)
         val started = adminPrefs.getLong(AdminPrefAt, 0L)
-        val fresh = System.currentTimeMillis() - started in 0..AdminRequestMaxAgeMs
+        val now = System.currentTimeMillis()
+        val deadline = adminPrefs.getLong(AdminPrefDeadline, started + AdminRequestMaxAgeMs)
+        val fresh = deadline >= now && now - started in 0..AdminRequestMaxAgeMs
         if (req == null || data == null || pending == null || req != pending || !fresh ||
             !AdminRequestPattern.matches(req) || data.length > 20_000
         ) {
@@ -547,34 +613,66 @@ internal class HarwConnection(private val context: Context, private val localBac
                 String(android.util.Base64.decode(data, android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP), Charsets.UTF_8)
             }
             applyProfileDocument(document, "Profil vom Admin-Dienst eingerichtet.")
-            adminPrefs.edit().remove(AdminPrefReq).remove(AdminPrefAt).apply()
+            adminPrefs.edit().remove(AdminPrefReq).remove(AdminPrefAt).remove(AdminPrefDeadline).apply()
             onInstalled()
         }
     }
 
-    fun selectRoute(preference: RoutePreference) {
+    fun selectRoute(expectedProfile: ServerProfile, preference: RoutePreference) {
         val current = state.value
-        if (current.hasConnection || current.stopping) return
-        if (preference == RoutePreference.ONION && current.profile?.onion == null) return
-        saveRoutePreference(preference)
-        change { it.copy(routePreference = preference) }
+        if (localBackend || !current.canSetUp || current.hasConnection || current.stopping ||
+            current.profile != expectedProfile || current.routePreference == preference ||
+            !routeChoiceEnabled(preference, expectedProfile)
+        ) return
+
+        setup(context.getString(R.string.harw_route_settings_title)) {
+            // Remove any retryable native intent carrying the previously consented
+            // mode before recording the new one. A network callback may not revive it.
+            stopRetainedCloudDial()
+            withContext(Dispatchers.IO) {
+                storageLock.withLock {
+                    val saved = store.readProfile()?.let(::parseServerProfile)
+                    check(saved?.routePreferenceKey() == expectedProfile.routePreferenceKey()) {
+                        context.getString(R.string.harw_route_profile_changed)
+                    }
+                    val key = expectedProfile.routePreferenceKey()
+                    val previous = routePrefs.all[key] as? String
+                    if (!routePrefs.edit().putString(key, preference.name).commit()) {
+                        // SharedPreferences may update its process cache before disk commit fails.
+                        routePrefs.edit().putString(key, previous).commit()
+                        error(context.getString(R.string.harw_route_save_failed))
+                    }
+                }
+            }
+            change {
+                if (it.profile != expectedProfile) it
+                else it.copy(
+                    phase = ConnectionPhase.DISCONNECTED,
+                    detail = null,
+                    activeRoute = null,
+                    tor = null,
+                    routePreference = preference,
+                )
+            }
+        }
     }
 
     private val routePrefs by lazy { context.getSharedPreferences(RoutePrefsName, Context.MODE_PRIVATE) }
 
-    private fun loadRoutePreference(): RoutePreference = try {
-        routePrefs.getString(RoutePrefKey, null)?.let { RoutePreference.valueOf(it) } ?: RoutePreference.ONION
-    } catch (error: Exception) {
-        if (error is CancellationException) throw error
-        RoutePreference.AUTO
+    private fun loadRoutePreference(profile: ServerProfile?): RoutePreference = try {
+        storedProfileRoute(profile?.let { routePrefs.getString(it.routePreferenceKey(), null) })
+    } catch (_: RuntimeException) {
+        DefaultProfileRoutePreference
     }
 
-    private fun saveRoutePreference(preference: RoutePreference) {
-        try {
-            routePrefs.edit().putString(RoutePrefKey, preference.name).apply()
-        } catch (error: Exception) {
-            Log.w(LogTag, "Could not persist the route preference", error)
-        }
+    private suspend fun stopRetainedCloudDial() {
+        unwatchNetwork()
+        ++lifecycle
+        withContext(Dispatchers.IO) { core?.disconnect() }
+        connectJob?.cancelAndJoin()
+        networkJob?.cancelAndJoin()
+        presenceJob?.cancelAndJoin()
+        withContext(Dispatchers.IO) { core?.disconnect() }
     }
 
     fun reportCameraUnavailable() {
@@ -590,6 +688,10 @@ internal class HarwConnection(private val context: Context, private val localBac
         val profile = start.profile ?: return false
         if (start.stopping || !start.canSetUp) return start.hasConnection
         if (start.hasConnection && !force) return true
+        if (!routeChoiceEnabled(start.routePreference, profile)) {
+            change { it.copy(setupError = context.getString(R.string.harw_route_unavailable)) }
+            return false
+        }
         val request = ++lifecycle
         change {
             it.copy(
@@ -611,7 +713,7 @@ internal class HarwConnection(private val context: Context, private val localBac
                 }
                 val status = try {
                     withContext(Dispatchers.IO) {
-                        native.setRoutePreference(start.routePreference)
+                        native.setProfileRoutePreference(profile, start.routePreference)
                         native.connect(profile)
                         native.status()
                     }
@@ -621,11 +723,6 @@ internal class HarwConnection(private val context: Context, private val localBac
                 if (request != lifecycle) return@launch
                 applyStatus(status)
                 if (request == lifecycle) startPolling(native, request)
-                if (request == lifecycle && status.phase == ConnectionPhase.CONNECTED &&
-                    status.route == ConnectionRoute.DIRECT && profile.onion == null
-                ) {
-                    learnOnionLocator(native, profile, request)
-                }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 if (request == lifecycle) {
@@ -640,39 +737,6 @@ internal class HarwConnection(private val context: Context, private val localBac
         }
         watchNetwork()
         return true
-    }
-
-    /**
-     * Asks the gateway (over the already authenticated direct link) for its onion locator and
-     * stores it in the profile, so the Tor route becomes selectable without re-pairing.
-     * Best effort: an old gateway, one without onion, or any error just leaves the profile as is.
-     */
-    private fun learnOnionLocator(native: MobileCore, profile: ServerProfile, request: Long) {
-        scope.launch {
-            try {
-                val locator = withContext(Dispatchers.IO) {
-                    native.configGet(listOf(OnionLocatorKey)).firstOrNull { it.key == OnionLocatorKey }?.value?.trim()
-                }
-                if (locator.isNullOrEmpty() || request != lifecycle) return@launch
-                val updated = withContext(Dispatchers.IO) {
-                    storageLock.withLock {
-                        val saved = store.readProfile() ?: return@withLock null
-                        val document = org.json.JSONObject(saved).put("onion", locator).toString()
-                        val parsed = parseServerProfile(document)
-                        if (parsed.windowKey() != profile.windowKey()) return@withLock null
-                        store.saveProfile(document)
-                        parsed
-                    }
-                } ?: return@launch
-                change {
-                    if (it.profile?.windowKey() != updated.windowKey()) it
-                    else it.copy(profile = updated, setupNotice = "Tor-Adresse vom Gateway übernommen.")
-                }
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                Log.i(LogTag, "Onion locator not learned: ${error.message}")
-            }
-        }
     }
 
     fun connectLocal(force: Boolean = false): Boolean {
@@ -710,14 +774,9 @@ internal class HarwConnection(private val context: Context, private val localBac
         return true
     }
 
-    /**
-     * Startet einen Chat im aktiven Backend. Mit Projekt wird dort angelegt; ohne Projekt wird aus der ersten
-     * Nachricht ein Projektname abgeleitet und die Session zugewiesen, soweit das Backend Projekte kennt.
-     * [opened] bekommt Session und (falls zugewiesen) Projektschluessel, [notice] Hinweise fuer den Nutzer.
-     */
+    /** Creates an untitled chat. Only an explicit project selection is applied here. */
     fun startChat(
         projectKey: String?,
-        firstMessage: String,
         model: String? = null,
         opened: (String, String?) -> Unit,
         notice: (String) -> Unit,
@@ -730,7 +789,6 @@ internal class HarwConnection(private val context: Context, private val localBac
         commands.launch {
             try {
                 val existing = projectKey?.takeIf { it.isNotEmpty() }
-                val topic = topicTitle(firstMessage)
                 var assigned: String? = null
                 var note: String? = null
                 val session = withContext(Dispatchers.IO) {
@@ -748,15 +806,6 @@ internal class HarwConnection(private val context: Context, private val localBac
                         } catch (error: Exception) {
                             if (error is CancellationException) throw error
                             note = "Modell „$model“ konnte nicht gesetzt werden: ${error.displayMessage()}"
-                        }
-                    }
-                    // Kein automatisches Projekt mehr aus der ersten Nachricht: der Chat bleibt "Ohne Projekt",
-                    // trägt aber den Themen-Titel. Zusammengehörige Chats schlägt die Projektliste später vor.
-                    if (existing == null && topic.isNotBlank()) {
-                        try {
-                            native.renameSession(created.sessionId, topic)
-                        } catch (error: Exception) {
-                            if (error is CancellationException) throw error
                         }
                     }
                     created
@@ -892,14 +941,18 @@ internal class HarwConnection(private val context: Context, private val localBac
     fun startChatgptSignIn(target: ChatgptTarget) {
         if (!state.value.chatgpt.canStartSignIn()) return
         runChatgpt(target, ChatgptOperation.Browser) { native, captured ->
-            val key = captured.profile.windowKey()
-            val (hostId, registration) = withContext(Dispatchers.IO) {
-                storageLock.withLock { store.chatgptHostId() to store.chatgptRegistration(key) }
+            val key = captured.profile.chatgptGatewayScope()
+            val registration = withContext(Dispatchers.IO) {
+                storageLock.withLock {
+                    ensureChatgptTarget(captured)
+                    store.chatgptGatewayRegistration(key, captured.profile.windowKey())
+                }
             }
+            var persisted = registration
             val tokens = signInWithChatgpt(
-                hostId = hostId,
-                returningClient = registration?.clientId,
-                expectedSubject = registration?.subject,
+                hostId = registration.hostId,
+                returningClient = registration.clientId,
+                expectedSubject = registration.subject,
                 openBrowser = { url ->
                     ensureChatgptTarget(captured)
                     try {
@@ -912,17 +965,32 @@ internal class HarwConnection(private val context: Context, private val localBac
                         throw SiwcFailure("No web browser is available to sign in to ChatGPT.")
                     }
                 },
-                onVerifying = { changeChatgpt { it.copy(operation = ChatgptOperation.Validating) } },
+                onVerifying = {
+                    ensureChatgptTarget(captured)
+                    changeChatgpt { it.copy(operation = ChatgptOperation.Validating) }
+                },
+                beforeTokenExchange = { issuedClient ->
+                    storageLock.withLock {
+                        ensureChatgptTarget(captured)
+                        val pending = persisted.beforeExchange(issuedClient)
+                        store.saveChatgptGatewayRegistration(key, persisted, pending)
+                        persisted = pending
+                    }
+                    ensureChatgptTarget(captured)
+                },
             )
             ensureChatgptTarget(captured)
             withContext(Dispatchers.IO) {
                 storageLock.withLock {
-                    store.saveChatgptRegistration(key, SiwcRegistration(tokens.clientId, tokens.identity.subject))
+                    ensureChatgptTarget(captured)
+                    val confirmed = persisted.afterVerification(tokens.clientId, tokens.identity.subject)
+                    store.saveChatgptGatewayRegistration(key, persisted, confirmed)
                 }
             }
             ensureChatgptTarget(captured)
             changeChatgpt { it.copy(operation = ChatgptOperation.Linking) }
             val status = withContext(Dispatchers.IO) {
+                ensureChatgptTarget(captured)
                 native.linkChatgptProvider(
                     captured.profile,
                     ChatgptProviderCredential(
@@ -933,15 +1001,23 @@ internal class HarwConnection(private val context: Context, private val localBac
                 )
             }
             if (!status.linked) throw SiwcFailure("The server has not accepted this ChatGPT account.")
-            ChatgptAccountState(linked = true, showPlanNotice = registration == null)
+            ChatgptAccountState(linked = true, showPlanNotice = registration.subject == null)
         }
     }
 
     fun unlinkChatgptAccount(target: ChatgptTarget) {
         if (state.value.chatgpt.linked != true) return
         runChatgpt(target, ChatgptOperation.Unlinking) { native, captured ->
+            val key = captured.profile.chatgptGatewayScope()
+            val registration = withContext(Dispatchers.IO) {
+                storageLock.withLock {
+                    ensureChatgptTarget(captured)
+                    store.chatgptGatewayRegistration(key, captured.profile.windowKey())
+                }
+            }
             var warning: String? = null
             val status = withContext(Dispatchers.IO) {
+                ensureChatgptTarget(captured)
                 try {
                     native.unlinkChatgptProvider(captured.profile)
                 } catch (error: MobileException.Session) {
@@ -952,7 +1028,10 @@ internal class HarwConnection(private val context: Context, private val localBac
             }
             if (status.linked) throw SiwcFailure("The server still reports a linked ChatGPT account.")
             withContext(Dispatchers.IO) {
-                storageLock.withLock { store.clearChatgptRegistration(captured.profile.windowKey()) }
+                storageLock.withLock {
+                    ensureChatgptTarget(captured)
+                    store.saveChatgptGatewayRegistration(key, registration, registration.afterUnlink())
+                }
             }
             ChatgptAccountState(linked = false, error = warning)
         }
@@ -1092,7 +1171,7 @@ internal class HarwConnection(private val context: Context, private val localBac
             try {
                 val sessions = withContext(Dispatchers.IO) { native.listSessions() }
                 if (generation == gate.generation) {
-                    change { it.copy(sessions = sessions, sessionsLoaded = true, listError = null) }
+                    change { it.copy(sessions = sessions, sessionsLoaded = true, sessionSummariesGeneration = generation, listError = null) }
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
@@ -1144,8 +1223,25 @@ internal class HarwConnection(private val context: Context, private val localBac
         }
     }
 
+    /** Fetch this session's catalog without reading or replacing another screen's shared cache. */
+    suspend fun composerCommandCatalog(sessionId: String, expectedGeneration: Long): List<ManageCommand> {
+        val native = core ?: return emptyList()
+        fun current() = gate.generation == expectedGeneration && core === native &&
+            state.value.online && state.value.windows[sessionId]?.generation == expectedGeneration
+        if (!current()) return emptyList()
+        val list = withContext(Dispatchers.IO) {
+            if (!native.manageSupport().manage) emptyList() else native.commands(sessionId).commands
+        }
+        return if (current()) list else emptyList()
+    }
+
     /** Fuehrt eine Zeile aus; `onDone(null)` bei Fehler oder wenn ein Step-up offen ist. */
-    fun runCommand(sessionId: String?, line: String, onDone: (ManageRunResult?) -> Unit = {}) {
+    fun runCommand(
+        sessionId: String?,
+        line: String,
+        publishCard: Boolean = true,
+        onDone: (ManageRunResult?) -> Unit = {},
+    ) {
         val generation = gate.generation ?: return
         val native = core ?: return
         if (state.value.manage.stepUp != null) {
@@ -1158,13 +1254,18 @@ internal class HarwConnection(private val context: Context, private val localBac
             try {
                 val result = withContext(Dispatchers.IO) { native.command(sessionId, line, newMsgId()) }
                 if (generation == gate.generation) {
-                    changeManage { applyManageResult(it, line, result, SystemClock.elapsedRealtime()) }
+                    changeManage {
+                        if (publishCard || result.stepup != null) applyManageResult(it, line, result, SystemClock.elapsedRealtime())
+                        else it.copy(running = null, commandsError = null)
+                    }
                     onDone(result)
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 if (generation == gate.generation) {
-                    changeManage { it.copy(running = null, commandsError = "$line: ${error.displayMessage()}") }
+                    changeManage {
+                        it.copy(running = null, commandsError = if (publishCard) "$line: ${error.displayMessage()}" else null)
+                    }
                     onDone(null)
                 }
             }
@@ -1199,7 +1300,9 @@ internal class HarwConnection(private val context: Context, private val localBac
         scope.launch {
             try {
                 val catalog = withContext(Dispatchers.IO) { native.catalog(sessionId) }
-                if (generation == gate.generation) changeManage { it.copy(catalog = catalog, catalogError = null) }
+                if (generation == gate.generation) changeManage {
+                    it.copy(catalog = catalog, catalogSessionId = sessionId, catalogError = null)
+                }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 if (generation == gate.generation) {
@@ -1375,8 +1478,12 @@ internal class HarwConnection(private val context: Context, private val localBac
         if (projectsJob?.isActive == true) return
         projectsJob = scope.launch {
             try {
-                val (supported, page) = withContext(Dispatchers.IO) {
-                    native.projectsSupported() to native.listProjects(null, null, null)
+                val (supported, page, canAssignExisting) = withContext(Dispatchers.IO) {
+                    Triple(
+                        native.projectsSupported(),
+                        native.listProjects(null, null, null),
+                        native.existingProjectAssignmentSupported(),
+                    )
                 }
                 if (generation == gate.generation) {
                     change {
@@ -1384,6 +1491,8 @@ internal class HarwConnection(private val context: Context, private val localBac
                             projectsSupported = supported,
                             projects = page.projects,
                             projectsLoaded = true,
+                            projectSummariesGeneration = generation,
+                            existingProjectAssignment = canAssignExisting,
                             projectsError = null,
                             projectsLegacy = page.legacy,
                             projectsShare = page.share,
@@ -1468,7 +1577,7 @@ internal class HarwConnection(private val context: Context, private val localBac
         projectSessionsJob = scope.launch {
             try {
                 val page = withContext(Dispatchers.IO) {
-                    native.listSessionsPage(key, query, false, cursor, ProjectPageSize)
+                    native.listSessionsPage(key, query, false, cursor, ProjectPageSize).filterDreamVisibility()
                 }
                 if (generation == gate.generation && state.value.projectView != null) {
                     projectCursor = page.nextCursor
@@ -1566,12 +1675,276 @@ internal class HarwConnection(private val context: Context, private val localBac
         }
     }
 
+    private fun cloudAssistantSelected(profile: ServerProfile, generation: Long): Boolean {
+        val current = state.value
+        return !localBackend && current.online && !current.stopping &&
+            current.profile == profile && current.generation == generation && gate.generation == generation
+    }
+
+    /** Snapshot one explicit status read without changing the ordinary route or profile identity. */
+    fun ownerStatusTarget(sessionId: String): OwnerStatusTarget? {
+        val before = state.value
+        val profile = before.profile ?: return null
+        val hub = profile.ownerStatusHub ?: return null
+        val generation = before.generation ?: return null
+        val device = before.deviceNodeId ?: return null
+        val target = OwnerStatusTarget(
+            profile.copy(ownerStatusHub = hub.copy()), generation, before.sessionResetEpoch, device, sessionId,
+        )
+        return target.takeIf(::ownerStatusTargetCurrent)
+    }
+
+    fun ownerStatusTargetCurrent(target: OwnerStatusTarget): Boolean {
+        val now = state.value
+        val chat = now.windows[target.sessionId]
+        return !localBackend && !now.local && now.online &&
+            now.activeRoute == ConnectionRoute.ONION && target.profile.onion != null &&
+            target.profile.ownerStatusHub != null && now.profile == target.profile &&
+            now.deviceNodeId == target.deviceNodeId && now.generation == target.generation &&
+            gate.generation == target.generation && now.sessionResetEpoch == target.resetEpoch &&
+            chat?.generation == target.generation && chat?.snapshot?.online == true
+    }
+
+    /** An explicit specialist read, with no local, direct IP or V1 fallback. */
+    suspend fun fencedOwnerStatus(target: OwnerStatusTarget): MobileOwnerStatus? {
+        val native = core ?: return null
+        if (!ownerStatusTargetCurrent(target) || !ownerStatusRead.tryLock()) return null
+        return try {
+            val observed = withContext(Dispatchers.IO) {
+                native.fencedOwnerStatus(target.profile, target.sessionId)
+            }
+            observed.takeIf { core === native && ownerStatusTargetCurrent(target) }
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            // Do not surface transport details, profile pins or session IDs.
+            null
+        } finally {
+            ownerStatusRead.unlock()
+        }
+    }
+
+    /** Pure local native hello check; opening Home does not call a remote Assistant method. */
+    suspend fun cloudAssistantTarget(profile: ServerProfile, generation: Long): CloudAssistantTarget? {
+        val native = core ?: return null
+        if (!cloudAssistantSelected(profile, generation)) return null
+        val offered = withContext(Dispatchers.IO) {
+            val access = native.cloudAssistantAccess(profile) ?: return@withContext null
+            val shared = native.cloudAssistantSharedSupported(access)
+            CloudAssistantTarget(
+                profile, generation, access,
+                recallSupported = native.cloudAssistantRecallSupported(access),
+                sharedSupported = shared,
+                sharedDeviceFingerprint = if (shared) native.cloudAssistantSharedDeviceFingerprint(access) else null,
+            )
+        } ?: return null
+        return if (core === native && cloudAssistantSelected(profile, generation)) {
+            offered
+        } else {
+            offered.access.destroy()
+            null
+        }
+    }
+
+    suspend fun cloudAssistantTargetCurrent(target: CloudAssistantTarget): Boolean {
+        val native = core ?: return false
+        if (!cloudAssistantSelected(target.profile, target.generation)) return false
+        val current = withContext(Dispatchers.IO) { native.cloudAssistantAccessCurrent(target.access) }
+        return current && core === native && cloudAssistantSelected(target.profile, target.generation)
+    }
+
+    /** Explicit specialist RPC only. Never falls through to the normal session composer. */
+    suspend fun cloudAssistantCall(
+        target: CloudAssistantTarget,
+        operation: CloudAssistantCommand,
+    ): MobileCloudAssistantSnapshot {
+        val native = core ?: throw MobileException.Disconnected()
+        if (!cloudAssistantSelected(target.profile, target.generation)) throw MobileException.Disconnected()
+        val result = withContext(Dispatchers.IO) {
+            val access = target.access
+            val snapshot = when (operation) {
+                CloudAssistantCommand.Status -> native.cloudAssistantStatus(access)
+                CloudAssistantCommand.Provision -> native.cloudAssistantProvision(access)
+                CloudAssistantCommand.Revoke -> native.cloudAssistantRevoke(access)
+                is CloudAssistantCommand.Submit -> {
+                    if (operation.recallMessageIds.isEmpty()) {
+                        native.cloudAssistantSubmit(access, operation.id, operation.text)
+                    } else {
+                        if (!target.recallSupported) throw MobileException.Denied("Cloud Assistant recall was not negotiated")
+                        native.cloudAssistantSubmitWithRecall(access, operation.id, operation.text, operation.recallMessageIds)
+                    }
+                }
+            }
+            if (!native.cloudAssistantAccessCurrent(access)) throw MobileException.Disconnected()
+            snapshot
+        }
+        if (core !== native || !cloudAssistantSelected(target.profile, target.generation)) throw MobileException.Disconnected()
+        return result
+    }
+
+    /** The opted-in shared room has no per-device, local, or ordinary session fallback. */
+    suspend fun cloudSharedAssistantCall(
+        target: CloudAssistantTarget,
+        action: CloudSharedAssistantAction,
+    ): MobileCloudAssistantSharedSnapshot {
+        val native = core ?: throw MobileException.Disconnected()
+        if (!target.sharedSupported) throw MobileException.Denied("Shared Assistant was not negotiated")
+        return withContext(Dispatchers.IO) {
+            val access = target.access
+            fun requireCurrent() {
+                if (core !== native || !cloudAssistantSelected(target.profile, target.generation) ||
+                    !native.cloudAssistantAccessCurrent(access)
+                ) throw MobileException.Disconnected()
+                if (!native.cloudAssistantSharedSupported(access)) {
+                    throw MobileException.Denied("Shared Assistant is no longer available")
+                }
+            }
+            fun status(): MobileCloudAssistantSharedSnapshot {
+                requireCurrent()
+                return native.cloudAssistantShared(access, MobileCloudAssistantSharedCommand.Status).also { requireCurrent() }
+            }
+            fun requireStatus(condition: Boolean) {
+                if (!condition) throw MobileException.Denied("Shared Assistant status changed")
+            }
+
+            // Revalidate each consented authority change against the current link and
+            // room. Approval requires an independently entered complete fingerprint.
+            val command = when (action) {
+                CloudSharedAssistantAction.Status -> return@withContext status()
+                CloudSharedAssistantAction.Provision -> {
+                    requireStatus(status().status == MobileCloudAssistantSharedStatus.UNPROVISIONED)
+                    MobileCloudAssistantSharedCommand.Provision
+                }
+                CloudSharedAssistantAction.RequestJoin -> {
+                    requireStatus(status().status == MobileCloudAssistantSharedStatus.NOT_GRANTED)
+                    MobileCloudAssistantSharedCommand.RequestJoin
+                }
+                CloudSharedAssistantAction.Revoke -> {
+                    requireStatus(status().status == MobileCloudAssistantSharedStatus.OWNER)
+                    MobileCloudAssistantSharedCommand.RevokeRoom
+                }
+                is CloudSharedAssistantAction.Approve -> {
+                    val device = action.device
+                    val current = status()
+                    requireStatus(
+                        current.status == MobileCloudAssistantSharedStatus.OWNER &&
+                            validCloudSharedRequestId(device.requestId) && device.pending &&
+                            canonicalCloudSharedFingerprint(action.fingerprint) == device.keyFingerprintHex &&
+                            current.devices.any { it == device },
+                    )
+                    MobileCloudAssistantSharedCommand.Approve(device.requestId)
+                }
+                is CloudSharedAssistantAction.Remove -> {
+                    val current = status()
+                    requireStatus(
+                        current.status == MobileCloudAssistantSharedStatus.OWNER &&
+                            validCloudSharedRequestId(action.device.requestId) &&
+                            current.devices.any { it == action.device },
+                    )
+                    MobileCloudAssistantSharedCommand.WithdrawOrRemove(action.device.requestId)
+                }
+                is CloudSharedAssistantAction.Leave -> {
+                    val current = status()
+                    requireStatus(
+                        current.status == action.expectedStatus &&
+                            (current.status == MobileCloudAssistantSharedStatus.PENDING ||
+                                current.status == MobileCloudAssistantSharedStatus.PARTICIPANT) &&
+                            validCloudSharedRequestId(action.requestId) && current.ownRequestId == action.requestId,
+                    )
+                    MobileCloudAssistantSharedCommand.WithdrawOrRemove(action.requestId)
+                }
+                is CloudSharedAssistantAction.Send ->
+                    MobileCloudAssistantSharedCommand.Submit(action.id, action.text)
+            }
+            requireCurrent()
+            native.cloudAssistantShared(access, command).also { requireCurrent() }
+        }.also {
+            if (core !== native || !cloudAssistantSelected(target.profile, target.generation)) throw MobileException.Disconnected()
+        }
+    }
+
+    suspend fun changeCloudAssistantSession(
+        target: CloudAssistantTarget,
+        change: AssistantSessionChange,
+    ) {
+        val native = core ?: throw MobileException.Disconnected()
+        val before = state.value
+        if (!cloudAssistantSelected(target.profile, target.generation) ||
+            !canManageCloudAssistantSessions(before, target) ||
+            before.sessions.asSequence().take(CloudAssistantSummaryLimit).none { it.sessionId == change.id }
+        ) throw MobileException.Disconnected()
+        if (change is AssistantSessionChange.AssignProject &&
+            change.destination !in assistantProjectChoices(before, target.generation)
+        ) throw MobileException.Denied("Project selection changed")
+        withContext(Dispatchers.IO) {
+            when (change) {
+                is AssistantSessionChange.Rename -> native.cloudAssistantRenameSession(target.access, change.id, change.title)
+                is AssistantSessionChange.Archive -> native.cloudAssistantArchiveSession(target.access, change.id)
+                is AssistantSessionChange.AssignProject ->
+                    native.cloudAssistantAssignExistingProject(target.access, change.id, change.destination.key)
+            }
+            if (!native.cloudAssistantAccessCurrent(target.access)) throw MobileException.Disconnected()
+        }
+        if (core !== native || !cloudAssistantSelected(target.profile, target.generation)) throw MobileException.Disconnected()
+        refreshSessions()
+        if (change is AssistantSessionChange.Archive || change is AssistantSessionChange.AssignProject) refreshProjectsQuietly()
+    }
+
+    /** Read from the profile that is still selected after the asynchronous native call. */
+    suspend fun sessionHomePage(
+        expectedScope: SessionHomeScope,
+        expectedGeneration: Long,
+        cursor: String?,
+        includeDreams: Boolean = false,
+    ): uniffi.harw_mobile_ffi.MobileSessionPage? {
+        val native = core ?: return null
+        if (!canUseSessionHome(expectedScope, expectedGeneration)) return null
+        val page = withContext(Dispatchers.IO) {
+            native.listSessionsPage(null, null, false, cursor, SessionHomePageSize.toUInt(), includeDreams)
+                .filterDreamVisibility(includeDreams)
+        }
+        return page.takeIf {
+            core === native && canUseSessionHome(expectedScope, expectedGeneration)
+        }
+    }
+
+    suspend fun systemSessionsPage(
+        expectedScope: SessionHomeScope,
+        expectedGeneration: Long,
+        cursor: String?,
+    ): SystemSessionPage? {
+        val native = core ?: return null
+        if (!canUseSessionHome(expectedScope, expectedGeneration)) return null
+        val result = withContext(Dispatchers.IO) {
+            val complete = native.systemSessionRowsSupported()
+            val legacyDream = !complete && native.dreamSessionRowsSupported()
+            val page = native.listSessionsPage(
+                null, null, false, cursor, SessionHomePageSize.toUInt(), legacyDream, complete,
+            ).let { data ->
+                if (complete || legacyDream) {
+                    data.copy(sessions = data.sessions.filter { it.purpose.isSystemRun() })
+                } else {
+                    // A pre-catalog host can only supply its already authorized regular page.
+                    // Accept the exact legacy producer fingerprint, never the title alone.
+                    data.projectLegacyDreamsForInternal()
+                }
+            }
+            SystemSessionPage(page, complete, legacyDiscovery = !complete && !legacyDream)
+        }
+        return result.takeIf { core === native && canUseSessionHome(expectedScope, expectedGeneration) }
+    }
+
+    fun canUseSessionHome(scope: SessionHomeScope, generation: Long): Boolean {
+        val current = state.value
+        return current.online && current.generation == generation &&
+            gate.generation == generation && sessionHomeScope(current) == scope
+    }
+
     /** Sessions ohne Projekt (für Vorschläge zusammengehöriger Chats). */
     suspend fun unassignedRows(): List<uniffi.harw_mobile_ffi.MobileSessionRow> {
         val native = core ?: return emptyList()
         if (!state.value.projectsSupported) return emptyList()
         return try {
-            withContext(Dispatchers.IO) { native.listSessionsPage("", null, false, null, ProjectPageSize).sessions }
+            withContext(Dispatchers.IO) { native.listSessionsPage("", null, false, null, ProjectPageSize).filterDreamVisibility().sessions }
         } catch (error: Exception) {
             if (error is CancellationException) throw error
             emptyList()
@@ -1637,6 +2010,105 @@ internal class HarwConnection(private val context: Context, private val localBac
         onAssign = ::assignProject,
     )
 
+    suspend fun manualCloudWorkTarget(expectedGeneration: Long): ManualCloudWorkTarget? {
+        val native = core ?: return null
+        val stateBefore = state.value
+        if (localBackend || !stateBefore.online || stateBefore.generation != expectedGeneration) return null
+        val profile = stateBefore.profile ?: return null
+        val access = withContext(Dispatchers.IO) { native.manualCloudWorkAccess() } ?: return null
+        val after = state.value
+        if (core !== native || !after.online || after.generation != expectedGeneration || after.profile != profile ||
+            !access.isCurrent()) return null
+        return ManualCloudWorkTarget(access, expectedGeneration, profile.label)
+    }
+
+    /** A single explicit empty work session, never dispatched to a Cloud core. */
+    suspend fun createLocalUiaWorkSession(
+        expectedGeneration: Long,
+        stillAuthorized: () -> Boolean,
+    ): LocalUiaWorkCreate {
+        val native = core ?: return LocalUiaWorkCreate.Unavailable
+        fun current() = core === native && canUseLocalUiaWork(expectedGeneration)
+        if (!current() || !state.value.canCreate || state.value.creating || !stillAuthorized()) {
+            return LocalUiaWorkCreate.Unavailable
+        }
+        change { it.copy(creating = true) }
+        try {
+            val created = withContext(Dispatchers.IO) { native.createSession(LocalUiaWorkTitle) }
+            if (!current() || !stillAuthorized()) return LocalUiaWorkCreate.Unconfirmed
+            change { state ->
+                state.copy(sessions = listOf(created) + state.sessions.filterNot { it.sessionId == created.sessionId })
+            }
+            refreshSessions()
+            return LocalUiaWorkCreate.Created(
+                LocalUiaWorkLink(
+                    created.sessionId, expectedGeneration, LocalUiaWorkTitle,
+                    System.currentTimeMillis(), android.os.SystemClock.elapsedRealtime(),
+                ),
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            return LocalUiaWorkCreate.Unconfirmed
+        } finally {
+            if (core === native && gate.generation == expectedGeneration) change { it.copy(creating = false) }
+        }
+    }
+
+    suspend fun localAssistantSearchTarget(
+        generation: Long, stillAuthorized: () -> Boolean,
+    ): LocalAssistantSearchTarget? {
+        val native = core ?: return null
+        if (!canUseLocalUiaWork(generation) || !stillAuthorized()) return null
+        val scope = withContext(Dispatchers.IO) {
+            native.localAssistantSessionAccess()?.let { it to native.localAssistantCanRenameSession(it) }
+        } ?: return null
+        if (core !== native || !canUseLocalUiaWork(generation) || !stillAuthorized()) return null
+        return LocalAssistantSearchTarget(generation, scope.first, scope.second)
+    }
+
+    suspend fun localAssistantSearchTargetCurrent(
+        target: LocalAssistantSearchTarget, stillAuthorized: () -> Boolean,
+    ): Boolean {
+        val native = core ?: return false
+        if (!canUseLocalUiaWork(target.generation) || !stillAuthorized()) return false
+        val current = withContext(Dispatchers.IO) { native.localAssistantSessionAccessCurrent(target.access) }
+        return current && core === native && canUseLocalUiaWork(target.generation) && stillAuthorized()
+    }
+
+    suspend fun changeLocalAssistantSession(
+        target: LocalAssistantSearchTarget, change: AssistantSessionChange, stillAuthorized: () -> Boolean,
+    ) {
+        val native = core ?: throw MobileException.Disconnected()
+        val before = state.value
+        if (!target.canRename || !canUseLocalUiaWork(target.generation) || !stillAuthorized() ||
+            localAssistantSummary(before, target, change.id) == null
+        ) throw MobileException.Disconnected()
+        if (change is AssistantSessionChange.AssignProject &&
+            change.destination !in assistantProjectChoices(before, target.generation)
+        ) throw MobileException.Denied("Project selection changed")
+        withContext(Dispatchers.IO) {
+            when (change) {
+                is AssistantSessionChange.Rename -> native.localAssistantRenameSession(target.access, change.id, change.title)
+                is AssistantSessionChange.AssignProject ->
+                    native.localAssistantAssignExistingProject(target.access, change.id, change.destination.key)
+                is AssistantSessionChange.Archive -> throw MobileException.Denied("Archive unavailable in Local Assistant")
+            }
+            if (!native.localAssistantSessionAccessCurrent(target.access)) throw MobileException.Disconnected()
+        }
+        if (core !== native || !canUseLocalUiaWork(target.generation) || !stillAuthorized()) {
+            throw MobileException.Disconnected()
+        }
+        refreshSessions()
+        if (change is AssistantSessionChange.AssignProject) refreshProjectsQuietly()
+    }
+
+    fun canUseLocalUiaWork(expectedGeneration: Long): Boolean {
+        val current = state.value
+        return localBackend && current.local && current.online &&
+            gate.generation == expectedGeneration && current.generation == expectedGeneration
+    }
+
     fun createSession(title: String?, select: (String) -> Unit) {
         val generation = gate.generation ?: return
         val native = core ?: return
@@ -1659,6 +2131,171 @@ internal class HarwConnection(private val context: Context, private val localBac
             } finally {
                 change { it.copy(creating = false) }
             }
+        }
+    }
+
+    /** Archive belongs to the live authenticated backend, not to a replayed window state. */
+    private suspend fun archiveBinding(sessionId: String): NativeArchiveBinding? {
+        val native = core ?: return null
+        val generation = gate.generation ?: return null
+        val initial = state.value
+        if (!archiveSourceKnown(initial, sessionId, generation)) return null
+        val (scope, retainedRewrite) = withContext(Dispatchers.IO) {
+            native.archiveScope()?.let { it to native.archivePreviousAvailable(it) }
+        } ?: return null
+        val current = state.value
+        if (core !== native || gate.generation != generation ||
+            initial.profile != current.profile || !archiveSourceKnown(current, sessionId, generation)
+        ) return null
+        val attachment = ArchiveAttachment(
+            archiveScopeFor(scope, sessionId), generation,
+            archiveCheckpointV1 = true, archiveRetainedRewriteV1 = retainedRewrite,
+        )
+        return NativeArchiveBinding(native, scope, attachment)
+    }
+
+    suspend fun cloudLibraryScope(): uniffi.harw_mobile_ffi.MobileCloudLibraryScope? {
+        val native = core ?: return null
+        val before = state.value
+        val generation = before.generation ?: return null
+        if (localBackend || !before.online || before.profile == null) return null
+        val scope = withContext(Dispatchers.IO) { native.cloudLibraryScope() } ?: return null
+        val current = state.value
+        return scope.takeIf {
+            current.online && current.generation == generation && current.profile == before.profile && core === native
+        }
+    }
+
+    suspend fun cloudLibrary(
+        scope: uniffi.harw_mobile_ffi.MobileCloudLibraryScope,
+        command: uniffi.harw_mobile_ffi.MobileCloudLibraryCommand,
+    ): uniffi.harw_mobile_ffi.MobileCloudLibraryReply {
+        val before = state.value
+        val native = core ?: throw MobileException.Disconnected()
+        if (localBackend || !before.online || before.generation == null) throw MobileException.Disconnected()
+        val result = native.cloudLibrary(scope, command)
+        val current = state.value
+        if (!current.online || current.generation != before.generation || current.profile != before.profile || core !== native) {
+            (result as? uniffi.harw_mobile_ffi.MobileCloudLibraryReply.Preview)?.jpeg?.fill(0)
+            if (command !is uniffi.harw_mobile_ffi.MobileCloudLibraryCommand.List &&
+                command !is uniffi.harw_mobile_ffi.MobileCloudLibraryCommand.Preview
+            ) throw MobileException.Ambiguous("Cloud Library connection changed during save")
+            throw MobileException.Disconnected()
+        }
+        return result
+    }
+
+    fun cloudLibraryCaptionAccess(
+        scope: uniffi.harw_mobile_ffi.MobileCloudLibraryScope,
+        revision: ULong,
+        assetId: String,
+    ): uniffi.harw_mobile_ffi.CloudLibraryCaptionAccess {
+        val native = core ?: throw MobileException.Disconnected()
+        if (localBackend || !state.value.online) throw MobileException.Disconnected()
+        return native.cloudLibraryCaptionAccess(scope, revision, assetId)
+    }
+
+    suspend fun cloudLibraryCaptionLocal(
+        access: uniffi.harw_mobile_ffi.CloudLibraryCaptionAccess,
+        device: HarwConnection,
+        choice: uniffi.harw_mobile_ffi.LocalVisionChoice,
+    ): uniffi.harw_mobile_ffi.CloudLibraryGeneratedCaption {
+        val native = core ?: throw MobileException.Disconnected()
+        val localNative = device.core ?: throw MobileException.Disconnected()
+        if (localBackend || !state.value.online || !device.localBackend || !device.state.value.online) {
+            throw MobileException.Disconnected()
+        }
+        return native.cloudLibraryCaptionLocal(access, localNative, choice)
+    }
+
+    suspend fun cloudLibraryCaptionApi(
+        access: uniffi.harw_mobile_ffi.CloudLibraryCaptionAccess,
+        provider: uniffi.harw_mobile_ffi.ProviderStore,
+        choice: uniffi.harw_mobile_ffi.ApiVisionChoice,
+    ): uniffi.harw_mobile_ffi.CloudLibraryGeneratedCaption {
+        val native = core ?: throw MobileException.Disconnected()
+        if (localBackend || !state.value.online) throw MobileException.Disconnected()
+        return native.cloudLibraryCaptionApi(access, provider, choice)
+    }
+
+    suspend fun saveCloudLibraryCaption(
+        caption: uniffi.harw_mobile_ffi.CloudLibraryGeneratedCaption,
+    ) {
+        val native = core ?: throw MobileException.Disconnected()
+        if (localBackend || !state.value.online) throw MobileException.Disconnected()
+        native.cloudLibrarySaveCaption(caption)
+    }
+
+    private fun archiveSourceKnown(current: WorkspaceState, sessionId: String, generation: Long): Boolean =
+        current.online && current.generation == generation &&
+            (current.windows[sessionId]?.generation == generation || current.sessions.any { it.sessionId == sessionId })
+
+    suspend fun archiveAttachment(sessionId: String): ArchiveAttachment? = archiveBinding(sessionId)?.attachment
+
+    /** Retain unresolved same-operation retries after the sheet, route, or Activity is closed. */
+    suspend fun archiveAccess(sessionId: String): ArchiveForkController? {
+        val active = archiveBinding(sessionId) ?: return null
+        if (archiveCore !== active.native) {
+            archiveControllers.clear()
+            archiveCore = active.native
+        }
+        val scope = active.attachment.scope
+        archiveControllers.keys.removeAll {
+            it.profileId != scope.profileId || it.serverId != scope.serverId || it.backend != scope.backend
+        }
+        val existing = archiveControllers[scope]
+        if (existing != null) return existing
+        if (archiveControllers.size >= ArchiveControllerLimit) {
+            val replaceable = archiveControllers.entries.firstOrNull { (_, controller) ->
+                val status = controller.state.value
+                !status.busy && !status.outcomeUnknown
+            }?.key ?: return null
+            archiveControllers.remove(replaceable)
+        }
+        val port = NativeArchiveForkPort(
+            binding = { archiveBinding(sessionId)?.takeIf { it.native === active.native } },
+            onCreated = { child ->
+                change { state ->
+                    state.copy(sessions = listOf(child) + state.sessions.filterNot { it.sessionId == child.sessionId })
+                }
+                // The host inherited and authorized the source project. No client-side reassign.
+                refreshSessions()
+                refreshProjectSessions()
+            },
+        )
+        return ArchiveForkController(scope, port).also { archiveControllers[scope] = it }
+    }
+
+    /** Normal Fork is based only on this exact attached displayed prefix, not the archive. */
+    suspend fun forkDisplayedSession(
+        sourceId: String,
+        generation: Long,
+        head: SessionCursor,
+        rows: List<uniffi.harw_mobile_ffi.TranscriptEntry>,
+    ): String {
+        val native = core ?: throw MobileException.Disconnected()
+        val current = state.value
+        if (generation != gate.generation || current.generation != generation || !current.online ||
+            current.windows[sourceId]?.generation != generation
+        ) throw MobileException.Disconnected()
+        if (!current.canCreate) throw IllegalStateException("Diese Verbindung darf keine neuen Chats anlegen.")
+        if (current.creating) throw IllegalStateException("Ein neuer Chat wird bereits angelegt.")
+        change { it.copy(creating = true, listError = null) }
+        try {
+            val child = withContext(Dispatchers.IO) {
+                native.forkDisplayedSession(sourceId, head, rows)
+            }
+            val after = state.value
+            if (child.sessionId == sourceId || child.sessionId.isBlank() || core !== native ||
+                gate.generation != generation || after.profile != current.profile
+            ) throw IllegalStateException("Der neue Chat konnte auf dieser Verbindung nicht bestätigt werden.")
+            change { state -> state.copy(sessions = listOf(child) +
+                state.sessions.filterNot { it.sessionId == child.sessionId }) }
+            refreshSessions()
+            refreshProjectSessions()
+            return child.sessionId
+        } finally {
+            if (core === native && gate.generation == generation) change { it.copy(creating = false) }
         }
     }
 
@@ -1695,19 +2332,37 @@ internal class HarwConnection(private val context: Context, private val localBac
         }
     }
 
-    fun submit(sessionId: String, generation: Long, attempt: DraftAttempt, result: (DraftResult) -> Unit): Boolean =
+    fun exactRewindAvailable(sessionId: String, generation: Long): Boolean {
+        val native = core ?: return false
+        val current = state.value
+        val window = current.windows[sessionId] ?: return false
+        val snapshot = window.snapshot ?: return false
+        return current.online && current.generation == generation && gate.generation == generation &&
+            window.generation == generation && snapshot.online && snapshot.canSubmit &&
+            snapshot.runningTurnId == null && native.supportsExactRewriteReceipts()
+    }
+
+    fun submit(
+        sessionId: String, generation: Long, attempt: DraftAttempt,
+        cloudLibraryScope: uniffi.harw_mobile_ffi.MobileCloudLibraryScope? = null,
+        result: (DraftResult) -> Unit,
+    ): Boolean =
         runAction(sessionId, generation, SessionActionKind.Send, failure = { error ->
             result(DraftResult.Rejected(error.displayMessage(), error is MobileException.Ambiguous))
         }) {
             val receipt = withContext(Dispatchers.IO) {
-                if (attempt.images.isEmpty() && attempt.rewindBefore == null) {
+                if (cloudLibraryScope != null) {
+                    it.submitCloudLibraryImages(cloudLibraryScope, sessionId, attempt.text, attempt.head, attempt.id, attempt.images)
+                } else if (attempt.images.isEmpty() && attempt.rewindBefore == null) {
                     it.submit(sessionId, attempt.text, attempt.head, attempt.id)
                 } else {
                     it.submitEdit(sessionId, attempt.text, attempt.head, attempt.id, attempt.images, attempt.rewindBefore)
                 }
             }
             val outcome = when (receipt.outcome) {
-                SubmitOutcome.ACCEPTED -> DraftResult.Accepted
+                SubmitOutcome.ACCEPTED -> receipt.replacementItemId
+                    ?.takeIf { attempt.rewindBefore != null && isDurableRewriteItemId(it) }
+                    ?.let { DraftResult.ExactAccepted(it) } ?: DraftResult.Accepted
                 SubmitOutcome.STALE -> DraftResult.Rejected("The session changed. Review the latest messages before sending again.")
                 SubmitOutcome.QUEUE_FULL -> DraftResult.Rejected(receipt.detail ?: "The server's queue is full.")
                 SubmitOutcome.DENIED -> DraftResult.Rejected(receipt.detail ?: "The server refused this prompt.")
@@ -1717,16 +2372,77 @@ internal class HarwConnection(private val context: Context, private val localBac
             result(outcome)
         }
 
-    /** Holt ein gespeichertes Prompt-Bild vom Host (Feature `media`); `null` bei jedem Fehler. */
-    suspend fun mediaThumbnail(sessionId: String, imageRef: String): uniffi.harw_mobile_ffi.PromptImage? {
-        val native = core ?: return null
-        return withContext(Dispatchers.IO) {
-            try {
-                native.mediaThumbnail(sessionId, imageRef)
-            } catch (_: Exception) {
-                null
-            }
+    suspend fun sessionMediaPreview(
+        expectedProfile: ServerProfile?,
+        expectedDevice: String?,
+        expectedGeneration: Long?,
+        expectedRewrite: UInt?,
+        sessionId: String,
+        itemId: String,
+        index: UInt,
+        expectedMedia: String,
+        mode: uniffi.harw_mobile_ffi.MobileMediaPreviewMode,
+    ): uniffi.harw_mobile_ffi.MobileMediaPreview {
+        val native = core ?: return uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
+        val generation = expectedGeneration ?: return uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
+        val rewrite = expectedRewrite ?: return uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
+        if (index >= 50u || expectedMedia.isEmpty() || !isDurableRewriteItemId(itemId)) {
+            return uniffi.harw_mobile_ffi.MobileMediaPreview.Unreadable
         }
+        fun stillAttached(): Boolean {
+            val current = state.value
+            val window = current.windows[sessionId] ?: return false
+            val snapshot = window.snapshot ?: return false
+            if (native !== core || !current.online || current.generation != generation ||
+                current.profile != expectedProfile || current.deviceNodeId != expectedDevice ||
+                window.generation != generation || window.answerReloadPending || !snapshot.online ||
+                snapshot.sessionId != sessionId || snapshot.head?.generation != rewrite
+            ) return false
+            // A per-row ordinal may only resolve the exact retained opaque
+            // reference projected into that authorized message, never a new slot.
+            val row = snapshot.transcript.singleOrNull { it.id == itemId } ?: return false
+            return row.kind == uniffi.harw_mobile_ffi.TranscriptKind.USER &&
+                row.images.getOrNull(index.toInt()) == expectedMedia
+        }
+        if (!stillAttached()) return uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
+        // This only captures a witness under the native state lock. It must
+        // happen before waiting on another dispatcher or issuing any RPC.
+        val pinned = try {
+            native.mediaPreviewScope(expectedProfile, sessionId)
+        } catch (_: MobileException.Denied) {
+            return uniffi.harw_mobile_ffi.MobileMediaPreview.Denied
+        } catch (_: MobileException.Revoked) {
+            return uniffi.harw_mobile_ffi.MobileMediaPreview.Denied
+        } catch (_: MobileException) {
+            return uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
+        }
+        try {
+            if (!stillAttached()) return uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
+            val result = withContext(Dispatchers.IO) { native.mediaPreview(pinned, itemId, index, mode) }
+            return if (stillAttached()) result else uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
+        } finally {
+            pinned.destroy()
+        }
+    }
+
+    suspend fun archiveMediaPreview(
+        expected: ArchiveAttachment,
+        checkpointId: String,
+        row: ArchiveRowLocator,
+        index: UInt,
+        mode: uniffi.harw_mobile_ffi.MobileMediaPreviewMode,
+    ): uniffi.harw_mobile_ffi.MobileMediaPreview {
+        val sessionId = expected.scope.sessionId
+        val active = archiveBinding(sessionId)?.takeIf { it.attachment == expected }
+            ?: return uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
+        val result = withContext(Dispatchers.IO) {
+            active.native.archiveMediaPreview(
+                active.scope, sessionId, checkpointId,
+                uniffi.harw_mobile_ffi.MobileArchiveRowLocator(row.sequence, row.itemId), index, mode,
+            )
+        }
+        return if (archiveBinding(sessionId) == active) result
+        else uniffi.harw_mobile_ffi.MobileMediaPreview.Offline
     }
 
     /** Setzt eine durch Neustart unterbrochene Session fort; `true` bei Erfolg. */
@@ -1740,6 +2456,134 @@ internal class HarwConnection(private val context: Context, private val localBac
                 false
             }
         }
+    }
+
+    suspend fun diagnostics(command: DiagnosticCommand): DiagnosticView? {
+        val native = core ?: return null
+        val view = withContext(Dispatchers.IO) {
+            when (command) {
+                DiagnosticCommand.Refresh -> Unit
+                DiagnosticCommand.Clear -> native.diagnosticsClear()
+                is DiagnosticCommand.Set -> native.diagnosticsSetLevel(command.domain, command.level)
+                is DiagnosticCommand.Trace -> native.diagnosticsEnableTrace(command.domain)
+            }
+            DiagnosticView(native.diagnosticsSnapshot(), uniffi.harw_mobile_ffi.Domain.entries.associateWith {
+                native.diagnosticsLevel(it)
+            })
+        }
+        return view.takeIf { core === native }
+    }
+
+    suspend fun apiImageEditChoices(): List<uniffi.harw_mobile_ffi.ApiImageEditChoice> {
+        if (!localBackend) return emptyList()
+        val native = core ?: return emptyList()
+        return withContext(Dispatchers.IO) { native.apiImageEditChoices() }
+    }
+
+    suspend fun prepareApiImageEdit(
+        choice: uniffi.harw_mobile_ffi.ApiImageEditChoice,
+        png: ByteArray,
+        instruction: String,
+    ): uniffi.harw_mobile_ffi.ApiImageEditDraft {
+        check(localBackend) { "Bildbearbeitung ist nicht im Cloud-Chat verfügbar" }
+        val native = core ?: error("Lokaler Host ist nicht verbunden")
+        // Caller owns the native preview handle and dispatches preparation off the UI thread.
+        return native.prepareApiImageEdit(choice, png, instruction)
+    }
+
+    suspend fun confirmApiImageEdit(
+        draft: uniffi.harw_mobile_ffi.ApiImageEditDraft,
+        explicitlySynchronous: Boolean,
+    ): uniffi.harw_mobile_ffi.ApiImageEditAsset {
+        check(localBackend) { "Bildbearbeitung ist nicht im Cloud-Chat verfügbar" }
+        val native = core ?: error("Lokaler Host ist nicht verbunden")
+        return withContext(Dispatchers.IO) { native.confirmApiImageEdit(draft, explicitlySynchronous) }
+    }
+
+    suspend fun apiVisionChoices(): List<uniffi.harw_mobile_ffi.ApiVisionChoice> {
+        if (!localBackend) return emptyList()
+        val native = core ?: return emptyList()
+        return withContext(Dispatchers.IO) { native.apiVisionChoices() }
+    }
+
+    suspend fun apiVisionDescribe(
+        choice: uniffi.harw_mobile_ffi.ApiVisionChoice,
+        image: uniffi.harw_mobile_ffi.PromptImage,
+    ): String {
+        check(localBackend) { "Keine lokale API-Bildroute verfügbar" }
+        val native = core ?: error("Lokaler Host ist nicht verbunden")
+        return native.apiVisionDescribe(choice, image)
+    }
+
+    suspend fun apiVisionObserve(
+        choice: uniffi.harw_mobile_ffi.ApiVisionChoice,
+        image: uniffi.harw_mobile_ffi.PromptImage,
+    ): uniffi.harw_mobile_ffi.ApiVisionObservation {
+        check(localBackend) { "Keine lokale API-Bildroute verfügbar" }
+        val native = core ?: error("Lokaler Host ist nicht verbunden")
+        return native.apiVisionObserve(choice, image)
+    }
+
+    suspend fun withAutoTitle(
+        expectedProfile: ServerProfile?,
+        expectedGeneration: Long,
+        sessionId: String,
+        generate: suspend (List<uniffi.harw_mobile_ffi.AutoTitleSeedPair>) -> String?,
+    ) {
+        val native = core ?: return
+        fun current(): Boolean = state.value.let {
+            core === native && it.online && it.profile == expectedProfile && it.generation == expectedGeneration &&
+                it.windows[sessionId]?.generation == expectedGeneration
+        }
+        if (!current()) return
+        // This native method only captures the current link and must stay before dispatch.
+        val access = native.autoTitleAccess(sessionId, expectedProfile) ?: return
+        try {
+            if (!current()) return
+            val pairs = withContext(Dispatchers.IO) { native.autoTitleSeed(access) } ?: return
+            if (!current()) return
+            val title = generate(pairs) ?: return
+            if (!current()) return
+            val outcome = withContext(Dispatchers.IO) { native.publishAutoTitle(access, title) }
+            if (current() && outcome == uniffi.harw_mobile_ffi.AutoTitlePublication.APPLIED) {
+                refreshSessions()
+                refreshProjectSessions()
+            }
+        } finally {
+            access.destroy()
+        }
+    }
+
+    suspend fun sessionTitleLocalModels(): List<uniffi.harw_mobile_ffi.SessionTitleLocalChoice> {
+        if (!localBackend) return emptyList()
+        val native = core ?: return emptyList()
+        return withContext(Dispatchers.IO) { native.sessionTitleLocalChoices() }
+    }
+
+    suspend fun generateLocalSessionTitle(
+        choice: uniffi.harw_mobile_ffi.SessionTitleLocalChoice,
+        pairs: List<uniffi.harw_mobile_ffi.SessionTitleTurn>,
+    ): String {
+        check(localBackend) { "Das gewählte Titelmodell ist nicht lokal geladen." }
+        val native = core ?: error("Das gewählte Titelmodell ist nicht lokal geladen.")
+        return withContext(Dispatchers.IO) { native.sessionTitleGenerateLocal(choice, pairs) }
+    }
+
+    suspend fun localVisionChoices(): List<uniffi.harw_mobile_ffi.LocalVisionChoice> {
+        check(localBackend) { "Kein lokales Modell verfügbar" }
+        val native = core ?: error("Lokaler Host ist nicht verbunden")
+        return withContext(Dispatchers.IO) { native.localVisionChoices() }
+    }
+
+    suspend fun localVisionDescribe(
+        choice: uniffi.harw_mobile_ffi.LocalVisionChoice,
+        images: List<uniffi.harw_mobile_ffi.LocalVisionImage>,
+        progress: uniffi.harw_mobile_ffi.LocalVisionProgress,
+    ) {
+        check(localBackend) { "Kein lokales Modell verfügbar" }
+        val native = core ?: error("Lokaler Host ist nicht verbunden")
+        // UniFFI serializes the bounded image payload before yielding to the Rust future.
+        withContext(Dispatchers.IO) { native.localVisionDescribe(choice, images, progress) }
     }
 
     suspend fun hybridVisionChoices(): List<uniffi.harw_mobile_ffi.HybridVisionChoice> {
@@ -1908,6 +2752,7 @@ internal class HarwConnection(private val context: Context, private val localBac
 
     internal fun networkAvailable() {
         val s = state.value
+        if (!s.canSetUp || (!localBackend && !routeChoiceEnabled(s.routePreference, s.profile))) return
         when (networkSignal(s.phase, s.stopping, s.forgetting, s.profile != null)) {
             NetworkSignal.None -> return
             NetworkSignal.Nudge -> {
@@ -2005,7 +2850,16 @@ internal class HarwConnection(private val context: Context, private val localBac
             }
             val previous = updates[id] ?: WindowState()
             updates[id] = if (snapshot != null) {
-                val keepStale = previous.preserveAnswerWhileReloading && !snapshot.online
+                // Native replay rebuilds from an authoritative snapshot. Hold the prior
+                // visible text (read-only) while that same observed session catches up;
+                // never concatenate its stale deltas with the replacement stream.
+                val prior = previous.snapshot
+                val keepStale = !snapshot.online && prior?.sessionId == snapshot.sessionId &&
+                    (previous.preserveAnswerWhileReloading ||
+                        (!prior?.liveText.isNullOrBlank() && snapshot.detail in setOf(
+                            "Attaching to session", "Reconnecting to the session stream",
+                            "Catching up with the server", "Synchronizing the session transcript",
+                        )))
                 val shown = if (keepStale) {
                     previous.snapshot?.copy(
                         online = false, canSubmit = false, canInterrupt = false, canApprove = false,
@@ -2044,6 +2898,7 @@ internal class HarwConnection(private val context: Context, private val localBac
         unwatchNetwork()
         if (state.value.phase == ConnectionPhase.REVOKED) return
         clearSessionActions()
+        clearArchiveAccess()
         change { it.invalidated() }
     }
 
@@ -2051,9 +2906,15 @@ internal class HarwConnection(private val context: Context, private val localBac
         unwatchNetwork()
         if (state.value.forgetting) return
         clearSessionActions()
+        clearArchiveAccess()
         setupJob?.cancel()
         change { it.forgetSetup() }
         purgeSetup()
+    }
+
+    private fun clearArchiveAccess() {
+        archiveControllers.clear()
+        archiveCore = null
     }
 
     private fun clearSessionActions() {
@@ -2069,17 +2930,13 @@ internal class HarwConnection(private val context: Context, private val localBac
         scope.launch {
             // Setup erasure can only wait on local storage writes before erasing the
             // identity. Native RPCs and Android document providers can finish later.
-            val storageFailed = try {
+            val storageFailed = setupRemovalFailed {
                 withContext(Dispatchers.IO) {
                     storageLock.withLock {
                         store.purgeSetup()
                         if (!routePrefs.edit().clear().commit()) error("route preference not cleared")
                     }
                 }
-                false
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                true
             }
             setupJob?.cancelAndJoin()
             connectJob?.join()
@@ -2089,12 +2946,13 @@ internal class HarwConnection(private val context: Context, private val localBac
             accountJob?.cancelAndJoin()
             commands.coroutineContext[Job]?.children?.toList()?.joinAll()
             val native = coreLock.withLock { core.also { core = null } }
-            val disposalFailed = try {
-                withContext(Dispatchers.IO) { native?.let { it.clearListener(); it.destroy() } }
-                false
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                true
+            val disposalFailed = setupRemovalFailed {
+                withContext(Dispatchers.IO) {
+                    native?.let {
+                        it.clearListener()
+                        it.destroy()
+                    }
+                }
             }
             if (storageFailed || disposalFailed) {
                 change {
@@ -2115,6 +2973,14 @@ internal class HarwConnection(private val context: Context, private val localBac
                 }
             }
         }
+    }
+
+    private suspend fun setupRemovalFailed(remove: suspend () -> Unit): Boolean = try {
+        remove()
+        false
+    } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        true
     }
 
     private fun closeGate() {
@@ -2177,13 +3043,18 @@ internal class HarwConnection(private val context: Context, private val localBac
         const val AdminPrefsName = "harw_admin_enroll"
         const val AdminPrefReq = "req"
         const val AdminPrefAt = "started_at_ms"
+        const val AdminPrefDeadline = "callback_deadline_ms"
         const val AdminPrefBase = "base_url"
         const val LogTag = "HarwConnection"
-        const val OnionLocatorKey = "gateway.onion_locator"
         const val RoutePrefsName = "harw_connection"
-        const val RoutePrefKey = "route_preference"
         const val ChatgptUnlinkWarning = "The server removed its local ChatGPT link. Revocation at OpenAI was not confirmed. Review the agent in ChatGPT Settings."
     }
+}
+
+internal fun displayedForkFailure(error: Throwable): String = when (error) {
+    is MobileException.Disconnected, is MobileException.Ambiguous, is MobileException.Transport ->
+        "Verbindung unterbrochen. Öffne nach dem Wiederverbinden denselben Fork, um das Ergebnis zu prüfen."
+    else -> error.displayMessage()
 }
 
 private fun Throwable.displayMessage(): String = when (this) {

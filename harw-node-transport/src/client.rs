@@ -19,9 +19,10 @@ use tokio_rustls::TlsConnector;
 use crate::error::TransportError;
 use crate::handshake::{
     AuthenticatedPeer, CHANNEL_BINDING_LEN, ClientFinish, ClientHandshake, HandshakePolicy,
-    ServerHello, decode_server_accept, now_unix_ms,
+    Role, ServerHello, decode_server_accept, now_unix_ms,
 };
 use crate::identity::{LocalNode, NodeVerifier};
+use crate::owner_process_channel::{LiveOwnerProcessChannel, OwnerProcessChannelBinding};
 use crate::server::random_nonce;
 use crate::tls;
 use crate::wire::{read_frame, write_frame};
@@ -64,7 +65,14 @@ harw_types::limits_struct! {
 pub struct NodeTransportClient {
     sender: SendRequest<NodeBody>,
     peer: AuthenticatedPeer,
+    owner_process_channel: OwnerProcessChannelBinding,
     connection: JoinHandle<()>,
+}
+
+struct ConnectedNode<I> {
+    peer: AuthenticatedPeer,
+    peer_key_fingerprint: Option<[u8; 32]>,
+    stream: tokio_rustls::client::TlsStream<I>,
 }
 
 impl NodeTransportClient {
@@ -107,10 +115,10 @@ impl NodeTransportClient {
             let _ = tcp.set_nodelay(true);
             Self::secure(tcp, local, expected_peer, verifier, &options.policy).await
         };
-        let (peer, stream) = tokio::time::timeout(options.handshake_timeout, work)
+        let connected = tokio::time::timeout(options.handshake_timeout, work)
             .await
             .map_err(|_| TransportError::HandshakeTimeout)??;
-        Self::finish(peer, stream).await
+        Self::finish(connected).await
     }
 
     /// Authenticates over an already established byte stream `io`, expecting
@@ -134,13 +142,13 @@ impl NodeTransportClient {
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (peer, stream) = tokio::time::timeout(
+        let connected = tokio::time::timeout(
             options.handshake_timeout,
             Self::secure(io, local, expected_peer, verifier, &options.policy),
         )
         .await
         .map_err(|_| TransportError::HandshakeTimeout)??;
-        Self::finish(peer, stream).await
+        Self::finish(connected).await
     }
 
     async fn secure<I>(
@@ -149,28 +157,31 @@ impl NodeTransportClient {
         expected_peer: &harw_types::NodeId,
         verifier: &dyn NodeVerifier,
         policy: &HandshakePolicy,
-    ) -> Result<(AuthenticatedPeer, tokio_rustls::client::TlsStream<I>), TransportError>
+    ) -> Result<ConnectedNode<I>, TransportError>
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let connector = TlsConnector::from(tls::client_config()?);
         let mut stream = connector.connect(tls::server_name()?, io).await?;
         let binding = tls::client_channel_binding(stream.get_ref().1)?;
-        let peer =
+        let (peer, peer_key_fingerprint) =
             client_handshake(&mut stream, binding, local, expected_peer, verifier, policy).await?;
-        Ok((peer, stream))
+        Ok(ConnectedNode { peer, peer_key_fingerprint, stream })
     }
 
-    async fn finish<I>(
-        peer: AuthenticatedPeer,
-        stream: tokio_rustls::client::TlsStream<I>,
-    ) -> Result<Self, TransportError>
+    async fn finish<I>(connected: ConnectedNode<I>) -> Result<Self, TransportError>
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Only the successful node handshake can reach this method.
+        let ConnectedNode { peer, peer_key_fingerprint, stream } = connected;
+        let exporter = tls::client_owner_process_exporter(stream.get_ref().1)?;
         let (sender, connection) =
             hyper::client::conn::http1::handshake::<_, NodeBody>(TokioIo::new(stream)).await?;
+        let (live_channel, owner_process_channel) =
+            LiveOwnerProcessChannel::new(peer.clone(), exporter, Role::Client, peer_key_fingerprint);
         let connection = tokio::spawn(async move {
+            let _live_channel = live_channel;
             // `with_upgrades` is inert unless a request asks for an upgrade
             // ([`NodeTransportClient::upgrade`]); plain requests behave as before.
             if let Err(err) = connection.with_upgrades().await {
@@ -180,6 +191,7 @@ impl NodeTransportClient {
         Ok(Self {
             sender,
             peer,
+            owner_process_channel,
             connection,
         })
     }
@@ -188,6 +200,15 @@ impl NodeTransportClient {
     #[must_use]
     pub fn peer(&self) -> &AuthenticatedPeer {
         &self.peer
+    }
+
+    /// A process-proof witness scoped to this exact authenticated HTTP
+    /// connection, only with a sealed verifying-key witness. It expires on
+    /// close and does not follow upgraded raw I/O.
+    #[must_use]
+    pub fn owner_process_channel_binding(&self) -> Option<OwnerProcessChannelBinding> {
+        let binding = &self.owner_process_channel;
+        binding.verified_peer_key_fingerprint().map(|_| binding.clone())
     }
 
     /// Sends `request` and hands back the response plus the authenticated
@@ -218,6 +239,7 @@ impl NodeTransportClient {
 
 impl Drop for NodeTransportClient {
     fn drop(&mut self) {
+        self.owner_process_channel.revoke();
         self.connection.abort();
     }
 }
@@ -229,7 +251,7 @@ async fn client_handshake<S>(
     expected_peer: &harw_types::NodeId,
     verifier: &dyn NodeVerifier,
     policy: &HandshakePolicy,
-) -> Result<AuthenticatedPeer, TransportError>
+) -> Result<(AuthenticatedPeer, Option<[u8; 32]>), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -241,10 +263,11 @@ where
     );
     write_frame(stream, &hello.encode()).await?;
     let server_hello = ServerHello::decode(&read_frame(stream).await?)?;
-    let pending =
-        handshake.on_server_hello(&server_hello, binding, verifier, policy, now_unix_ms())?;
+    let (pending, peer_key_fingerprint) = handshake.on_server_hello_with_key_fingerprint(
+        &server_hello, binding, verifier, policy, now_unix_ms(),
+    )?;
     let signature = local.signer.sign(&pending.signing_payload()).await?;
     write_frame(stream, &ClientFinish { signature }.encode()).await?;
     decode_server_accept(&read_frame(stream).await?)?;
-    Ok(pending.peer())
+    Ok((pending.peer(), peer_key_fingerprint))
 }

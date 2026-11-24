@@ -174,6 +174,12 @@ pub struct AnthropicMessagesProvider {
 }
 
 impl AnthropicMessagesProvider {
+    pub(crate) fn force_single_dispatch(&mut self) -> crate::HttpProviderResult<()> {
+        self.client = super::one_shot_http_client()?;
+        self.credential_pool = None;
+        Ok(())
+    }
+
     /// Baut einen Provider aus einer bereits zusammengesetzten Endpoint-URL.
     ///
     /// # Arguments
@@ -1259,11 +1265,27 @@ impl AnthropicMessagesProvider {
             && let Some(sink) = stream_sink
         {
             let mut accumulator = crate::sse::AnthropicStreamAccumulator::default();
-            crate::sse::read_sse(response, Some(self.stream_idle_timeout), |frame| {
+            let body_read = crate::sse::read_sse(response, Some(self.stream_idle_timeout), |frame| {
                 accumulator.push(&frame, Some(sink))
             })
-            .await?;
-            let value = accumulator.finish()?;
+            .await;
+            let outcome = match body_read {
+                Ok(()) => accumulator.finish()?,
+                // No automatic transport retry after a prefix was displayed.
+                Err(ModelError::Truncated { .. } | ModelError::Timeout { .. })
+                    if accumulator.has_confirmed_end_or_text() =>
+                {
+                    accumulator.finish_after_transport_error()?
+                }
+                Err(error) => return Err(error),
+            };
+            let value = match outcome {
+                crate::sse::NativeStreamOutcome::Completed(body) => body,
+                crate::sse::NativeStreamOutcome::Interrupted(partial) => {
+                    budget_permit.reconcile(&partial.usage);
+                    return Ok(partial); // Never write an unconfirmed turn into replay.
+                }
+            };
             let response = self.interpret_body(&request, model, &value)?;
             if !matches!(response.stop, StopReason::Refusal { .. }) {
                 crate::replay_bounds::remember_or_warn(
@@ -1397,7 +1419,9 @@ impl AnthropicMessagesProvider {
                 ..call
             })
             .collect::<Vec<_>>();
-        if text.is_none() && tool_calls.is_empty() {
+        // An explicit output limit is meaningful even if the entire budget
+        // was consumed by reasoning and no assistant text was emitted.
+        if text.is_none() && tool_calls.is_empty() && stop != StopReason::MaxTokens {
             return Err(ModelError::EmptyResponse);
         }
 
@@ -3161,6 +3185,78 @@ mod tests {
             peak.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENCY,
             "observed more than {MAX_CONCURRENCY} requests in flight simultaneously"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn respond_preserves_partial_anthropic_stream_without_fabricating_a_limit() -> TestResult {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        for (explicit_limit, transport_error, expected) in [
+            (false, false, StopReason::StreamInterrupted),
+            (false, true, StopReason::StreamTransportInterrupted),
+            (true, false, StopReason::MaxTokens),
+            (true, true, StopReason::MaxTokens),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind SSE fixture"))?;
+            let url = format!(
+                "http://{}/v1/messages",
+                listener.local_addr().map_err(ctx("SSE fixture address"))?
+            );
+            let server = thread::spawn(move || -> TestResult<()> {
+                let (mut stream, _) = listener.accept().map_err(ctx("accept SSE request"))?;
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).map_err(ctx("read SSE request"))?;
+                let start = serde_json::json!({
+                    "type":"message_start", "message":{"stop_reason":null,"usage":{"input_tokens":7}}
+                });
+                let text = serde_json::json!({
+                    "type":"content_block_start", "index":0, "content_block":{"type":"text","text":""}
+                });
+                let delta = serde_json::json!({
+                    "type":"content_block_delta", "index":0, "delta":{"type":"text_delta","text":"visible prefix"}
+                });
+                let mut body = format!("data: {start}\n\ndata: {text}\n\ndata: {delta}\n\n");
+                if explicit_limit {
+                    let stop_block = serde_json::json!({"type":"content_block_stop","index":0});
+                    let stop = serde_json::json!({
+                        "type":"message_delta","delta":{"stop_reason":"max_tokens"},
+                        "usage":{"output_tokens":8}
+                    });
+                    body.push_str(&format!("data: {stop_block}\n\ndata: {stop}\n\n"));
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len() + if transport_error { 1 } else { 0 },
+                )
+                .map_err(ctx("write SSE response"))?;
+                Ok(())
+            });
+            let provider = AnthropicMessagesProvider::new(
+                url,
+                "configured-model",
+                AnthropicCredential::ApiKey(SecretString::new("fixture".into())),
+            )
+            .map_err(ctx("construct SSE fixture provider"))?;
+            let mut request = request_with_ids(None, None);
+            request.stream = Some(harw_core::StreamSink::new(|_| {}));
+            let response = provider
+                .respond(request)
+                .await
+                .map_err(ctx("classify Anthropic SSE finish"))?;
+            server
+                .join()
+                .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
+            assert_eq!(response.stop, expected);
+            assert_eq!(response.message.as_deref(), Some("visible prefix"));
+            assert_eq!(response.usage.input_tokens, 7);
+            assert_eq!(response.usage.output_tokens, if explicit_limit { 8 } else { 0 });
+            assert!(response.tool_calls.is_empty());
+            assert!(response.reasoning.is_none());
+        }
         Ok(())
     }
 

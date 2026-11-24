@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_title_heading">Automatic chat titles</string>
+    <string name="chat_title_purpose">For local and Cloud chats you open in the app. The model receives the first three complete message pairs, without images or the rest of the conversation. Titles you set stay unchanged.</string>
+    <string name="chat_title_load_failed">Could not load the model list.</string>
+    <string name="chat_title_loading">Loading models…</string>
+    <string name="chat_title_on">On</string>
+    <string name="chat_title_off">Off</string>
+    <string name="chat_title_pick_provider">Choose a provider or Local</string>
+    <string name="chat_title_pick_model">Choose a title model</string>
+    <string name="chat_title_selected_missing">The saved model is unavailable. Harw will not switch automatically.</string>
+    <string name="chat_title_allow_loaded">Use the loaded local model as an alternative</string>
+    <string name="chat_title_preferred_unloaded">The preferred model is not loaded. Harw will not switch the chat model.</string>
+    <string name="chat_title_empty_catalog">Load a local model or configure a text provider.</string>
+    <string name="chat_title_refresh">Refresh model list</string>
+    <string name="chat_title_fallback_heading">API fallback for local titles</string>
+    <string name="chat_title_pick_fallback">Choose an API fallback</string>
+    <string name="chat_title_no_fallback">No API fallback</string>
+    <string name="chat_title_fallback_missing">The saved API fallback is unavailable.</string>
+    <string name="chat_title_fallback_consent">This provider is contacted only after you confirm in the relevant chat.</string>
+    <string name="chat_title_provider_consent">Turning this on allows these text excerpts to be sent to %1$s. Harw will not switch providers automatically.</string>
+    <string name="chat_title_can_use_loaded">Harw can currently use %1$s without switching the chat model.</string>
+    <string name="chat_title_provider_local">Local on this device</string>
+    <string name="chat_title_provider_linked">ChatGPT account · %1$s</string>
+</resources>

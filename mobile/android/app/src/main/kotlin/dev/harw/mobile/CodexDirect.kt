@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
@@ -75,35 +76,43 @@ private suspend fun waitForCodexCallback(port: Int, path: String, openBrowser: s
                 } catch (_: SocketTimeoutException) {
                     continue
                 }
-                socket.use {
-                    socket.soTimeout = 1_500
-                    val target = runCatching {
-                        val line = socket.getInputStream().bufferedReader(Charsets.US_ASCII).readLine().orEmpty()
-                        val parts = line.split(' ')
-                        if (parts.size == 3 && parts[0] == "GET" && parts[1].substringBefore('?') == path) parts[1] else null
-                    }.getOrNull()
-                    val message = if (target != null) {
-                        "Zurück zu harw, um die Codex-Anmeldung abzuschließen."
-                    } else {
-                        "Diese Anfrage gehört nicht zur harw-Anmeldung."
-                    }
-                    val body = "<!doctype html><meta charset=utf-8><title>harw</title><p>$message</p>".encodeToByteArray()
-                    val head = "HTTP/1.1 ${if (target != null) "200 OK" else "404 Not Found"}\r\n" +
-                        "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n" +
-                        "Referrer-Policy: no-referrer\r\nConnection: close\r\nContent-Length: ${body.size}\r\n\r\n"
-                    runCatching {
-                        socket.getOutputStream().apply {
-                            write(head.encodeToByteArray())
-                            write(body)
-                            flush()
-                        }
-                    }
-                    if (target != null) return@withContext target
-                }
+                val target = socket.use { handleCodexCallback(it, path) }
+                if (target != null) return@withContext target
             }
             throw MobileException.Denied("Die Codex-Anmeldung ist abgelaufen. Starte sie erneut.")
         }
     }
+
+private fun handleCodexCallback(socket: Socket, path: String): String? {
+    socket.soTimeout = 1_500
+    val target = runCatching {
+        val line = socket.getInputStream().bufferedReader(Charsets.US_ASCII).readLine().orEmpty()
+        val parts = line.split(' ')
+        parts.takeIf { it.size == 3 && it[0] == "GET" && it[1].substringBefore('?') == path }
+            ?.get(1)
+    }.getOrNull()
+    respondToCodexCallback(socket, target != null)
+    return target
+}
+
+private fun respondToCodexCallback(socket: Socket, accepted: Boolean) {
+    val message = if (accepted) {
+        "Zurück zu harw, um die Codex-Anmeldung abzuschließen."
+    } else {
+        "Diese Anfrage gehört nicht zur harw-Anmeldung."
+    }
+    val body = "<!doctype html><meta charset=utf-8><title>harw</title><p>$message</p>".encodeToByteArray()
+    val head = "HTTP/1.1 ${if (accepted) "200 OK" else "404 Not Found"}\r\n" +
+        "Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n" +
+        "Referrer-Policy: no-referrer\r\nConnection: close\r\nContent-Length: ${body.size}\r\n\r\n"
+    runCatching {
+        socket.getOutputStream().apply {
+            write(head.encodeToByteArray())
+            write(body)
+            flush()
+        }
+    }
+}
 
 /**
  * "Codex" im Standalone-Modus: Anmeldung mit dem ChatGPT-/Codex-Abo auf dem Telefon, Modellwahl und

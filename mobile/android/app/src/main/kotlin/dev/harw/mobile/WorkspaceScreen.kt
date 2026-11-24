@@ -41,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -48,8 +49,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ConnectionPhase
@@ -76,9 +80,12 @@ internal fun WorkspaceScreen(
     projectView: ProjectSessionsState? = null,
     projectActions: ProjectSessionsActions? = null,
     onSwitchBackend: (Boolean) -> Unit = {},
+    modifier: Modifier = Modifier,
 ) {
     val sessionId = window.sessionId
     val session = state.sessions.firstOrNull { it.sessionId == sessionId }
+    var agentVersion by remember(connection, state.profile, sessionId) { mutableIntStateOf(0) }
+    val archiveMenu = remember(connection, state.profile, sessionId) { ChatArchiveMenuEntry() }
     val conversationState = rememberSaveableStateHolder()
     var creating by rememberSaveable { mutableStateOf(false) }
     if (creating) {
@@ -92,22 +99,22 @@ internal fun WorkspaceScreen(
         )
     }
 
-    BoxWithConstraints(Modifier.fillMaxSize()) {
+    BoxWithConstraints(modifier.fillMaxSize()) {
         val split = maxWidth >= 650.dp
         val separateActivity = maxWidth >= 820.dp && sessionId != null
         val roomy = maxWidth >= 985.dp
         Column(Modifier.fillMaxSize()) {
             HarwHeader(
-                title = session?.displayName() ?: sessionId?.let { "Session ${it.take(8)}" } ?: "Sessions",
+                title = session?.displayName() ?: sessionId?.let { "Session ${it.take(8)}" } ?: stringResource(R.string.workspace_title),
                 onBack = if (sessionId != null && !split) ({ window.select(null) }) else null,
             ) {
-                ConnectionBadge(state)
-                if (sessionId != null) {
-                    IconButton(onClick = { onNewWindow(sessionId) }) {
-                        Icon(Icons.Outlined.OpenInNew, "Session in neuem Fenster öffnen")
-                    }
+                if (sessionId == null) {
+                    ConnectionBadge(state)
+                } else {
+                    ChatRouteBadge(state)
+                    SessionChatSettings(state, window, sessionId, session, connection, agentVersion, archiveMenu) { agentVersion++ }
+                    IconButton(onClick = onOpenSettings) { Icon(Icons.Outlined.Settings, "Einstellungen") }
                 }
-                IconButton(onClick = onOpenSettings) { Icon(Icons.Outlined.Settings, "Verbindungseinstellungen") }
             }
             Row(Modifier.fillMaxSize()) {
                 if ((split || sessionId == null) && projectView != null && projectActions != null) {
@@ -141,7 +148,10 @@ internal fun WorkspaceScreen(
                 }
                 if (split) VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 if (sessionId != null) {
-                    conversationState.SaveableStateProvider(sessionId) {
+                    val alertScope = window.alertTarget?.scope
+                    val conversationKey = if (alertScope == null) sessionId
+                    else "alert:${alertScope.backend.name}:${alertScope.profileId}:$sessionId"
+                    conversationState.SaveableStateProvider(conversationKey) {
                         SessionConversation(
                             state = state,
                             window = window,
@@ -150,7 +160,8 @@ internal fun WorkspaceScreen(
                             connection = connection,
                             authorizingApproval = authorizingApproval,
                             onDecide = onDecide,
-                            inlineActivity = !separateActivity,
+                            archiveMenu = archiveMenu,
+                            agentVersion = agentVersion,
                             modifier = Modifier.weight(1f).fillMaxHeight(),
                         )
                     }
@@ -192,50 +203,26 @@ private fun SessionDirectory(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                if (narrow) "Sessions" else if (state.local) "Lokal" else state.profile?.label ?: "Sessions",
+                if (narrow) stringResource(R.string.workspace_title) else if (state.local) stringResource(R.string.directory_local) else state.profile?.label ?: stringResource(R.string.workspace_title),
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            IconButton(onClick = onRefresh, enabled = state.online) { Icon(Icons.Outlined.Refresh, "Sessions aktualisieren") }
+            IconButton(onClick = onRefresh, enabled = state.online) { Icon(Icons.Outlined.Refresh, stringResource(R.string.workspace_refresh_sessions)) }
             val canCreate = state.online && state.canCreate && !state.creating
             val newIcon: @Composable () -> Unit = {
                 if (state.creating) {
                     CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
                 } else {
-                    Icon(Icons.Outlined.Add, contentDescription = if (narrow) "Neue Session" else null, Modifier.size(18.dp))
+                    Icon(Icons.Outlined.Add, contentDescription = if (narrow) stringResource(R.string.directory_new_session) else null, Modifier.size(18.dp))
                 }
             }
             if (narrow) FilledIconButton(onClick = onNew, enabled = canCreate, content = newIcon)
         }
         if (state.sessions.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(inset), contentAlignment = Alignment.Center) {
-                when {
-                    state.online && !state.sessionsLoaded && state.listError == null -> Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                        Text(
-                            "Sessions werden geladen …",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    }
-                    state.listError != null -> Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        StatusMessage("Sessions konnten nicht geladen werden: ${state.listError}", error = true)
-                        if (state.online) TextButton(onClick = onRefresh) { Text("Erneut versuchen") }
-                    }
-                    !state.online -> DirectoryEmpty(offlineMessage(state, hasSessions = false))
-                    state.canCreate -> DirectoryEmpty("Noch keine Sessions. Mit „Neu“ startest du eine.")
-                    else -> DirectoryEmpty("Für dieses Gerät sind keine Sessions sichtbar.")
-                }
-            }
+            EmptySessionDirectory(state, inset, onRefresh)
         } else {
             LazyColumn(
                 contentPadding = PaddingValues(start = inset, end = inset, top = 9.dp, bottom = 14.dp),
@@ -245,10 +232,10 @@ private fun SessionDirectory(
                     item { StatusMessage(offlineMessage(state, hasSessions = true), error = state.phase.isFailure()) }
                 }
                 state.listError?.let { message ->
-                    item { StatusMessage("Sessions konnten nicht aktualisiert werden: $message", error = true) }
+                    item { StatusMessage(stringResource(R.string.workspace_session_refresh_error, message), error = true) }
                 }
                 if (state.online && !state.canCreate) {
-                    item { StatusMessage("Dieses Gerät darf keine Sessions anlegen.") }
+                    item { StatusMessage(stringResource(R.string.directory_create_denied)) }
                 }
                 items(state.sessions, key = { it.sessionId }) { session ->
                     SessionRow(
@@ -259,6 +246,35 @@ private fun SessionDirectory(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun EmptySessionDirectory(state: WorkspaceState, inset: Dp, onRefresh: () -> Unit) {
+    Box(Modifier.fillMaxSize().padding(inset), contentAlignment = Alignment.Center) {
+        when {
+            state.online && !state.sessionsLoaded && state.listError == null -> Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                Text(
+                    stringResource(R.string.workspace_session_loading),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            state.listError != null -> Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                StatusMessage(stringResource(R.string.workspace_session_load_error, state.listError.orEmpty()), error = true)
+                if (state.online) TextButton(onClick = onRefresh) { Text(stringResource(R.string.directory_retry)) }
+            }
+            !state.online -> DirectoryEmpty(offlineMessage(state, hasSessions = false))
+            state.canCreate -> DirectoryEmpty(stringResource(R.string.workspace_sessions_empty))
+            else -> DirectoryEmpty(stringResource(R.string.workspace_no_sessions_visible))
         }
     }
 }
@@ -287,13 +303,13 @@ private fun SessionRow(
                     session.displayName(), style = MaterialTheme.typography.titleSmall,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
-                val detail = listOfNotNull(session.state.displayName(), session.model?.takeUnless { it.isBlank() })
+                val detail = listOfNotNull(stringResource(homeStateLabel(session.state)), session.model?.takeUnless { it.isBlank() })
                     .joinToString(" · ")
                 Text(detail, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (onNewWindow != null) {
                 IconButton(onClick = onNewWindow) {
-                    Icon(Icons.Outlined.OpenInNew, "${session.displayName()} in neuem Fenster öffnen", Modifier.size(19.dp))
+                    Icon(Icons.Outlined.OpenInNew, stringResource(R.string.workspace_open_session_window, session.displayName()), Modifier.size(19.dp))
                 }
             }
         }
@@ -317,18 +333,18 @@ private fun NewSessionDialog(enabled: Boolean, onDismiss: () -> Unit, onCreate: 
     var title by rememberSaveable { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Neue Session") },
+        title = { Text(stringResource(R.string.directory_new_session)) },
         text = {
             OutlinedTextField(
                 value = title, onValueChange = { title = it },
-                label = { Text("Titel (optional)") },
+                label = { Text(stringResource(R.string.workspace_optional_title)) },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
             )
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.directory_cancel)) } },
         confirmButton = {
-            Button(onClick = { onCreate(title.trim().ifBlank { null }) }, enabled = enabled) { Text("Anlegen") }
+            Button(onClick = { onCreate(title.trim().ifBlank { null }) }, enabled = enabled) { Text(stringResource(R.string.directory_create)) }
         },
     )
 }
@@ -336,20 +352,18 @@ private fun NewSessionDialog(enabled: Boolean, onDismiss: () -> Unit, onCreate: 
 private fun ConnectionPhase.isFailure(): Boolean =
     this == ConnectionPhase.FAILED || this == ConnectionPhase.REVOKED
 
+@Composable
 private fun offlineMessage(state: WorkspaceState, hasSessions: Boolean): String {
-    val base = when {
-        state.stopping -> "Verbindung wird getrennt …"
-        else -> when (state.phase) {
-            ConnectionPhase.CONNECTING -> "Verbinde mit dem Server …"
-            ConnectionPhase.RECONNECTING -> "Verbindung verloren. Verbinde erneut …"
-            ConnectionPhase.FAILED -> "Verbindung fehlgeschlagen."
-            ConnectionPhase.REVOKED -> "Der Zugriff auf diesen Server wurde beendet."
-            ConnectionPhase.DISCONNECTED, ConnectionPhase.CONNECTED -> "Offline."
-        }
+    val base = if (state.stopping) R.string.workspace_disconnecting else when (state.phase) {
+        ConnectionPhase.CONNECTING -> R.string.workspace_connecting
+        ConnectionPhase.RECONNECTING -> R.string.workspace_reconnecting
+        ConnectionPhase.FAILED -> R.string.workspace_connection_failed
+        ConnectionPhase.REVOKED -> R.string.workspace_connection_revoked
+        ConnectionPhase.DISCONNECTED, ConnectionPhase.CONNECTED -> R.string.workspace_connection_offline
     }
     val detail = state.detail?.takeUnless { it.isBlank() }
-    val tail = if (hasSessions) "Zeige die zuletzt geladenen Sessions." else "Verbinde dich, um Sessions zu laden."
-    return listOfNotNull(base, detail, tail).joinToString(" ")
+    val tail = if (hasSessions) R.string.workspace_sessions_cached else R.string.workspace_connect_to_load
+    return listOfNotNull(stringResource(base), detail, stringResource(tail)).joinToString(" ")
 }
 
 internal fun MobileSession.displayName(): String = title?.takeUnless { it.isBlank() } ?: "Session ${sessionId.take(8)}"
@@ -385,10 +399,13 @@ internal data class ProjectSessionsState(
 
 internal data class ProjectSessionSection(val heading: String?, val rows: List<MobileSessionRow>)
 
-internal fun projectSessionSections(view: ProjectSessionsState): List<ProjectSessionSection> = when {
+internal fun projectSessionSections(
+    view: ProjectSessionsState,
+    monthTitle: (String?) -> String = ::monthHeading,
+): List<ProjectSessionSection> = when {
     view.rows.isEmpty() -> emptyList()
     view.projectKey == NoProjectKey ->
-        groupByMonth(view.rows, { it.updatedAt }).map { (key, rows) -> ProjectSessionSection(monthHeading(key), rows) }
+        groupByMonth(view.rows, { it.updatedAt }).map { (key, rows) -> ProjectSessionSection(monthTitle(key), rows) }
     else -> listOf(ProjectSessionSection(null, view.rows))
 }
 
@@ -445,18 +462,57 @@ internal fun MobileReadOnlyReason.label(): String = when (this) {
     MobileReadOnlyReason.UNKNOWN -> "Nur lesen"
 }
 
+private fun OwnerMark.workspaceLabel(): Int = when (this) {
+    OwnerMark.RUNNING_ON_GATEWAY -> R.string.workspace_gateway_running
+    OwnerMark.HELD_BY_TERMINAL -> R.string.workspace_terminal_held
+    OwnerMark.HELD_BY_JOB -> R.string.workspace_job_held
+    OwnerMark.HELD -> R.string.workspace_held
+    OwnerMark.LAST_PHONE -> R.string.workspace_last_phone
+    OwnerMark.LAST_TERMINAL -> R.string.workspace_last_terminal
+}
+
+private fun MobileTier.workspaceLabel(): Int = when (this) {
+    MobileTier.OBSERVER -> R.string.workspace_observer
+    MobileTier.OPERATOR -> R.string.workspace_operator
+    MobileTier.MAINTAINER -> R.string.workspace_maintainer
+    MobileTier.OWNER -> R.string.workspace_owner
+}
+
+private fun MobileReadOnlyReason.workspaceLabel(): Int = when (this) {
+    MobileReadOnlyReason.SHARE_READ_ONLY -> R.string.workspace_share_read_only
+    MobileReadOnlyReason.FOREIGN_ORIGIN -> R.string.workspace_foreign_origin
+    MobileReadOnlyReason.NO_WORKDIR -> R.string.workspace_no_workdir
+    MobileReadOnlyReason.NO_STEER -> R.string.workspace_no_write_permission
+    MobileReadOnlyReason.CLOSED -> R.string.workspace_closed
+    MobileReadOnlyReason.UNKNOWN -> R.string.workspace_read_only
+}
+
 internal fun MobileSessionRow.displayTitle(): String =
-    title?.takeUnless { it.isBlank() } ?: firstMessage?.takeUnless { it.isBlank() }?.take(60) ?: "Session ${sessionId.take(8)}"
+    title?.takeUnless { it.isBlank() } ?: "Session ${sessionId.take(8)}"
 
 /** Leer-Text der Projektansicht; null, wenn Zeilen vorhanden sind. */
-internal fun projectEmptyText(view: ProjectSessionsState, canCreate: Boolean): String? {
+internal fun projectEmptyText(
+    view: ProjectSessionsState,
+    canCreate: Boolean,
+    localized: (resource: Int, substitute: String?, fallback: String) -> String = { _, _, fallback -> fallback },
+): String? {
     if (view.rows.isNotEmpty()) return null
     return when {
-        view.query.isNotBlank() -> "Keine Treffer für \u201E${view.query.trim()}\u201C."
-        view.share?.mode == MobileShareMode.OFF && !view.legacy -> "Dieses Gateway teilt keine TUI-Sessions."
-        view.legacy -> "Dieser Server kennt keine Projekte. Es werden nur Handy-Sessions angezeigt."
-        canCreate -> "In diesem Projekt gibt es noch keine Sessions. Mit + startest du eine."
-        else -> "In diesem Projekt sind für dieses Gerät keine Sessions sichtbar."
+        view.query.isNotBlank() -> localized(
+            R.string.workspace_project_search_empty, view.query.trim(), "Keine Treffer für „${view.query.trim()}“.",
+        )
+        view.share?.mode == MobileShareMode.OFF && !view.legacy -> localized(
+            R.string.workspace_project_share_off, null, "Dieses Gateway teilt keine TUI-Sessions.",
+        )
+        view.legacy -> localized(
+            R.string.workspace_project_legacy, null, "Dieser Server kennt keine Projekte. Es werden nur Handy-Sessions angezeigt.",
+        )
+        canCreate -> localized(
+            R.string.workspace_project_sessions_empty, null, "In diesem Projekt gibt es noch keine Sessions. Mit + startest du eine.",
+        )
+        else -> localized(
+            R.string.workspace_project_none_visible, null, "In diesem Projekt sind für dieses Gerät keine Sessions sichtbar.",
+        )
     }
 }
 
@@ -496,35 +552,48 @@ private fun ProjectSessionList(
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
-                    view.project?.label ?: "Sessions",
+                    view.project?.label ?: stringResource(R.string.workspace_title),
                     style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
                 view.share?.let { share ->
-                    Text(share.tier.label(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(share.tier.workspaceLabel()), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
-            IconButton(onClick = actions.onRefresh, enabled = online) { Icon(Icons.Outlined.Refresh, "Aktualisieren") }
-            if (showNew) FilledIconButton(onClick = actions.onNew, enabled = canWrite) { Icon(Icons.Outlined.Add, "Neue Session", Modifier.size(18.dp)) }
+            IconButton(onClick = actions.onRefresh, enabled = online) { Icon(Icons.Outlined.Refresh, stringResource(R.string.workspace_refresh_sessions)) }
+            if (showNew) FilledIconButton(onClick = actions.onNew, enabled = canWrite) { Icon(Icons.Outlined.Add, stringResource(R.string.directory_new_session), Modifier.size(18.dp)) }
         }
-        val empty = projectEmptyText(view, canWrite)
+        val context = LocalContext.current
+        val empty = projectEmptyText(view, canWrite) { resource, substitute, _ ->
+            if (substitute == null) context.getString(resource) else context.getString(resource, substitute)
+        }
         when {
             view.loading && view.rows.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
             }
             view.error != null && view.rows.isEmpty() -> Box(Modifier.fillMaxSize().padding(14.dp), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    StatusMessage("Sessions konnten nicht geladen werden: ${view.error}", error = true)
-                    TextButton(onClick = actions.onRefresh, enabled = online) { Text("Erneut versuchen") }
+                    StatusMessage(stringResource(R.string.workspace_session_load_error, view.error.orEmpty()), error = true)
+                    TextButton(onClick = actions.onRefresh, enabled = online) { Text(stringResource(R.string.directory_retry)) }
                 }
             }
-            empty != null -> Box(Modifier.fillMaxSize().padding(14.dp), contentAlignment = Alignment.Center) { DirectoryEmpty(empty) }
+            empty != null && !view.hasMore -> Box(Modifier.fillMaxSize().padding(14.dp), contentAlignment = Alignment.Center) { DirectoryEmpty(empty) }
             else -> LazyColumn(
                 contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 9.dp, bottom = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                view.error?.let { item { StatusMessage("Aktualisieren fehlgeschlagen: $it", error = true) } }
-                for (section in projectSessionSections(view)) {
+                view.error?.let { item { StatusMessage(stringResource(R.string.workspace_session_refresh_error, it), error = true) } }
+                val locale = context.resources.configuration.locales[0] ?: java.util.Locale.ENGLISH
+                val monthFormatter = java.time.format.DateTimeFormatter.ofPattern("LLLL yyyy", locale)
+                val sections = projectSessionSections(view) { key ->
+                    if (key == null) context.getString(R.string.workspace_month_unknown)
+                    else try {
+                        java.time.YearMonth.parse(key).format(monthFormatter)
+                    } catch (_: java.time.DateTimeException) {
+                        context.getString(R.string.workspace_month_unknown)
+                    }
+                }
+                for (section in sections) {
                     section.heading?.let { heading ->
                         item(key = "month-$heading") {
                             Text(heading, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -539,9 +608,9 @@ private fun ProjectSessionList(
                                 onLongClick = { if (!view.legacy) menuFor = row.sessionId },
                             )
                             DropdownMenu(expanded = menuFor == row.sessionId, onDismissRequest = { menuFor = null }) {
-                                DropdownMenuItem(text = { Text("Umbenennen") }, enabled = canWrite, onClick = { menuFor = null; renaming = row })
-                                DropdownMenuItem(text = { Text("Projekt zuweisen") }, enabled = canWrite, onClick = { menuFor = null; assigning = row })
-                                DropdownMenuItem(text = { Text("Archivieren") }, enabled = canWrite, onClick = { menuFor = null; actions.onArchive(row.sessionId) })
+                                DropdownMenuItem(text = { Text(stringResource(R.string.workspace_rename)) }, enabled = canWrite, onClick = { menuFor = null; renaming = row })
+                                DropdownMenuItem(text = { Text(stringResource(R.string.workspace_assign_project)) }, enabled = canWrite, onClick = { menuFor = null; assigning = row })
+                                DropdownMenuItem(text = { Text(stringResource(R.string.workspace_archive)) }, enabled = canWrite, onClick = { menuFor = null; actions.onArchive(row.sessionId) })
                             }
                         }
                     }
@@ -549,7 +618,7 @@ private fun ProjectSessionList(
                 if (view.hasMore) {
                     item {
                         TextButton(onClick = actions.onLoadMore, enabled = online && !view.loading, modifier = Modifier.fillMaxWidth()) {
-                            Text(if (view.loading) "Lädt …" else "Weitere laden")
+                            Text(stringResource(if (view.loading) R.string.workspace_loading else R.string.workspace_load_more))
                         }
                     }
                 }
@@ -573,14 +642,14 @@ private fun ProjectSessionRow(row: MobileSessionRow, selected: Boolean, onClick:
         ) {
             Text(row.displayTitle(), style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val detail = listOfNotNull(
-                row.state.displayName(),
+                stringResource(homeStateLabel(row.state)),
                 row.model?.takeUnless { it.isBlank() },
-                row.turns?.let { "$it Turns" },
+                row.turns?.let { stringResource(R.string.workspace_session_turns, it.toString()) },
             ).joinToString(" · ")
             Text(detail, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val marks = listOfNotNull(
-                row.ownerMark()?.label(),
-                if (!row.continuable) (row.reason ?: MobileReadOnlyReason.UNKNOWN).label() else null,
+                row.ownerMark()?.let { stringResource(it.workspaceLabel()) },
+                if (!row.continuable) stringResource((row.reason ?: MobileReadOnlyReason.UNKNOWN).workspaceLabel()) else null,
             )
             if (marks.isNotEmpty()) {
                 Text(marks.joinToString(" · "), style = MaterialTheme.typography.labelSmall, color = colors.primary, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -594,10 +663,10 @@ private fun RenameDialog(initial: String, onDismiss: () -> Unit, onConfirm: (Str
     var title by rememberSaveable { mutableStateOf(initial) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Umbenennen") },
-        text = { OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Titel") }, modifier = Modifier.fillMaxWidth(), singleLine = true) },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } },
-        confirmButton = { Button(onClick = { onConfirm(title.trim()) }, enabled = title.isNotBlank()) { Text("Speichern") } },
+        title = { Text(stringResource(R.string.workspace_rename)) },
+        text = { OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text(stringResource(R.string.workspace_title_field)) }, modifier = Modifier.fillMaxWidth(), singleLine = true) },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.directory_cancel)) } },
+        confirmButton = { Button(onClick = { onConfirm(title.trim()) }, enabled = title.isNotBlank()) { Text(stringResource(R.string.directory_save)) } },
     )
 }
 
@@ -605,11 +674,11 @@ private fun RenameDialog(initial: String, onDismiss: () -> Unit, onConfirm: (Str
 private fun AssignDialog(projects: List<MobileProject>, onDismiss: () -> Unit, onPick: (String) -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Projekt zuweisen") },
+        title = { Text(stringResource(R.string.workspace_assign_project)) },
         text = {
             LazyColumn {
                 items(projects, key = { it.projectKey }) { project ->
-                    val name = project.label.ifBlank { "Ohne Projekt" }
+                    val name = project.label.ifBlank { stringResource(R.string.directory_no_project) }
                     Text(
                         listOfNotNull(name, project.pathHint).joinToString("  "),
                         Modifier.fillMaxWidth().clickable { onPick(project.projectKey) }.padding(vertical = 12.dp),
@@ -619,6 +688,6 @@ private fun AssignDialog(projects: List<MobileProject>, onDismiss: () -> Unit, o
             }
         },
         confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.directory_cancel)) } },
     )
 }

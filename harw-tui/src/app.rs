@@ -4104,12 +4104,16 @@ impl ChatApp {
             }
             None => ModelRolesView::empty(provider.as_deref(), model.as_deref()),
         };
-        let live_command = if self.runtime().is_some_and(|rt| rt.root_is_uia()) {
+        view.with_resolved_live(self.live_model_command())
+    }
+
+    /// The current session's model picker must follow the mounted root role.
+    fn live_model_command(&self) -> &'static str {
+        if self.runtime().is_some_and(|rt| rt.root_is_uia()) {
             "/uia-model"
         } else {
             "/model"
-        };
-        view.with_resolved_live(live_command)
+        }
     }
 }
 
@@ -4540,6 +4544,7 @@ fn local_intercept_for_scoped(app: &ChatApp, raw: &str) -> Option<LocalIntercept
         approval: app.current_approval(),
         live_provider: live_provider.as_deref(),
         live_model: live_model.as_deref(),
+        live_model_command: app.live_model_command(),
         project_root: &project_root,
         session_id: app.session_id(),
         tier: app.caller_tier(),

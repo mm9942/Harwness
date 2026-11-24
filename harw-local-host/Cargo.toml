@@ -16,6 +16,8 @@ harw-extension-api = { path = "../harw-extension-api" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 # Phone-portable: no `browser` default feature (concept AP 1.1).
 harw-runtime = { path = "../harw-runtime", default-features = false }
+harw-operations = { path = "../harw-operations" }
+harw-ops = { path = "../harw-ops" }
 harw-protocol = { path = "../harw-protocol" }
 harw-session-driver = { path = "../harw-session-driver" }
 harw-session-host = { path = "../harw-session-host" }

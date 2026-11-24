@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_route_settings_title">Mode de connexion</string>
+    <string name="harw_route_onion">Onion uniquement</string>
+    <string name="harw_route_direct">IP directe uniquement</string>
+    <string name="harw_route_auto">Tor puis IP directe</string>
+    <string name="harw_route_direct_address">IP directe : %1$s</string>
+    <string name="harw_route_onion_address">Onion : %1$s</string>
+    <string name="harw_route_hint_onion_only">Profil Onion uniquement. Aucune IP directe enregistrée ; Harw ne passe jamais à une connexion directe.</string>
+    <string name="harw_route_hint_no_onion">Ce profil n’a pas d’adresse Onion. Importez-en une ou autorisez explicitement l’IP directe pour ce profil avant toute connexion.</string>
+    <string name="harw_route_hint_onion">Onion uniquement. Harw n’utilisera pas l’IP directe enregistrée, même si Tor ne peut pas se connecter.</string>
+    <string name="harw_route_hint_direct">IP directe uniquement. Le trafic va vers l’IP enregistrée de ce profil sans passer par Tor.</string>
+    <string name="harw_route_hint_auto">Harw essaie d’abord Onion et peut utiliser l’IP directe enregistrée si Tor échoue. Ce choix vaut uniquement pour ce profil exact.</string>
+    <string name="harw_route_consent_title">Autoriser une connexion directe ?</string>
+    <string name="harw_route_consent_direct">Connectez-vous à %1$s directement via son IP enregistrée, sans Tor. Le serveur et le réseau peuvent voir votre IP. Ce choix est mémorisé uniquement pour ce profil exact.</string>
+    <string name="harw_route_consent_auto">Essayez d’abord Onion pour %1$s. En cas d’échec, Harw peut emprunter l’IP directe enregistrée et révéler votre IP au serveur et au réseau. Ce choix est mémorisé uniquement pour ce profil exact.</string>
+    <string name="harw_route_consent_confirm">Autoriser pour ce profil</string>
+    <string name="harw_route_profile_changed">Le profil enregistré a changé. Vérifiez le nouveau profil avant de choisir le mode.</string>
+    <string name="harw_route_save_failed">Impossible d’enregistrer ce mode de connexion.</string>
+    <string name="harw_route_unavailable">Ce mode n’est pas disponible pour ce profil. Aucune autre connexion n’a été tentée.</string>
+</resources>

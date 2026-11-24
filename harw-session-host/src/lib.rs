@@ -39,8 +39,13 @@
 pub mod agents;
 pub mod approvals;
 pub mod arbiter;
+#[allow(dead_code, reason = "archive admission and transport are not exposed in this isolated foundation")]
+pub(crate) mod archived_fork;
+mod cloud_library;
 pub mod driver;
 pub mod durable_approvals;
+pub mod cloud_assistant;
+pub mod membership;
 pub mod durable_replay;
 pub mod error;
 pub mod fanout;
@@ -50,6 +55,8 @@ pub mod index;
 pub mod live_ring;
 pub mod ops;
 pub mod overview;
+pub mod owner_creation;
+pub mod owner_readiness_contract;
 pub mod record;
 pub mod replay;
 pub mod stepup;
@@ -59,7 +66,10 @@ pub use agents::{AgentCredential, AgentRegistry, Delegation, ResolvedAgent};
 pub use durable_approvals::DurableApprovals;
 pub use durable_replay::DurableTranscripts;
 pub use error::HostError;
-pub use host::{HostConfig, HostConnection, SessionHost};
+pub use host::{
+    ClaimedOwnerObservation, CurrentOwnerPlacement, DirectOwnerPlacementAuthority, HostConfig, HostConnection,
+    OwnerObservationScope, OwnerObservationStatus, OwnerProcessPin, SessionHost,
+};
 pub use identity::{
     AgentPrincipal, ClientIdentity, ConnectionId, ToolGrant, ToolGrantError, caps_for_tier,
     gateway_caps_for_tier,

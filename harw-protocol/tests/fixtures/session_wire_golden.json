@@ -2,7 +2,8 @@
   "constants": {
     "subprotocol": "harw.session.v1",
     "path": "/v1/session-ws",
-    "wire_minor": 4,
+    "wire_minor": 5,
+    "archive_checkpoint_wire_minor": 5,
     "tool_gateway_wire_minor": 2,
     "projects_wire_minor": 3,
     "manage_wire_minor": 4,
@@ -63,6 +64,43 @@
     "session_id": "s-1",
     "cursor": {"generation": 1, "durable": 15, "live": 0},
     "frame": {"kind": "heartbeat"}
+  },
+  "archive_checkpoint_issue_v1": {
+    "session_id": "s-1",
+    "expected": {"generation": 1, "durable_next": 14}
+  },
+  "archive_checkpoint_describe_v1": {
+    "session_id": "s-1",
+    "checkpoint_id": "01800000-1234-5678-9abc-000000000001"
+  },
+  "archive_checkpoint_info_v1": {
+    "session_id": "s-1",
+    "checkpoint_id": "01800000-1234-5678-9abc-000000000001",
+    "revision": {"generation": 1, "durable_next": 14}
+  },
+  "archive_checkpoint_page_v1": {
+    "session_id": "s-1",
+    "checkpoint_id": "01800000-1234-5678-9abc-000000000001",
+    "before_sequence": 12,
+    "limit": 30
+  },
+  "archive_checkpoint_rows_v1": {
+    "session_id": "s-1",
+    "checkpoint_id": "01800000-1234-5678-9abc-000000000001",
+    "rows": [{
+      "locator": {"sequence": 8, "item_id": "archived-row-1"},
+      "role": "user",
+      "text_parts": ["visible"],
+      "recorded_at": "2026-10-01T12:00:00Z",
+      "image_count": 2
+    }],
+    "next_before_sequence": 8
+  },
+  "fork_inclusive_v1": {
+    "session_id": "s-1",
+    "checkpoint_id": "01800000-1234-5678-9abc-000000000001",
+    "row": {"sequence": 8, "item_id": "archived-row-1"},
+    "client_operation_id": "android-operation-1"
   },
   "error_codes": {
     "HELLO_REQUIRED": -32001,

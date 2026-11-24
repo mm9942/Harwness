@@ -67,10 +67,20 @@
         <service
             android:name=".HarwConnectionService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Keeps the user-started authenticated Harw workspace connection open for live sessions and approvals." />
+        </service>
+        <service
+            android:name=".PrivateAssistantAttemptService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Finishes only a user-started on-device private Assistant request without keeping its transcript or library unlocked." />
         </service>
         <service
             android:name=".ModelDownloadJob"

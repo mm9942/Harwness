@@ -8,71 +8,208 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.padding
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.Icon
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import uniffi.harw_mobile_ffi.ApprovalDecision
 import uniffi.harw_mobile_ffi.ConnectionPhase
+import uniffi.harw_mobile_ffi.MobileCloudLibraryScope
+import uniffi.harw_mobile_ffi.ServerProfile
 import uniffi.harw_mobile_ffi.SessionCursor
 
-internal open class MainActivity : ComponentActivity() {
+private typealias GatewayLibraryTarget = CloudLibraryTarget<ServerProfile, MobileCloudLibraryScope>
+private typealias GatewayLibraryVisit = CloudLibraryVisit<ServerProfile, MobileCloudLibraryScope>
+
+internal open class MainActivity : HarwLocaleActivity() {
     private val window by viewModels<HarwWindowModel>()
     private val cloud get() = (application as HarwApplication).connection
     private val onDevice get() = (application as HarwApplication).localConnection
 
     /** Welche Liste gezeigt wird; beide Verbindungen laufen unabhaengig davon weiter. */
     private var viewLocal by mutableStateOf(false)
-    private val connection get() = if (viewLocal) onDevice else cloud
+    private val connection get() = when (window.alertTarget?.scope?.backend) {
+        SessionHomeBackend.Local -> onDevice
+        SessionHomeBackend.Cloud -> cloud
+        null -> if (viewLocal && window.cloudOnlyProfile == null) onDevice else cloud
+    }
     private val approvalAuthorization = ApprovalAuthorization(this)
     private val stepUpAuthorization = StepUpAuthorization(this)
     private var themePref by mutableStateOf("system")
     private var openUpdate by mutableStateOf(false)
+    private var assistantDev by mutableStateOf<LocalUiaDevSession?>(null)
+    private var assistantStartsInLibrary by mutableStateOf(false)
+    // Cloud routes are not restored, and never share the local vault owner.
+    private var cloudAssistant by mutableStateOf<CloudAssistantTarget?>(null)
+
+    private var cloudLibrary by mutableStateOf(CloudLibraryNavigation<ServerProfile, MobileCloudLibraryScope, Uri>())
+    private val cloudLibraryPicker = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        val target = cloudLibrary.visit?.target?.takeIf(::currentCloudLibraryTarget)
+        cloudLibrary = cloudLibrary.pickResult(uri?.takeIf { it.scheme == "content" }, target)
+    }
+
+    private fun currentCloudLibraryTarget(target: GatewayLibraryTarget): Boolean {
+        val current = cloud.state.value
+        return !viewLocal && current.online && !current.stopping &&
+            current.profile == target.profile && current.generation == target.generation
+    }
+
+    private fun pickCloudLibraryPhoto(visit: GatewayLibraryVisit, revision: ULong) {
+        if (cloudLibrary.visible !== visit || !currentCloudLibraryTarget(visit.target)) return
+        val before = cloudLibrary
+        val next = before.beginPick(revision)
+        if (next === before) return
+        cloudLibrary = next
+        try {
+            cloudLibraryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        } catch (_: Exception) {
+            cloudLibrary = cloudLibrary.pickResult(null, visit.target.takeIf(::currentCloudLibraryTarget))
+            Toast.makeText(this, "Die Galerie konnte nicht geöffnet werden.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // Single transient request. It deliberately is not stored in saved state.
+    private var libraryPick: LibraryPhotoRequest? = null
+    private var libraryPhoto by mutableStateOf<PendingLibraryPhoto?>(null)
+    private val libraryPicker = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        val request = libraryPick.also { libraryPick = null }
+        if (request != null && uri?.scheme == "content") {
+            libraryPhoto = PendingLibraryPhoto(request, uri)
+        }
+    }
+
+    private fun pickPrivateLibraryPhoto(
+        owner: LocalUiaDevSession, vault: VaultPinScope, revision: ULong,
+    ) {
+        if (assistantDev !== owner || libraryPick != null || libraryPhoto != null || !viewLocal) return
+        libraryPick = LibraryPhotoRequest(owner.profile, vault, revision)
+        // Revoke all native authority before leaving for Android's system UI.
+        closeAssistantDev()
+        try {
+            libraryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        } catch (_: Exception) {
+            libraryPick = null
+            Toast.makeText(this, "Die Galerie konnte nicht geöffnet werden.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun retireAssistantPresentation(): LocalUiaDevSession? {
+        val retired = assistantDev
+        assistantDev = null
+        assistantStartsInLibrary = false
+        return retired
+    }
+
+    private fun closeAssistantDev() {
+        retireAssistantPresentation()?.close()
+    }
+
+    private fun hideAssistantDevForActivity() {
+        retireAssistantPresentation()?.hideForActivity()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        cloudLibrary = cloudLibrary.resume()
+    }
+
+    override fun onPause() {
+        cloudLibrary = cloudLibrary.pause()
+        cloudAssistant = null
+        if (assistantDev?.retainOnlyLockedBiometricPrompt() != true) {
+            if (assistantDev != null) libraryPhoto = null
+            hideAssistantDevForActivity()
+        }
+        super.onPause()
+    }
+
+    override fun onStop() {
+        if (assistantDev != null) libraryPhoto = null
+        hideAssistantDevForActivity()
+        super.onStop()
+    }
+    private var openedProtectedContent = false
+
+    private fun applyProtectedWindowPreference() {
+        val flag = android.view.WindowManager.LayoutParams.FLAG_SECURE
+        if (openedProtectedContent && readScreenshotProtection(this)) getWindow().addFlags(flag)
+        else getWindow().clearFlags(flag)
+    }
+
+    private fun preparePrivateWindow() {
+        openedProtectedContent = true
+        applyProtectedWindowPreference()
+    }
+
     private val themeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == PREF_THEME) themePref = readThemePref(this)
+        if (key == PREF_SCREENSHOT_PROTECTION) applyProtectedWindowPreference()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         approvalAuthorization.restoreCredentialState(savedInstanceState?.getBoolean(AwaitingCredentialKey) == true)
+        lifecycleScope.launch {
+            // The app-owned local host can come online without a Cloud login.
+            // Adopt it while an Activity is visibly interactive, before it can
+            // become background work. Closing this collector never stops it.
+            lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                combine(cloud.state, onDevice.state) { c, l -> c.hasConnection || l.hasConnection }
+                    .distinctUntilChanged()
+                    .collect { active ->
+                        if (active && !isFinishing && lifecycle.currentState == Lifecycle.State.RESUMED) {
+                            try {
+                                HarwConnectionService.holdFrom(this@MainActivity)
+                            } catch (error: Exception) {
+                                // Never turn denied Android foreground status
+                                // into a synthetic disconnect or a duplicate send.
+                                (if (onDevice.state.value.hasConnection) onDevice else cloud).reportServiceError(error)
+                            }
+                        }
+                    }
+            }
+        }
         lifecycleScope.launch {
             cloud.state
                 .map { state ->
@@ -100,10 +237,18 @@ internal open class MainActivity : ComponentActivity() {
         themePref = readThemePref(this)
         getSharedPreferences(UI_PREFS, MODE_PRIVATE).registerOnSharedPreferenceChangeListener(themeListener)
         setContent {
-            HarwTheme(dark = themeDarkOverride(themePref)) {
+            val dark = themeDarkOverride(themePref) ?: isSystemInDarkTheme()
+            SideEffect {
+                val activityWindow = getWindow()
+                WindowCompat.getInsetsController(activityWindow, activityWindow.decorView).apply {
+                    isAppearanceLightStatusBars = !dark
+                    isAppearanceLightNavigationBars = !dark
+                }
+            }
+            HarwTheme(dark = dark) {
                 Surface(Modifier.fillMaxSize()) {
                     Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) { Workspace() }
-                    UpdateHost(openRequested = openUpdate)
+                    if (assistantDev == null && cloudAssistant == null && cloudLibrary.visit == null) UpdateHost(openRequested = openUpdate)
                 }
             }
         }
@@ -112,12 +257,46 @@ internal open class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (intent.action == HarwConnectionService.OpenSessionAlertAction ||
+            (intent.data == null && intent.hasExtra(HarwConnectionService.ExtraOpenSession))
+        ) {
+            handleLink(intent)
+            return
+        }
+        closeExternalSurfaces()
         if (intent.getBooleanExtra(ExtraOpenUpdate, false)) openUpdate = true
         handleLink(intent)
     }
 
+    private fun closeExternalSurfaces() {
+        cloudLibrary = cloudLibrary.close()
+        cloudAssistant = null
+        libraryPick = null
+        libraryPhoto = null
+        closeAssistantDev()
+    }
+
     // Deep-Link und Benachrichtigungs-Extra sind unvertrauene Eingabe: nur geprueft navigieren.
     private fun handleLink(intent: Intent?) {
+        if (intent?.action == HarwConnectionService.OpenSessionAlertAction) {
+            val target = alertTargetFromIntent(intent)
+            intent.removeExtra(HarwConnectionService.ExtraOpenSession)
+            intent.removeExtra(HarwConnectionService.ExtraAlertBackend)
+            intent.removeExtra(HarwConnectionService.ExtraAlertProfile)
+            intent.removeExtra(HarwConnectionService.ExtraAlertKind)
+            intent.data = null
+            if (target != null) {
+                val local = target.id.scope.backend == SessionHomeBackend.Local
+                val state = (if (local) onDevice else cloud).state.value
+                if (sessionAlertDirectory(state)?.authorizes(target.id) == true &&
+                    window.selectAlertSession(target.id)
+                ) {
+                    viewLocal = local
+                    closeExternalSurfaces()
+                }
+            }
+            return
+        }
         val uri = intent?.data
         if (uri != null && uri.scheme == "harw" && uri.host == "profile") {
             // Rückweg der Admin-Einrichtung: unvertraute Eingabe, geprüft in installAdminProfile.
@@ -127,13 +306,19 @@ internal open class MainActivity : ComponentActivity() {
             cloud.installAdminProfile(req, data) { startConnection() }
             return
         }
-        val link = linkFromIntent(intent) ?: return
-        window.openLink(link)
+        val link = linkFromIntent(intent)
         intent?.removeExtra(HarwConnectionService.ExtraOpenSession)
+        if (link == null) return
+        window.openLink(link)
         intent?.data = null
     }
 
     override fun onDestroy() {
+        cloudLibrary = CloudLibraryNavigation()
+        cloudAssistant = null
+        libraryPick = null
+        libraryPhoto = null
+        closeAssistantDev()
         approvalAuthorization.cancel()
         stepUpAuthorization.cancel()
         getSharedPreferences(UI_PREFS, MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(themeListener)
@@ -149,17 +334,258 @@ internal open class MainActivity : ComponentActivity() {
     private fun Workspace() {
         val cloudState by cloud.state.collectAsState()
         val localState by onDevice.state.collectAsState()
+        // Capture the concrete backend for this composition and its disposal callbacks.
+        val connection = this.connection
         val state by connection.state.collectAsState()
         val sessionId = window.sessionId
         val projectKey = window.projectKey
+        val alertTarget = window.alertTarget
+        if (alertTarget != null) {
+            val source = if (alertTarget.scope.backend == SessionHomeBackend.Local) localState else cloudState
+            if (sessionAlertDirectory(source)?.authorizes(alertTarget) != true) {
+                // Never show or attach to a matching bare ID in the other directory.
+                LaunchedEffect(alertTarget, source.generation) {
+                    if (window.alertTarget == alertTarget) window.select(null)
+                }
+                return
+            }
+        }
+        var devProfile by remember { mutableStateOf<LocalUiaProfile?>(null) }
+        val app = application as HarwApplication
+        val cloudProfile = cloudState.profile
+        val cloudGeneration = cloudState.generation
+        val cloudEligible = !viewLocal && cloudState.online && !cloudState.stopping &&
+            cloudProfile != null && cloudGeneration != null
+        var availableCloudAssistant by remember(cloudEligible, cloudProfile, cloudGeneration) {
+            mutableStateOf<CloudAssistantTarget?>(null)
+        }
+        LaunchedEffect(cloudEligible, cloudProfile, cloudGeneration) {
+            if (!cloudEligible || cloudProfile == null || cloudGeneration == null) return@LaunchedEffect
+            while (true) {
+                // Only checks the local negotiated grant, not server status or contents.
+                availableCloudAssistant = try {
+                    val previous = availableCloudAssistant
+                    if (previous != null && cloud.cloudAssistantTargetCurrent(previous)) previous
+                    else cloud.cloudAssistantTarget(cloudProfile, cloudGeneration)
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    null
+                }
+                delay(1_000)
+            }
+        }
+        var availableCloudLibrary by remember(cloudEligible, cloudProfile, cloudGeneration) {
+            mutableStateOf<GatewayLibraryTarget?>(null)
+        }
+        LaunchedEffect(cloudEligible, cloudProfile, cloudGeneration) {
+            if (!cloudEligible || cloudProfile == null || cloudGeneration == null) return@LaunchedEffect
+            while (true) {
+                // This probes only the negotiated native capability, never Library contents.
+                availableCloudLibrary = try {
+                    cloud.cloudLibraryScope()?.let { GatewayLibraryTarget(cloudProfile, cloudGeneration, it) }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
+                delay(1_000)
+            }
+        }
+        LaunchedEffect(availableCloudLibrary, cloudLibrary.visit) {
+            cloudLibrary = cloudLibrary.retain(availableCloudLibrary)
+        }
+        if (cloudLibrary.visit != null && !cloudLibrary.resumed) {
+            // Clear the protected composition while Android owns the picker.
+            // Do not activate Home auto-navigation behind the external UI.
+            Box(Modifier.fillMaxSize())
+            return
+        }
+        val openLibrary = cloudLibrary.visible
+        if (openLibrary != null && openLibrary.target == availableCloudLibrary) {
+            val target = openLibrary.target
+            CloudLibraryScreen(
+                connection = cloud,
+                device = onDevice,
+                scope = target.scope,
+                stillOpen = {
+                    cloudLibrary.visible === openLibrary && currentCloudLibraryTarget(target) &&
+                        !isFinishing && lifecycle.currentState == androidx.lifecycle.Lifecycle.State.RESUMED
+                },
+                server = target.profile.label,
+                photo = cloudLibrary.photo,
+                pickerBusy = cloudLibrary.request != null,
+                onPick = { revision -> pickCloudLibraryPhoto(openLibrary, revision) },
+                onConsumePhoto = { picked ->
+                    if (!currentCloudLibraryTarget(target)) false else {
+                        val before = cloudLibrary
+                        val after = before.consume(openLibrary, picked)
+                        if (after === before) false else {
+                            cloudLibrary = after
+                            true
+                        }
+                    }
+                },
+                onBack = { cloudLibrary = cloudLibrary.close() },
+            )
+            return
+        }
+        val openCloudAssistant = cloudAssistant
+        LaunchedEffect(openCloudAssistant, availableCloudAssistant) {
+            if (openCloudAssistant != null && openCloudAssistant !== availableCloudAssistant &&
+                cloudAssistant === openCloudAssistant
+            ) cloudAssistant = null
+        }
+        if (openCloudAssistant != null && openCloudAssistant === availableCloudAssistant) {
+            CloudAssistantScreen(
+                openCloudAssistant, cloud, cloudState,
+                onOpenSession = { id ->
+                    val current = cloud.state.value
+                    val profile = openCloudAssistant.profile.windowKey()
+                    val valid = cloudAssistant === openCloudAssistant && !viewLocal && !isFinishing &&
+                        lifecycle.currentState == androidx.lifecycle.Lifecycle.State.RESUMED &&
+                        current.profile == openCloudAssistant.profile && current.online &&
+                        current.generation == openCloudAssistant.generation &&
+                        current.sessionSummariesGeneration == openCloudAssistant.generation &&
+                        current.sessions.asSequence().take(CloudAssistantSummaryLimit).any { it.sessionId == id }
+                    if (valid && SessionIdPattern.matches(id) && window.selectCloudSession(id, profile)) {
+                        cloudAssistant = null
+                        true
+                    } else false
+                },
+                onBack = { cloudAssistant = null },
+            )
+            return
+        }
+        val cloudOnly = window.cloudOnlyProfile
+        val cloudOnlyMatches = cloudOnly == null || cloudProfile?.windowKey() == cloudOnly
+        if (!cloudOnlyMatches) {
+            LaunchedEffect(cloudOnly, cloudProfile, cloudState.setupPending) {
+                if (!cloudState.setupPending) window.select(null)
+            }
+            HarwHeader(title = "Cloud-Session", onBack = { window.select(null) }) { }
+            return
+        }
+        LaunchedEffect(viewLocal, localState.online, localState.generation) {
+            devProfile = null
+            if (!BuildConfig.LOCAL_UIA || !viewLocal || !localState.online) {
+                if (!localState.online) PrivateAssistantAttemptAdmission.cancelOnProfileChange(null)
+                closeAssistantDev()
+                return@LaunchedEffect
+            }
+            while (true) {
+                val native = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    LocalUiaDevCapability.current(app)
+                }
+                PrivateAssistantAttemptAdmission.cancelOnProfileChange(native)
+                val opened = assistantDev
+                if (opened != null && native != opened.profile) {
+                    libraryPhoto = null
+                    closeAssistantDev()
+                }
+                devProfile = native
+                kotlinx.coroutines.delay(750)
+            }
+        }
+        val pickedLibraryPhoto = libraryPhoto
+        LaunchedEffect(pickedLibraryPhoto, viewLocal, localState.online, localState.generation) {
+            val picked = pickedLibraryPhoto ?: return@LaunchedEffect
+            if (!viewLocal || !localState.online || !BuildConfig.LOCAL_UIA) {
+                if (libraryPhoto === picked) libraryPhoto = null
+                return@LaunchedEffect
+            }
+            val current = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                LocalUiaDevCapability.current(app)
+            }
+            if (libraryPhoto !== picked) return@LaunchedEffect
+            if (current != picked.request.profile) {
+                libraryPhoto = null
+                return@LaunchedEffect
+            }
+            if (assistantDev == null) {
+                preparePrivateWindow()
+                assistantStartsInLibrary = true
+                assistantDev = LocalUiaDevSession(app, picked.request.profile)
+            }
+        }
+        assistantDev?.let { assistant ->
+            val handoff = PrivateLibraryGallery(
+                pending = pickedLibraryPhoto?.takeIf { it.request.profile == assistant.profile },
+                request = { vault, revision -> pickPrivateLibraryPhoto(assistant, vault, revision) },
+                consume = { expected ->
+                    if (assistantDev !== assistant || libraryPhoto !== expected || !viewLocal) false else {
+                        libraryPhoto = null
+                        true
+                    }
+                },
+            )
+            CompositionLocalProvider(LocalPrivateLibraryGallery provides handoff) {
+                LocalUiaDevScreen(
+                    assistant, onBack = { libraryPhoto = null; closeAssistantDev() },
+                    startInLibrary = assistantStartsInLibrary,
+                    workHostState = localState,
+                    workConnection = onDevice,
+                    cloudWorkHostState = cloudState,
+                    cloudWorkConnection = cloud,
+                    ownerStillCurrent = {
+                        assistantDev === assistant && viewLocal && !isFinishing &&
+                            lifecycle.currentState == androidx.lifecycle.Lifecycle.State.RESUMED
+                    },
+                    authorizingWorkApproval = approvalAuthorization.busy,
+                    onDecideWork = { link, id, generation, approval, decision, stillOpen ->
+                        authenticateLocalUiaWorkDecision(assistant, link, id, generation, approval, decision, stillOpen)
+                    },
+                )
+            }
+            return
+        }
+        val canOpenAssistant = showLocalUiaDev(BuildConfig.LOCAL_UIA, viewLocal && localState.online, devProfile)
+        fun openLocalPrivate(library: Boolean) {
+            val profile = devProfile ?: return
+            if (!canOpenAssistant || !viewLocal || !localState.online) return
+            // Protect the task snapshot after navigating back too, unless
+            // the user explicitly opted out in the display settings.
+            preparePrivateWindow()
+            assistantStartsInLibrary = library
+            assistantDev = LocalUiaDevSession(app, profile)
+        }
+        fun openCloudPrivate() {
+            val target = availableCloudAssistant ?: return
+            val current = cloud.state.value
+            if (viewLocal || assistantDev != null || !current.online || current.stopping ||
+                current.profile != target.profile || current.generation != target.generation
+            ) return
+            preparePrivateWindow()
+            cloudAssistant = target
+        }
+        fun openCloudLibrary() {
+            val target = availableCloudLibrary ?: return
+            if (!currentCloudLibraryTarget(target) || assistantDev != null || cloudAssistant != null) return
+            val before = cloudLibrary
+            val opened = before.open(target)
+            if (opened === before) return
+            preparePrivateWindow()
+            cloudLibrary = opened
+        }
+        val shortcuts = if (sessionId == null) {
+            homeShortcuts(
+                state.online, state.canCreate, state.creating,
+                assistantDev = canOpenAssistant, privateLibrary = canOpenAssistant,
+                viewingLocal = viewLocal, cloudAssistant = availableCloudAssistant != null,
+                cloudLibrary = availableCloudLibrary != null,
+            )
+        } else emptyList()
         // Automatisch verbinden: beim Start, nach Fehlern (mit Pause) und wenn ein Profil neu hinzukommt.
         LaunchedEffect(cloudState.profile != null, cloudState.phase, cloudState.stopping, cloudState.hasConnection) {
             val eligible = cloudState.profile != null && !cloudState.hasConnection && !cloudState.stopping &&
                 cloudState.phase in setOf(ConnectionPhase.DISCONNECTED, ConnectionPhase.FAILED) &&
                 readAutoConnect(this@MainActivity) && !readManualDisconnect(this@MainActivity)
-            if (eligible) {
+            if (eligible) lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                 if (cloudState.phase == ConnectionPhase.FAILED) kotlinx.coroutines.delay(20_000)
-                if (readAutoConnect(this@MainActivity) && !readManualDisconnect(this@MainActivity)) startConnection()
+                val current = cloud.state.value
+                if (!isFinishing && current.profile == cloudState.profile && !current.hasConnection && !current.stopping &&
+                    current.phase in setOf(ConnectionPhase.DISCONNECTED, ConnectionPhase.FAILED) &&
+                    readAutoConnect(this@MainActivity) && !readManualDisconnect(this@MainActivity)
+                ) startConnection()
             }
         }
         var settingsRouteName by rememberSaveable { mutableStateOf<String?>(null) }
@@ -168,6 +594,7 @@ internal open class MainActivity : ComponentActivity() {
             settingsRouteName = route?.name
         }
         var connectingFromSetup by rememberSaveable { mutableStateOf(false) }
+        var connectingLocalFromSetup by rememberSaveable { mutableStateOf(false) }
         var firstRunDone by remember { mutableStateOf(readFirstRunDone(this@MainActivity)) }
         fun finishFirstRun() {
             firstRunDone = true
@@ -214,8 +641,19 @@ internal open class MainActivity : ComponentActivity() {
         LaunchedEffect(cloudState.setupPending, cloudState.profile == null) {
             if (!cloudState.setupPending && cloudState.profile == null && !viewChosen) viewLocal = true
         }
-        LaunchedEffect(sessionId, cloudState.sessions, localState.sessions) {
-            if (sessionId != null) {
+        LaunchedEffect(alertTarget) {
+            if (alertTarget != null) {
+                viewChosen = true
+                viewLocal = alertTarget.scope.backend == SessionHomeBackend.Local
+                openSettings(null)
+            }
+        }
+        LaunchedEffect(alertTarget, sessionId, cloudOnly, cloudState.sessions, localState.sessions) {
+            if (alertTarget != null) return@LaunchedEffect
+            if (cloudOnly != null) {
+                viewChosen = true
+                viewLocal = false
+            } else if (sessionId != null) {
                 val inCloud = cloudState.sessions.any { it.sessionId == sessionId }
                 val inLocal = localState.sessions.any { it.sessionId == sessionId }
                 if (inLocal && !inCloud) viewLocal = true else if (inCloud && !inLocal) viewLocal = false
@@ -227,7 +665,21 @@ internal open class MainActivity : ComponentActivity() {
                 connectingFromSetup = false
             }
         }
-        DisposableEffect(sessionId, selectedProfileKey, viewLocal) {
+        LaunchedEffect(localState.online, localState.phase, localState.setupError, connectingLocalFromSetup) {
+            if (connectingLocalFromSetup) {
+                if (localState.online) {
+                    viewChosen = true
+                    viewLocal = true
+                    window.select(null)
+                    window.selectProject(null)
+                    openSettings(null)
+                    connectingLocalFromSetup = false
+                } else if (localState.phase == ConnectionPhase.FAILED || localState.setupError != null) {
+                    connectingLocalFromSetup = false
+                }
+            }
+        }
+        DisposableEffect(sessionId, selectedProfileKey, connection) {
             if (sessionId != null) connection.retainSession(sessionId)
             onDispose { if (sessionId != null) connection.releaseSession(sessionId) }
         }
@@ -284,286 +736,346 @@ internal open class MainActivity : ComponentActivity() {
                 confirmButton = { TextButton(onClick = { manageConnection.clearStepUpError() }) { Text("OK") } },
             )
         }
-        if (settingsRoute == SettingsRoute.Hub) {
-            SettingsHub(
-                state = manageState,
-                connection = manageConnection,
-                onBack = { openSettings(null) },
-                onOpen = ::openSettings,
-            )
-        } else if (settingsRoute == SettingsRoute.Models) {
-            val providerStore = remember {
-                uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
+        when {
+            settingsRoute == SettingsRoute.Hub -> {
+                SettingsHub(
+                    state = manageState,
+                    connection = manageConnection,
+                    onBack = { openSettings(null) },
+                    onOpen = ::openSettings,
+                    diagnosticsConnection = connection,
+                    diagnosticsLocal = viewLocal,
+                )
             }
-            ModelsAndProviders(
-                initialTab = ModelsTab.Cloud,
-                cloudState = manageState,
-                cloudConnection = manageConnection,
-                cloudSessionId = if (manageConnection === connection) sessionId else null,
-                providerStore = providerStore,
-                onBack = { openSettings(SettingsRoute.Hub) },
-                onOpenConnection = { openSettings(SettingsRoute.Connection) },
-                onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
-            )
-        } else if (settingsRoute == SettingsRoute.Providers) {
-            val providerStore = remember {
-                uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
-            }
-            ModelsAndProviders(
-                initialTab = ModelsTab.Local,
-                cloudState = manageState,
-                cloudConnection = manageConnection,
-                cloudSessionId = if (manageConnection === connection) sessionId else null,
-                providerStore = providerStore,
-                onBack = { openSettings(SettingsRoute.Hub) },
-                onOpenConnection = { openSettings(SettingsRoute.Connection) },
-                onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
-            )
-        } else if (settingsRoute == SettingsRoute.Uias) {
-            val uiaStore = remember { uniffi.harw_mobile_ffi.UiaStore(filesDir.path) }
-            UiaScreen(uiaStore, onBack = { openSettings(SettingsRoute.Hub) })
-        } else if (settingsRoute == SettingsRoute.Agents) {
-            AgentsOverviewScreen(
-                cloudState = cloudState,
-                cloud = cloud,
-                localState = localState,
-                local = onDevice,
-                initialTarget = if (cloudState.profile == null) OverviewTarget.Local else OverviewTarget.Cloud,
-                onBack = { openSettings(SettingsRoute.Hub) },
-                onOpenSession = { id, local ->
-                    viewChosen = true
-                    viewLocal = local
-                    openSettings(null)
-                    window.select(id)
-                },
-                onOpenUias = { openSettings(SettingsRoute.Uias) },
-            )
-        } else if (settingsRoute == SettingsRoute.Jobs) {
-            JobsOverviewScreen(
-                cloudState = cloudState,
-                cloud = cloud,
-                localState = localState,
-                local = onDevice,
-                initialTarget = if (cloudState.profile == null) OverviewTarget.Local else OverviewTarget.Cloud,
-                onBack = { openSettings(SettingsRoute.Hub) },
-                onOpenSession = { id, local ->
-                    viewChosen = true
-                    viewLocal = local
-                    openSettings(null)
-                    window.select(id)
-                },
-            )
-        } else if (settingsRoute == SettingsRoute.LocalModels) {
-            val modelManager = remember { ModelManager(ModelStore(applicationContext)) }
-            ModelsScreen(modelManager, onBack = { openSettings(SettingsRoute.Hub) })
-        } else if (settingsRoute == SettingsRoute.Files) {
-            FilesScreen(onBack = { openSettings(SettingsRoute.Hub) })
-        } else if (settingsRoute == SettingsRoute.Termux) {
-            TermuxScreen(onBack = { openSettings(SettingsRoute.Hub) })
-        } else if (settingsRoute == SettingsRoute.Knowledge) {
-            KnowledgeScreen(state = manageState, connection = manageConnection, onBack = { openSettings(SettingsRoute.Hub) })
-        } else if (settingsRoute == SettingsRoute.Commands) {
-            CommandsScreen(
-                state = manageState,
-                connection = manageConnection,
-                sessionId = null,
-                onBack = { openSettings(SettingsRoute.Hub) },
-                onOpenModels = { openSettings(SettingsRoute.Models) },
-            )
-        } else if (window.newChat != null && settingsRoute != SettingsRoute.Connection) {
-            val draft = window.newChat!!
-            val target = if (draft.local) onDevice else cloud
-            val targetState = if (draft.local) localState else cloudState
-            LaunchedEffect(draft.local, targetState.online, targetState.generation) {
-                if (targetState.online) target.refreshProjects()
-            }
-            LaunchedEffect(draft.local, cloudState.online, cloudState.generation) {
-                if (!draft.local && cloudState.online) {
-                    cloud.refreshManageSupport()
-                    cloud.refreshCatalog(null)
+            settingsRoute == SettingsRoute.Models -> {
+                val providerStore = remember {
+                    uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
                 }
+                ModelsAndProviders(
+                    initialTab = ModelsTab.Cloud,
+                    cloudState = manageState,
+                    cloudConnection = manageConnection,
+                    cloudSessionId = if (manageConnection === connection) sessionId else null,
+                    providerStore = providerStore,
+                    onBack = { openSettings(SettingsRoute.Hub) },
+                    onOpenConnection = { openSettings(SettingsRoute.Connection) },
+                    onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
+                )
             }
-            NewChatScreen(
-                draft = draft,
-                targetState = targetState,
-                cloudState = cloudState,
-                connection = target,
-                onBack = window::closeNewChat,
-                onSwitch = window::newChatBackend,
-                onProject = window::newChatProject,
-                onModel = window::newChatModel,
-                onEdit = window::newChatEdit,
-                onAttach = window::newChatAttach,
-                onDetach = window::newChatDetach,
-                onImageError = window::newChatError,
-                onSend = {
-                    val message = draft.text.trim()
-                    val images = draft.images
-                    if (message.isNotBlank() || images.isNotEmpty()) {
-                        target.startChat(
-                            projectKey = draft.projectKey,
-                            firstMessage = message,
-                            model = draft.model.takeIf { !draft.local },
-                            opened = { id, assigned ->
-                                viewChosen = true
-                                viewLocal = draft.local
-                                window.queueFirstMessage(id, message, images.map { it.image })
-                                window.finishNewChat()
-                                window.openLink(DeepLink(assigned, id))
-                            },
-                            notice = { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() },
-                        )
+            settingsRoute == SettingsRoute.Providers -> {
+                val providerStore = remember {
+                    uniffi.harw_mobile_ffi.ProviderStore(filesDir.path, AndroidPlatformKeystore(applicationContext))
+                }
+                ModelsAndProviders(
+                    initialTab = ModelsTab.Local,
+                    cloudState = manageState,
+                    cloudConnection = manageConnection,
+                    cloudSessionId = if (manageConnection === connection) sessionId else null,
+                    providerStore = providerStore,
+                    onBack = { openSettings(SettingsRoute.Hub) },
+                    onOpenConnection = { openSettings(SettingsRoute.Connection) },
+                    onOpenLocalModels = { openSettings(SettingsRoute.LocalModels) },
+                )
+            }
+            settingsRoute == SettingsRoute.Uias -> {
+                val uiaStore = remember { uniffi.harw_mobile_ffi.UiaStore(filesDir.path) }
+                UiaScreen(uiaStore, onBack = { openSettings(SettingsRoute.Hub) })
+            }
+            settingsRoute == SettingsRoute.Agents -> {
+                AgentsOverviewScreen(
+                    cloudState = cloudState,
+                    cloud = cloud,
+                    localState = localState,
+                    local = onDevice,
+                    initialTarget = if (cloudState.profile == null) OverviewTarget.Local else OverviewTarget.Cloud,
+                    onBack = { openSettings(SettingsRoute.Hub) },
+                    onOpenSession = { id, local ->
+                        viewChosen = true
+                        viewLocal = local
+                        openSettings(null)
+                        window.select(id)
+                    },
+                    onOpenUias = { openSettings(SettingsRoute.Uias) },
+                )
+            }
+            settingsRoute == SettingsRoute.Jobs -> {
+                JobsOverviewScreen(
+                    cloudState = cloudState,
+                    cloud = cloud,
+                    localState = localState,
+                    local = onDevice,
+                    initialTarget = if (cloudState.profile == null) OverviewTarget.Local else OverviewTarget.Cloud,
+                    onBack = { openSettings(SettingsRoute.Hub) },
+                    onOpenSession = { id, local ->
+                        viewChosen = true
+                        viewLocal = local
+                        openSettings(null)
+                        window.select(id)
+                    },
+                )
+            }
+            settingsRoute == SettingsRoute.LocalModels -> {
+                val modelManager = remember { ModelManager(ModelStore(applicationContext)) }
+                ModelsScreen(modelManager, onBack = { openSettings(SettingsRoute.Hub) })
+            }
+            settingsRoute == SettingsRoute.Files -> {
+                FilesScreen(onBack = { openSettings(SettingsRoute.Hub) })
+            }
+            settingsRoute == SettingsRoute.Termux -> {
+                TermuxScreen(onBack = { openSettings(SettingsRoute.Hub) })
+            }
+            settingsRoute == SettingsRoute.Knowledge -> {
+                KnowledgeScreen(state = manageState, connection = manageConnection, onBack = { openSettings(SettingsRoute.Hub) })
+            }
+            settingsRoute == SettingsRoute.Commands -> {
+                CommandsScreen(
+                    state = manageState,
+                    connection = manageConnection,
+                    sessionId = null,
+                    onBack = { openSettings(SettingsRoute.Hub) },
+                    onOpenModels = { openSettings(SettingsRoute.Models) },
+                )
+            }
+            window.newChat != null && settingsRoute != SettingsRoute.Connection -> {
+                val draft = window.newChat!!
+                val target = if (draft.local) onDevice else cloud
+                val targetState = if (draft.local) localState else cloudState
+                LaunchedEffect(draft.local, targetState.online, targetState.generation) {
+                    if (targetState.online) target.refreshProjects()
+                }
+                LaunchedEffect(draft.local, cloudState.online, cloudState.generation) {
+                    if (!draft.local && cloudState.online) {
+                        cloud.refreshManageSupport()
+                        cloud.refreshCatalog(null)
                     }
-                },
-            )
-        } else if (showSetup && settingsRoute == null && cloudState.profile == null && !firstRunDone) {
-            FirstRunScreen(
-                onConnect = { finishFirstRun(); openSettings(SettingsRoute.Connection) },
-                onProviders = { finishFirstRun(); openSettings(SettingsRoute.Providers) },
-                onLocalModels = { finishFirstRun(); openSettings(SettingsRoute.LocalModels) },
-                onSkip = { finishFirstRun() },
-            )
-        } else if (showSetup) {
-            ConnectionScreen(
-                state = cloudState,
-                notificationDenied = notificationDenied,
-                canGoBack = settingsRoute == SettingsRoute.Connection &&
-                    (cloudState.online || cloudState.sessions.isNotEmpty() || sessionId != null),
-                onBack = { openSettings(SettingsRoute.Hub) },
-                onImport = {
-                    profilePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream"))
-                },
-                onExport = { enrollmentPicker.launch("harw-device-enrollment.json") },
-                onShowEnrollmentQr = { cloud.showEnrollmentQr { enrollmentQr = it } },
-                scanning = scannerOpen,
-                adminUrlSuggestion = cloudState.profile?.adminUrl ?: cloud.lastAdminUrl().orEmpty(),
-                onAdminSetup = { url ->
-                    cloud.startAdminEnrollment(url) { target ->
+                }
+                NewChatScreen(
+                    draft = draft,
+                    targetState = targetState,
+                    cloudState = cloudState,
+                    connection = target,
+                    onBack = window::closeNewChat,
+                    onSwitch = window::newChatBackend,
+                    onProject = window::newChatProject,
+                    onModel = window::newChatModel,
+                    onEdit = window::newChatEdit,
+                    onAttach = window::newChatAttach,
+                    onDetach = window::newChatDetach,
+                    onImageError = window::newChatError,
+                    onSend = {
+                        val message = draft.text.trim()
+                        val images = draft.images
+                        if (message.isNotBlank() || images.isNotEmpty()) {
+                            target.startChat(
+                                projectKey = draft.projectKey,
+                                model = draft.model.takeIf { !draft.local },
+                                opened = { id, assigned ->
+                                    viewChosen = true
+                                    viewLocal = draft.local
+                                    window.queueFirstMessage(id, message, images.map { it.image })
+                                    window.finishNewChat()
+                                    window.openLink(DeepLink(assigned, id))
+                                },
+                                notice = { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() },
+                            )
+                        }
+                    },
+                )
+            }
+            showSetup && settingsRoute == null && cloudState.profile == null && !firstRunDone -> {
+                FirstRunScreen(
+                    onConnect = { finishFirstRun(); openSettings(SettingsRoute.Connection) },
+                    onProviders = { finishFirstRun(); openSettings(SettingsRoute.Providers) },
+                    onLocalModels = { finishFirstRun(); openSettings(SettingsRoute.LocalModels) },
+                    onSkip = { finishFirstRun() },
+                )
+            }
+            showSetup -> {
+                ConnectionScreen(
+                    state = cloudState,
+                    localState = localState,
+                    notificationDenied = notificationDenied,
+                    canGoBack = settingsRoute == SettingsRoute.Connection &&
+                        (localState.online || cloudState.online || cloudState.sessions.isNotEmpty() || sessionId != null),
+                    onBack = { openSettings(SettingsRoute.Hub) },
+                    onImport = {
+                        profilePicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream"))
+                    },
+                    onExport = { enrollmentPicker.launch("harw-device-enrollment.json") },
+                    onShowEnrollmentQr = { cloud.showEnrollmentQr { enrollmentQr = it } },
+                    scanning = scannerOpen,
+                    adminUrlSuggestion = cloudState.profile?.adminUrl ?: cloud.lastAdminUrl().orEmpty(),
+                    onAdminSetup = { url ->
+                        cloud.startAdminEnrollment(url) { target ->
+                            try {
+                                startActivity(Intent(Intent.ACTION_VIEW, target).addCategory(Intent.CATEGORY_BROWSABLE))
+                            } catch (_: Exception) {
+                                Toast.makeText(this, "Kein Browser gefunden.", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    },
+                    onScanProfile = {
+                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                            scannerOpen = true
+                        } else {
+                            cameraPermission.launch(Manifest.permission.CAMERA)
+                        }
+                    },
+                    onConnect = {
+                        connectingFromSetup = true
+                        writeManualDisconnect(this@MainActivity, false)
+                        if (Build.VERSION.SDK_INT >= 33 && !notificationDenied &&
+                            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            startConnection()
+                        }
+                    },
+                    onConnectLocal = localConnect@{
+                        connectingFromSetup = false
+                        if (!localState.online && (localState.stopping || !localState.canSetUp)) {
+                            Toast.makeText(this, "Der lokale Host ist gerade nicht verfügbar.", Toast.LENGTH_LONG).show()
+                            return@localConnect
+                        }
+                        connectingLocalFromSetup = true
                         try {
-                            startActivity(Intent(Intent.ACTION_VIEW, target).addCategory(Intent.CATEGORY_BROWSABLE))
-                        } catch (_: Exception) {
-                            Toast.makeText(this, "Kein Browser gefunden.", Toast.LENGTH_LONG).show()
+                            // Protect the app-owned host before an explicit Local
+                            // connect; do not connect a configured Cloud profile as a side effect.
+                            HarwConnectionService.startLocalFrom(this@MainActivity)
+                        } catch (error: Exception) {
+                            connectingLocalFromSetup = false
+                            onDevice.reportServiceError(error)
+                            Toast.makeText(this, "Der lokale Host ist gerade nicht verfügbar.", Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    onDisconnect = {
+                        writeManualDisconnect(this@MainActivity, true)
+                        (application as HarwApplication).localAutostart.suppress()
+                        cloud.disconnect(); onDevice.disconnect()
+                    },
+                    onSelectRoute = cloud::selectRoute,
+                    onForgetSetup = cloud::forgetSetup,
+                    onRetryCleanup = cloud::retryCleanup,
+                    onCheckChatgpt = cloud::refreshChatgptAccount,
+                    onChatgptSignIn = cloud::startChatgptSignIn,
+                    onChatgptUnlink = cloud::unlinkChatgptAccount,
+                    onChatgptCancel = cloud::cancelChatgptBrowser,
+                    onDismissPlanNotice = cloud::dismissChatgptPlanNotice,
+                    onManageChatgpt = ::openChatgptUsage,
+                )
+            }
+            projectKey == null && sessionId == null -> {
+                LaunchedEffect(state.online, state.generation) { if (state.online) connection.refreshProjects() }
+                HomeShortcutLayout(
+                    shortcuts = shortcuts,
+                    onAssistant = { openLocalPrivate(false) },
+                    onCloudAssistant = ::openCloudPrivate,
+                    onLibrary = { openLocalPrivate(true) },
+                    onCloudLibrary = ::openCloudLibrary,
+                    onSettings = { openSettings(SettingsRoute.Hub) },
+                    onNewSession = { window.openNewChat(viewLocal, null) },
+                    overlayShortcuts = true,
+                ) { modifier ->
+                    Column(modifier) {
+                        val backendName = if (state.local) "local" else "cloud"
+                        val showInternal = rememberShowSystemSessions(this@MainActivity)
+                        var internalOpen by remember(backendName, state.profile, state.deviceNodeId) { mutableStateOf(false) }
+                        LaunchedEffect(showInternal) { if (!showInternal) internalOpen = false }
+                        HarwHeader(
+                            title = if (showInternal && internalOpen) "Internal"
+                            else androidx.compose.ui.res.stringResource(R.string.unified_home_overview),
+                        ) { ConnectionBadge(state) }
+                        BackendSwitch(
+                            local = state.local,
+                            enabled = !state.stopping,
+                            onSelect = { viewChosen = true; viewLocal = it },
+                        )
+                        if (showInternal && internalOpen) {
+                            SystemSessionsScreen(state, connection, onBack = { internalOpen = false }, modifier = Modifier.weight(1f))
+                        } else {
+                            var projectNames by remember(backendName) { mutableStateOf(readProjectNames(this@MainActivity, backendName)) }
+                            var suggestion by remember(backendName) { mutableStateOf<ProjectSuggestion?>(null) }
+                            LaunchedEffect(connection, state.online, state.generation, state.projects) {
+                                suggestion = if (!state.online) null else suggestProject(
+                                    connection.unassignedRows(), readDismissedSuggestions(this@MainActivity),
+                                )
+                            }
+                            SessionHomeScreen(
+                                state = state,
+                                connection = connection,
+                                projectNames = projectNames,
+                                onOpen = window::select,
+                                projectLinks = HomeProjectLinks(
+                                    open = window::selectProject,
+                                    create = { newProjectOpen = true },
+                                    newSession = { key ->
+                                        connection.createInProject(key) { id ->
+                                            applyProjectAgent(this@MainActivity, key, id)
+                                            window.openLink(DeepLink(key, id))
+                                        }
+                                    },
+                                    rename = { key, name ->
+                                        projectNames = writeProjectName(this@MainActivity, backendName, key, name)
+                                    },
+                                    openInternal = if (showInternal) ({ internalOpen = true }) else null,
+                                    suggestion = suggestion,
+                                    acceptSuggestion = { selected ->
+                                        val key = slugify(selected.name)
+                                        connection.assignMany(selected.sessionIds, key)
+                                        projectNames = writeProjectName(this@MainActivity, backendName, key, selected.name)
+                                        suggestion = null
+                                    },
+                                    dismissSuggestion = { selected ->
+                                        dismissSuggestion(this@MainActivity, selected.name)
+                                        suggestion = null
+                                    },
+                                ),
+                                modifier = Modifier.weight(1f),
+                            )
                         }
                     }
-                },
-                onScanProfile = {
-                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                        scannerOpen = true
-                    } else {
-                        cameraPermission.launch(Manifest.permission.CAMERA)
-                    }
-                },
-                onConnect = {
-                    connectingFromSetup = true
-                    writeManualDisconnect(this@MainActivity, false)
-                    if (Build.VERSION.SDK_INT >= 33 && !notificationDenied &&
-                        ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-                    ) {
-                        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-                    } else {
-                        startConnection()
-                    }
-                },
-                onConnectLocal = {
-                    connectingFromSetup = true
-                    (application as HarwApplication).localAutostart.resume()
-                    onDevice.connectLocal()
-                },
-                onDisconnect = {
-                    writeManualDisconnect(this@MainActivity, true)
-                    (application as HarwApplication).localAutostart.suppress()
-                    cloud.disconnect(); onDevice.disconnect()
-                },
-                onSelectRoute = { cloud.selectRoute(it) },
-                onForgetSetup = cloud::forgetSetup,
-                onRetryCleanup = cloud::retryCleanup,
-                onCheckChatgpt = cloud::refreshChatgptAccount,
-                onChatgptSignIn = cloud::startChatgptSignIn,
-                onChatgptUnlink = cloud::unlinkChatgptAccount,
-                onChatgptCancel = cloud::cancelChatgptBrowser,
-                onDismissPlanNotice = cloud::dismissChatgptPlanNotice,
-                onManageChatgpt = ::openChatgptUsage,
-            )
-        } else if (projectKey == null && sessionId == null) {
-            LaunchedEffect(state.online, state.generation) { if (state.online) connection.refreshProjects() }
-            Box(Modifier.fillMaxSize()) {
-            Column(Modifier.fillMaxSize()) {
-                HarwHeader(title = "Projekte") {
-                    ConnectionBadge(state)
-                    IconButton(onClick = { openSettings(SettingsRoute.Hub) }) {
-                        Icon(Icons.Outlined.Settings, "Einstellungen")
-                    }
                 }
-                BackendSwitch(local = state.local, enabled = !state.stopping, onSelect = { viewChosen = true; viewLocal = it })
-                val backendName = if (state.local) "local" else "cloud"
-                var projectNames by remember(backendName) { mutableStateOf(readProjectNames(this@MainActivity, backendName)) }
-                var projectSort by remember { mutableStateOf(readProjectSort(this@MainActivity)) }
-                var suggestion by remember(backendName) { mutableStateOf<ProjectSuggestion?>(null) }
-                LaunchedEffect(state.online, state.projects, backendName) {
-                    suggestion = if (!state.online) null else suggestProject(
-                        connection.unassignedRows(), readDismissedSuggestions(this@MainActivity),
+            }
+            else -> {
+                val key = projectKey
+                if (key != null) {
+                    LaunchedEffect(key, state.online, state.generation) { if (state.online) connection.openProject(key) }
+                }
+                // E-10: eine globale Projektansicht; gehoert sie zu einem anderen Fenster, Rueckfall auf SessionDirectory.
+                val view = if (key == null) null else state.projectView?.takeIf { it.projectKey == key }
+                val actions = if (key == null) null else remember(key) {
+                    connection.projectActions { id -> window.openLink(DeepLink(key, id)) }
+                }
+                HomeShortcutLayout(
+                    shortcuts = shortcuts,
+                    onAssistant = { openLocalPrivate(false) },
+                    onCloudAssistant = ::openCloudPrivate,
+                    onLibrary = { openLocalPrivate(true) },
+                    onCloudLibrary = ::openCloudLibrary,
+                    onSettings = { openSettings(SettingsRoute.Hub) },
+                    onNewSession = { window.openNewChat(viewLocal, key?.takeIf { it.isNotEmpty() }) },
+                ) { modifier ->
+                    WorkspaceScreen(
+                        onSwitchBackend = { local ->
+                            if (window.alertTarget != null || (local && window.cloudOnlyProfile != null)) {
+                                window.select(null)
+                            }
+                            viewChosen = true
+                            viewLocal = local
+                        },
+                        state = state,
+                        window = window,
+                        connection = connection,
+                        authorizingApproval = approvalAuthorization.busy,
+                        onDecide = ::authenticateDecision,
+                        onOpenSettings = { openSettings(SettingsRoute.Hub) },
+                        onNewWindow = ::openWindow,
+                        projectView = view,
+                        projectActions = if (view != null) actions else null,
+                        modifier = modifier,
                     )
                 }
-                ProjectsScreen(
-                    names = projectNames,
-                    sort = projectSort,
-                    onSort = { projectSort = it; writeProjectSort(this@MainActivity, it) },
-                    onRename = { key, name -> projectNames = writeProjectName(this@MainActivity, backendName, key, name) },
-                    suggestion = suggestion,
-                    onAcceptSuggestion = { s ->
-                        val key = slugify(s.name)
-                        connection.assignMany(s.sessionIds, key)
-                        projectNames = writeProjectName(this@MainActivity, backendName, key, s.name)
-                        suggestion = null
-                    },
-                    onDismissSuggestion = { s -> dismissSuggestion(this@MainActivity, s.name); suggestion = null },
-                    onNewProject = { newProjectOpen = true },
-                    projects = state.projects,
-                    loaded = state.projectsLoaded,
-                    online = state.online,
-                    canCreate = state.online && state.canCreate && !state.creating,
-                    error = state.projectsError,
-                    onSelect = window::selectProject,
-                    onNewSession = { key -> connection.createInProject(key) { id -> applyProjectAgent(this@MainActivity, key, id); window.openLink(DeepLink(key, id)) } },
-                    onRefresh = connection::refreshProjects,
-                )
-            }
-            NewChatFab(
-                enabled = state.online && state.canCreate && !state.creating,
-                onClick = { window.openNewChat(viewLocal, projectKey?.takeIf { it.isNotEmpty() }) },
-                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-            )
-            }
-        } else {
-            val key = projectKey
-            if (key != null) {
-                LaunchedEffect(key, state.online, state.generation) { if (state.online) connection.openProject(key) }
-            }
-            // E-10: eine globale Projektansicht; gehoert sie zu einem anderen Fenster, Rueckfall auf SessionDirectory.
-            val view = if (key == null) null else state.projectView?.takeIf { it.projectKey == key }
-            val actions = if (key == null) null else remember(key) {
-                connection.projectActions { id -> window.openLink(DeepLink(key, id)) }
-            }
-            Box(Modifier.fillMaxSize()) {
-            WorkspaceScreen(
-                onSwitchBackend = { viewChosen = true; viewLocal = it },
-                state = state,
-                window = window,
-                connection = connection,
-                authorizingApproval = approvalAuthorization.busy,
-                onDecide = ::authenticateDecision,
-                onOpenSettings = { openSettings(SettingsRoute.Hub) },
-                onNewWindow = ::openWindow,
-                projectView = view,
-                projectActions = if (view != null) actions else null,
-            )
-            if (sessionId == null) {
-                NewChatFab(
-                    enabled = state.online && state.canCreate && !state.creating,
-                    onClick = { window.openNewChat(viewLocal, projectKey?.takeIf { it.isNotEmpty() }) },
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-                )
-            }
             }
         }
         if (newProjectOpen) {
@@ -586,6 +1098,30 @@ internal open class MainActivity : ComponentActivity() {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://chatgpt.com/settings/usage")))
         } catch (_: Exception) {
             Toast.makeText(this, "Android konnte die ChatGPT-Nutzungseinstellungen nicht öffnen.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun authenticateLocalUiaWorkDecision(
+        assistant: LocalUiaDevSession,
+        link: LocalUiaWorkLink,
+        sessionId: String,
+        generation: Long,
+        approvalId: String,
+        decision: ApprovalDecision,
+        stillOpen: () -> Boolean,
+    ) {
+        fun current() = sessionId == link.sessionId && generation == link.generation &&
+            assistantDev === assistant && viewLocal && !isFinishing &&
+            lifecycle.currentState == androidx.lifecycle.Lifecycle.State.RESUMED &&
+            onDevice.canUseLocalUiaWork(generation) && stillOpen()
+        if (!current()) return
+        approvalAuthorization.confirm(decision.displayName()) { error ->
+            if (!current()) return@confirm
+            if (error != null) {
+                onDevice.approvalFailure(sessionId, generation, error)
+            } else if (!onDevice.decide(sessionId, generation, approvalId, decision)) {
+                onDevice.approvalFailure(sessionId, generation, "Diese Freigabe ist nicht mehr verfügbar.")
+            }
         }
     }
 
@@ -615,6 +1151,7 @@ internal open class MainActivity : ComponentActivity() {
             Intent(this, SessionWindowActivity::class.java)
                 .putExtra(InitialSessionKey, sessionId)
                 .putExtra(WindowProfileKey, cloud.state.value.profile?.windowKey())
+                .putExtra(CloudOnlyProfileKey, window.cloudOnlyProfile)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT),
         )
     }
@@ -633,21 +1170,21 @@ internal data class SessionDraft(
 )
 
 internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewModel() {
+    val chatNotices = ChatNoticeLedger()
     var sessionId by mutableStateOf(
         if (savedState.contains(SelectedSessionKey)) savedState.get<String>(SelectedSessionKey)
         else savedState.get<String>(InitialSessionKey),
     )
         private set
+    var cloudOnlyProfile by mutableStateOf(savedState.get<String>(CloudOnlyProfileKey))
+        private set
+    // Never restored from an Intent or SavedState after process death.
+    var alertTarget by mutableStateOf<SessionHomeId?>(null)
+        private set
     var projectKey by mutableStateOf(savedState.get<String>(SelectedProjectKey))
         private set
     private var drafts by mutableStateOf<Map<String, SessionDraft>>(emptyMap())
     private var firstMessages by mutableStateOf<Map<String, String>>(emptyMap())
-
-    /** Lokale Kopie gesendeter Bilder je Session (nur diese App-Sitzung): Text + Bilder, aeltestes zuerst. */
-    private var sentGroups by mutableStateOf<Map<String, List<Pair<String, List<uniffi.harw_mobile_ffi.PromptImage>>>>>(emptyMap())
-
-    fun sentImages(id: String, cleanText: String, count: Int): List<uniffi.harw_mobile_ffi.PromptImage>? =
-        sentGroups[id]?.lastOrNull { it.second.size == count && sentTextKey(it.first) == sentTextKey(cleanText) }?.second
 
     /** Ungesendeter neuer Chat (Entwurf ohne Session); `null` = keiner offen. */
     var newChat by mutableStateOf<NewChatDraft?>(null)
@@ -734,8 +1271,38 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
     }
 
     fun select(id: String?) {
+        alertTarget = null
+        if (id != sessionId || id == null) updateCloudOnlyProfile(null)
         sessionId = id
         savedState[SelectedSessionKey] = id
+    }
+
+    fun selectAlertSession(target: SessionHomeId): Boolean {
+        // The old composer and its queued first message are keyed by bare ID.
+        // A notification may not attach that state to a different owner.
+        if (target.sessionId in firstMessages || target.sessionId in drafts) return false
+        updateCloudOnlyProfile(null)
+        selectProject(null)
+        alertTarget = target
+        sessionId = target.sessionId
+        savedState[SelectedSessionKey] = null
+        return true
+    }
+
+    fun selectCloudSession(id: String, profileKey: String): Boolean {
+        // The normal composer can auto-send a queued first message on attach.
+        // Never reuse per-ID phone state from an unknown owner at this boundary.
+        if (id in firstMessages || id in drafts) return false
+        useProfile(profileKey)
+        selectProject(null)
+        select(id)
+        updateCloudOnlyProfile(profileKey)
+        return true
+    }
+
+    private fun updateCloudOnlyProfile(profileKey: String?) {
+        cloudOnlyProfile = profileKey
+        savedState[CloudOnlyProfileKey] = profileKey
     }
 
     fun selectProject(key: String?) {
@@ -763,28 +1330,92 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
         drafts = drafts + (id to previous.copy(images = previous.images + image, error = null))
     }
 
-    /** Sendet eine fruehere Nachricht (Text und Bilder) erneut; ein offener Entwurf bleibt unangetastet. */
+    private data class RewriteScope(
+        val connection: HarwConnection, val profile: ServerProfile?, val deviceNodeId: String?, val sessionId: String,
+    )
+    private data class PendingRewrite(val attempt: DraftAttempt, val variant: RewriteVersionCandidate)
+
+    private val unresolvedRewrites = mutableStateMapOf<RewriteScope, PendingRewrite>()
+    private val rewriting = mutableStateMapOf<RewriteScope, Unit>()
+
+    private fun rewriteScope(connection: HarwConnection, id: String): RewriteScope {
+        val current = connection.state.value
+        return RewriteScope(connection, current.profile, current.deviceNodeId, id)
+    }
+
+    fun uncertainRewriteRequestId(connection: HarwConnection, id: String): String? =
+        unresolvedRewrites[rewriteScope(connection, id)]?.attempt?.id
+
+    fun restoreUncertainRewrite(
+        connection: HarwConnection, id: String, saved: ChatVersions.Pending.Found,
+    ) {
+        val key = rewriteScope(connection, id)
+        if (key !in rewriting && key !in unresolvedRewrites) {
+            unresolvedRewrites[key] = PendingRewrite(saved.attempt, saved.candidate)
+        }
+    }
+
+    /** Forget only the phone-side operation; no provider or host mutation. */
+    fun forgetUncertainRewrite(connection: HarwConnection, id: String, requestId: String?): Boolean {
+        val key = rewriteScope(connection, id)
+        if (key in rewriting || unresolvedRewrites[key]?.attempt?.id != requestId) return false
+        return unresolvedRewrites.remove(key) != null
+    }
+
+    /** Only the explicit Resolve action may look up this exact prior request. */
+    fun resolveUncertainRewrite(
+        connection: HarwConnection,
+        id: String,
+        generation: Long,
+        onResult: (DraftResult, RewriteVersionCandidate) -> Unit,
+    ): Boolean {
+        val key = rewriteScope(connection, id)
+        val pending = unresolvedRewrites[key] ?: return false
+        return dispatchRewrite(key, generation, pending, onResult)
+    }
+
+    /** Never turn an unresolved rewrite into a different operation by advancing the fence. */
     fun regenerate(
         connection: HarwConnection,
         id: String,
         generation: Long,
-        head: SessionCursor,
-        entryId: String,
-        text: String,
-        images: List<uniffi.harw_mobile_ffi.PromptImage>,
-    ) {
-        val previous = draft(id)
-        if (previous.uncertain || previous.sending) return
-        if (previous.text.isNotBlank() || previous.images.isNotEmpty()) {
-            drafts = drafts + (id to previous.copy(error = "Erst den Entwurf senden oder leeren, dann neu generieren."))
-            return
+        saved: ChatVersions.Pending.Found,
+        onResult: (DraftResult, RewriteVersionCandidate) -> Unit,
+    ): Boolean {
+        val attempt = saved.attempt
+        if (!isDurableRewriteItemId(attempt.rewindBefore.orEmpty()) ||
+            (attempt.text.isNotEmpty() && attempt.text.isBlank())) return false
+        val observedHead = connection.state.value.windows[id]?.snapshot?.head ?: return false
+        if (!observedHead.hasSameRewriteBoundary(attempt.head)) return false
+        val key = rewriteScope(connection, id)
+        if (key in unresolvedRewrites || key in rewriting || unresolvedRewrites.size + rewriting.size >= 8) return false
+        return dispatchRewrite(key, generation, PendingRewrite(attempt, saved.candidate), onResult)
+    }
+
+    private fun dispatchRewrite(
+        key: RewriteScope,
+        generation: Long,
+        pending: PendingRewrite,
+        onResult: (DraftResult, RewriteVersionCandidate) -> Unit,
+    ): Boolean {
+        val (connection, _, _, id) = key
+        if (key in rewriting || !connection.exactRewindAvailable(id, generation)) return false
+        val resolving = unresolvedRewrites[key] === pending
+        rewriting[key] = Unit
+        val admitted = connection.submit(id, generation, pending.attempt) { result ->
+            rewriting.remove(key)
+            val cannotEstablishOriginal = resolving && result !is DraftResult.ExactAccepted
+            if (cannotEstablishOriginal || (result is DraftResult.Rejected && result.ambiguous)) {
+                // A stale/denied retry or old queue-only receipt may not settle
+                // the original operation that lost its reply.
+                unresolvedRewrites[key] = pending
+            } else {
+                unresolvedRewrites.remove(key)
+            }
+            onResult(result, pending.variant)
         }
-        drafts = drafts + (id to SessionDraft(
-            text,
-            images = images.mapIndexed { i, image -> DraftImage("Bild ${i + 1}", image, image.dataB64.length) },
-            rewindBefore = entryId,
-        ))
-        submit(connection, id, generation, head)
+        if (!admitted) rewriting.remove(key)
+        return admitted
     }
 
     fun detachImage(id: String, index: Int) {
@@ -804,38 +1435,77 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
     }
 
     fun submit(connection: HarwConnection, id: String, generation: Long, head: SessionCursor) {
+        submitPrepared(connection, id, generation, head)
+    }
+
+    /** Called only by the manual send path after the exact remote Library lookup. */
+    fun submitCloudLibraryImage(
+        connection: HarwConnection,
+        target: ScopedCloudChatLibraryTarget,
+        currentScope: uniffi.harw_mobile_ffi.MobileCloudLibraryScope?,
+        expectedDraft: SessionDraft,
+        head: SessionCursor,
+        jpeg: ByteArray,
+    ): Boolean {
+        val now = connection.state.value
+        val view = now.windows[target.sessionId]
+        val snapshot = view?.snapshot
+        if (!target.permits(
+                now.profile, currentScope, now.generation, sessionId, now.local,
+                now.online && !now.stopping && view?.generation == target.generation &&
+                    snapshot?.online == true && snapshot.canSubmit && snapshot.head == head,
+                // The caller has just checked the lifecycle on the main thread.
+                foreground = true,
+            ) || draft(target.sessionId) != expectedDraft ||
+            expectedDraft.rewindBefore != null || expectedDraft.attempt != null ||
+            firstMessage(target.sessionId) != null ||
+            jpeg.size !in 4..180_000
+        ) return false
+        val encoded = android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP)
+        val image = uniffi.harw_mobile_ffi.PromptImage("image/jpeg", encoded)
+        return submitPrepared(connection, target.sessionId, target.generation, head, image, target.scope)
+    }
+
+    private fun submitPrepared(
+        connection: HarwConnection, id: String, generation: Long, head: SessionCursor,
+        transientCloudImage: uniffi.harw_mobile_ffi.PromptImage? = null,
+        cloudLibraryScope: uniffi.harw_mobile_ffi.MobileCloudLibraryScope? = null,
+    ): Boolean {
         val current = draft(id)
-        if ((current.text.isBlank() && current.images.isEmpty()) || current.sending || current.uncertain) return
+        if ((current.text.isBlank() && current.images.isEmpty() && transientCloudImage == null) ||
+            current.sending || current.uncertain
+        ) return false
         val attempt = current.attempt ?: DraftAttempt(
             current.text.ifBlank { "(Bild)" },
             head,
             UUID.randomUUID().toString(),
-            current.images.map { it.image },
+            current.images.map { it.image } + listOfNotNull(transientCloudImage),
             current.rewindBefore,
         )
-        drafts = drafts + (id to current.copy(attempt = attempt, sending = true, error = null))
-        val admitted = connection.submit(id, generation, attempt) { result ->
+        // Keep only the receipt identity in the window model for an ephemeral
+        // Library send, never the bytes that the transport currently owns.
+        val tracked = if (transientCloudImage == null) attempt else attempt.copy(images = emptyList())
+        drafts = drafts + (id to current.copy(attempt = tracked, sending = true, error = null))
+        val admitted = connection.submit(id, generation, attempt, cloudLibraryScope) { result ->
             val latest = draft(id)
             if (latest.attempt?.id != attempt.id) return@submit
             drafts = when (result) {
-                DraftResult.Accepted -> {
-                    if (attempt.images.isNotEmpty()) {
-                        sentGroups = sentGroups + (id to (sentGroups[id].orEmpty() + (attempt.text to attempt.images)))
-                    }
-                    drafts - id
-                }
+                DraftResult.Accepted, is DraftResult.ExactAccepted -> drafts - id
                 is DraftResult.Rejected -> {
                     val uncertain = latest.uncertain || result.ambiguous
                     drafts + (id to latest.copy(
                         error = result.error,
                         uncertain = uncertain,
-                        attempt = attempt.takeIf { uncertain },
+                        // Do not keep the transient Cloud Library bytes in an
+                        // ordinary draft or local thumbnail cache after a result.
+                        attempt = attempt.takeIf { uncertain && transientCloudImage == null },
                         sending = false,
                     ))
                 }
             }
         }
         if (!admitted) drafts = drafts + (id to current)
+        return admitted
     }
 }
 
@@ -843,6 +1513,7 @@ private const val InitialSessionKey = "initial_session"
 private const val SelectedSessionKey = "selected_session"
 private const val SelectedProjectKey = "selected_project"
 private const val WindowProfileKey = "window_profile"
+private const val CloudOnlyProfileKey = "selected_cloud_session_profile"
 private const val AwaitingCredentialKey = "awaiting_approval_credential"
 
 // ---- Routen Projekte -> Sessions -> Unterhaltung (Paket A6) ----
@@ -884,9 +1555,31 @@ internal fun parseDeepLink(scheme: String?, host: String?, project: String?, ses
     return DeepLink(projectKey, sessionId)
 }
 
-/** Nur die Session-Id aus dem Benachrichtigungs-Extra (A9), geprueft. */
-internal fun parseOpenSessionExtra(sessionId: String?): DeepLink? =
-    sessionId?.takeIf { SessionIdPattern.matches(it) }?.let { DeepLink(null, it) }
+private val AlertProfilePattern = Regex("^[A-Za-z0-9_-]{1,64}$")
+
+internal fun parseAlertTarget(
+    sessionId: String?, source: String?, profileId: String?, alertKind: String?,
+): SessionAlertTarget? {
+    val id = sessionId?.takeIf(SessionIdPattern::matches) ?: return null
+    val backend = SessionHomeBackend.entries.firstOrNull { it.name == source } ?: return null
+    val profile = profileId?.takeIf(AlertProfilePattern::matches) ?: return null
+    val kind = SessionAlertKind.entries.firstOrNull { it.name == alertKind } ?: return null
+    return SessionAlertTarget(SessionHomeId(SessionHomeScope(backend, profile), id), kind)
+}
+
+private fun alertTargetFromIntent(intent: Intent): SessionAlertTarget? {
+    if (intent.action != HarwConnectionService.OpenSessionAlertAction) return null
+    return try {
+        parseAlertTarget(
+            intent.getStringExtra(HarwConnectionService.ExtraOpenSession),
+            intent.getStringExtra(HarwConnectionService.ExtraAlertBackend),
+            intent.getStringExtra(HarwConnectionService.ExtraAlertProfile),
+            intent.getStringExtra(HarwConnectionService.ExtraAlertKind),
+        )?.takeIf { intent.data == it.intentData() }
+    } catch (_: Exception) {
+        null
+    }
+}
 
 internal fun linkFromIntent(intent: Intent?): DeepLink? {
     if (intent == null) return null
@@ -898,5 +1591,6 @@ internal fun linkFromIntent(intent: Intent?): DeepLink? {
             null
         }
     }
-    return parseOpenSessionExtra(intent.getStringExtra(HarwConnectionService.ExtraOpenSession))
+    // Old local notifications with only a bare ID cannot prove their owner.
+    return null
 }

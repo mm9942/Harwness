@@ -113,6 +113,10 @@ pub struct ParkedApproval {
 /// with a scripted fake. All calls are per session; the driver guarantees one
 /// leg (turn or resume) at a time per session (host arbiter).
 pub trait CoreRuntime: Send + Sync + 'static {
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        None
+    }
+
     /// Trusted host admission; production runtimes must use it in assembly.
     fn prepare_execution(
         &self,
@@ -137,14 +141,26 @@ pub trait CoreRuntime: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Copy the history of `source` before its user message `before_item` into the new session `new`.
-    fn fork_history<'a>(
+    /// Actual completed-write cursor of the same host's source transcript.
+    fn committed_fork_head<'a>(
         &'a self,
         _new: &'a SessionId,
         _source: &'a SessionId,
-        _before_item: &'a str,
-    ) -> CoreFuture<'a, ()> {
-        Box::pin(async { Err(DriverBridgeError::Runtime("runtime does not support fork".into())) })
+    ) -> CoreFuture<'a, Option<u64>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Install a verified visible prefix into a new runtime.
+    fn seed_fork_history<'a>(
+        &'a self,
+        _new: &'a SessionId,
+        _items: Vec<harw_protocol::items::TurnItem>,
+    ) -> CoreFuture<'a, u64> {
+        Box::pin(async {
+            Err(DriverBridgeError::Runtime(
+                "runtime does not support fork".into(),
+            ))
+        })
     }
 
     /// Prepare the session (idempotent).
@@ -695,6 +711,43 @@ fn resolution_of(record: &ApprovalResolutionRecord) -> ApprovalResolution {
 }
 
 impl TurnDriver for CoreTurnDriver {
+    fn supports_archive_checkpoints(&self) -> bool {
+        self.runtime.archive_state_store().is_some()
+    }
+
+    fn supports_exact_rewind(&self) -> bool {
+        self.runtime.archive_state_store().is_some()
+    }
+
+    fn archive_published_head(
+        &self,
+        source: &SessionId,
+    ) -> Result<Option<std::num::NonZeroU64>, HostError> {
+        let Some(store) = self.runtime.archive_state_store() else {
+            return Ok(None);
+        };
+        store
+            .committed_fork_head(source)
+            .map(|head| head.and_then(std::num::NonZeroU64::new))
+            .map_err(|_| HostError::Storage("archive clock is unavailable".into()))
+    }
+
+    fn archive_journal_binding(
+        &self,
+        target: &SessionId,
+    ) -> Result<harw_session_host::driver::ArchiveJournalBinding, HostError> {
+        let (root, thread) = self
+            .runtime
+            .archive_state_store()
+            .and_then(|store| store.archive_journal_binding(target))
+            .ok_or(HostError::NotImplemented("archive journal binding"))?;
+        Ok(harw_session_host::driver::ArchiveJournalBinding { root, thread })
+    }
+
+    fn archive_media_store(&self) -> Option<&harw_media::MediaStore> {
+        self.media.as_deref()
+    }
+
     fn prepare_execution(
         &self,
         session_id: &SessionId,
@@ -724,16 +777,30 @@ impl TurnDriver for CoreTurnDriver {
             .map_err(HostError::from)
     }
 
-    fn fork_history(
+    fn committed_fork_head(
         &self,
         new: &SessionId,
         source: &SessionId,
-        before_item: &str,
-    ) -> DriverFuture<'_, ()> {
-        let (new, source, before) = (new.clone(), source.clone(), before_item.to_owned());
+    ) -> DriverFuture<'_, Option<u64>> {
+        let new = new.clone();
+        let source = source.clone();
         Box::pin(async move {
             self.runtime
-                .fork_history(&new, &source, &before)
+                .committed_fork_head(&new, &source)
+                .await
+                .map_err(HostError::from)
+        })
+    }
+
+    fn seed_fork_history(
+        &self,
+        new: &SessionId,
+        items: Vec<harw_protocol::items::TurnItem>,
+    ) -> DriverFuture<'_, u64> {
+        let new = new.clone();
+        Box::pin(async move {
+            self.runtime
+                .seed_fork_history(&new, items)
                 .await
                 .map_err(HostError::from)
         })
@@ -763,7 +830,17 @@ impl TurnDriver for CoreTurnDriver {
                 submitted_by = %input.submitted_by,
                 "session driver: turn start"
             );
-            let control = TurnControl::new();
+            let rewrite_sink = Arc::clone(&sink);
+            let media = self.media.clone();
+            let control = TurnControl::new()
+                .with_hosted_title_source(input.title_seed_human)
+                .with_rewrite_replacement_id(input.rewrite_replacement_id.clone())
+                .with_history_replaced(Arc::new(move || {
+                    rewrite_sink.emit(DriverEvent::HistoryReplaced);
+                }))
+                .with_rewind_media_check(Arc::new(move |reference| {
+                    media.as_ref().is_some_and(|store| store.contains(reference))
+                }));
             let token = control.cancel_token().clone();
             self.remember_control(&input.session_id, control.clone())?;
             let (tx, rx) = mpsc::unbounded_channel();
@@ -872,6 +949,12 @@ pub struct CoreSession {
 /// The approval actor in the session's spawn context is what the durable
 /// approval record binds; the responding connection's actor must match it.
 pub trait CoreSessionFactory: Send + Sync + 'static {
+    /// Authoritative factory-wide store used by source and future target.
+    /// A factory with per-core storage must not claim this capability.
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        None
+    }
+
     /// Build using the host's current, authenticated creator ceiling. An
     /// effectful factory must override this instead of discarding authority.
     fn build_with_execution(
@@ -1110,6 +1193,10 @@ where
 }
 
 impl CoreRuntime for HarwCoreRuntime {
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        self.factory.archive_state_store()
+    }
+
     fn prepare_execution(
         &self,
         session_id: &SessionId,
@@ -1209,33 +1296,65 @@ impl CoreRuntime for HarwCoreRuntime {
         Box::pin(async move { self.slot(session_id, title).await.map(|_| ()) })
     }
 
-    fn fork_history<'a>(
+    fn committed_fork_head<'a>(
         &'a self,
         new: &'a SessionId,
         source: &'a SessionId,
-        before_item: &'a str,
-    ) -> CoreFuture<'a, ()> {
+    ) -> CoreFuture<'a, Option<u64>> {
         Box::pin(async move {
-            let source_slot = self.slot(source, None).await?;
-            let items: Vec<harw_protocol::items::TurnItem> =
-                source_slot.lock().await.core.session.history().items().to_vec();
-            let Some(index) = items.iter().position(|item| {
-                matches!(item, harw_protocol::items::TurnItem::UserMessage(m) if m.id.as_str() == before_item)
-            }) else {
-                return Err(DriverBridgeError::Runtime(
-                    "fork target is not a user message of the source session".into(),
-                ));
-            };
+            // Cloud and embedded LocalHost share the factory's StateStore.
+            // The fresh destination has no inference; the source runtime
+            // need not even have a cached core. Separate stores yield None.
+            let target = self.slot(new, None).await?;
+            let store = Arc::clone(&target.lock().await.core.store);
+            store
+                .committed_fork_head(source)
+                .map_err(|error| DriverBridgeError::Core(error.to_string()))
+        })
+    }
+
+    fn seed_fork_history<'a>(
+        &'a self,
+        new: &'a SessionId,
+        items: Vec<harw_protocol::items::TurnItem>,
+    ) -> CoreFuture<'a, u64> {
+        Box::pin(async move {
             let target_slot = self.slot(new, None).await?;
             let mut guard = target_slot.lock().await;
-            *guard.core.session.history_mut() =
-                harw_core::ConversationHistory::from_items(items[..index].to_vec());
+            if !guard.core.session.history().items().is_empty()
+                || guard
+                    .core
+                    .store
+                    .committed_fork_head(new)
+                    .map_err(|error| DriverBridgeError::Core(error.to_string()))?
+                    .is_some()
+                || items.iter().any(|item| {
+                    !matches!(
+                        item,
+                        harw_protocol::items::TurnItem::UserMessage(_)
+                            | harw_protocol::items::TurnItem::AssistantMessage(_)
+                    )
+                })
+            {
+                return Err(DriverBridgeError::Runtime(
+                    "fork destination is not a fresh chat".into(),
+                ));
+            }
+            let seed = harw_core::ConversationHistory::from_items(items);
             guard
                 .core
                 .store
-                .save_history(new, guard.core.session.history())
+                .save_history(new, &seed)
                 .await
-                .map_err(|error| DriverBridgeError::Core(error.to_string()))
+                .map_err(|error| DriverBridgeError::Core(error.to_string()))?;
+            let head = guard
+                .core
+                .store
+                .committed_fork_head(new)
+                .map_err(|error| DriverBridgeError::Core(error.to_string()))?
+                .ok_or_else(|| DriverBridgeError::Core("fork seed cursor unavailable".into()))?;
+            *guard.core.session.history_mut() = seed;
+            Ok(head)
         })
     }
 
@@ -1903,11 +2022,13 @@ mod live_events {
             images: Vec::new(),
             client_msg_id: "msg-1".to_owned(),
             submitted_by: "tester".to_owned(),
+            title_seed_human: false,
             actor: ApprovalActor::Operator {
                 id: "op".to_owned(),
             },
             origin: ConnectionId::next(),
             rewind_before: None,
+            rewrite_replacement_id: None,
         };
         let cancel = tokio::sync::watch::channel(false).1;
         let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());

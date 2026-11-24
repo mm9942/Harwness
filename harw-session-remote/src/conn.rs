@@ -38,7 +38,7 @@ use harw_node_transport::{
     ClientOptions, LocalNode, NodeTransportClient, NodeVerifier, UpgradeError, empty_body,
 };
 use harw_protocol::methods::{METHOD_SESSION_HELLO, NOTIF_EVENT_FRAME};
-use harw_protocol::session_wire::{HelloAck, HelloParams, SESSION_WIRE_MINOR};
+use harw_protocol::session_wire::{HelloAck, HelloParams, SESSION_WIRE_MINOR, features};
 use harw_protocol::{
     ClientCaps, Cursor, FrameEnvelope, FrameSource, PortError, PortFuture, ProtocolVersion,
     RequestEnvelope, ResponseEnvelope, SessionFrame,
@@ -418,6 +418,10 @@ pub struct RemoteConnection {
     shared: Arc<Shared>,
     out: mpsc::Sender<RequestEnvelope>,
     hello: HelloAck,
+    // Only set by the successful NodeTransport upgrade, never from a hello
+    // field, a Unix socket, or a caller-provided raw I/O stream.
+    authenticated_node: Option<NodeId>,
+    offered_direct_owner_status: bool,
     max_message_bytes: usize,
 }
 
@@ -434,6 +438,27 @@ impl RemoteConnection {
     #[must_use]
     pub fn hello_ack(&self) -> &HelloAck {
         &self.hello
+    }
+
+    pub(crate) fn require_direct_owner_status(&self) -> Result<(), PortError> {
+        if self.authenticated_node.is_none()
+            || !self.offered_direct_owner_status
+            || !self.hello.granted.observe
+            || !self.hello.features.iter().any(|feature| feature == features::DIRECT_OWNER_STATUS_V1)
+        {
+            return Err(PortError::Denied(
+                "direct owner status was not negotiated on an authenticated Observe connection"
+                    .to_owned(),
+            ));
+        }
+        self.require_live()
+    }
+
+    pub(crate) fn require_live(&self) -> Result<(), PortError> {
+        match lock(&self.shared.state).end.as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     /// Cursor to resume `session` from, if one was recorded (h19: the
@@ -517,6 +542,7 @@ impl RemoteConnection {
 async fn start<S>(
     ws: WebSocketStream<S>,
     options: &ConnectOptions,
+    authenticated_node: Option<NodeId>,
 ) -> Result<RemoteConnection, RemoteError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -606,6 +632,10 @@ where
             host_epoch: 0,
             granted: ClientCaps::NONE,
         },
+        authenticated_node,
+        offered_direct_owner_status: options.features.iter().any(|feature| {
+            feature == features::DIRECT_OWNER_STATUS_V1
+        }),
         max_message_bytes: limits.max_message_bytes,
     };
     let params = HelloParams {
@@ -666,7 +696,7 @@ where
             Some(limits.tungstenite_config()),
         )
         .await;
-        start(ws, &options).await
+        start(ws, &options, None).await
     };
     match tokio::time::timeout(limits.hello_timeout, attempt).await {
         Ok(result) => result,
@@ -764,7 +794,7 @@ where
 
 /// Shared tail of the node connects: upgrade request, response check,
 /// websocket framing and `session.hello`.
-async fn upgrade_node(
+pub(crate) async fn upgrade_node(
     client: NodeTransportClient,
     options: &ConnectOptions,
 ) -> Result<RemoteConnection, RemoteError> {
@@ -773,17 +803,18 @@ async fn upgrade_node(
     let request = request.map(|_| empty_body());
     let upgraded = client.upgrade(request).await.map_err(upgrade_error)?;
     verify(&upgraded.response, &key)?;
+    let authenticated_node = upgraded.peer.node_id;
     let ws = WebSocketStream::from_raw_socket(
         upgraded.io,
         Role::Client,
         Some(options.limits.tungstenite_config()),
     )
     .await;
-    start(ws, options).await
+    start(ws, options, Some(authenticated_node)).await
 }
 
 /// Bounds a node connect attempt by the hello timeout.
-async fn bounded<F>(
+pub(crate) async fn bounded<F>(
     timeout: std::time::Duration,
     attempt: F,
 ) -> Result<RemoteConnection, RemoteError>

@@ -4,6 +4,10 @@
 use harw_protocol::items::ToolPlacement;
 use harw_protocol::session_port::PortError;
 use harw_protocol::session_wire::{
+    ARCHIVE_CHECKPOINT_WIRE_MINOR, ArchiveCheckpointDescribeV1, ArchiveCheckpointInfoV1,
+    ArchiveCheckpointIssueV1, ArchiveCheckpointPageV1, ArchiveCheckpointRowsV1, ForkInclusiveV1,
+};
+use harw_protocol::session_wire::{
     ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams,
     CatalogProvider, CatalogResult, CommandEffect, CommandEntry, CommandOrigin, CommandRunParams,
     CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams, ConfigGetResult,
@@ -288,6 +292,33 @@ fn unknown_frame_kind_in_envelope_decodes_to_unknown() -> TestResult {
 }
 
 #[test]
+fn frozen_v5_checkpoint_shapes_are_proof_only() -> TestResult {
+    let issue: ArchiveCheckpointIssueV1 = round_trip("archive_checkpoint_issue_v1")?;
+    let lookup: ArchiveCheckpointDescribeV1 = round_trip("archive_checkpoint_describe_v1")?;
+    let checkpoint: ArchiveCheckpointInfoV1 = round_trip("archive_checkpoint_info_v1")?;
+    assert_eq!(issue.session_id, checkpoint.session_id);
+    assert_eq!(issue.expected, checkpoint.revision);
+    assert_eq!(lookup.checkpoint_id, checkpoint.checkpoint_id);
+    let page: ArchiveCheckpointPageV1 = round_trip("archive_checkpoint_page_v1")?;
+    let rows: ArchiveCheckpointRowsV1 = round_trip("archive_checkpoint_rows_v1")?;
+    let fork: ForkInclusiveV1 = round_trip("fork_inclusive_v1")?;
+    assert_eq!(page.checkpoint_id, fork.checkpoint_id);
+    assert_eq!(rows.rows[0].locator, fork.row);
+    assert_eq!(rows.rows[0].image_count, 2);
+    for field in ["history", "roles", "media", "title", "project"] {
+        let mut params = golden("fork_inclusive_v1")?;
+        params[field] = Value::Null;
+        assert!(serde_json::from_value::<ForkInclusiveV1>(params).is_err());
+    }
+    for field in ["roles", "history", "media", "project"] {
+        let mut params = golden("archive_checkpoint_issue_v1")?;
+        params[field] = Value::Null;
+        assert!(serde_json::from_value::<ArchiveCheckpointIssueV1>(params).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn version_and_subprotocol_constants_match_fixture() -> TestResult {
     let constants = golden("constants")?;
     let text = |key: &str| {
@@ -300,6 +331,10 @@ fn version_and_subprotocol_constants_match_fixture() -> TestResult {
     assert_eq!(text("subprotocol").as_deref(), Some(SESSION_WS_SUBPROTOCOL));
     assert_eq!(text("path").as_deref(), Some(SESSION_WS_PATH));
     assert_eq!(number("wire_minor"), Some(u64::from(SESSION_WIRE_MINOR)));
+    assert_eq!(
+        number("archive_checkpoint_wire_minor"),
+        Some(u64::from(ARCHIVE_CHECKPOINT_WIRE_MINOR))
+    );
     assert_eq!(
         number("projects_wire_minor"),
         Some(u64::from(PROJECTS_WIRE_MINOR))

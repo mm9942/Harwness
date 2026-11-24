@@ -24,6 +24,7 @@ internal suspend fun signInWithChatgpt(
     expectedSubject: String?,
     openBrowser: (String) -> Unit,
     onVerifying: () -> Unit,
+    beforeTokenExchange: suspend (String) -> Unit = {},
 ): SiwcTokens = withContext(Dispatchers.IO) {
     val (attempt, callback) = ServerSocket().use { server ->
         server.bind(InetSocketAddress(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), 0), 4)
@@ -36,6 +37,10 @@ internal suspend fun signInWithChatgpt(
         throw SiwcFailure("ChatGPT sign-in or plan permission was declined.")
     }
     withContext(Dispatchers.Main.immediate) { onVerifying() }
+    // The paired caller must durably retain a freshly issued client ID
+    // before the code is consumed. Never persist the code, verifier or tokens.
+    beforeTokenExchange(callback.clientId)
+    currentCoroutineContext().ensureActive()
     val response = openAiJson(
         "/api/accounts/oauth/token",
         siwcForm(listOf(
@@ -69,10 +74,11 @@ internal suspend fun signInWithChatgpt(
         ?: response.string("earliest_refresh_at")?.let {
             it.toLongOrNull() ?: runCatching { Instant.parse(it).epochSecond }.getOrNull()
         }
+    val earliestRefreshAt = if (earliest == null || earliest <= 0L) null else earliest.toULong()
     SiwcTokens(
         callback.clientId, response.token("access_token"), response.token("refresh_token"),
         idToken, scope, (now.epochSecond + expiresIn).toULong(),
-        earliest?.takeIf { it > 0L }?.toULong(), identity,
+        earliestRefreshAt, identity,
     )
 }
 

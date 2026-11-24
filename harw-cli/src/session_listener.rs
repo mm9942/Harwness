@@ -59,12 +59,16 @@ use harw_session_host::index::ShareMode;
 use harw_types::{DeviceId, NodeId, PermissionTier};
 use tokio::net::TcpListener;
 
-use crate::session_serve_remote::{RemoteIngress, RemoteServeConfig, start_remote};
+use crate::session_serve_remote::{
+    CloudServiceKeys, DirectOwnerStatusInstance, RemoteIngress, RemoteServeConfig,
+    direct_owner_placement_requested, private_remote_writer_requested,
+    private_writer_creation_receipts_requested, private_writer_readiness_requested, start_remote,
+};
 
 /// File name of the pinned peer keys inside the remote state directory.
 pub const PEERS_FILE: &str = "node-peers.conf";
 /// AuthHub namespace of node identity keys.
-const NODE_IDENTITY_NAMESPACE: &str = "harw.node-identity";
+pub(crate) const NODE_IDENTITY_NAMESPACE: &str = "harw.node-identity";
 /// Directory name of the onion state below the session-host state directory.
 pub const ONION_DIR: &str = "onion";
 /// File name of the canonical locator inside the onion directory.
@@ -111,7 +115,7 @@ impl AuthHubSign for HubSign {
 }
 
 /// Decodes lowercase/uppercase hex; `None` for odd length or a bad digit.
-fn decode_hex(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
     }
@@ -429,6 +433,20 @@ pub async fn start_from_config(
     model: Arc<dyn ModelProvider>,
 ) -> Result<RemoteIngress, String> {
     let plan = plan(section)?;
+    let direct_owner_status_instance = DirectOwnerStatusInstance::from_gateway_environment()?;
+    let direct_owner_placement = direct_owner_placement_requested()?;
+    let private_remote_writer = private_remote_writer_requested()?;
+    let private_writer_creation_receipts = private_writer_creation_receipts_requested()?;
+    let private_writer_readiness = private_writer_readiness_requested()?;
+    if private_writer_readiness && (!private_writer_creation_receipts || !private_remote_writer) {
+        return Err("HARW_PRIVATE_WRITER_READINESS requires the isolated writer and creation receipts".into());
+    }
+    if private_writer_creation_receipts && !private_remote_writer {
+        return Err("HARW_PRIVATE_WRITER_CREATE_RECEIPTS requires HARW_PRIVATE_REMOTE_WRITER=1".into());
+    }
+    if direct_owner_placement && direct_owner_status_instance.is_none() {
+        return Err("HARW_DIRECT_OWNER_PLACEMENT requires HARW_DIRECT_OWNER_STATUS_INSTANCE".into());
+    }
     let infrastructure = infrastructure
         .ok_or_else(|| "[session_listener] needs [infrastructure] (AuthHub)".to_owned())?;
     let client = crate::secret_store::authhub_client(infrastructure)?;
@@ -457,6 +475,16 @@ pub async fn start_from_config(
     config.approval_device = plan.approval_device;
     config.provider_link_device = plan.provider_link_device;
     config.share = plan.share.clone();
+    config.cloud_keys = CloudServiceKeys::from_gateway_environment();
+    config.direct_owner_status_instance = direct_owner_status_instance;
+    config.direct_owner_placement = direct_owner_placement;
+    config.private_remote_writer = private_remote_writer;
+    config.private_writer_creation_receipts = private_writer_creation_receipts;
+    config.private_writer_readiness = private_writer_readiness;
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    {
+        config.owner_onion_ingress = plan.onion;
+    }
     let remote_dir = state_dir.join("remote");
     let peers_text = crate::session_serve_remote::read_peer_pins(&remote_dir.join(PEERS_FILE))?;
     config.peer_pins_digest = Some(*blake3::hash(peers_text.as_bytes()).as_bytes());
@@ -485,6 +513,8 @@ pub async fn start_from_config(
             }
         }
     }
+    #[cfg(all(unix, feature = "direct-owner-placement"))]
+    ingress.start_owner_reporter();
     Ok(ingress)
 }
 

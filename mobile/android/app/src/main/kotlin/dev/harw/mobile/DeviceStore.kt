@@ -5,11 +5,13 @@ import android.content.pm.PackageManager
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
+import android.system.Os
+import android.system.OsConstants
 import android.util.AtomicFile
-import com.google.gson.JsonObject
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.security.KeyStore
 import java.util.UUID
 import javax.crypto.Cipher
@@ -23,6 +25,7 @@ internal class DeviceStore(private val context: Context) {
     private val resetMarker = AtomicFile(File(context.noBackupFilesDir, "setup-reset.pending"))
     private val siwcHostFile = AtomicFile(File(context.noBackupFilesDir, "chatgpt-host-id"))
     private val siwcRegistrationFile = AtomicFile(File(context.noBackupFilesDir, "chatgpt-registration.json"))
+    private val gatewaySiwcFile = AtomicFile(File(context.noBackupFilesDir, "chatgpt-gateway-registrations-v1.json"))
 
     fun loadOrGenerateIdentity(generate: () -> ByteArray): ByteArray {
         val keyStore = KeyStore.getInstance(KeyStoreName).apply { load(null) }
@@ -65,40 +68,58 @@ internal class DeviceStore(private val context: Context) {
 
     fun hasPendingReset(): Boolean = atomicFileExists(resetMarker.baseFile)
 
-    fun chatgptHostId(): String {
-        val saved = siwcHostFile.readIfPresent(::readProfileDocument)
-        if (saved != null) {
-            require(saved.startsWith("urn:uuid:") && UUID.fromString(saved.removePrefix("urn:uuid:")).version() == 4) {
-                "The saved ChatGPT host identifier is invalid."
-            }
-            return saved
+    /** Call under the app-wide connection storage lock. Never send the legacy UUID to another gateway. */
+    fun chatgptGatewayRegistration(gatewayScope: String, legacyScope: String): GatewaySiwcRegistration {
+        val rows = readGatewaySiwcRegistrations()
+        rows[gatewayScope]?.let { return it }
+        val legacy = legacyGatewaySiwcRegistration(
+            siwcRegistrationFile.readIfPresent(::readProfileDocument), legacyScope,
+        ) { siwcHostFile.readIfPresent(::readProfileDocument) }
+        // A legacy UUID can be migrated only once, even if an old route is
+        // imported a second time. Retain all other gateway state on disk.
+        val selected = legacy?.takeUnless { candidate -> rows.values.any { it.hostId == candidate.hostId } }
+            ?: GatewaySiwcRegistration("urn:uuid:${UUID.randomUUID()}")
+        writeGatewaySiwcRegistrations(rows + (gatewayScope to selected))
+        return selected
+    }
+
+    fun saveChatgptGatewayRegistration(
+        gatewayScope: String,
+        expected: GatewaySiwcRegistration,
+        next: GatewaySiwcRegistration,
+    ) {
+        val rows = readGatewaySiwcRegistrations()
+        if (rows[gatewayScope] != expected || next.hostId != expected.hostId ||
+            (next != expected && (next.revision <= expected.revision || next.revision - expected.revision != 1L))
+        ) {
+            throw SiwcFailure("The saved ChatGPT gateway sign-in changed. Start sign-in again.")
         }
-        val hostId = "urn:uuid:${UUID.randomUUID()}"
-        siwcHostFile.writeAtomically(hostId.encodeToByteArray())
-        return hostId
+        // Also sync an unchanged registration before token exchange. A
+        // preceding failed directory sync may have left visible but not
+        // durably confirmed bytes; mere readback cannot recover that.
+        writeGatewaySiwcRegistrations(rows + (gatewayScope to next))
     }
 
-    fun chatgptRegistration(serverScope: String): SiwcRegistration? {
-        val saved = siwcRegistrationFile.readIfPresent(::readProfileDocument) ?: return null
-        val fields = SiwcJson.fromJson(saved, JsonObject::class.java)
-        if (fields.string("server_scope") != serverScope) return null
-        val client = requireNotNull(fields.string("client_id"))
-        val subject = requireNotNull(fields.string("subject"))
-        require(isSiwcClientId(client) && subject.isNotBlank())
-        return SiwcRegistration(client, subject)
+    private fun readGatewaySiwcRegistrations(): Map<String, GatewaySiwcRegistration> =
+        gatewaySiwcFile.readIfPresent { decodeGatewaySiwcRegistrations(readGatewaySiwcDocument(it)) }
+            ?: emptyMap()
+
+    private fun writeGatewaySiwcRegistrations(rows: Map<String, GatewaySiwcRegistration>) {
+        val bytes = encodeGatewaySiwcRegistrations(rows).encodeToByteArray()
+        require(bytes.size <= GatewaySiwcMaxBytes)
+        gatewaySiwcFile.writeAtomically(bytes, durableDirectory = true)
     }
 
-    fun saveChatgptRegistration(serverScope: String, registration: SiwcRegistration) {
-        val fields = JsonObject().apply {
-            addProperty("server_scope", serverScope)
-            addProperty("client_id", registration.clientId)
-            addProperty("subject", registration.subject)
+    private fun readGatewaySiwcDocument(input: InputStream): String {
+        val bytes = java.io.ByteArrayOutputStream()
+        val chunk = ByteArray(8 * 1024)
+        while (true) {
+            val count = input.read(chunk)
+            if (count < 0) break
+            require(bytes.size() + count <= GatewaySiwcMaxBytes)
+            bytes.write(chunk, 0, count)
         }
-        siwcRegistrationFile.writeAtomically(SiwcJson.toJson(fields).encodeToByteArray())
-    }
-
-    fun clearChatgptRegistration(serverScope: String) {
-        if (chatgptRegistration(serverScope) != null) siwcRegistrationFile.deleteChecked()
+        return bytes.toByteArray().decodeToString(throwOnInvalidSequence = true)
     }
 
     fun purgeSetup() {
@@ -111,6 +132,7 @@ internal class DeviceStore(private val context: Context) {
             runCatching { profileFile.deleteChecked() }.exceptionOrNull(),
             runCatching { siwcHostFile.deleteChecked() }.exceptionOrNull(),
             runCatching { siwcRegistrationFile.deleteChecked() }.exceptionOrNull(),
+            runCatching { gatewaySiwcFile.deleteChecked() }.exceptionOrNull(),
         ).filterNotNull()
         if (failures.isNotEmpty()) {
             val failure = failures.first()
@@ -164,14 +186,23 @@ internal class DeviceStore(private val context: Context) {
             .generateKey()
     }
 
-    private fun AtomicFile.writeAtomically(bytes: ByteArray) {
+    private fun AtomicFile.writeAtomically(bytes: ByteArray, durableDirectory: Boolean = false) {
         val output = startWrite()
         try {
             output.write(bytes)
+            if (durableDirectory) output.fd.sync()
             finishWrite(output)
         } catch (error: Exception) {
             failWrite(output)
             throw error
+        }
+        if (durableDirectory) {
+            val directory = Os.open(requireNotNull(baseFile.parent), OsConstants.O_RDONLY or OsConstants.O_DIRECTORY, 0)
+            try {
+                Os.fsync(directory)
+            } finally {
+                Os.close(directory)
+            }
         }
         check(readFully().contentEquals(bytes)) { "Android could not confirm that connection data was saved." }
     }
@@ -199,6 +230,7 @@ internal class DeviceStore(private val context: Context) {
         const val Transformation = "AES/GCM/NoPadding"
         const val FormatVersion: Byte = 1
         const val IvBytes = 12
+        const val GatewaySiwcMaxBytes = 1024 * 1024
         const val TagBytes = 16
         val AssociatedData = KeyAlias.toByteArray(Charsets.UTF_8)
     }

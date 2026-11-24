@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cloud_assistant_recall_clear">Auswahl verwerfen</string>
+    <string name="cloud_assistant_recall_choose">Frühere Nachrichten für diese Anfrage auswählen</string>
+    <string name="cloud_assistant_recall_disclosure">Wähle bis zu vier Frage-Antwort-Paare (insgesamt höchstens 8 KiB). Nur für diese Anfrage erhält der am Gateway konfigurierte Anbieter die ausgewählten Nachrichten zusätzlich zum jüngsten Verlauf.</string>
+    <string name="cloud_assistant_recall_include">Dieses Paar mitgeben</string>
+    <string name="cloud_assistant_recall_count">%1$d von %2$d Paaren für diese Anfrage ausgewählt</string>
+    <string name="cloud_assistant_recall_send">Mit Auswahl senden</string>
+</resources>

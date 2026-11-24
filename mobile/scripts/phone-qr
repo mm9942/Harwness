@@ -76,8 +76,8 @@ def main():
     if args.action == "enrollment":
         print(json.dumps(read_enrollment(), ensure_ascii=False))
         return
-    import segno
     text = profile_text(args.profile_json)
+    import segno
     try:
         qr = segno.make_qr(text, error="M", mode="alphanumeric")
     except segno.DataOverflowError:

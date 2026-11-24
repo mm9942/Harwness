@@ -1,26 +1,17 @@
 package dev.harw.mobile
 
 import android.content.Context
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -53,14 +44,25 @@ internal fun rememberChatAgentName(sessionId: String, local: Boolean, version: I
     return name
 }
 
-/** Chip mit Auswahl des Agenten dieses Chats; Eintrag zum Setzen als Projekt-Standard. */
+internal class ChatAgentControl(
+    val selectedName: String?,
+    val canChoose: Boolean,
+    val choices: @Composable (onClose: () -> Unit) -> Unit,
+)
+
+/** The quick picker and Settings open the same scoped UIA selection. */
 @Composable
-internal fun ChatAgentChip(sessionId: String, projectKey: String?, version: Int, onChanged: () -> Unit) {
+internal fun rememberChatAgentControl(
+    sessionId: String,
+    projectKey: String?,
+    version: Int,
+    canChange: () -> Boolean,
+    onChanged: () -> Unit,
+): ChatAgentControl? {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var open by remember { mutableStateOf(false) }
     var reload by remember { mutableIntStateOf(0) }
-    val data by produceState<Triple<List<UiaProfile>, UiaProfile?, UiaProfile?>?>(null, sessionId, version, reload) {
+    val data by produceState<Triple<List<UiaProfile>, UiaProfile?, UiaProfile?>?>(null, sessionId, projectKey, version, reload) {
         value = withContext(Dispatchers.IO) {
             runCatching {
                 val uias = store(context)
@@ -71,51 +73,52 @@ internal fun ChatAgentChip(sessionId: String, projectKey: String?, version: Int,
             }.getOrNull()
         }
     }
-    val (all, current, projectDefault) = data ?: return
-    if (all.size < 2 && projectDefault == null) return
-    Column(Modifier.padding(top = 2.dp)) {
-        AssistChip(
-            onClick = { open = true },
-            label = { Text("Agent: ${current?.name ?: "–"} ▾", maxLines = 1, overflow = TextOverflow.Ellipsis) },
-        )
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            all.forEach { uia ->
-                DropdownMenuItem(
-                    text = { Text(if (uia.id == current?.id) "✓ ${uia.name}" else uia.name) },
-                    onClick = {
-                        open = false
-                        scope.launch(Dispatchers.IO) {
-                            runCatching { store(context).setSessionUia(sessionId, uia.id) }
-                            onChanged()
+    val (all, current, projectDefault) = data ?: return null
+    return ChatAgentControl(current?.name, all.size >= 2 || projectDefault != null) { close ->
+        all.forEach { uia ->
+            DropdownMenuItem(
+                text = { Text(if (uia.id == current?.id) "✓ ${uia.name}" else uia.name) },
+                onClick = {
+                    if (canChange()) {
+                        close()
+                        scope.launch {
+                            val changed = withContext(Dispatchers.IO) {
+                                runCatching { store(context).setSessionUia(sessionId, uia.id) }.isSuccess
+                            }
+                            if (changed) onChanged()
                         }
-                    },
-                )
-            }
-            val project = projectKey?.takeIf { it != NoProjectKey }
-            if (project != null && current != null) {
-                HorizontalDivider()
-                DropdownMenuItem(
-                    text = { Text("${current.name} als Standard für dieses Projekt") },
-                    onClick = {
-                        open = false
-                        scope.launch(Dispatchers.IO) {
-                            runCatching { store(context).setProjectDefaultUia(project, current.id) }
+                    }
+                },
+            )
+        }
+        val project = projectKey?.takeIf { it != NoProjectKey }
+        if (project != null && current != null) {
+            HorizontalDivider()
+            DropdownMenuItem(
+                text = { Text("${current.name} als Standard für dieses Projekt") },
+                onClick = {
+                    if (canChange()) {
+                        close()
+                        scope.launch {
+                            withContext(Dispatchers.IO) { runCatching { store(context).setProjectDefaultUia(project, current.id) } }
                             reload++
                         }
-                    },
-                )
-                if (projectDefault != null) {
-                    DropdownMenuItem(
-                        text = { Text("Projekt-Standard (${projectDefault.name}) entfernen") },
-                        onClick = {
-                            open = false
-                            scope.launch(Dispatchers.IO) {
-                                runCatching { store(context).setProjectDefaultUia(project, null) }
+                    }
+                },
+            )
+            if (projectDefault != null) {
+                DropdownMenuItem(
+                    text = { Text("Projekt-Standard (${projectDefault.name}) entfernen") },
+                    onClick = {
+                        if (canChange()) {
+                            close()
+                            scope.launch {
+                                withContext(Dispatchers.IO) { runCatching { store(context).setProjectDefaultUia(project, null) } }
                                 reload++
                             }
-                        },
-                    )
-                }
+                        }
+                    },
+                )
             }
         }
     }

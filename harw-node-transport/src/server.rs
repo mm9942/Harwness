@@ -20,9 +20,10 @@ use tokio_rustls::TlsAcceptor;
 use crate::error::TransportError;
 use crate::handshake::{
     AuthenticatedPeer, ClientFinish, ClientHello, HandshakePolicy, NONCE_LEN, ReplayCache,
-    ServerHandshake, encode_server_accept, now_unix_ms,
+    Role, ServerHandshake, encode_server_accept, now_unix_ms,
 };
 use crate::identity::{LocalNode, NodeVerifier};
+use crate::owner_process_channel::{LiveOwnerProcessChannel, ServerOwnerProcessBinding};
 use crate::tls;
 use crate::wire::{read_frame, write_frame};
 
@@ -141,17 +142,19 @@ impl NodeTransportServer {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
         F: Future<Output = ()>,
     {
-        self.serve_loop(listener, service, shutdown, false).await
+        self.serve_loop(listener, service, shutdown, false, || true)
+            .await
     }
 
     /// Shared accept loop of [`Self::serve_with_shutdown`] and
     /// `serve_upgradable`; `upgrades` enables HTTP/1 upgrades on connections.
-    pub(crate) async fn serve_loop<S, B, F>(
+    pub(crate) async fn serve_loop<S, B, F, G>(
         &self,
         listener: TcpListener,
         service: S,
         shutdown: F,
         upgrades: bool,
+        admit: G,
     ) -> Result<(), TransportError>
     where
         S: tower_service::Service<Request<Incoming>, Response = Response<B>>
@@ -164,6 +167,7 @@ impl NodeTransportServer {
         B::Data: Send,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
         F: Future<Output = ()>,
+        G: Fn() -> bool + Clone + Send + 'static,
     {
         let mut shutdown = std::pin::pin!(shutdown);
         loop {
@@ -182,6 +186,12 @@ impl NodeTransportServer {
                     continue;
                 }
             };
+            // Close refused sockets without consuming a transport slot,
+            // spawning work, or reading transport bytes.
+            if !admit() {
+                drop(tcp);
+                continue;
+            }
             let Ok(permit) = Arc::clone(&self.inner.slots).try_acquire_owned() else {
                 tracing::warn!(%remote, "node transport connection limit reached");
                 drop(tcp);
@@ -191,8 +201,13 @@ impl NodeTransportServer {
             let inner = Arc::clone(&self.inner);
             let service = service.clone();
             let timeout = inner.options.handshake_timeout;
+            let admit = admit.clone();
             tokio::spawn(async move {
                 let _permit = permit;
+                // The task might only have been scheduled after disable.
+                if !admit() {
+                    return;
+                }
                 if let Err(err) = handle_connection(inner, tcp, service, upgrades, timeout).await {
                     // `remote` is logged for operators only; it is never
                     // used as identity.
@@ -213,7 +228,42 @@ impl NodeTransportServer {
         tcp: TcpStream,
     ) -> Result<(AuthenticatedPeer, ServerTlsStream), TransportError> {
         let _ = tcp.set_nodelay(true);
-        accept_node(&self.inner, tcp, self.inner.options.handshake_timeout).await
+        let accepted = accept_node(&self.inner, tcp, self.inner.options.handshake_timeout).await?;
+        Ok((accepted.peer, accepted.stream))
+    }
+
+    /// Serves one established stream without offering HTTP/1 upgrades.
+    ///
+    /// TLS, pinned node authentication, replay checks and connection limits
+    /// are the same as TCP. Dropping this future closes the stream and
+    /// invalidates any connection-bound witnesses. An exhausted connection
+    /// budget drops the stream and returns `Ok(())`.
+    ///
+    /// # Errors
+    /// Handshake, timeout or HTTP failures.
+    pub async fn serve_io<I, S, B>(
+        &self,
+        io: I,
+        service: S,
+        handshake_timeout: Duration,
+    ) -> Result<(), TransportError>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: tower_service::Service<Request<Incoming>, Response = Response<B>>
+            + Clone
+            + Send
+            + 'static,
+        S::Future: Send + 'static,
+        S::Error: Into<Box<dyn StdError + Send + Sync>>,
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let Ok(_permit) = Arc::clone(&self.inner.slots).try_acquire_owned() else {
+            tracing::warn!("node transport connection limit reached");
+            return Ok(());
+        };
+        handle_connection(Arc::clone(&self.inner), io, service, false, handshake_timeout).await
     }
 
     /// Serves one already-connected byte stream (e.g. an accepted onion
@@ -269,11 +319,17 @@ fn is_per_connection(err: &std::io::Error) -> bool {
     )
 }
 
+struct AcceptedNode<I> {
+    peer: AuthenticatedPeer,
+    peer_key_fingerprint: Option<[u8; 32]>,
+    stream: tokio_rustls::server::TlsStream<I>,
+}
+
 async fn accept_node<I>(
     inner: &ServerInner,
     io: I,
     timeout: Duration,
-) -> Result<(AuthenticatedPeer, tokio_rustls::server::TlsStream<I>), TransportError>
+) -> Result<AcceptedNode<I>, TransportError>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -285,14 +341,18 @@ where
 async fn accept_untimed<I>(
     inner: &ServerInner,
     io: I,
-) -> Result<(AuthenticatedPeer, tokio_rustls::server::TlsStream<I>), TransportError>
+) -> Result<AcceptedNode<I>, TransportError>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut stream = inner.acceptor.accept(io).await?;
     let binding = tls::server_channel_binding(stream.get_ref().1)?;
     match server_handshake(inner, &mut stream, binding).await {
-        Ok(peer) => Ok((peer, stream)),
+        Ok((peer, peer_key_fingerprint)) => Ok(AcceptedNode {
+            peer,
+            peer_key_fingerprint,
+            stream,
+        }),
         Err(err) => {
             // Close with close_notify so the client sees a clean rejection;
             // the reason stays server-side.
@@ -306,7 +366,7 @@ async fn server_handshake<S>(
     inner: &ServerInner,
     stream: &mut S,
     binding: [u8; crate::handshake::CHANNEL_BINDING_LEN],
-) -> Result<AuthenticatedPeer, TransportError>
+) -> Result<(AuthenticatedPeer, Option<[u8; 32]>), TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -325,14 +385,14 @@ where
     let signature = inner.local.signer.sign(&pending.signing_payload()).await?;
     write_frame(stream, &pending.server_hello(signature).encode()).await?;
     let finish = ClientFinish::decode(&read_frame(stream).await?)?;
-    let peer = pending.finish(
+    let verified = pending.finish_with_key_fingerprint(
         &finish,
         inner.verifier.as_ref(),
         &inner.replay,
         now_unix_ms(),
     )?;
     write_frame(stream, &encode_server_accept()).await?;
-    Ok(peer)
+    Ok(verified)
 }
 
 async fn handle_connection<I, S, B>(
@@ -351,11 +411,16 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let (peer, stream) = accept_node(&inner, io, handshake_timeout).await?;
+    let AcceptedNode { peer, peer_key_fingerprint, stream } =
+        accept_node(&inner, io, handshake_timeout).await?;
     tracing::debug!(peer = %peer.node_id, "node transport peer authenticated");
+    let exporter = tls::server_owner_process_exporter(stream.get_ref().1)?;
+    let (_live_channel, owner_process_channel) =
+        LiveOwnerProcessChannel::new(peer.clone(), exporter, Role::Server, peer_key_fingerprint);
     let service = TowerToHyperService::new(InjectPeer {
         inner: service,
         peer,
+        owner_process_channel: ServerOwnerProcessBinding(owner_process_channel),
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
@@ -380,12 +445,13 @@ pub(crate) fn random_nonce() -> Result<[u8; NONCE_LEN], TransportError> {
 }
 
 /// Tower middleware inserting the connection's [`AuthenticatedPeer`] into
-/// every request. It overwrites any value already present, so nothing a
-/// client sends can influence it.
-#[derive(Debug, Clone)]
+/// every request, alongside the private connection-bound proof witness.
+/// Both overwrite any existing value; nothing a client sends influences them.
+#[derive(Clone)]
 struct InjectPeer<S> {
     inner: S,
     peer: AuthenticatedPeer,
+    owner_process_channel: ServerOwnerProcessBinding,
 }
 
 impl<S, B> tower_service::Service<Request<B>> for InjectPeer<S>
@@ -401,7 +467,9 @@ where
     }
 
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        request.extensions_mut().insert(self.peer.clone());
+        let extensions = request.extensions_mut();
+        extensions.insert(self.peer.clone());
+        extensions.insert(self.owner_process_channel.clone());
         self.inner.call(request)
     }
 }

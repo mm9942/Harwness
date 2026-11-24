@@ -27,6 +27,54 @@ pub enum RecordKind {
     Lifecycle,
 }
 
+/// Authority-supplied purpose written only at first transcript admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPurpose {
+    Dream,
+    // Reserved only for genuine future transcript producers. A diary file,
+    // ledger item or maintenance task is not a session and cannot emit these.
+    Diary,
+    Ledger,
+    MemoryReconciliation,
+    AutomaticWorkbench,
+    /// An internal purpose that has no explicitly published metadata category.
+    #[serde(other)]
+    Internal,
+}
+
+const SESSION_PURPOSE_MARKER: &str = "harw_session_purpose";
+const SESSION_PURPOSE_VERSION: u32 = 1;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionPurposePayload {
+    marker: String,
+    version: u32,
+    purpose: SessionPurpose,
+}
+
+impl SessionPurpose {
+    pub(crate) fn opening_payload(self) -> serde_json::Value {
+        serde_json::json!({
+            "marker": SESSION_PURPOSE_MARKER,
+            "version": SESSION_PURPOSE_VERSION,
+            "purpose": self,
+        })
+    }
+
+    /// Only a recognized sequence-zero Lifecycle marker can classify a transcript.
+    #[must_use]
+    pub fn from_opening_record(record: &TranscriptRecord) -> Option<Self> {
+        if record.kind != RecordKind::Lifecycle || record.sequence != 0 {
+            return None;
+        }
+        let value: SessionPurposePayload = serde_json::from_value(record.payload.clone()).ok()?;
+        (value.marker == SESSION_PURPOSE_MARKER && value.version == SESSION_PURPOSE_VERSION)
+            .then_some(value.purpose)
+    }
+}
+
 /// One append-only transcript entry for a session's replay log.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TranscriptRecord {

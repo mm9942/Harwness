@@ -46,6 +46,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -64,6 +65,7 @@ import uniffi.harw_mobile_ffi.TorBootstrap
 @Composable
 internal fun ConnectionScreen(
     state: WorkspaceState,
+    localState: WorkspaceState,
     notificationDenied: Boolean,
     canGoBack: Boolean,
     onBack: () -> Unit,
@@ -77,7 +79,7 @@ internal fun ConnectionScreen(
     onConnect: () -> Unit,
     onConnectLocal: () -> Unit,
     onDisconnect: () -> Unit,
-    onSelectRoute: (RoutePreference) -> Unit,
+    onSelectRoute: (ServerProfile, RoutePreference) -> Unit,
     onForgetSetup: () -> Unit,
     onRetryCleanup: () -> Unit,
     onCheckChatgpt: () -> Unit,
@@ -87,6 +89,32 @@ internal fun ConnectionScreen(
     onDismissPlanNotice: () -> Unit,
     onManageChatgpt: () -> Unit,
 ) {
+    var routeConsent by remember(state.profile) { mutableStateOf<RoutePreference?>(null) }
+    val routeProfile = state.profile
+    val requestedRoute = routeConsent
+    if (requestedRoute != null && routeProfile != null) {
+        AlertDialog(
+            onDismissRequest = { routeConsent = null },
+            title = { Text(stringResource(R.string.harw_route_consent_title)) },
+            text = {
+                Text(stringResource(
+                    if (requestedRoute == RoutePreference.DIRECT) R.string.harw_route_consent_direct
+                    else R.string.harw_route_consent_auto,
+                    routeProfile.label,
+                ))
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = state.canSetUp && !state.hasConnection && !state.stopping &&
+                        routeChoiceEnabled(requestedRoute, routeProfile),
+                    onClick = { routeConsent = null; onSelectRoute(routeProfile, requestedRoute) },
+                ) { Text(stringResource(R.string.harw_route_consent_confirm)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { routeConsent = null }) { Text(stringResource(android.R.string.cancel)) }
+            },
+        )
+    }
     var confirmForget by rememberSaveable { mutableStateOf(false) }
     var adminDialog by rememberSaveable { mutableStateOf(false) }
     var adminUrl by rememberSaveable(adminUrlSuggestion) { mutableStateOf(adminUrlSuggestion) }
@@ -199,36 +227,42 @@ internal fun ConnectionScreen(
                             )
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Text(
-                                    "Direkt  ${saved.endpoint}",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontFamily = FontFamily.Monospace,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
+                                if (saved.endpoint.isNotBlank()) {
+                                    Text(
+                                        stringResource(R.string.harw_route_direct_address, saved.endpoint),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                                 saved.onion?.let {
                                     Text(
-                                        "Tor  ${shortOnion(it)}",
+                                        stringResource(R.string.harw_route_onion_address, shortOnion(it)),
                                         style = MaterialTheme.typography.bodyMedium,
                                         fontFamily = FontFamily.Monospace,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
                             }
-                            routeHint(saved, state.routePreference)?.let {
-                                Text(
-                                    it,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
+                            Text(
+                                stringResource(routeHintResource(saved, state.routePreference)),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                for ((choice, name) in ROUTE_CHOICES) {
+                                for ((choice, label) in ROUTE_CHOICES) {
                                     val enabled = routeChoiceEnabled(choice, saved) &&
                                         state.canSetUp && !state.hasConnection && !state.stopping
+                                    val select: () -> Unit = {
+                                        if (choice != state.routePreference) {
+                                            if (choice == RoutePreference.ONION) onSelectRoute(saved, choice)
+                                            else routeConsent = choice
+                                        }
+                                    }
                                     if (state.routePreference == choice) {
-                                        Button(enabled = enabled, onClick = { onSelectRoute(choice) }) { Text(name) }
+                                        Button(enabled = enabled, onClick = select) { Text(stringResource(label)) }
                                     } else {
-                                        OutlinedButton(enabled = enabled, onClick = { onSelectRoute(choice) }) { Text(name) }
+                                        OutlinedButton(enabled = enabled, onClick = select) { Text(stringResource(label)) }
                                     }
                                 }
                             }
@@ -259,7 +293,10 @@ internal fun ConnectionScreen(
                             if (state.hasConnection || state.stopping) {
                                 Button(onClick = onDisconnect, enabled = !state.stopping) { Text("Trennen") }
                             } else {
-                                Button(onClick = onConnect, enabled = saved != null && state.canSetUp) {
+                                Button(
+                                    onClick = onConnect,
+                                    enabled = state.canSetUp && routeChoiceEnabled(state.routePreference, saved),
+                                ) {
                                     Text(when (state.phase) {
                                         ConnectionPhase.FAILED -> "Erneut versuchen"
                                         ConnectionPhase.REVOKED -> "Erneut verbinden"
@@ -274,10 +311,24 @@ internal fun ConnectionScreen(
                     enabled = state.canSetUp && !state.hasConnection && !state.stopping,
                     onClick = { adminDialog = true },
                 ) { Text("Mit Admin-Konto einrichten") }
+                val localStarting = localState.phase == ConnectionPhase.CONNECTING ||
+                    localState.phase == ConnectionPhase.RECONNECTING
                 OutlinedButton(
-                    enabled = state.canSetUp && !state.hasConnection && !state.stopping,
+                    enabled = localState.online || (localState.canSetUp && !localState.stopping && !localStarting),
                     onClick = onConnectLocal,
-                ) { Text("Auf diesem Gerät starten") }
+                ) {
+                    Text(when {
+                        localState.online -> "Lokale Ansicht öffnen"
+                        localStarting -> "Lokaler Host startet …"
+                        else -> "Auf diesem Gerät starten"
+                    })
+                }
+                if (localState.phase == ConnectionPhase.FAILED) {
+                    Text(
+                        "Der lokale Host konnte nicht gestartet werden. Du kannst es erneut versuchen.",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 if (wide) {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Box(Modifier.weight(1f)) { device() }
@@ -510,6 +561,26 @@ internal fun ConnectionBadge(state: WorkspaceState) {
     }
 }
 
+/** The chat header identifies the established host transport, not the model provider or chosen route. */
+@Composable
+internal fun ChatRouteBadge(state: WorkspaceState) {
+    if (state.local || !state.online || state.stopping) return
+    val label = when (state.activeRoute) {
+        ConnectionRoute.ONION -> "Onion"
+        ConnectionRoute.DIRECT -> stringResource(R.string.directory_cloud)
+        else -> return
+    }
+    val colors = MaterialTheme.colorScheme
+    Surface(shape = CircleShape, color = colors.tertiaryContainer, contentColor = colors.onTertiaryContainer) {
+        Text(
+            label,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            style = MaterialTheme.typography.labelMedium,
+            maxLines = 1,
+        )
+    }
+}
+
 @Composable
 internal fun StatusMessage(text: String, modifier: Modifier = Modifier, error: Boolean = false) {
     val colors = MaterialTheme.colorScheme
@@ -541,35 +612,23 @@ private fun SetupCard(icon: ImageVector, title: String, content: @Composable () 
 }
 
 private val ROUTE_CHOICES = listOf(
-    RoutePreference.AUTO to "Auto",
-    RoutePreference.ONION to "Tor (.onion)",
-    RoutePreference.DIRECT to "Direkt",
+    RoutePreference.ONION to R.string.harw_route_onion,
+    RoutePreference.DIRECT to R.string.harw_route_direct,
+    RoutePreference.AUTO to R.string.harw_route_auto,
 )
 
-/** German hint under the route chips; null when nothing needs explaining. */
-internal fun routeHint(profile: ServerProfile?, preference: RoutePreference): String? = when {
-    profile == null -> null
-    profile.onion == null ->
-        "Tor ist nicht verfügbar: Das Gateway hat noch keine .onion-Adresse gemeldet. " +
-            "Verbinde dich einmal direkt – die Adresse wird dann automatisch übernommen " +
-            "(das Gateway braucht dafür onion = true und einen Build mit Tor-Unterstützung)."
-    preference == RoutePreference.AUTO -> "Auto verbindet zuerst direkt und weicht bei Fehlschlag auf Tor aus."
-    preference == RoutePreference.ONION -> "Nur über Tor. Der erste Start kann bis zu zwei Minuten dauern."
-    else -> null
+internal fun routeHintResource(profile: ServerProfile, preference: RoutePreference): Int = when {
+    profile.endpoint.isBlank() -> R.string.harw_route_hint_onion_only
+    profile.onion.isNullOrBlank() && preference != RoutePreference.DIRECT -> R.string.harw_route_hint_no_onion
+    preference == RoutePreference.AUTO -> R.string.harw_route_hint_auto
+    preference == RoutePreference.DIRECT -> R.string.harw_route_hint_direct
+    else -> R.string.harw_route_hint_onion
 }
 
-/** Routes a saved profile offers, in display order; empty without a profile. */
-internal fun profileRoutes(profile: ServerProfile?): List<ConnectionRoute> = when {
-    profile == null -> emptyList()
-    profile.onion != null -> listOf(ConnectionRoute.ONION, ConnectionRoute.DIRECT)
-    else -> listOf(ConnectionRoute.DIRECT)
-}
-
-/** Whether a route preference can be selected for this profile. */
-internal fun routeChoiceEnabled(choice: RoutePreference, profile: ServerProfile?): Boolean = when {
-    profile == null -> false
-    choice == RoutePreference.ONION -> profile.onion != null
-    else -> true
+/** Available routes in order. Only normalized profiles from the native parser reach the screen. */
+internal fun profileRoutes(profile: ServerProfile?): List<ConnectionRoute> = buildList {
+    if (routeChoiceEnabled(RoutePreference.ONION, profile)) add(ConnectionRoute.ONION)
+    if (routeChoiceEnabled(RoutePreference.DIRECT, profile)) add(ConnectionRoute.DIRECT)
 }
 
 /** Badge label for the connection phase, with the active route while a link is being made or live. */
