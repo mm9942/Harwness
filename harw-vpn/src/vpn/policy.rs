@@ -70,7 +70,7 @@ mod tests {
             BTreeMap::from([(1, RouteMode::OnionOnly)]),
         );
         let destination = Destination::Onion(
-            "2gzyxa5ihm7nsggfxnu52rckvv4rvmdlkiu3zzui4xyclen53wid.onion:443"
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443"
                 .parse()
                 .unwrap(),
         );
