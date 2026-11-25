@@ -6019,6 +6019,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-vpn"
+version = "0.10.0"
+dependencies = [
+ "bytes",
+ "harw-onion",
+]
+
+[[package]]
 name = "harw-warden"
 version = "0.10.0"
 dependencies = [
