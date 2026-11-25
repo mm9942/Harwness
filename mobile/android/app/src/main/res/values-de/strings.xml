@@ -61,4 +61,11 @@
     <string name="notification_turn_done_title">Antwort fertig</string>
     <string name="notification_turn_done_text">Eine Session hat ihre Antwort fertig geschrieben</string>
     <string name="model_download_channel">Modell-Downloads</string>
+    <string name="vpn_title">Harw VPN</string>
+    <string name="vpn_off">Aus</string>
+    <string name="vpn_wait_network">Warte auf ein Netzwerk</string>
+    <string name="vpn_starting">Tor startet</string>
+    <string name="vpn_tor_ready">Tor verbunden</string>
+    <string name="vpn_retrying">Tor verbindet sich erneut</string>
+    <string name="vpn_blocked">VPN-Verkehr gesperrt</string>
 </resources>
