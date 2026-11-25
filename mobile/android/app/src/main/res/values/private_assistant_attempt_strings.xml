@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="private_assistant_attempt_channel">Private Assistant</string>
+    <string name="private_assistant_attempt_running">Local Assistant request in progress</string>
+    <string name="private_assistant_attempt_stop">Stop</string>
+    <string name="private_assistant_attempt_not_sent">Android could not hold this request in the foreground. Nothing was sent.</string>
+    <string name="private_assistant_parked_pending">A local Assistant request is finishing. The Assistant stays locked until it ends.</string>
+    <string name="private_assistant_parked_check_unavailable">Harw could not check whether a local request is still running. No PIN attempt was used.</string>
+    <string name="private_assistant_parked_check_again">Check again</string>
+</resources>

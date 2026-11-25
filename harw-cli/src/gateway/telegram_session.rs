@@ -43,7 +43,9 @@
 //! Anhänge auf. Nach einem Klick schließt der Callback-Worker die
 //! Freigabe-Nachricht; bei Ablauf oder Zustellfehler schließt sie der
 //! Wiederaufnahme-Job (`close_approval_async`). Offene Tokens der Anfrage
-//! werden in jedem Fall widerrufen.
+//! werden in jedem Fall widerrufen. Hat der DoD-Taint des Turns die
+//! Rückfrage verursacht (PL-100 O1), nennt die Nachricht den Grund in einer
+//! eigenen Zeile.
 //!
 //! # Sicherheit / Logging
 //! Nachrichtentexte, Modellantworten und Tokens werden nie geloggt.
@@ -60,6 +62,7 @@ use harw_authority::WorkspaceRegistry;
 use harw_channel::{ApprovalAction, ApprovalPrompt, InboundEvent, OutboundContent, SessionKey};
 use harw_channel_telegram::ChatStateStore;
 use harw_channel_telegram_transport::TelegramRenderer;
+use harw_core::dod_taint::pending_ask_reason;
 use harw_core::{
     AgentSession, ApprovalResolution, CoreResult, ModelProvider, StateStore, TurnInput,
     TurnOutcome, resume_after_approval, run_turn,
@@ -431,6 +434,28 @@ fn normalize_turn_request_id(request_id: &str) -> String {
         request_id.to_owned()
     } else {
         format!("{TURN_REQUEST_PREFIX}{request_id}")
+    }
+}
+
+/// Hängt den vom Kern zugeschriebenen Grund einer Rückfrage an den Text der
+/// Freigabe-Nachricht an.
+///
+/// # Beschreibung
+/// Heute nur der DoD-Taint (PL-100 Entscheidung O1,
+/// `harw_core::dod_taint::pending_ask_reason`, bereits escapt). Der Grund
+/// steht in einer eigenen Zeile; `harw_channel::ApprovalPrompt` bleibt
+/// unverändert.
+///
+/// # Argumente
+/// - `summary` (`String`): der bisherige Nachrichtentext.
+/// - `reason` (`Option<&str>`): der Grund, falls es einen gibt.
+///
+/// # Rückgabe
+/// `summary` unverändert oder `summary` + `\nGrund: <reason>`.
+fn with_ask_reason(summary: String, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("{summary}\nGrund: {reason}"),
+        None => summary,
     }
 }
 
@@ -1172,9 +1197,14 @@ impl Engine {
             .unwrap_or(Timestamp::MAX);
         let (summary, deadline) = match session.pending_approval() {
             Some(pending) => (
-                format!(
-                    "Freigabe erforderlich: Werkzeug `{}` möchte ausgeführt werden.",
-                    pending.call.name
+                // PL-100 O1: hat der DoD-Taint gefragt, nennt die Nachricht
+                // den Grund (Kanal-Prompt bleibt unverändert).
+                with_ask_reason(
+                    format!(
+                        "Freigabe erforderlich: Werkzeug `{}` möchte ausgeführt werden.",
+                        pending.call.name
+                    ),
+                    pending_ask_reason(&session).as_deref(),
                 ),
                 pending.timeout_at.min(ttl_deadline),
             ),
@@ -1491,6 +1521,19 @@ mod tests {
             PeerId::from_str(peer),
             None,
         )
+    }
+
+    /// PL-100 O1: der Taint-Grund steht in einer eigenen Zeile der
+    /// Freigabe-Nachricht; ohne Grund bleibt der Text unverändert.
+    #[test]
+    fn the_approval_text_names_the_taint_reason_only_when_there_is_one() {
+        let base = "Freigabe erforderlich: Werkzeug `job.stop` möchte ausgeführt werden.";
+        assert_eq!(with_ask_reason(base.to_owned(), None), base);
+
+        let reason = harw_core::dod_taint::ask_reason("job.stop");
+        let text = with_ask_reason(base.to_owned(), Some(&reason));
+        assert_eq!(text, format!("{base}\nGrund: {reason}"));
+        assert!(text.contains(harw_core::dod_taint::TAINT_REASON), "{text}");
     }
 
     #[test]

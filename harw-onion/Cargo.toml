@@ -1,0 +1,45 @@
+[package]
+name = "harw-onion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version = "1.92"
+# arti 0.48 (arti-v2.8.0) needs Rust 1.92; the workspace MSRV (1.89) is unaffected for crates built without this dependency.
+description = "Tor onion transport for the harw node listener and the phone: embedded arti onion-service accept loop and onion dialer behind cargo features; Tor is only a byte transport, identity stays with harw-node-transport"
+
+[features]
+default = []
+# Onion dialer only (phone and clients). No key storage, no service side.
+client = ["dep:arti-client", "dep:tor-rtcompat", "dep:rustls", "dep:futures"]
+# server side only, never enable on the phone
+service = ["client", "arti-client/onion-service-service", "arti-client/keymgr", "dep:tor-hsservice", "dep:tor-cell", "dep:tor-proto", "dep:safelog"]
+
+[dependencies]
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "io-util"] }
+tracing = { workspace = true }
+
+# Exact pins of one arti release (arti-v2.8.0). Never "full", never native-tls/openssl. Bump all together.
+arti-client = { version = "=0.48.0", default-features = false, features = ["tokio", "rustls", "static-sqlite", "compression", "vanguards", "onion-service-client"], optional = true }
+tor-rtcompat = { version = "=0.48.0", default-features = false, features = ["tokio", "rustls"], optional = true }
+tor-hsservice = { version = "=0.48.0", default-features = false, optional = true }
+tor-cell = { version = "=0.48.0", default-features = false, optional = true }
+tor-proto = { version = "=0.48.0", default-features = false, features = ["tokio"], optional = true }
+safelog = { version = "=0.10.1", default-features = false, optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"], optional = true }
+futures = { version = "0.3.34", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "io-util"] }
+
+[[test]]
+name = "live_onion"
+path = "tests/live_onion.rs"
+required-features = ["service"]
+
+[lints]
+workspace = true

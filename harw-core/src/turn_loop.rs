@@ -761,7 +761,20 @@ pub struct TurnControl {
     // Bucht jeden Werkzeugaufruf vor seiner Ausführung (siehe
     // `crate::tool_call_meter`); Klone teilen denselben Meter.
     tool_call_meter: Option<Arc<dyn ToolCallMeter>>,
+    // The host receives a signal only after the complete rewind frame is durable.
+    history_replaced: Option<Arc<dyn Fn() + Send + Sync>>,
+    rewind_media: Option<Arc<RewindMediaCheck>>,
+    rewrite_replacement_id: Option<harw_types::ItemId>,
+    // Only the trusted hosted driver sets source provenance; not model metadata.
+    title_seed_human: Option<bool>,
+    title_seed_pending: bool,
+    // PL-100 Phase 4 (B22): DoD-Taint dieses Turns (siehe
+    // `crate::dod_taint`); Klone teilen denselben Zustand.
+    dod_taint: crate::dod_taint::DodTaint,
 }
+
+/// Trusted hosted source check; never receives a client-supplied reference.
+pub type RewindMediaCheck = dyn Fn(&harw_protocol::MediaRef) -> bool + Send + Sync;
 
 impl std::fmt::Debug for TurnControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -770,6 +783,7 @@ impl std::fmt::Debug for TurnControl {
             .field("limits", &self.limits)
             .field("token_budget", &self.token_budget)
             .field("tool_call_meter", &self.tool_call_meter.is_some())
+            .field("dod_taint", &self.dod_taint)
             .finish_non_exhaustive()
     }
 }
@@ -794,7 +808,58 @@ impl TurnControl {
             meter: Arc::new(Mutex::new(TurnMeter::default())),
             token_budget: None,
             tool_call_meter: None,
+            history_replaced: None,
+            rewind_media: None,
+            rewrite_replacement_id: None,
+            title_seed_human: None,
+            title_seed_pending: false,
+            dod_taint: crate::dod_taint::DodTaint::new(),
         }
+    }
+
+    /// Mark the origin of an actual hosted user input. The durable store still
+    /// refuses legacy, imported, forked, and otherwise uninitialized sessions.
+    #[must_use]
+    pub fn with_hosted_title_source(mut self, human: bool) -> Self {
+        self.title_seed_human = Some(human);
+        self
+    }
+
+    /// Installs the hosted driver's post-commit notification for an exact history edit.
+    #[must_use]
+    pub fn with_history_replaced(mut self, notify: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.history_replaced = Some(notify);
+        self
+    }
+
+    /// Uses the canonical replacement identity derived by the hosted driver.
+    #[must_use]
+    pub fn with_rewrite_replacement_id(mut self, id: Option<harw_types::ItemId>) -> Self {
+        self.rewrite_replacement_id = id;
+        self
+    }
+
+    /// Verifies target-owned stored prompt media before replacing history.
+    #[must_use]
+    pub fn with_rewind_media_check(mut self, check: Arc<RewindMediaCheck>) -> Self {
+        self.rewind_media = Some(check);
+        self
+    }
+
+    /// Der DoD-Taint dieses Turns (PL-100 Phase 4, Bedrohung B22).
+    ///
+    /// # Beschreibung
+    /// Der Turn-Loop vermerkt darin jeden abgefertigten `dod.*`-Aufruf;
+    /// `check_approval` liest ihn für die
+    /// [`crate::policy::DodTaintPolicy`]. Eine Oberfläche, die den Block
+    /// selbst gebaut hat, kann darüber den Grund einer Rückfrage anzeigen.
+    ///
+    /// # Returns
+    /// Den geteilten [`crate::dod_taint::DodTaint`]; Klone dieses Blocks sehen
+    /// denselben Zustand.
+    #[must_use]
+    pub fn dod_taint(&self) -> &crate::dod_taint::DodTaint {
+        &self.dod_taint
     }
 
     /// Registriert den [`ToolCallMeter`], der jeden Werkzeugaufruf bucht und
@@ -1144,6 +1209,9 @@ pub struct TurnInput {
     pub metadata: serde_json::Value,
     /// Steuerblock (Abbruch, Grenzwerte, Uhr, Zähler) dieses Turns.
     pub control: TurnControl,
+    /// Id einer früheren User-Nachricht: der Verlauf wird vor dieser Nachricht abgeschnitten (und
+    /// dauerhaft ersetzt), bevor der Turn läuft. So ersetzt "Neu senden" die Nachricht, statt sie zu doppeln.
+    pub rewind_before: Option<String>,
 }
 
 impl TurnInput {
@@ -1154,7 +1222,15 @@ impl TurnInput {
             user_images: Vec::new(),
             metadata: serde_json::Value::Null,
             control: TurnControl::new(),
+            rewind_before: None,
         }
+    }
+
+    /// Schneidet den Verlauf vor der User-Nachricht `item_id` ab, bevor der Turn läuft.
+    #[must_use]
+    pub fn with_rewind_before(mut self, item_id: Option<String>) -> Self {
+        self.rewind_before = item_id;
+        self
     }
 
     /// Hängt gespeicherte Bilder an die User-Nachricht dieses Turns. Die
@@ -1439,6 +1515,193 @@ fn delegation_targets_fragment(
         digest: harw_types::ContentDigest::of(body.as_bytes()),
         body,
     })
+}
+
+/// Abstand, in dem ein wartendes Orchestrator-Kind nach Ergebnissen seiner
+/// Hintergrund-Kinder sieht (kein Modellaufruf, keine Tokens).
+const BACKGROUND_RESULT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Legt die Abschlussmeldungen der Hintergrund-Kinder dieser Sitzung als
+/// Nutzer-Nachricht in den Verlauf.
+///
+/// # Description
+/// Nur für Kind-Sitzungen (Orchestratoren unter der UIA): die UIA-Wurzel
+/// holt ihre Meldungen über die TUI (Auto-Turn). Früher blieben die
+/// Meldungen der Enkel im Register liegen — ein Orchestrator-Kind erfuhr nie,
+/// was seine Hintergrund-Kinder geliefert hatten.
+///
+/// Zustellung genau einmal: die Meldungen werden nur gelesen, in den Verlauf
+/// gelegt und erst **nach** erfolgreichem Persistieren bestätigt. Scheitert
+/// das Schreiben, wird der Eintrag aus dem Verlauf zurückgenommen und die
+/// Meldungen bleiben im Register — ein Neuversuch stellt sie zu.
+///
+/// # Returns
+/// `true`, wenn mindestens eine Meldung zugestellt wurde.
+///
+/// # Errors
+/// Fehler des [`StateStore`] (dann ist nichts bestätigt).
+async fn inject_background_notices(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+) -> CoreResult<bool> {
+    if session.parent_session_id().is_none() {
+        return Ok(false);
+    }
+    let Some(spawner) = session.registry().spawner().cloned() else {
+        return Ok(false);
+    };
+    let notices = spawner.pending_background_notices(session.id());
+    if notices.is_empty() {
+        return Ok(false);
+    }
+    let mark = session.history().len();
+    let text = notices
+        .iter()
+        .map(|notice| notice.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    session.history_mut().push_user_text(text);
+    if let Err(error) = persist_last(session, store).await {
+        session.history_mut().truncate(mark);
+        return Err(error);
+    }
+    let children: Vec<harw_types::SessionId> =
+        notices.into_iter().map(|notice| notice.child).collect();
+    spawner.acknowledge_background_notices(session.id(), &children);
+    tracing::info!(
+        session = %session.id(),
+        notices = children.len(),
+        "turn_loop.background_notices_delivered"
+    );
+    Ok(true)
+}
+
+/// Bricht die noch laufenden Hintergrund-Kinder einer abgebrochenen
+/// Kind-Sitzung ab.
+///
+/// # Description
+/// Zentral in [`cancel_turn`] (auch über `cancel_turn_with_pending_calls`),
+/// damit **jeder** abgebrochene Ausgang eines Orchestrator-Kindes seine
+/// Hintergrund-Kinder mitnimmt — auch wenn der Abbruch erst nach einer
+/// zugestellten Meldung in der nächsten Runde greift. Ihre Ergebnisse
+/// erreichten sonst nie mehr einen Elternteil. Die UIA-Wurzel ist
+/// ausgenommen: dort verwaltet die TUI ihre Hintergrund-Agenten selbst
+/// (`/new`, `/resume`, Beenden), ein abgebrochener UIA-Turn beendet sie nicht.
+fn cancel_owned_background_children(session: &AgentSession, reason: CancelReason) {
+    if session.parent_session_id().is_none() {
+        return;
+    }
+    let Some(spawner) = session.registry().spawner() else {
+        return;
+    };
+    if spawner.running_background_children(session.id()) == 0 {
+        return;
+    }
+    let cancelled = spawner.cancel_background_children(session.id(), "parent turn cancelled");
+    tracing::info!(
+        session = %session.id(),
+        ?reason,
+        cancelled,
+        "turn_loop.background_children_cancelled_with_parent"
+    );
+}
+
+/// Ergebnis des Wartens auf Hintergrund-Kinder am Turn-Ende.
+#[derive(Debug)]
+enum BackgroundWait {
+    /// Mindestens eine Meldung liegt im Verlauf; der Turn läuft weiter.
+    Delivered,
+    /// Kein Kind läuft (mehr) oder keine Kind-Sitzung: der Turn endet normal.
+    Idle,
+    /// Abbruch oder Budget-/Zeitende während des Wartens; bereits
+    /// vorliegende Meldungen sind zugestellt, die laufenden Hintergrund-Kinder
+    /// bricht [`cancel_turn`] ab.
+    Stopped(CancelReason),
+}
+
+/// Wartet am Ende eines Orchestrator-Kind-Turns auf Ergebnisse noch
+/// laufender Hintergrund-Kinder.
+///
+/// # Description
+/// Gewartet wird ohne Modellaufruf ([`BACKGROUND_RESULT_POLL`]). Ein
+/// Abbruch, ein erschöpftes Budget oder die Wanduhr des Turns beenden das
+/// Warten als [`BackgroundWait::Stopped`] — nie als Erfolg. Der Aufrufer
+/// endet dann über [`cancel_turn`], das die noch laufenden Hintergrund-Kinder
+/// dieser Sitzung abbricht ([`cancel_owned_background_children`]).
+///
+/// # Errors
+/// Fehler des [`StateStore`] beim Zustellen.
+async fn await_background_results(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+    control: &TurnControl,
+) -> CoreResult<BackgroundWait> {
+    if session.parent_session_id().is_none() {
+        return Ok(BackgroundWait::Idle);
+    }
+    let Some(spawner) = session.registry().spawner().cloned() else {
+        return Ok(BackgroundWait::Idle);
+    };
+    loop {
+        // Erst der Stopp-Prüfpunkt, dann die Zustellung. Bei einem Stopp
+        // werden die noch laufenden Geschwister *vor* dem fehlbaren
+        // Schreibversuch abgebrochen — ein Schreibfehler darf sie nicht
+        // weiterlaufen lassen. Eine bereits vorliegende Meldung wird danach
+        // noch geschrieben und bestätigt; scheitert das, bleibt sie
+        // unbestätigt im Register (siehe `inject_background_notices`).
+        if let Some(reason) = control
+            .model_checkpoint()
+            .or_else(|| control.tool_checkpoint(0))
+        {
+            cancel_owned_background_children(session, reason);
+            inject_background_notices(session, store).await?;
+            tracing::info!(
+                session = %session.id(),
+                ?reason,
+                "turn_loop.background_wait_stopped"
+            );
+            return Ok(BackgroundWait::Stopped(reason));
+        }
+        if inject_background_notices(session, store).await? {
+            return Ok(BackgroundWait::Delivered);
+        }
+        if spawner.running_background_children(session.id()) == 0 {
+            return Ok(BackgroundWait::Idle);
+        }
+        tokio::time::sleep(BACKGROUND_RESULT_POLL).await;
+    }
+}
+
+/// Text der Werkzeug-Antwort auf eine abgelehnte Delegation.
+///
+/// # Description
+/// Bekannte Ablehnungen (Orchestrierungsgrenze, abgelehnte Fortsetzung,
+/// Plan-Modus, typisierte Kapazitäts-/Tiefengrenzen) behalten ihren Text.
+/// Alle übrigen (z. B. nicht registrierte Rolle, fehlende Sandbox, ein nach
+/// `prepare` gescheiterter Fortsetzungsschritt) bekommen den stabilen Code
+/// `HARW-ORCH-001` und einen Hinweis — früher brachen sie als
+/// `CoreError::HandoffFailed` den ganzen Turn des Orchestrators ab.
+fn spawn_rejection_text(role: &str, error: &harw_extension_api::AgentSpawnError) -> String {
+    let known = crate::background_children::is_orchestration_limit_rejection(&error.message)
+        || crate::child_handoff::is_continuation_rejection(&error.message)
+        || crate::delegation_visibility::is_plan_mode_refusal(&error.message)
+        || error.kind != harw_extension_api::SpawnRejectionKind::Other;
+    tracing::warn!(
+        code = "HARW-ORCH-001",
+        role,
+        kind = ?error.kind,
+        reason = %error.message,
+        "turn_loop.delegation_rejected"
+    );
+    if known {
+        error.message.clone()
+    } else {
+        format!(
+            "[HARW-ORCH-001] Delegation an '{role}' abgelehnt: {}. Dein Turn läuft weiter: \
+             prüfe Rolle, Sandbox und Grenzen, oder schneide den Auftrag neu zu.",
+            error.message
+        )
+    }
 }
 
 /// Wickelt eine Fortsetzungs-Instruktion nach einem `MaxTokens`-Abbruch in
@@ -1745,7 +2008,8 @@ fn stream_sink_for_round(
 /// - Sonst gilt das **erste** `AskUser` samt seiner `ItemId`; spätere
 ///   `AskUser`-Anfragen werden verworfen.
 /// - Nur wenn alle `Allow` sagen (oder kein Handler registriert ist), gilt
-///   `Allow`.
+///   `Allow` — außer der DoD-Taint-Fallback greift (siehe Abschnitt
+///   DoD-Taint).
 ///
 /// Früher gewann der erste Nicht-`Allow`: ein vorn registriertes `AskUser`
 /// (etwa `DefaultApprovalPolicy`) überstimmte ein später registriertes `Deny`
@@ -1765,14 +2029,84 @@ fn stream_sink_for_round(
 /// Wer diese Funktion außerhalb des sequenziellen Tool-Loops aufruft (siehe
 /// [`PreparedApprovals`]), muss die Entscheidung deshalb weiterreichen statt
 /// sie später erneut einzuholen.
+///
+/// # DoD-Taint (PL-100 Phase 4, B22/O1)
+/// Die Befragung läuft im Prüfkontext
+/// [`crate::dod_taint::with_review_taint`] mit dem Taint-Stand des laufenden
+/// Turns; die [`crate::policy::DodTaintPolicy`] liest ihn dort. Trägt die
+/// Registry keine solche Politik, fragt der Turn-Loop modusblind nach,
+/// sobald [`crate::policy::DodTaintPolicy::fallback_applies`] zutrifft
+/// (fail-closed; unter Full Access verletzt das O1 — die Produktivketten
+/// müssen die Politik deshalb installieren). Der Taint kann eine
+/// Entscheidung nur verschärfen (`Allow` → `AskUser` bzw. → `Deny`), nie
+/// lockern.
+///
+/// Hat der Taint die Rückfrage verursacht (die Politik lieferte `AskUser`
+/// oder der Fallback griff) und ist das Ergebnis `AskUser`, gilt:
+/// - Kann niemand antworten
+///   ([`crate::policy::DodTaintPolicy::ask_answerable`]: kein
+///   Freigabe-Akteur oder ein nicht interaktiver Einstieg), wird der Aufruf
+///   mit [`crate::dod_taint::unanswerable_reason`] abgelehnt — statt einer
+///   Pause, die niemand auflöst (bzw. statt `MissingApprovalActor`).
+/// - Sonst vermerkt der Turn die Call-Id
+///   ([`crate::dod_taint::DodTaint::note_ask`]); nur dann nennt
+///   [`crate::dod_taint::pending_ask_reason`] der Oberfläche den Grund.
 pub async fn check_approval(session: &AgentSession, call: &ToolCall) -> ApprovalDecision {
+    let tainted = crate::dod_taint::session_turn_tainted(session);
+    let (decision, policy_asked) =
+        crate::dod_taint::with_review_taint(tainted, aggregate_approval(session, call)).await;
+    let handlers = session.registry().approval_handlers();
+    // Genau eine Auswertung des Fallbacks: derselbe Befund ändert die
+    // Entscheidung und schreibt die Rückfrage dem Taint zu.
+    let fallback =
+        crate::policy::DodTaintPolicy::fallback_applies(handlers, call, tainted, &decision);
+    let decision = if fallback {
+        ApprovalDecision::AskUser(harw_types::ItemId::new())
+    } else {
+        decision
+    };
+    let taint_caused_ask =
+        (policy_asked || fallback) && matches!(decision, ApprovalDecision::AskUser(_));
+    if !taint_caused_ask {
+        return decision;
+    }
+    let actor_present = session
+        .spawn_context()
+        .is_some_and(|context| context.approval_actor.is_some());
+    if !crate::policy::DodTaintPolicy::ask_answerable(handlers, actor_present) {
+        tracing::info!(
+            tool = %crate::dod_taint::display_tool_name(call.name.as_str()),
+            actor_present,
+            "dod_taint.ask_unanswerable_denied"
+        );
+        return ApprovalDecision::Deny(crate::dod_taint::unanswerable_reason(call.name.as_str()));
+    }
+    crate::dod_taint::note_session_ask(session, &call.id);
+    tracing::info!(
+        reason = %crate::dod_taint::ask_reason(call.name.as_str()),
+        fallback,
+        "dod_taint.ask"
+    );
+    decision
+}
+
+// Befragt jeden registrierten Handler genau einmal und aggregiert
+// `Deny` > `AskUser` > `Allow` (siehe `check_approval`). Der zweite Wert
+// meldet, ob die `DodTaintPolicy` (Label `DOD_TAINT_POLICY_LABEL`) selbst
+// `AskUser` geliefert hat — so wird die Rückfrage dem Taint nur
+// zugeschrieben, wenn er sie verursacht hat.
+async fn aggregate_approval(session: &AgentSession, call: &ToolCall) -> (ApprovalDecision, bool) {
     let mut first_ask: Option<ApprovalDecision> = None;
     let mut first_deny: Option<ApprovalDecision> = None;
+    let mut taint_policy_asked = false;
     for handler in session.registry().approval_handlers() {
         let decision = handler.review(call).await;
         match decision {
             ApprovalDecision::Allow => {}
             ApprovalDecision::AskUser(_) => {
+                if handler.label() == crate::policy::DOD_TAINT_POLICY_LABEL {
+                    taint_policy_asked = true;
+                }
                 if first_ask.is_none() {
                     first_ask = Some(decision);
                 }
@@ -1784,7 +2118,10 @@ pub async fn check_approval(session: &AgentSession, call: &ToolCall) -> Approval
             }
         }
     }
-    first_deny.or(first_ask).unwrap_or(ApprovalDecision::Allow)
+    (
+        first_deny.or(first_ask).unwrap_or(ApprovalDecision::Allow),
+        taint_policy_asked,
+    )
 }
 
 /// Guardrail-Entscheidungen, die für eine Modellantwort bereits eingeholt
@@ -2301,6 +2638,38 @@ fn append_handoff_tools(
     }
 }
 
+/// Ob der Turn-Loop ein erzeugtes Delegationswerkzeug (ohne
+/// Registry-Ausführer) dieser Session gerade anbietet.
+///
+/// # Beschreibung
+/// Welche Namen überhaupt erzeugte Delegationswerkzeuge sind, entscheidet
+/// allein [`crate::child_approval::is_generated_delegation_tool`]; hier kommt
+/// nur die Sichtbarkeit dazu — dieselben Regeln für Modus, Ziele und
+/// Aktivierung wie bei der Modellanfrage ([`append_handoff_tools`]). Eine
+/// Freigabe darf ein inzwischen abgeschaltetes Werkzeug nicht wieder
+/// aufrufbar machen.
+pub(crate) fn generated_delegation_tool_available(session: &AgentSession, name: &ToolName) -> bool {
+    if !crate::child_approval::is_generated_delegation_tool(name) {
+        return false;
+    }
+    // Ein registriertes Werkzeug besitzt seinen Namen, auch ohne Ausführer.
+    if session.registry().tool_providers().iter().any(|provider| {
+        provider
+            .tools()
+            .iter()
+            .any(|spec| spec.name() == name.as_str())
+    }) {
+        return false;
+    }
+    let plan_mode = session.mode() == crate::mode::InteractionMode::Plan;
+    let Some(Ok(targets)) = session_delegation_targets(session, plan_mode) else {
+        return false;
+    };
+    let mut tools = Vec::new();
+    append_handoff_tools(session, &mut tools, &targets.targets);
+    tools.iter().any(|spec| spec.name() == name.as_str())
+}
+
 /// Plan R9, Teil C: schränkt `targets[].role` eines vorhandenen
 /// `delegate_wave`-Werkzeugs auf die sichtbaren Ziele ein (Enum).
 ///
@@ -2510,16 +2879,6 @@ fn delegation_refusal(
     }
 }
 
-/// Plan R9, Teil C: Rolle und Handoff-Argumente eines Delegationsaufrufs —
-/// `transfer_to_<rolle>` (Argumente unverändert) oder ein gültiges
-/// `agents.delegate` (Argumente ohne `agent`).
-fn delegation_call(call: &ToolCall) -> Option<(String, serde_json::Value)> {
-    if let Some(role) = handoff_role(&call.name) {
-        return Some((role, call.arguments.clone()));
-    }
-    delegate_tool_role(call).and_then(Result::ok)
-}
-
 /// Plan R9, Teil C: die Delegationsziele der Session ohne die, deren
 /// `transfer_to_<name>` die Aktivierung ausdrücklich abschaltet (etwa
 /// `forbidden = ["transfer_to_executor"]` des Matrix-Game-Masters).
@@ -2575,7 +2934,12 @@ fn delegation_step(
     let plan_mode = session.mode() == crate::mode::InteractionMode::Plan;
     if call.name.as_str() == AGENTS_CATALOG_TOOL && find_executor(session, &call.name).is_none() {
         let result = match session_delegation_targets(session, plan_mode) {
-            Some(Ok(targets)) => agents_catalog_result(&targets, &call.arguments),
+            Some(Ok(targets)) if generated_delegation_tool_available(session, &call.name) => {
+                agents_catalog_result(&targets, &call.arguments)
+            }
+            Some(Ok(_)) => ToolCallResult::error(
+                "agents.catalog: Werkzeug ist für diese Sitzung nicht verfügbar".to_owned(),
+            ),
             Some(Err(error)) => ToolCallResult::error(error.to_string()),
             None => ToolCallResult::error(
                 "agents.catalog: kein Agent-Spawner in dieser Sitzung".to_owned(),
@@ -3071,6 +3435,9 @@ fn notify_tool_outcome(
     arguments: &serde_json::Value,
     result: &ToolCallResult,
 ) {
+    // PL-100 Phase 4 (B22): jeder abgefertigte `dod.*`-Aufruf taintet den
+    // laufenden Turn — auch ein gescheiterter oder abgelehnter.
+    crate::dod_taint::note_session_dispatch(session, tool_name);
     emit_plan_update(session, tool_name, arguments, result);
     // Runde 9, E3: ein Erfolg löst passende Pitfalls (kein veralteter
     // `[harw-Wächter]`-Hinweis an späteren Ergebnissen desselben Werkzeugs).
@@ -3566,13 +3933,109 @@ pub async fn run_turn_durable(
     run_turn_with_approvals(session, model, store, Some(approvals), input).await
 }
 
+/// Rewind and the replacement prompt are one durable frame. Publish the in-memory
+/// change only after the durable writer accepts it, then continue the one turn.
+async fn replace_prompt(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+    target: &str,
+    text: String,
+    images: Vec<harw_protocol::MediaRef>,
+    media_check: Option<Arc<RewindMediaCheck>>,
+    replacement_id: Option<harw_types::ItemId>,
+) -> CoreResult<()> {
+    use harw_protocol::items::{ContentPart, TurnItem, UserMessageItem};
+    if !images.is_empty() {
+        return Err(CoreError::TurnRejected("rewind reuses stored media, not client image payloads".to_owned()));
+    }
+    if !matches!(
+        session.state(),
+        crate::session::SessionState::Idle | crate::session::SessionState::Failed(_)
+    ) {
+        return Err(CoreError::TurnRejected("rewind needs an idle session".to_owned()));
+    }
+    let mut history = if session.history().is_empty() {
+        store.load_history(session.id()).await
+            .map_err(|error| state_store_error(error, "rewind history load"))?
+    } else {
+        session.history().clone()
+    };
+    let mut matches = history.items().iter().enumerate().filter_map(|(index, item)| {
+        matches!(item, harw_protocol::items::TurnItem::UserMessage(m) if m.id.as_str() == target)
+            .then_some(index)
+    });
+    let index = matches.next().ok_or_else(|| CoreError::TurnRejected(
+        "rewind target is not a user message of this session".to_owned()
+    ))?;
+    if matches.next().is_some() {
+        return Err(CoreError::TurnRejected("rewind target is ambiguous".to_owned()));
+    }
+    let original = match &history.items()[index] {
+        TurnItem::UserMessage(user) => user,
+        _ => return Err(CoreError::TurnRejected("rewind target changed".to_owned())),
+    };
+    if original.content.is_empty() || original.content.iter().any(|part| matches!(part, ContentPart::ImageUrl { .. })) {
+        return Err(CoreError::TurnRejected("rewind target contains unavailable prompt media".to_owned()));
+    }
+    let refs = original.content.iter().filter_map(|part| match part {
+        ContentPart::Media { media, .. } => Some(media.clone()),
+        _ => None,
+    }).collect::<Vec<_>>();
+    if !refs.is_empty() {
+        let check = media_check.ok_or_else(|| CoreError::TurnRejected(
+            "rewind cannot verify the original stored images".to_owned(),
+        ))?;
+        let intact = tokio::task::spawn_blocking(move || refs.iter().all(|reference| check(reference)))
+            .await.unwrap_or(false);
+        if !intact {
+            return Err(CoreError::TurnRejected("rewind original images are unavailable".to_owned()));
+        }
+    }
+    let content = if text.is_empty() {
+        original.content.clone()
+    } else {
+        let mut retained = original.content.iter().filter(|part| matches!(part, ContentPart::Media { .. }))
+            .cloned().collect::<Vec<_>>();
+        retained.push(ContentPart::Text { text });
+        retained
+    };
+    let id = replacement_id.unwrap_or_default();
+    if history.items().iter().any(|item| {
+        matches!(item, TurnItem::UserMessage(user) if user.id == id)
+    }) {
+        return Err(CoreError::TurnRejected("rewind replacement identity already exists".to_owned()));
+    }
+    history.truncate(index);
+    history.extend([TurnItem::UserMessage(UserMessageItem { id, content })]);
+    store.save_history_with_rewind_boundary(session.id(), &history, Some(target)).await
+        .map_err(|error| state_store_error(error, "rewind history save"))?;
+    *session.history_mut() = history;
+    Ok(())
+}
+
 async fn run_turn_with_approvals(
     session: &mut AgentSession,
     model: &dyn ModelProvider,
     store: &dyn StateStore,
     approvals: Option<&ApprovalStore>,
-    input: TurnInput,
+    mut input: TurnInput,
 ) -> CoreResult<TurnOutcome> {
+    if let Some(target) = input.rewind_before.as_deref() {
+        let text = input.user_text.take().ok_or_else(|| CoreError::TurnRejected(
+            "rewind requires an explicit edit or retry prompt".to_owned(),
+        ))?;
+        if !text.is_empty() && text.trim().is_empty() {
+            return Err(CoreError::TurnRejected("rewind edit is blank".to_owned()));
+        }
+        replace_prompt(
+            session, store, target, text, std::mem::take(&mut input.user_images),
+            input.control.rewind_media.clone(),
+            input.control.rewrite_replacement_id.clone(),
+        ).await?;
+        if let Some(notify) = &input.control.history_replaced {
+            notify();
+        }
+    }
     let handle = session
         .try_start_turn()
         .map_err(|r| CoreError::TurnRejected(r.to_string()))?;
@@ -3588,7 +4051,7 @@ async fn run_turn_with_approvals(
     // bekommt die Vorgabe-Grenzen der Session (aus dem Budget des Laufs,
     // `AgentSession::with_default_turn_limits`); explizit gesetzte Grenzen
     // haben Vorrang.
-    let control = match session.default_turn_limits() {
+    let mut control = match session.default_turn_limits() {
         Some(limits) if *input.control.limits() == TurnLimits::unlimited() => {
             input.control.clone().with_limits(limits)
         }
@@ -3631,6 +4094,24 @@ async fn run_turn_with_approvals(
 
     // User-Input in den Verlauf spielen und persistieren.
     if has_user_input {
+        if let Some(human) = control.title_seed_human {
+            // Actual UserMessage rows only; the fourth is enough to disqualify any incomplete
+            // first-three index. Let canonical persistence proceed even if its optional index fails.
+            let preceding_users = session.history().items().iter()
+                .filter(|item| matches!(item, TurnItem::UserMessage(_)))
+                .take(4)
+                .count();
+            control.title_seed_pending = match store.begin_title_seed(
+                &ctx.session_id, &ctx.turn_id, human, preceding_users,
+            ).await {
+                Ok(pending) => pending,
+                Err(_) => {
+                    tracing::warn!("optional title source admission was not confirmed");
+                    false
+                }
+            };
+            session.set_active_turn_control(control.clone());
+        }
         let text = input.user_text.unwrap_or_default();
         if input.user_images.is_empty() {
             session.history_mut().push_user_text(text);
@@ -3639,7 +4120,18 @@ async fn run_turn_with_approvals(
                 .history_mut()
                 .push_user_message(text, input.user_images);
         }
-        if let Err(error) = persist_last(session, store).await {
+        // Request replay is handled by the transport's submission ID. Equal
+        // content is not equal identity: collapsing legitimately repeated
+        // messages destroys the durable anchors used by fork/edit/retry.
+        let persisted = if control.title_seed_pending {
+            match persist_title_seed_last(session, store).await {
+                Ok(location) => { bind_title_user(store, &ctx, location).await; Ok(()) }
+                Err(error) => Err(error),
+            }
+        } else {
+            persist_last(session, store).await
+        };
+        if let Err(error) = persisted {
             transition_after_turn_failure(session, &ctx, &error);
             return Err(error);
         }
@@ -3650,7 +4142,9 @@ async fn run_turn_with_approvals(
     // nach dem Einspielen des User-Inputs, damit die Schätzung den vollen,
     // aktuellen Verlauf sieht. `resume_after_child`/`resume_after_approval`
     // laufen nicht durch diese Funktion und sind damit keine Auftragsgrenze.
-    maybe_hard_compact_at_turn_start(session, model, store).await;
+    if input.rewind_before.is_none() {
+        maybe_hard_compact_at_turn_start(session, model, store).await;
+    }
 
     notify_turn_start(
         session,
@@ -3660,7 +4154,9 @@ async fn run_turn_with_approvals(
         },
     );
 
+    let title_seed_pending = control.title_seed_pending;
     let result = drive_turn(session, model, store, approvals, &ctx, handle, control).await;
+    if title_seed_pending { settle_title_seed_failure(store, &ctx, &result).await; }
     if let Err(error) = &result {
         transition_after_turn_failure(session, &ctx, error);
     }
@@ -3689,8 +4185,12 @@ fn transition_after_turn_failure(
         error,
         CoreError::Model(model_error) if model_error.is_retryable()
     );
+    // Jeder Modellfehler (auch HTTP 400/401) beendet nur diesen Turn: Die Session kehrt nach
+    // `Idle` zurück, damit die nächste Nachricht normal läuft, statt als „session not idle:
+    // Failed" abgewiesen zu werden. Die Fehlermeldung bleibt trotzdem sichtbar.
+    let recover_to_idle = retryable || matches!(error, CoreError::Model(_));
 
-    if retryable {
+    if recover_to_idle {
         // `transition_after_turn_failure` liefert `()` zurück, ein `?` ist
         // hier also nicht möglich — der Fehler wird stattdessen mit vollem
         // Kontext protokolliert. Die Session bleibt in diesem seltenen Fall
@@ -3893,7 +4393,9 @@ async fn resume_after_child_with_approvals(
         .active_turn_control()
         .cloned()
         .unwrap_or_else(TurnControl::new);
+    let title_seed_pending = control.title_seed_pending;
     let result = drive_turn(session, model, store, approvals, &ctx, handle, control).await;
+    if title_seed_pending { settle_title_seed_failure(store, &ctx, &result).await; }
     if let Err(error) = &result {
         transition_after_turn_failure(session, &ctx, error);
     }
@@ -3999,6 +4501,7 @@ async fn resume_after_approval_with_store(
     // (dieselbe Scope-Regel wie bei Closures), nicht die Funktion, sodass
     // genau ein `Result` unten geprüft und — im Fehlerfall genau einmal — die
     // Übergangsfunktion aufgerufen wird, bevor es zurückgegeben wird.
+    let title_seed_pending = control.title_seed_pending;
     let outcome: CoreResult<TurnOutcome> = async {
         match resolution {
             ApprovalResolution::Reject { reason } => {
@@ -4052,27 +4555,49 @@ async fn resume_after_approval_with_store(
                         .await;
                     }
                 };
-                // Plan R9, Teil C: `agents.delegate` wird wie
-                // `transfer_to_<agent>` gespawnt (Argumente ohne `agent`).
-                if let Some((role, handoff_arguments)) = delegation_call(&pending.call) {
-                    // Background-only: refuse before spawning, so no child leaks.
-                    if let Some(result) = background_only_refusal(session, &handoff_arguments) {
-                        // Nichts gespawnt: das Ergebnis steht fest.
-                        drop(permit);
-                        notify_tool_outcome(
-                            session,
-                            pending.call.name.as_str(),
-                            &pending.call.arguments,
-                            &result,
-                        );
-                        notify_tool_progress(session);
-                        session
-                            .history_mut()
-                            .push_tool_result(pending.call.id, result, 0);
-                        persist_last(session, store).await?;
-                        return drive_turn(session, model, store, approvals, &ctx, handle, control)
-                            .await;
-                    }
+                // Wie im normalen Dispatch (`delegation_step`): der Katalog
+                // wird lokal beantwortet, eine Delegation prüft auch nach der
+                // Freigabe Sichtbarkeit, Plan-Modus und Background-only, bevor
+                // ein Kind entsteht. Ein erzeugtes Delegationswerkzeug, das
+                // während der Freigabe abgeschaltet wurde, bleibt
+                // unerreichbar. Andere Operationen (auch `agent.message`)
+                // bleiben auf dem reinen Ausführerpfad.
+                let (handoff, local_result) =
+                    if crate::child_approval::is_generated_delegation_tool(&pending.call.name) {
+                        if find_executor(session, &pending.call.name).is_none()
+                            && !generated_delegation_tool_available(session, &pending.call.name)
+                        {
+                            (
+                                None,
+                                Some(ToolCallResult::error(format!(
+                                    "{}: Werkzeug ist für diese Sitzung nicht verfügbar",
+                                    pending.call.name
+                                ))),
+                            )
+                        } else {
+                            delegation_step(session, &pending.call)
+                        }
+                    } else {
+                        (None, None)
+                    };
+                if let Some(result) = local_result {
+                    // Nichts gespawnt: das Ergebnis steht fest.
+                    drop(permit);
+                    notify_tool_outcome(
+                        session,
+                        pending.call.name.as_str(),
+                        &pending.call.arguments,
+                        &result,
+                    );
+                    notify_tool_progress(session);
+                    session
+                        .history_mut()
+                        .push_tool_result(pending.call.id, result, 0);
+                    persist_last(session, store).await?;
+                    return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                        .await;
+                }
+                if let Some((role, handoff_arguments)) = handoff {
                     let spawner = session.registry().spawner().cloned().ok_or_else(|| {
                         CoreError::HandoffFailed {
                             role: role.clone(),
@@ -4117,33 +4642,21 @@ async fn resume_after_approval_with_store(
                         .await
                     {
                         Ok(child) => child,
-                        // Runde 5, Teil K: eine Orchestrierungsgrenze ist eine
-                        // Antwort an das Modell, kein Turn-Abbruch.
-                        // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung.
-                        Err(error)
-                            if crate::background_children::is_orchestration_limit_rejection(
-                                &error.message,
-                            ) || crate::child_handoff::is_continuation_rejection(
-                                &error.message,
-                            ) || crate::delegation_visibility::is_plan_mode_refusal(
-                                &error.message,
-                            ) =>
-                        {
+                        // Runde 5, Teile J/K: eine Orchestrierungsgrenze oder
+                        // abgelehnte Fortsetzung ist eine Antwort an das Modell,
+                        // kein Turn-Abbruch — ebenso jede andere abgelehnte
+                        // Admission (HARW-ORCH-001), damit ein Orchestrator
+                        // nachsteuern kann statt seinen ganzen Turn zu verlieren.
+                        Err(error) => {
                             drop(permit);
                             session.history_mut().push_tool_result(
                                 pending.call.id,
-                                ToolCallResult::error(error.message),
+                                ToolCallResult::error(spawn_rejection_text(&role, &error)),
                                 0,
                             );
                             persist_last(session, store).await?;
                             return drive_turn(session, model, store, approvals, &ctx, handle, control)
                                 .await;
-                        }
-                        Err(error) => {
-                            return Err(CoreError::HandoffFailed {
-                                role: role.clone(),
-                                reason: error.to_string(),
-                            });
                         }
                     };
                     // Ein genehmigungspflichtiger Handoff wird ausschließlich hier
@@ -4345,6 +4858,7 @@ async fn resume_after_approval_with_store(
     }
     .await;
 
+    if title_seed_pending { settle_title_seed_failure(store, &ctx, &outcome).await; }
     if let Err(error) = &outcome {
         transition_after_turn_failure(session, &ctx, error);
     }
@@ -4371,9 +4885,17 @@ async fn drive_turn(
     // ehrlichen `Truncated`-Ausgang mitsamt bereits persistiertem Teiltext.
     const MAX_AUTOMATIC_CONTINUATIONS: u32 = 3;
     const CONTINUATION_INSTRUCTION: &str = "Die unmittelbar vorherige Assistant-Antwort wurde wegen eines Ausgabelimits abgeschnitten. Setze exakt an ihrer letzten Stelle fort, ohne Text zu wiederholen oder neu anzufangen. Schließe den ursprünglichen Auftrag eigenständig ab.";
+    const TOOL_CALL_SPLIT_INSTRUCTION: &str = "Deine unmittelbar vorherigen Werkzeugaufrufe wurden wegen des Ausgabelimits abgeschnitten und NICHT ausgeführt. Wiederhole sie kleiner: weniger Aufrufe pro Antwort, weniger Ziele pro delegate_wave, kürzere Aufträge und Argumente.";
 
     let mut total_usage = harw_types::TokenUsage::default();
+    // Zählt *aufeinanderfolgende* Abschneidungen: jede angenommene Runde, die
+    // nicht mit `MaxTokens` endet, setzt Zähler und Anweisung zurück. Früher
+    // galt die Grenze pro Turn und die Fortsetzungsanweisung hing ab der
+    // ersten Abschneidung an *jeder* weiteren Runde — lange
+    // Orchestrator-Turns endeten so grundlos als `Truncated`, und das Modell
+    // las in normalen Tool-Runden „setze exakt an der letzten Stelle fort".
     let mut automatic_continuations = 0u32;
+    let mut continuation_instruction: Option<&'static str> = None;
     // Fortlaufende Modell-Runden-Nummer dieses `drive_turn`-Aufrufs, für
     // `UsageRound::round` — bei jedem Modellaufruf inkrementiert, bevor die
     // Runde persistiert wird.
@@ -4442,6 +4964,7 @@ async fn drive_turn(
     // Werkzeug-Budget (Kind): Aufrufe einer Antwort über dem Rest werden
     // nicht ausgeführt; nach der Runde mit den erlaubten endet der Turn.
     let mut over_tool_budget: Option<(Vec<ToolCall>, String)> = None;
+    let final_title_location;
 
     loop {
         if let Some((calls, message)) = over_tool_budget.take() {
@@ -4469,7 +4992,10 @@ async fn drive_turn(
         // 1./2./4a. Context + Instructions + Request-Montage (siehe
         // `assemble_round_request`). Eine Wiederholung nach Notfall-
         // Kompaktierung baut den Request über denselben Weg neu.
-        let continuation = (automatic_continuations > 0).then_some(CONTINUATION_INSTRUCTION);
+        // Abschlussmeldungen von Hintergrund-Kindern eines Orchestrator-Kindes
+        // gehen in diese Runde (die UIA-Wurzel bekommt ihre über die TUI).
+        inject_background_notices(session, store).await?;
+        let continuation = continuation_instruction;
         let mut request = assemble_round_request(
             session,
             ctx,
@@ -4564,6 +5090,7 @@ async fn drive_turn(
         // cancel-aware provider (e.g. `RetryingProvider::race_respond`)
         // abort its own retry loop early; this `select!` is the backstop
         // for every provider, cancel-aware or not.
+        let respond_session = session.id().clone();
         let response = tokio::select! {
             biased;
             _ = control.cancel_token().cancelled() => {
@@ -4575,7 +5102,7 @@ async fn drive_turn(
                 )
                 .await;
             }
-            result = model.respond(request) => result,
+            result = crate::model::with_current_session(respond_session, model.respond(request)) => result,
         };
         // `ModelError::Cancelled` can also surface from inside `respond()`
         // itself (a cancel-aware provider observed the token before this
@@ -4753,6 +5280,10 @@ async fn drive_turn(
                 continue;
             }
         }
+        if !matches!(response.stop, crate::model::StopReason::MaxTokens) {
+            automatic_continuations = 0;
+            continuation_instruction = None;
+        }
         // Antwort angenommen: die Einmal-Wiederholungen gelten wieder für
         // den nächsten Request, das angehobene Ausgabelimit nur für die
         // eine wiederholte Runde.
@@ -4768,6 +5299,19 @@ async fn drive_turn(
         // Ab hier angehängte Tool-Ergebnisse sind in `last_round_usage`
         // noch nicht enthalten — `maybe_compact` schätzt sie ab dieser Marke.
         history_mark = session.history().len();
+
+        // Defense in depth: provider adapters should already remove partial
+        // tools and reasoning on an interrupted stream. Never persist or
+        // execute either even if an alternative adapter returned them.
+        if matches!(
+            response.stop,
+            crate::model::StopReason::StreamInterrupted
+                | crate::model::StopReason::StreamTransportInterrupted
+                | crate::model::StopReason::IncompleteUnknown
+        ) {
+            response.tool_calls.clear();
+            response.reasoning = None;
+        }
 
         // Für die Fortschritts-Erkennung des reinen Text-Zweigs unten
         // („Assistant-Text ohne Tool-Aufrufe") vor dem Move gesichert.
@@ -4809,6 +5353,7 @@ async fn drive_turn(
             );
         }
 
+        let mut title_location = None;
         if let Some(text) = response.message {
             let phase = if response.tool_calls.is_empty() {
                 Some(harw_types::MessagePhase::FinalAnswer)
@@ -4817,7 +5362,13 @@ async fn drive_turn(
             };
             let text_for_event = text.clone();
             session.history_mut().push_assistant_text(text, phase);
-            persist_last(session, store).await?;
+            if control.title_seed_pending && response_had_no_tool_calls &&
+                matches!(&response_stop, crate::model::StopReason::EndTurn | crate::model::StopReason::StopSequence)
+            {
+                title_location = persist_title_seed_last(session, store).await?;
+            } else {
+                persist_last(session, store).await?;
+            }
             emit(
                 session,
                 TurnEvent::ItemAdded {
@@ -4833,40 +5384,93 @@ async fn drive_turn(
             );
         }
 
+        let unreliable_end = match &response_stop {
+            crate::model::StopReason::StreamInterrupted => Some(ModelStopOutcome::StreamInterrupted),
+            crate::model::StopReason::StreamTransportInterrupted => Some(ModelStopOutcome::StreamTransportInterrupted),
+            crate::model::StopReason::IncompleteUnknown => Some(ModelStopOutcome::IncompleteUnknown),
+            crate::model::StopReason::Other(code) => Some(ModelStopOutcome::ProviderStopCode(code.clone())),
+            _ => None,
+        };
+        if let Some(stop) = unreliable_end {
+            return finish_model_stop(
+                session,
+                store,
+                handle,
+                total_usage,
+                pending_guard_hint.clone(),
+                stop,
+            )
+            .await;
+        }
+
         // Ein Provider darf nie dazu verleitet werden, abgeschnittene oder
         // gefilterte Tool-Argumente auszuführen. Die Antwort ist trotzdem
         // bereits als Text erhalten, damit ein Nutzer den sichtbaren Teil
         // nicht verliert.
         if !response_had_no_tool_calls {
             match response_stop {
+                // Auch nach der Wiederholung mit verdoppeltem Limit zu lang:
+                // die Calls werden verworfen (nie ausgeführt) und das Modell
+                // aufgefordert, sie kleiner zu schneiden — statt den ganzen
+                // (Orchestrator-)Turn als `Truncated` zu beenden.
+                crate::model::StopReason::MaxTokens
+                    if automatic_continuations < MAX_AUTOMATIC_CONTINUATIONS =>
+                {
+                    automatic_continuations += 1;
+                    continuation_instruction = Some(TOOL_CALL_SPLIT_INSTRUCTION);
+                    tracing::info!(
+                        continuation = automatic_continuations,
+                        dropped_tool_calls = response.tool_calls.len(),
+                        "turn_loop.auto_continue_after_truncated_tool_calls"
+                    );
+                    let appended_tokens = appended_tokens_since(session, history_mark);
+                    maybe_compact(
+                        session,
+                        model,
+                        store,
+                        &last_round_usage,
+                        appended_tokens,
+                        false,
+                        &mut last_compaction_tokens_after,
+                    )
+                    .await;
+                    continue;
+                }
                 crate::model::StopReason::MaxTokens
                 | crate::model::StopReason::ContextWindowExceeded => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Truncated,
+                        if response_stop == crate::model::StopReason::ContextWindowExceeded {
+                            ModelStopOutcome::ContextLimit
+                        } else {
+                            ModelStopOutcome::OutputLimit
+                        },
                     )
                     .await;
                 }
                 crate::model::StopReason::Refusal { detail } => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Refused { detail },
+                        ModelStopOutcome::Refused { detail },
                     )
                     .await;
                 }
                 crate::model::StopReason::ContentFilter => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Refused { detail: None },
+                        ModelStopOutcome::ContentFiltered,
                     )
                     .await;
                 }
@@ -4907,6 +5511,7 @@ async fn drive_turn(
                     if automatic_continuations < MAX_AUTOMATIC_CONTINUATIONS =>
                 {
                     automatic_continuations += 1;
+                    continuation_instruction = Some(CONTINUATION_INSTRUCTION);
                     tracing::info!(
                         continuation = automatic_continuations,
                         "turn_loop.auto_continue_after_max_tokens"
@@ -4928,34 +5533,58 @@ async fn drive_turn(
                 | crate::model::StopReason::ContextWindowExceeded => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Truncated,
+                        if response_stop == crate::model::StopReason::ContextWindowExceeded {
+                            ModelStopOutcome::ContextLimit
+                        } else {
+                            ModelStopOutcome::OutputLimit
+                        },
                     )
                     .await;
                 }
                 crate::model::StopReason::Refusal { detail } => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Refused { detail },
+                        ModelStopOutcome::Refused { detail },
                     )
                     .await;
                 }
                 crate::model::StopReason::ContentFilter => {
                     return finish_model_stop(
                         session,
+                        store,
                         handle,
                         total_usage,
                         pending_guard_hint.clone(),
-                        TurnOutcome::Refused { detail: None },
+                        ModelStopOutcome::ContentFiltered,
                     )
                     .await;
                 }
-                _ => break,
+                _ => {
+                    // Ein Orchestrator-Kind endet nicht vor seinen eigenen
+                    // Hintergrund-Kindern: deren Ergebnisse kämen sonst nie an
+                    // (die TUI liefert sie nur der UIA-Wurzel).
+                    match await_background_results(session, store, &control).await? {
+                        BackgroundWait::Delivered => continue,
+                        BackgroundWait::Idle => {
+                            final_title_location = title_location;
+                            break;
+                        }
+                        // Abbruch oder Budget-Ende während des Wartens ist
+                        // kein Erfolg: ehrlich abbrechen (die Kinder wurden
+                        // mit abgebrochen).
+                        BackgroundWait::Stopped(reason) => {
+                            return cancel_turn(session, handle, total_usage, reason).await;
+                        }
+                    }
+                }
             }
         }
 
@@ -5289,15 +5918,11 @@ async fn drive_turn(
                 // Runde 5, Teil K: eine Orchestrierungsgrenze (`[agents]`) ist
                 // eine Antwort an das Modell — Werkzeugfehler statt Turn-Abbruch.
                 // Runde 5, Teil J: ebenso eine abgelehnte Fortsetzung
-                // (`continue_from`), damit das Modell nachsteuern kann.
-                if let Err(error) = &spawned
-                    && (crate::background_children::is_orchestration_limit_rejection(
-                        &error.message,
-                    ) || crate::child_handoff::is_continuation_rejection(&error.message)
-                        || crate::delegation_visibility::is_plan_mode_refusal(&error.message))
-                {
+                // (`continue_from`), damit das Modell nachsteuern kann; und
+                // jede andere abgelehnte Admission (HARW-ORCH-001).
+                if let Err(error) = &spawned {
                     drop(permit);
-                    let mut result = ToolCallResult::error(error.message.clone());
+                    let mut result = ToolCallResult::error(spawn_rejection_text(&role, error));
                     let abort_reason = apply_tool_guard(
                         session,
                         store,
@@ -5329,10 +5954,10 @@ async fn drive_turn(
                     }
                     continue;
                 }
-                let child = spawned.map_err(|e| CoreError::HandoffFailed {
-                    role: role.clone(),
-                    reason: e.to_string(),
-                })?;
+                // Jeder Fehler wurde oben als Werkzeug-Antwort beantwortet.
+                let Ok(child) = spawned else {
+                    continue;
+                };
                 let question = child_question(&handoff_arguments);
                 emit(
                     session,
@@ -5668,6 +6293,13 @@ async fn drive_turn(
     // `Completed`. Der `?`-Aufrufer (`run_turn_with_approvals` &co.) fängt den
     // Fehler bereits über `transition_after_turn_failure` ab.
     session.complete_turn(handle, total_usage)?;
+    if control.title_seed_pending &&
+        store.finish_title_seed(&ctx.session_id, &ctx.turn_id, true, final_title_location).await.is_err()
+    {
+        // A pending record left by ambiguous I/O blocks future title evidence.
+        // Never fail or replay the already-completed inference because of optional indexing.
+        tracing::warn!("title source completion was not confirmed");
+    }
     Ok(TurnOutcome::Completed)
 }
 
@@ -6573,6 +7205,7 @@ async fn cancel_turn(
     total_usage: harw_types::TokenUsage,
     reason: CancelReason,
 ) -> CoreResult<TurnOutcome> {
+    cancel_owned_background_children(session, reason);
     emit(
         session,
         TurnEvent::TurnAborted {
@@ -6591,14 +7224,26 @@ async fn cancel_turn(
     Ok(TurnOutcome::Cancelled { reason })
 }
 
+enum ModelStopOutcome {
+    OutputLimit,
+    ContextLimit,
+    IncompleteUnknown,
+    ProviderStopCode(String),
+    StreamInterrupted,
+    StreamTransportInterrupted,
+    ContentFiltered,
+    Refused { detail: Option<String> },
+}
+
 /// Beendet einen Turn nach einem Provider-Stop-Grund, der kein reguläres
 /// Turn-Ende ist ([`StopReason::MaxTokens`] nach ausgeschöpften
 /// Auto-Continuations, [`StopReason::ContextWindowExceeded`],
-/// [`StopReason::Refusal`], [`StopReason::ContentFilter`]).
+/// [`StopReason::StreamInterrupted`], [`StopReason::IncompleteUnknown`], [`StopReason::Refusal`],
+/// [`StopReason::ContentFilter`]).
 ///
 /// # Beschreibung
 /// Spiegelt den regulären Abschluss-Pfad am Ende von [`drive_turn`]
-/// (Guard-Hinweis, Observer, `TurnCompleted`, `complete_turn`), endet aber mit
+/// (Guard-Hinweis, Observer, `complete_turn`), endet aber mit
 /// dem ehrlichen [`TurnOutcome::Truncated`]- bzw. [`TurnOutcome::Refused`]-Ausgang
 /// statt `Completed`. Die bereits erhaltene Assistant-Antwort (inklusive
 /// abgeschnittener Teiltext) ist zu diesem Zeitpunkt bereits persistiert; das
@@ -6610,11 +7255,83 @@ async fn cancel_turn(
 /// `handle` nicht mehr der aktive Turn der Session ist).
 async fn finish_model_stop(
     session: &mut AgentSession,
+    store: &dyn StateStore,
     handle: TurnHandle,
     total_usage: harw_types::TokenUsage,
     pending_guard_hint: Option<String>,
-    outcome: TurnOutcome,
+    stop: ModelStopOutcome,
 ) -> CoreResult<TurnOutcome> {
+    let (outcome, incomplete) = match stop {
+        ModelStopOutcome::OutputLimit => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Das Ausgabelimit des Anbieters wurde erreicht.".to_owned(),
+                true,
+            )),
+        ),
+        ModelStopOutcome::ContextLimit => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Das Kontextfenster des Modells wurde überschritten.".to_owned(),
+                true,
+            )),
+        ),
+        ModelStopOutcome::IncompleteUnknown => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Der Anbieter meldete ein unvollständiges Ergebnis. Die Ursache ist unbekannt.".to_owned(),
+                false,
+            )),
+        ),
+        ModelStopOutcome::ProviderStopCode(code) => {
+            let code = code.trim();
+            let valid = !code.is_empty() && code.len() <= 64
+                && code.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+            let message = if valid {
+                format!("Antwort unvollständig: Der Anbieter hat die Antwort mit dem Statuscode {code} beendet.")
+            } else {
+                "Antwort unvollständig: Der Anbieter hat die Antwort beendet, aber keinen verständlichen Grund übermittelt.".to_owned()
+            };
+            (TurnOutcome::Truncated, Some((message, false)))
+        }
+        ModelStopOutcome::StreamInterrupted => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Der Antwortstream endete vor der Abschlussmeldung. Die Ursache ist unbekannt.".to_owned(),
+                false,
+            )),
+        ),
+        ModelStopOutcome::StreamTransportInterrupted => (
+            TurnOutcome::Truncated,
+            Some((
+                "Antwort unvollständig: Die Übertragung der Anbieterantwort wurde unterbrochen oder hat zu lange keine Daten geliefert.".to_owned(),
+                false,
+            )),
+        ),
+        ModelStopOutcome::ContentFiltered => (
+            TurnOutcome::Refused { detail: None },
+            Some((
+                "Antwort unvollständig: Der Inhaltsfilter des Anbieters hat die Ausgabe gestoppt. Kein genauerer Grund wurde übermittelt.".to_owned(),
+                false,
+            )),
+        ),
+        ModelStopOutcome::Refused { detail } => {
+            let display_detail = detail
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+                .take(240)
+                .collect::<String>();
+            let display_detail = display_detail.trim();
+            let message = if display_detail.is_empty() {
+                "Antwort unvollständig: Das Modell hat die Antwort abgelehnt. Kein genauerer Grund wurde übermittelt.".to_owned()
+            } else {
+                format!("Antwort unvollständig: Das Modell hat die Antwort abgelehnt. Grund laut Anbieter: {display_detail}")
+            };
+            (TurnOutcome::Refused { detail }, Some((message, false)))
+        }
+    };
     // Welle FANIN-K: ein Hinweis, der am Ende der letzten Runde entstand,
     // aber keinem Tool-Ergebnis mehr zugeordnet werden konnte, geht auch an
     // dieser Endgrenze nicht verloren — er wird ans letzte Verlaufs-Item
@@ -6622,13 +7339,37 @@ async fn finish_model_stop(
     if let Some(hint) = pending_guard_hint {
         session.history_mut().append_hint_to_last(&hint);
     }
-    emit(
-        session,
-        TurnEvent::TurnCompleted {
-            turn_id: handle.turn_id.clone(),
-            usage: Some(total_usage.clone()),
-        },
-    );
+    if let Some((message, retryable)) = incomplete {
+        // Persist before the terminal event: a client can reattach as soon as
+        // it sees that event, missing any subsequent transient host notice.
+        session.history_mut().push_error(message.clone(), retryable);
+        persist_last(session, store).await?;
+        if let Some(item) = session.history().last().cloned() {
+            emit(
+                session,
+                TurnEvent::ItemAdded {
+                    turn_id: handle.turn_id.clone(),
+                    item,
+                },
+            );
+        }
+        emit(
+            session,
+            TurnEvent::TurnFailed {
+                turn_id: handle.turn_id.clone(),
+                reason: message,
+                retryable,
+            },
+        );
+    } else {
+        emit(
+            session,
+            TurnEvent::TurnCompleted {
+                turn_id: handle.turn_id.clone(),
+                usage: Some(total_usage.clone()),
+            },
+        );
+    }
     notify_turn_stop(
         session,
         &TurnStopInput {
@@ -7135,8 +7876,9 @@ async fn try_execute_parallel_calls(
 /// Jede eingeholte Entscheidung — auch die abschlägige — wird in `prepared`
 /// hinterlegt, damit der sequenzielle Fallback sie verbrauchen kann statt
 /// denselben Handler erneut zu fragen. Ohne registrierten `ApprovalHandler`
-/// liefert [`check_approval`] `Allow`, ohne dass irgendetwas aufgerufen wird;
-/// die Vorprüfung ist dann ein reiner Durchlauf.
+/// liefert [`check_approval`] `Allow`, ohne dass irgendetwas aufgerufen wird
+/// — außer der DoD-Taint-Fallback greift (siehe Abschnitt DoD-Taint an
+/// [`check_approval`]); sonst ist die Vorprüfung dann ein reiner Durchlauf.
 ///
 /// # Arguments
 /// - `calls` (`&[ToolCall]`): die Calls der Modellantwort in Originalreihenfolge.
@@ -7150,6 +7892,13 @@ async fn preflight_approvals(
     prepared: &mut PreparedApprovals,
 ) -> bool {
     prepared.decisions = Vec::with_capacity(calls.len());
+    // PL-100 Phase 4 (B22): ein `dod.*`-Aufruf taintet erst nach seiner
+    // Abfertigung. Mischt die Antwort ihn mit einem taint-pflichtigen
+    // Aufruf, läuft sie sequenziell (keine Entscheidung vorab), damit der
+    // spätere Aufruf den Taint sieht.
+    if crate::dod_taint::batch_mixes_dod_and_gated(calls) {
+        return false;
+    }
     for call in calls {
         let decision = check_approval(session, call).await;
         let allowed = matches!(decision, ApprovalDecision::Allow);
@@ -7177,6 +7926,35 @@ async fn persist_last(session: &AgentSession, store: &dyn StateStore) -> CoreRes
         tracing::debug!(records_written = 0u64, "transcript.persist");
     }
     Ok(())
+}
+
+async fn persist_title_seed_last(
+    session: &AgentSession, store: &dyn StateStore,
+) -> CoreResult<Option<harw_session_store::title_seed::TitleSeedLocation>> {
+    let Some(item) = session.history().last() else { return Ok(None); };
+    store.save_title_seed_item(session.id(), item).await
+        .map_err(|error| state_store_error(error, "persistence"))
+}
+
+async fn bind_title_user(
+    store: &dyn StateStore, ctx: &TurnInputContext,
+    user: Option<harw_session_store::title_seed::TitleSeedLocation>,
+) {
+    if store.attach_title_seed_user(&ctx.session_id, &ctx.turn_id, user).await.is_err() {
+        tracing::warn!("title source user origin was not confirmed");
+    }
+}
+
+async fn settle_title_seed_failure(
+    store: &dyn StateStore, ctx: &TurnInputContext, result: &CoreResult<TurnOutcome>,
+) {
+    let known_not_completed = !matches!(result,
+        Ok(TurnOutcome::Completed | TurnOutcome::AwaitingApproval { .. } | TurnOutcome::AwaitingChild { .. }));
+    if known_not_completed &&
+        store.finish_title_seed(&ctx.session_id, &ctx.turn_id, false, None).await.is_err()
+    {
+        tracing::warn!("title source terminal state was not confirmed");
+    }
 }
 
 fn state_store_error(error: StateStoreError, operation_name: &str) -> CoreError {
@@ -10618,6 +11396,687 @@ mod tests {
         Ok(())
     }
 
+    // ------------------------------------------------------------------
+    // PL-100 Phase 4 (B22, O1): DoD-Taint je Turn
+    // ------------------------------------------------------------------
+
+    /// Werkzeuge der Taint-Tests; alle sequenziell (nicht `parallel_safe`).
+    const TAINT_TOOLS: &[&str] = &[
+        "dod.findings",
+        "job.stop",
+        "job.start",
+        "job.logs",
+        "process.kill",
+        "host.sudo_exec",
+    ];
+
+    /// Sitzung mit `allow` (gibt alles frei — steht für Auto-Modus,
+    /// Sitzungsfreigabe oder gemerkte Regel) und, falls `mode` gesetzt ist,
+    /// der `DodTaintPolicy` über einer Zelle in diesem Modus.
+    fn taint_session(
+        allow: Arc<CountingApproval>,
+        mode: Option<harw_extension_api::approval_mode::ApprovalMode>,
+    ) -> TestResult<AgentSession> {
+        let allow: Arc<dyn harw_extension_api::ApprovalHandler> = allow;
+        let mut handlers = vec![allow];
+        if let Some(mode) = mode {
+            handlers.push(taint_policy(mode));
+        }
+        taint_session_with(handlers, true)
+    }
+
+    /// Die `DodTaintPolicy` über einer Zelle im Modus `mode`.
+    fn taint_policy(
+        mode: harw_extension_api::approval_mode::ApprovalMode,
+    ) -> Arc<dyn harw_extension_api::ApprovalHandler> {
+        Arc::new(crate::policy::DodTaintPolicy::new().with_mode(
+            harw_extension_api::approval_mode::ApprovalModeCell::new(mode),
+        ))
+    }
+
+    /// Sitzung mit genau `handlers`; `approval_actor = false` lässt den
+    /// Freigabe-Akteur weg (wie ein Job-Worker ohne Oberfläche).
+    fn taint_session_with(
+        handlers: Vec<Arc<dyn harw_extension_api::ApprovalHandler>>,
+        approval_actor: bool,
+    ) -> TestResult<AgentSession> {
+        taint_session_on(
+            StubToolProvider::with_names(TAINT_TOOLS),
+            handlers,
+            approval_actor,
+        )
+    }
+
+    /// Wie [`taint_session_with`], aber über dem Werkzeuganbieter `provider`.
+    fn taint_session_on(
+        provider: Arc<dyn ToolProvider>,
+        handlers: Vec<Arc<dyn harw_extension_api::ApprovalHandler>>,
+        approval_actor: bool,
+    ) -> TestResult<AgentSession> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut builder = ExtensionRegistryBuilder::default().tool_provider(provider);
+        for handler in handlers {
+            builder = builder.approval_handler(handler);
+        }
+        let mut context = test_spawn_context()?;
+        if !approval_actor {
+            context.approval_actor = None;
+        }
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, builder.build(), tx)
+                .with_spawn_context(context),
+        )
+    }
+
+    /// Gibt alles frei und meldet `label` — steht für die Ask-Auflösung
+    /// eines nicht interaktiven Einstiegs (`harw-runtime`), die den Taint
+    /// nicht kennt.
+    struct LabelledAllow(&'static str);
+
+    impl harw_extension_api::ApprovalHandler for LabelledAllow {
+        fn review<'a>(
+            &'a self,
+            _call: &'a ToolCall,
+        ) -> harw_extension_api::ExtFuture<'a, ApprovalDecision> {
+            Box::pin(async { ApprovalDecision::Allow })
+        }
+
+        fn label(&self) -> &'static str {
+            self.0
+        }
+    }
+
+    /// Die Antworten „`dod.findings`, dann `gated`, dann Text".
+    fn dod_then(gated: &ToolCallId, tool: &str) -> Vec<crate::model::ModelResponse> {
+        vec![
+            response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+            response_with(vec![call(gated, tool)]),
+            crate::model::ModelResponse::text("erledigt"),
+        ]
+    }
+
+    /// Prüft, dass genau der zweite Aufruf mit dem Taint-Grund abgelehnt
+    /// wurde (der erste war `dod.findings`).
+    fn expect_taint_denial(session: &AgentSession) -> TestResult {
+        let results = tool_results(session);
+        let denied = results
+            .get(1)
+            .ok_or(TestError::Missing("Ergebnis des taint-pflichtigen Aufrufs"))?;
+        match denied {
+            ToolCallResult::Error { message }
+                if message.starts_with("denied: ")
+                    && message.contains(crate::dod_taint::TAINT_REASON) =>
+            {
+                Ok(())
+            }
+            other => Err(TestError::Unexpected(format!(
+                "erwartet eine Taint-Ablehnung, bekommen {other:?}"
+            ))),
+        }
+    }
+
+    /// Führt einen Turn mit den vorprogrammierten Antworten `script` aus.
+    async fn run_taint_turn(
+        session: &mut AgentSession,
+        store: &crate::state_store::InMemoryStateStore,
+        script: Vec<crate::model::ModelResponse>,
+        control: TurnControl,
+    ) -> TestResult<TurnOutcome> {
+        let model = ScriptedModel::new(script);
+        Ok(run_turn(
+            session,
+            &model,
+            store,
+            TurnInput::user("taint").with_control(control),
+        )
+        .await?)
+    }
+
+    /// Die Call-Id, auf deren Freigabe der Turn wartet.
+    fn awaited_call(outcome: &TurnOutcome) -> Option<&ToolCallId> {
+        match outcome {
+            TurnOutcome::AwaitingApproval { call_id, .. } => Some(call_id),
+            _ => None,
+        }
+    }
+
+    /// Auto-Modus + `dod.findings`, danach `job.stop` → Rückfrage, obwohl
+    /// ein anderer Handler freigibt; die Oberfläche bekommt den Grund.
+    #[tokio::test]
+    async fn dod_taint_asks_for_job_stop_after_dod_findings_in_auto_mode() -> TestResult {
+        let dod = ToolCallId::new();
+        let stop = ToolCallId::new();
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&dod, "dod.findings")]),
+                response_with(vec![call(&stop, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        let reason = crate::dod_taint::pending_ask_reason(&session)
+            .ok_or(TestError::Missing("Taint-Grund der offenen Rückfrage"))?;
+        assert!(reason.contains(crate::dod_taint::TAINT_REASON), "{reason}");
+        Ok(())
+    }
+
+    /// Entscheidung O1: unter Full Access fragt auch der Taint nicht.
+    #[tokio::test]
+    async fn dod_taint_never_asks_under_full_access() -> TestResult {
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::FullAccess),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                response_with(vec![call(&ToolCallId::new(), "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        Ok(())
+    }
+
+    /// Ohne `dod.*`-Aufruf bleibt die Entscheidung unverändert.
+    #[tokio::test]
+    async fn dod_taint_leaves_turns_without_dod_calls_unchanged() -> TestResult {
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        Ok(())
+    }
+
+    /// Der Taint endet mit seinem Turn — auch wenn der Aufrufer denselben
+    /// Steuerblock im nächsten Turn wiederverwendet.
+    #[tokio::test]
+    async fn dod_taint_ends_with_its_turn() -> TestResult {
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let control = TurnControl::new();
+
+        let first = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                crate::model::ModelResponse::text("Befunde gelesen"),
+            ],
+            control.clone(),
+        )
+        .await?;
+        assert!(matches!(first, TurnOutcome::Completed), "{first:?}");
+
+        let second = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "job.stop")]),
+                crate::model::ModelResponse::text("gestoppt"),
+            ],
+            control,
+        )
+        .await?;
+        assert!(matches!(second, TurnOutcome::Completed), "{second:?}");
+        Ok(())
+    }
+
+    /// Lesende Job-Werkzeuge bleiben nach einer DoD-Abfrage frei.
+    #[tokio::test]
+    async fn dod_taint_leaves_read_only_job_tools_alone() -> TestResult {
+        let mut session = taint_session(
+            Arc::new(CountingApproval::allow_everything()),
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                response_with(vec![call(&ToolCallId::new(), "job.logs")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        Ok(())
+    }
+
+    /// `process.kill`, `host.sudo_exec` und `job.start` fragen nach einer
+    /// DoD-Abfrage ebenfalls, auch wenn jeder andere Handler freigibt.
+    #[tokio::test]
+    async fn dod_taint_gates_host_tools_and_job_start() -> TestResult {
+        for tool in ["process.kill", "host.sudo_exec", "job.start"] {
+            let gated = ToolCallId::new();
+            let mut session = taint_session(
+                Arc::new(CountingApproval::allow_everything()),
+                Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+            )?;
+            let store = crate::state_store::InMemoryStateStore::new();
+
+            let outcome = run_taint_turn(
+                &mut session,
+                &store,
+                vec![
+                    response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                    response_with(vec![call(&gated, tool)]),
+                    crate::model::ModelResponse::text("erledigt"),
+                ],
+                TurnControl::new(),
+            )
+            .await?;
+
+            assert_eq!(awaited_call(&outcome), Some(&gated), "{tool}: {outcome:?}");
+        }
+        Ok(())
+    }
+
+    /// Ein abgelehnter (nie ausgeführter) `dod.*`-Aufruf taintet den Turn
+    /// trotzdem (fail-closed).
+    #[tokio::test]
+    async fn dod_taint_counts_a_denied_dod_call() -> TestResult {
+        let dod = ToolCallId::new();
+        let stop = ToolCallId::new();
+        let denying = Arc::new(CountingApproval::new(vec![(
+            dod.clone(),
+            ApprovalDecision::Deny("regel".to_owned()),
+        )]));
+        let mut session = taint_session(
+            denying,
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&dod, "dod.findings")]),
+                response_with(vec![call(&stop, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        Ok(())
+    }
+
+    /// Liefert für `dod.*` ein Werkzeugfehler-Ergebnis, für alles andere
+    /// `ok` — steht für einen DoD-Export, der sich nicht lesen lässt.
+    struct DodFailsExecutor;
+
+    impl ToolExecutor for DodFailsExecutor {
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolExecutionContext,
+            call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            let output = if crate::dod_taint::is_dod_tool(call.name.as_str()) {
+                ToolOutput::error("dod export unreadable")
+            } else {
+                ToolOutput::text("ok")
+            };
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
+    /// Bietet [`TAINT_TOOLS`] an; jedes läuft über [`DodFailsExecutor`].
+    struct DodFailsProvider {
+        // Die angebotenen Werkzeuge (wie `StubToolProvider`).
+        inner: Arc<StubToolProvider>,
+    }
+
+    impl ToolProvider for DodFailsProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            self.inner.tools()
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            self.inner
+                .executor(name)
+                .map(|_| Arc::new(DodFailsExecutor) as Arc<dyn ToolExecutor>)
+        }
+    }
+
+    /// Ein abgefertigter `dod.*`-Aufruf, der bei der Ausführung scheitert,
+    /// taintet den Turn ebenfalls — gleich ob der Ausführer einen Fehler
+    /// liefert oder es gar keinen Ausführer gibt (die Sitzung bietet das
+    /// Werkzeug nicht an: „no executor for tool").
+    #[tokio::test]
+    async fn dod_taint_counts_a_dod_call_that_fails_in_execution() -> TestResult {
+        let providers: [(&str, Arc<dyn ToolProvider>); 2] = [
+            (
+                "Ausführer meldet Fehler",
+                Arc::new(DodFailsProvider {
+                    inner: StubToolProvider::with_names(TAINT_TOOLS),
+                }) as Arc<dyn ToolProvider>,
+            ),
+            (
+                "kein Ausführer",
+                StubToolProvider::with_names(&["job.stop"]) as Arc<dyn ToolProvider>,
+            ),
+        ];
+        for (case, provider) in providers {
+            let stop = ToolCallId::new();
+            let allow: Arc<dyn harw_extension_api::ApprovalHandler> =
+                Arc::new(CountingApproval::allow_everything());
+            let mut session = taint_session_on(
+                provider,
+                vec![
+                    allow,
+                    taint_policy(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+                ],
+                true,
+            )?;
+            let store = crate::state_store::InMemoryStateStore::new();
+
+            let outcome = run_taint_turn(
+                &mut session,
+                &store,
+                dod_then(&stop, "job.stop"),
+                TurnControl::new(),
+            )
+            .await?;
+
+            match tool_results(&session).first() {
+                Some(ToolCallResult::Error { .. }) => {}
+                other => {
+                    return Err(TestError::Unexpected(format!(
+                        "{case}: der DoD-Aufruf muss scheitern, Ergebnis {other:?}"
+                    )));
+                }
+            }
+            assert_eq!(awaited_call(&outcome), Some(&stop), "{case}: {outcome:?}");
+            let reason = crate::dod_taint::pending_ask_reason(&session).ok_or(
+                TestError::Missing("Taint-Grund nach gescheitertem DoD-Aufruf"),
+            )?;
+            assert!(
+                reason.contains(crate::dod_taint::TAINT_REASON),
+                "{case}: {reason}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Der Taint gilt für den **Rest** des Turns und überlebt die
+    /// Rückfrage-Pause: nach Freigabe wie nach Ablehnung des ersten
+    /// `job.stop` fragt ein zweites `job.stop` im selben Turn erneut, mit dem
+    /// Taint-Grund (der Steuerblock des Turns wird beim Fortsetzen
+    /// wiederverwendet).
+    #[tokio::test]
+    async fn dod_taint_survives_the_approval_pause_for_the_rest_of_the_turn() -> TestResult {
+        for resolution in [
+            ApprovalResolution::Approve,
+            ApprovalResolution::Reject {
+                reason: "nicht stoppen".to_owned(),
+            },
+        ] {
+            let first = ToolCallId::new();
+            let second = ToolCallId::new();
+            let mut session = taint_session(
+                Arc::new(CountingApproval::allow_everything()),
+                Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+            )?;
+            let store = crate::state_store::InMemoryStateStore::new();
+
+            let paused = run_taint_turn(
+                &mut session,
+                &store,
+                dod_then(&first, "job.stop"),
+                TurnControl::new(),
+            )
+            .await?;
+            assert_eq!(awaited_call(&paused), Some(&first), "{paused:?}");
+            let turn = session
+                .current_turn()
+                .cloned()
+                .ok_or(TestError::Missing("laufender Turn in der Pause"))?;
+
+            let model = ScriptedModel::new(vec![
+                response_with(vec![call(&second, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ]);
+            let resumed = resume_after_approval(
+                &mut session,
+                &model,
+                &store,
+                ApprovalActor::Operator {
+                    id: "test-operator".to_owned(),
+                },
+                resolution.clone(),
+            )
+            .await?;
+
+            assert_eq!(
+                awaited_call(&resumed),
+                Some(&second),
+                "{resolution:?}: {resumed:?}"
+            );
+            assert_eq!(
+                session.current_turn(),
+                Some(&turn),
+                "{resolution:?}: derselbe Turn"
+            );
+            let reason = crate::dod_taint::pending_ask_reason(&session)
+                .ok_or(TestError::Missing("Taint-Grund der zweiten Rückfrage"))?;
+            assert!(
+                reason.contains(crate::dod_taint::TAINT_REASON),
+                "{resolution:?}: {reason}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ohne installierte `DodTaintPolicy` fragt der Turn-Loop selbst
+    /// (modusblind, fail-closed).
+    #[tokio::test]
+    async fn dod_taint_fallback_asks_without_an_installed_policy() -> TestResult {
+        let stop = ToolCallId::new();
+        let mut session = taint_session(Arc::new(CountingApproval::allow_everything()), None)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&ToolCallId::new(), "dod.findings")]),
+                response_with(vec![call(&stop, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        let reason = crate::dod_taint::pending_ask_reason(&session)
+            .ok_or(TestError::Missing("Taint-Grund der Fallback-Rückfrage"))?;
+        assert!(reason.contains(crate::dod_taint::TAINT_REASON), "{reason}");
+        Ok(())
+    }
+
+    /// Ohne Freigabe-Akteur (Job-Worker) lehnt der Fallback ab, statt eine
+    /// Rückfrage zu öffnen, die den Turn mit `MissingApprovalActor`
+    /// scheitern ließe; der Turn läuft weiter.
+    #[tokio::test]
+    async fn dod_taint_denies_instead_of_asking_without_an_approval_actor() -> TestResult {
+        for mode in [
+            None,
+            Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+        ] {
+            let allow: Arc<dyn harw_extension_api::ApprovalHandler> =
+                Arc::new(CountingApproval::allow_everything());
+            let mut handlers = vec![allow];
+            if let Some(mode) = mode {
+                handlers.push(taint_policy(mode));
+            }
+            let mut session = taint_session_with(handlers, false)?;
+            let store = crate::state_store::InMemoryStateStore::new();
+
+            let outcome = run_taint_turn(
+                &mut session,
+                &store,
+                dod_then(&ToolCallId::new(), "job.stop"),
+                TurnControl::new(),
+            )
+            .await?;
+
+            assert!(
+                matches!(outcome, TurnOutcome::Completed),
+                "{mode:?}: {outcome:?}"
+            );
+            expect_taint_denial(&session)?;
+        }
+        Ok(())
+    }
+
+    /// Ein nicht interaktiver Einstieg (Ask-Auflösung `ask:*` in der Kette,
+    /// die den Taint nicht kennt) bekommt eine deterministische Ablehnung
+    /// statt einer Pause — mit installierter Politik wie im Fallback.
+    #[tokio::test]
+    async fn dod_taint_denies_in_a_non_interactive_entry() -> TestResult {
+        for label in crate::policy::NON_INTERACTIVE_ASK_LABELS {
+            for mode in [
+                None,
+                Some(harw_extension_api::approval_mode::ApprovalMode::Delegated),
+            ] {
+                let allow: Arc<dyn harw_extension_api::ApprovalHandler> =
+                    Arc::new(CountingApproval::allow_everything());
+                let mut handlers: Vec<Arc<dyn harw_extension_api::ApprovalHandler>> =
+                    vec![allow, Arc::new(LabelledAllow(label))];
+                if let Some(mode) = mode {
+                    handlers.push(taint_policy(mode));
+                }
+                let mut session = taint_session_with(handlers, true)?;
+                let store = crate::state_store::InMemoryStateStore::new();
+
+                let outcome = run_taint_turn(
+                    &mut session,
+                    &store,
+                    dod_then(&ToolCallId::new(), "job.stop"),
+                    TurnControl::new(),
+                )
+                .await?;
+
+                assert!(
+                    matches!(outcome, TurnOutcome::Completed),
+                    "{label} {mode:?}: {outcome:?}"
+                );
+                expect_taint_denial(&session)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fragt unter Full Access ein anderer Handler, nennt die Oberfläche den
+    /// Taint-Grund nicht: der Taint hat diese Rückfrage nicht verursacht.
+    #[tokio::test]
+    async fn dod_taint_reason_is_not_claimed_for_an_ask_it_did_not_cause() -> TestResult {
+        let stop = ToolCallId::new();
+        let asking: Arc<dyn harw_extension_api::ApprovalHandler> =
+            Arc::new(CountingApproval::new(vec![(
+                stop.clone(),
+                ApprovalDecision::AskUser(harw_types::ItemId::new()),
+            )]));
+        let mut session = taint_session_with(
+            vec![
+                asking,
+                taint_policy(harw_extension_api::approval_mode::ApprovalMode::FullAccess),
+            ],
+            true,
+        )?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            dod_then(&stop, "job.stop"),
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        assert_eq!(crate::dod_taint::pending_ask_reason(&session), None);
+        Ok(())
+    }
+
+    /// Stehen `dod.*` und ein taint-pflichtiger Aufruf in derselben Antwort,
+    /// läuft sie sequenziell: die Vorprüfung entscheidet nichts vorab, der
+    /// spätere Aufruf sieht den Taint, und kein Handler wird doppelt gefragt.
+    #[tokio::test]
+    async fn dod_taint_serialises_a_mixed_parallel_response() -> TestResult {
+        let dod = ToolCallId::new();
+        let stop = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let allow = Arc::new(CountingApproval::allow_everything());
+        let provider =
+            StubParallelProvider::instant(&["dod.findings", "job.stop"], Arc::clone(&executions));
+        let mut session = guarded_session(provider, Arc::clone(&allow))?;
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let outcome = run_taint_turn(
+            &mut session,
+            &store,
+            vec![
+                response_with(vec![call(&dod, "dod.findings"), call(&stop, "job.stop")]),
+                crate::model::ModelResponse::text("erledigt"),
+            ],
+            TurnControl::new(),
+        )
+        .await?;
+
+        assert_eq!(awaited_call(&outcome), Some(&stop), "{outcome:?}");
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "nur dod.findings lief"
+        );
+        assert_eq!(allow.reviews_for(&dod), 1);
+        assert_eq!(allow.reviews_for(&stop), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn parallel_preflight_aggregates_a_later_deny_over_an_earlier_ask_user() -> TestResult {
         // Der Parallel-Vorprüfpfad muss identisch aggregieren: statt einer
@@ -10807,6 +12266,482 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Ein Spawner mit genau einem laufenden Hintergrund-Kind, dessen
+    /// Abschlussmeldung ab der `ready_after`-ten Abfrage bereitliegt, bis sie
+    /// bestätigt wird.
+    struct BackgroundResultSpawner {
+        polls: AtomicUsize,
+        ready_after: usize,
+        child: harw_types::SessionId,
+        acknowledged: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    impl BackgroundResultSpawner {
+        fn new(ready_after: usize) -> Arc<Self> {
+            Arc::new(Self {
+                polls: AtomicUsize::new(0),
+                ready_after,
+                child: harw_types::SessionId::new(),
+                acknowledged: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            })
+        }
+
+        fn done(&self) -> bool {
+            self.acknowledged.load(Ordering::SeqCst) > 0
+                || self.cancelled.load(Ordering::SeqCst) > 0
+        }
+    }
+
+    impl AgentSpawner for BackgroundResultSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            _input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            Box::pin(async move { Err(harw_extension_api::AgentSpawnError::new("unused")) })
+        }
+
+        fn pending_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+        ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
+            let polls = self.polls.fetch_add(1, Ordering::SeqCst);
+            if polls >= self.ready_after && !self.done() {
+                vec![harw_extension_api::PendingBackgroundNotice {
+                    child: self.child.clone(),
+                    text: "[Hintergrund-Agent explorer k1 fertig nach 3 s]\nBefund X".to_owned(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn acknowledge_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+            children: &[harw_types::SessionId],
+        ) {
+            if children.contains(&self.child) {
+                self.acknowledged.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn running_background_children(&self, _parent: &harw_types::SessionId) -> usize {
+            usize::from(!self.done())
+        }
+
+        fn cancel_background_children(
+            &self,
+            _parent: &harw_types::SessionId,
+            _reason: &str,
+        ) -> usize {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            1
+        }
+    }
+
+    fn orchestrator_child_session(
+        spawner: &Arc<BackgroundResultSpawner>,
+    ) -> TestResult<AgentSession> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        Ok(AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?))
+    }
+
+    fn user_texts_containing(session: &AgentSession, needle: &str) -> usize {
+        session
+            .history()
+            .items()
+            .iter()
+            .filter(|item| match item {
+                TurnItem::UserMessage(message) => format!("{:?}", message.content).contains(needle),
+                _ => false,
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_child_waits_for_its_background_children_before_finishing() -> TestResult
+    {
+        // Abfrage 0: Rundenbeginn, 1: Turn-Ende (läuft noch, eine
+        // Warteschleife), 2: Ergebnis da.
+        let spawner = BackgroundResultSpawner::new(2);
+        let mut session = orchestrator_child_session(&spawner)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            crate::model::ModelResponse::text("Welle gestartet, warte auf Ergebnisse."),
+            crate::model::ModelResponse::text("Synthese mit Befund X."),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("auftrag"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        assert_eq!(user_texts_containing(&session, "Befund X"), 1);
+        assert_eq!(spawner.acknowledged.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.cancelled.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancellation_while_waiting_is_a_cancel_not_a_success() -> TestResult {
+        let spawner = BackgroundResultSpawner::new(usize::MAX);
+        let mut session = orchestrator_child_session(&spawner)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte")]);
+        let token = crate::cancel::CancelToken::new();
+        let control = TurnControl::new().with_cancel(token.clone());
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            token.cancel(CancelReason::User);
+        });
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn endet mit Abbruch"))?;
+        canceller
+            .await
+            .map_err(|error| TestError::Unexpected(error.to_string()))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            spawner.cancelled.load(Ordering::SeqCst),
+            1,
+            "die wartenden Hintergrund-Kinder werden mit abgebrochen"
+        );
+        Ok(())
+    }
+
+    /// Ein Kind ist fertig (Meldung wartet, sobald `ready`), ein Geschwister
+    /// läuft noch.
+    struct TwoChildrenSpawner {
+        finished: harw_types::SessionId,
+        ready: std::sync::atomic::AtomicBool,
+        acknowledged: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    impl TwoChildrenSpawner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                finished: harw_types::SessionId::new(),
+                ready: std::sync::atomic::AtomicBool::new(false),
+                acknowledged: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl AgentSpawner for TwoChildrenSpawner {
+        fn spawn_child<'a>(
+            &'a self,
+            _role: &'a str,
+            _input: SpawnInput,
+            _sandbox: SandboxSpec,
+            _suggestions: Option<AgentSuggestions>,
+        ) -> SpawnFuture<'a> {
+            Box::pin(async move { Err(harw_extension_api::AgentSpawnError::new("unused")) })
+        }
+
+        fn pending_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+        ) -> Vec<harw_extension_api::PendingBackgroundNotice> {
+            if self.ready.load(Ordering::SeqCst) && self.acknowledged.load(Ordering::SeqCst) == 0 {
+                vec![harw_extension_api::PendingBackgroundNotice {
+                    child: self.finished.clone(),
+                    text: "[Hintergrund-Agent explorer k1 fertig nach 3 s]\nBefund Y".to_owned(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn acknowledge_background_notices(
+            &self,
+            _parent: &harw_types::SessionId,
+            children: &[harw_types::SessionId],
+        ) {
+            if children.contains(&self.finished) {
+                self.acknowledged.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn running_background_children(&self, _parent: &harw_types::SessionId) -> usize {
+            usize::from(self.cancelled.load(Ordering::SeqCst) == 0)
+        }
+
+        fn cancel_background_children(
+            &self,
+            _parent: &harw_types::SessionId,
+            _reason: &str,
+        ) -> usize {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_parent_keeps_a_finished_result_and_cancels_the_running_sibling()
+    -> TestResult {
+        let spawner = TwoChildrenSpawner::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(&spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?);
+        let store = crate::state_store::InMemoryStateStore::new();
+        // Der Token ist schon abgebrochen, wenn das Turn-Ende erreicht wird:
+        // der Abbruch kommt nach der Modellantwort, vor dem Warten.
+        let token = crate::cancel::CancelToken::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte auf Kinder")]);
+        let control = TurnControl::new().with_cancel(token.clone());
+        // Während das Turn-Ende wartet: ein Kind wird fertig, dann kommt der
+        // Abbruch — die nächste Prüfung sieht beides zugleich.
+        let _finisher = finish_then_cancel(Arc::clone(&spawner), token);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn endet mit Abbruch"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            spawner.acknowledged.load(Ordering::SeqCst),
+            1,
+            "das fertige Ergebnis wird geschrieben und bestätigt"
+        );
+        assert_eq!(user_texts_containing(&session, "Befund Y"), 1);
+        assert_eq!(
+            spawner.cancelled.load(Ordering::SeqCst),
+            1,
+            "das laufende Geschwister wird mit abgebrochen"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_on_cancel_still_cancels_the_sibling_and_keeps_the_notice() -> TestResult
+    {
+        let spawner = TwoChildrenSpawner::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .spawner(Arc::clone(&spawner) as Arc<dyn AgentSpawner>)
+            .build();
+        let mut session = AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            registry,
+            tx,
+        )
+        .with_spawn_context(test_spawn_context()?);
+        let store = FailOnceStore {
+            inner: crate::state_store::InMemoryStateStore::new(),
+            needle: "Befund Y",
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let token = crate::cancel::CancelToken::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte auf Kinder")]);
+        let control = TurnControl::new().with_cancel(token.clone());
+        // Während das Turn-Ende wartet: ein Kind wird fertig, dann kommt der
+        // Abbruch — die nächste Prüfung sieht beides zugleich.
+        let _finisher = finish_then_cancel(Arc::clone(&spawner), token);
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "der Schreibfehler bleibt sichtbar: {outcome:?}"
+        );
+        assert_eq!(
+            spawner.cancelled.load(Ordering::SeqCst),
+            1,
+            "das laufende Geschwister wird trotz Schreibfehler genau einmal abgebrochen"
+        );
+        assert_eq!(
+            spawner.acknowledged.load(Ordering::SeqCst),
+            0,
+            "die nicht geschriebene Meldung bleibt unbestätigt im Register"
+        );
+        assert_eq!(user_texts_containing(&session, "Befund Y"), 0);
+        Ok(())
+    }
+
+    /// Macht nach kurzer Zeit ein Kind fertig und bricht dann den Token ab.
+    fn finish_then_cancel(
+        spawner: Arc<TwoChildrenSpawner>,
+        token: crate::cancel::CancelToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            spawner.ready.store(true, Ordering::SeqCst);
+            token.cancel(CancelReason::User);
+        })
+    }
+
+    #[tokio::test]
+    async fn wall_time_expiry_while_waiting_ends_as_budget() -> TestResult {
+        let spawner = BackgroundResultSpawner::new(usize::MAX);
+        let mut session = orchestrator_child_session(&spawner)?;
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("warte")]);
+        let control = TurnControl::new().with_limits(TurnLimits {
+            wall_time: Duration::from_secs(1),
+            ..TurnLimits::unlimited()
+        });
+
+        let outcome = run_turn(
+            &mut session,
+            &model,
+            &store,
+            TurnInput::user("auftrag").with_control(control),
+        )
+        .await
+        .map_err(ctx("der Turn endet mit Budget-Ende"))?;
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(spawner.cancelled.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Scheitert genau einmal beim Schreiben einer Nutzer-Nachricht, die
+    /// `needle` enthält; sonst wie ein `InMemoryStateStore`.
+    struct FailOnceStore {
+        inner: crate::state_store::InMemoryStateStore,
+        needle: &'static str,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl StateStore for FailOnceStore {
+        fn save_turn<'a>(
+            &'a self,
+            sid: &'a SessionId,
+            item: &'a TurnItem,
+        ) -> harw_extension_api::ExtFuture<'a, crate::state_store::StateStoreResult<()>> {
+            let hit = matches!(item, TurnItem::UserMessage(message)
+                if format!("{:?}", message.content).contains(self.needle));
+            if hit && !self.failed.swap(true, Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(crate::state_store::StateStoreError::PoisonedMutex {
+                        operation: "test_fail_once",
+                    })
+                });
+            }
+            self.inner.save_turn(sid, item)
+        }
+
+        fn load_history<'a>(
+            &'a self,
+            sid: &'a SessionId,
+        ) -> harw_extension_api::ExtFuture<
+            'a,
+            crate::state_store::StateStoreResult<crate::history::ConversationHistory>,
+        > {
+            self.inner.load_history(sid)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_keeps_the_notice_for_exactly_one_later_delivery() -> TestResult {
+        let spawner = BackgroundResultSpawner::new(0);
+        let mut session = orchestrator_child_session(&spawner)?;
+        let store = FailOnceStore {
+            inner: crate::state_store::InMemoryStateStore::new(),
+            needle: "Befund X",
+            failed: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let first = run_turn(
+            &mut session,
+            &ScriptedModel::new(vec![crate::model::ModelResponse::text("eins")]),
+            &store,
+            TurnInput::user("auftrag"),
+        )
+        .await;
+        assert!(first.is_err(), "der Schreibfehler bricht den Turn ab");
+        assert_eq!(
+            spawner.acknowledged.load(Ordering::SeqCst),
+            0,
+            "nicht geschriebene Meldungen werden nicht bestätigt"
+        );
+        assert_eq!(user_texts_containing(&session, "Befund X"), 0);
+
+        // Der reguläre Weg aus `Failed`: Recovery, dann der Neuversuch.
+        session
+            .recover()
+            .map_err(ctx("die Session lässt sich wiederherstellen"))?;
+        let second = run_turn(
+            &mut session,
+            &ScriptedModel::new(vec![crate::model::ModelResponse::text("Synthese")]),
+            &store,
+            TurnInput::user("weiter"),
+        )
+        .await
+        .map_err(ctx("der Neuversuch läuft durch"))?;
+        assert!(matches!(second, TurnOutcome::Completed), "{second:?}");
+        assert_eq!(user_texts_containing(&session, "Befund X"), 1);
+        assert_eq!(spawner.acknowledged.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     /// Runde 5, Teil K: eine Orchestrierungsgrenze bricht den Turn nicht ab,
@@ -12441,6 +14376,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_retry_replaces_the_selected_prompt_without_deduping_intentional_repetition() -> TestResult {
+        let mut session = make_session(StubToolProvider::with_names(&[]), SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let prefix = session.history_mut().push_user_text("same words");
+        let target = session.history_mut().push_user_text("same words");
+        let suffix = session.history_mut().push_user_text("must not reach model");
+        store.save_history(session.id(), session.history()).await.map_err(ctx("save fixture"))?;
+        let checkpoint_notice = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observer = checkpoint_notice.clone();
+        let model = RecordingModel::new(vec![crate::model::ModelResponse::text("new answer")]);
+        let input = TurnInput::user("")
+            .with_rewind_before(Some(target.as_str().into()))
+            .with_control(TurnControl::new().with_history_replaced(Arc::new(move || {
+                observer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })));
+        let outcome = run_turn(&mut session, &model, &store, input).await.map_err(ctx("run retry"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        assert_eq!(checkpoint_notice.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let requests = model.take_requests();
+        assert_eq!(requests.len(), 1);
+        let users = requests[0].items.iter().filter_map(|item| match item {
+            TurnItem::UserMessage(prompt) => Some(prompt),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].id, prefix);
+        assert_ne!(users[1].id, target);
+        assert_ne!(users[1].id, suffix);
+        assert!(matches!(&users[1].content[..], [harw_protocol::items::ContentPart::Text { text }] if text == "same words"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn an_attached_image_reaches_the_model_request_with_its_bytes() -> TestResult {
         use harw_media::MemorySource;
         let source = std::sync::Arc::new(MemorySource::new());
@@ -13141,15 +15109,211 @@ mod tests {
     }
 
     fn catalog_session(spawner: Arc<CatalogSpawner>) -> TestResult<AgentSession> {
+        catalog_session_with_approval(spawner, None)
+    }
+
+    fn catalog_session_with_approval(
+        spawner: Arc<CatalogSpawner>,
+        approval: Option<Arc<dyn harw_extension_api::ApprovalHandler>>,
+    ) -> TestResult<AgentSession> {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let registry = ExtensionRegistryBuilder::default()
+        let mut registry = ExtensionRegistryBuilder::default()
             .tool_provider(StubToolProvider::with_names(&["fs.read"]))
             .spawner(spawner)
-            .agent_job_submitter(RecordingJobSubmitter::new())
-            .build();
-        Ok(AgentSession::new(AgentRole::Assistant, None, registry, tx)
-            .with_activation(SessionActivation::new(ToolProfile::Minimal))
-            .with_spawn_context(test_spawn_context()?))
+            .agent_job_submitter(RecordingJobSubmitter::new());
+        if let Some(approval) = approval {
+            registry = registry.approval_handler(approval);
+        }
+        Ok(
+            AgentSession::new(AgentRole::Assistant, None, registry.build(), tx)
+                .with_activation(SessionActivation::new(ToolProfile::Minimal))
+                .with_spawn_context(test_spawn_context()?),
+        )
+    }
+
+    #[tokio::test]
+    async fn agents_catalog_runs_after_explicit_approval() -> TestResult {
+        catalog_after_explicit_approval(false).await
+    }
+
+    #[tokio::test]
+    async fn agents_catalog_disabled_during_approval_stays_unavailable() -> TestResult {
+        catalog_after_explicit_approval(true).await
+    }
+
+    async fn catalog_after_explicit_approval(disabled: bool) -> TestResult {
+        let id = ToolCallId::new();
+        let approval = Arc::new(CountingApproval::new(vec![(
+            id.clone(),
+            ApprovalDecision::AskUser(harw_types::ItemId::new()),
+        )]));
+        let mut session =
+            catalog_session_with_approval(CatalogSpawner::new(analysis_catalog()), Some(approval))?;
+        session.set_mode(crate::mode::InteractionMode::Plan);
+        let model = RecordingModel::new(vec![
+            response_with(vec![ToolCall {
+                id,
+                name: ToolName::new(AGENTS_CATALOG_TOOL),
+                arguments: serde_json::json!({}),
+            }]),
+            crate::model::ModelResponse::text("done"),
+        ]);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("research"))
+            .await
+            .map_err(ctx("catalog approval"))?;
+        assert!(matches!(outcome, TurnOutcome::AwaitingApproval { .. }));
+        if disabled {
+            *session.activation_mut() = SessionActivation::new(ToolProfile::Full);
+            session
+                .activation_mut()
+                .disable_tool(ToolName::new(AGENTS_CATALOG_TOOL));
+        }
+        let actor = session
+            .pending_approval()
+            .ok_or(TestError::Missing("pending approval"))?
+            .actor
+            .clone();
+        let outcome = resume_after_approval(
+            &mut session,
+            &model,
+            &store,
+            actor,
+            ApprovalResolution::Approve,
+        )
+        .await
+        .map_err(ctx("approved catalog"))?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        let results = tool_results(&session);
+        if disabled {
+            assert!(
+                matches!(results.as_slice(), [ToolCallResult::Error { .. }]),
+                "{results:?}"
+            );
+            return Ok(());
+        }
+        let [ToolCallResult::Success { value }] = results.as_slice() else {
+            return Err(TestError::Unexpected(format!("{results:?}")));
+        };
+        assert_eq!(value["count"], serde_json::json!(2));
+        assert!(!value["agents"].to_string().contains("executor"));
+        Ok(())
+    }
+
+    /// Generated tools have no registry executor, but must survive the child
+    /// approval relay and dispatch through the same path as an ordinary turn.
+    #[tokio::test]
+    async fn generated_delegation_tools_survive_child_approval() -> TestResult {
+        use crate::child_approval::{
+            ChildApprovalAnswer, ChildApprovalBroker, ChildApprovalRequest,
+        };
+        struct Approve;
+        impl ChildApprovalBroker for Approve {
+            fn submit(
+                &self,
+                _request: ChildApprovalRequest,
+            ) -> Option<tokio::sync::oneshot::Receiver<ChildApprovalAnswer>> {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(ChildApprovalAnswer::Approve);
+                Some(rx)
+            }
+        }
+
+        for (name, disabled, allowed) in [
+            (AGENTS_CATALOG_TOOL, false, true),
+            ("transfer_to_explorer", false, true),
+            (AGENTS_DELEGATE_TOOL, false, true),
+            (AGENTS_CATALOG_TOOL, true, false),
+            ("transfer_to_explorer", true, false),
+            (AGENTS_DELEGATE_TOOL, true, false),
+            ("transfer_to_executor", false, false),
+            ("host.sudo_exec", false, false),
+        ] {
+            let mut catalog = analysis_catalog();
+            if name == AGENTS_DELEGATE_TOOL {
+                for n in 0..8 {
+                    catalog.push(catalog_entry(
+                        &format!("reader-{n}"),
+                        "worker",
+                        true,
+                        true,
+                        "read",
+                    ));
+                }
+            }
+            let spawner = CatalogSpawner::new(catalog);
+            let id = ToolCallId::new();
+            let approval = Arc::new(CountingApproval::new(vec![(
+                id.clone(),
+                ApprovalDecision::AskUser(harw_types::ItemId::new()),
+            )]));
+            let mut session = catalog_session_with_approval(Arc::clone(&spawner), Some(approval))?;
+            if name != "host.sudo_exec" {
+                session.set_mode(crate::mode::InteractionMode::Plan);
+            }
+            let model = RecordingModel::new(vec![
+                response_with(vec![ToolCall {
+                    id,
+                    name: ToolName::new(name),
+                    arguments: if name == AGENTS_CATALOG_TOOL {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"agent": "explorer", "task": "read"})
+                    },
+                }]),
+                crate::model::ModelResponse::text("done"),
+            ]);
+            let store = crate::state_store::InMemoryStateStore::new();
+            let outcome = run_turn(&mut session, &model, &store, TurnInput::user("research"))
+                .await
+                .map_err(ctx("pause for approval"))?;
+            assert!(
+                matches!(outcome, TurnOutcome::AwaitingApproval { .. }),
+                "{outcome:?}"
+            );
+            if disabled {
+                *session.activation_mut() = SessionActivation::new(ToolProfile::Full);
+                session.activation_mut().disable_tool(ToolName::new(name));
+            }
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let controller = crate::child_controller::ManagedAgentSpawner::new(
+                Arc::new(Mutex::new(crate::SessionManager::new(tx))),
+                crate::child_controller::ChildLimits::default(),
+            );
+            controller.attach_child_approval_broker(Arc::new(Approve));
+            let child = session.id().clone();
+            let outcome = crate::child_approval::relay_child_approvals(
+                &controller,
+                &child,
+                &mut session,
+                &model,
+                &store,
+                None,
+                outcome,
+            )
+            .await
+            .map_err(ctx("relay generated tool approval"))?;
+            assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+            let results = tool_results(&session);
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].is_success(),
+                allowed,
+                "{name}, disabled={disabled}: {results:?}"
+            );
+            if allowed && name == AGENTS_CATALOG_TOOL {
+                let ToolCallResult::Success { value } = &results[0] else {
+                    return Err(TestError::Unexpected(format!("{results:?}")));
+                };
+                assert_eq!(value["count"], serde_json::json!(2));
+                assert!(!value["agents"].to_string().contains("executor"));
+            }
+            assert_eq!(
+                spawner.take().is_some(),
+                allowed && name != AGENTS_CATALOG_TOOL
+            );
+        }
+        Ok(())
     }
 
     fn tool_results(session: &AgentSession) -> Vec<ToolCallResult> {
@@ -13842,6 +16006,8 @@ mod tests {
         >,
         /// Je Turn-Request: geschätzte Bytes und gesetztes Ausgabelimit.
         requests: Mutex<Vec<(u64, Option<u32>)>>,
+        /// Je Turn-Request: die Debug-Darstellung (für Anweisungs-Prüfungen).
+        rendered: Mutex<Vec<String>>,
     }
 
     impl GuardModel {
@@ -13849,7 +16015,15 @@ mod tests {
             Self {
                 script: Mutex::new(script.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
+                rendered: Mutex::new(Vec::new()),
             }
+        }
+
+        fn rendered(&self) -> Vec<String> {
+            self.rendered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         fn requests(&self) -> Vec<(u64, Option<u32>)> {
@@ -13876,6 +16050,10 @@ mod tests {
                     crate::context_budget::estimate_request_bytes(&request),
                     request.max_output_tokens,
                 ));
+            self.rendered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("{request:?}"));
             let next = self
                 .script
                 .lock()
@@ -14058,6 +16236,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_stream_preserves_partial_text_without_retrying_or_running_tools()
+    -> TestResult {
+        const PARTIAL: &str = "Abgebrochener Antwortanfang";
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(vec![
+            Ok(crate::model::ModelResponse {
+                message: Some(PARTIAL.to_owned()),
+                stop: crate::model::StopReason::StreamInterrupted,
+                tool_calls: vec![call(&ToolCallId::new(), "lookup")],
+                ..crate::model::ModelResponse::default()
+            }),
+            Ok(crate::model::ModelResponse::text("unexpected retry")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("partial response goes through durable completion"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Truncated), "{outcome:?}");
+        assert_eq!(model.requests().len(), 1);
+        let durable = store
+            .load_history(session.id())
+            .await
+            .map_err(ctx("persist partial response and interruption notice"))?;
+        assert!(durable.items().iter().any(|item| matches!(
+            item, TurnItem::AssistantMessage(message)
+                if message.content.iter().any(|part| matches!(part, ContentPart::Text { text } if text == PARTIAL))
+        )));
+        assert!(
+            !durable
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::ToolCall(_) | TurnItem::ToolResult(_)))
+        );
+        assert!(matches!(durable.last(), Some(TurnItem::Error(error))
+            if error.message.contains("Antwortstream") && !error.message.contains("limit") && !error.retryable));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn max_tokens_with_tool_calls_retries_once_with_a_doubled_output_limit() -> TestResult {
         let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
         let mut session = make_session(
@@ -14091,6 +16313,217 @@ mod tests {
                 .any(|item| matches!(item, TurnItem::ToolCall(_))),
             "abgeschnittene Tool-Calls dürfen nie in den Verlauf gelangen"
         );
+        Ok(())
+    }
+
+    /// Ein eindeutiger `lookup`-Aufruf (andere Argumente je `part`), damit
+    /// der Schleifen-Wächter wiederholte Runden nicht als Stillstand wertet.
+    fn distinct_lookup(part: usize) -> crate::model::ModelResponse {
+        response_with(vec![ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("lookup"),
+            arguments: serde_json::json!({"part": part}),
+        }])
+    }
+
+    fn truncated_text(text: &str) -> crate::model::ModelResponse {
+        crate::model::ModelResponse {
+            stop: crate::model::StopReason::MaxTokens,
+            ..crate::model::ModelResponse::text(text)
+        }
+    }
+
+    #[test]
+    fn unknown_spawn_rejections_get_a_stable_code_and_known_ones_keep_their_text() {
+        let unknown =
+            harw_extension_api::AgentSpawnError::new("child role 'ghost' is not registered");
+        let text = spawn_rejection_text("ghost", &unknown);
+        assert!(text.starts_with("[HARW-ORCH-001]"), "{text}");
+        assert!(text.contains("not registered"));
+        let continuation = harw_extension_api::AgentSpawnError::new(
+            "continue_from: kein eigenes, beendetes Kind mit der ID x",
+        );
+        assert_eq!(
+            spawn_rejection_text("explorer", &continuation),
+            continuation.message
+        );
+    }
+
+    const TEXT_CONTINUATION_MARK: &str = "Setze exakt an ihrer letzten Stelle fort";
+    const SPLIT_MARK: &str = "NICHT ausgeführt";
+
+    #[tokio::test]
+    async fn the_continuation_instruction_is_sent_only_right_after_a_truncation() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new(vec![
+            Ok(truncated_text("Teil eins")),
+            Ok(distinct_lookup(1)),
+            Ok(distinct_lookup(2)),
+            Ok(crate::model::ModelResponse::text("fertig")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn läuft durch"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let marks: Vec<bool> = model
+            .rendered()
+            .iter()
+            .map(|request| request.contains(TEXT_CONTINUATION_MARK))
+            .collect();
+        assert_eq!(marks, vec![false, true, false, false]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn separate_truncations_in_a_long_turn_do_not_end_it() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let mut script = Vec::new();
+        for part in 0..5 {
+            script.push(Ok(truncated_text("Zwischenstand")));
+            script.push(Ok(distinct_lookup(part)));
+        }
+        script.push(Ok(crate::model::ModelResponse::text("fertig")));
+        let model = GuardModel::new(script);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der lange Turn läuft durch"))?;
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed),
+            "fünf getrennte Abschneidungen sind kein Grund für Truncated: {outcome:?}"
+        );
+        assert_eq!(model.requests().len(), 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_stop_notice_distinguishes_filter_and_refusal() -> TestResult {
+        for (stop, expected) in [
+            (
+                crate::model::StopReason::ContentFilter,
+                "Inhaltsfilter des Anbieters",
+            ),
+            (
+                crate::model::StopReason::Refusal {
+                    detail: Some("Provider-Prüfung".into()),
+                },
+                "Grund laut Anbieter: Provider-Prüfung",
+            ),
+        ] {
+            let mut session = make_session(
+                StubToolProvider::with_names(&["lookup"]),
+                SessionActivation::new(ToolProfile::Full),
+            );
+            let store = crate::state_store::InMemoryStateStore::new();
+            let model = GuardModel::new(vec![Ok(crate::model::ModelResponse {
+                stop,
+                ..crate::model::ModelResponse::text("Teilantwort")
+            })]);
+            let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+                .await
+                .map_err(ctx("provider stop"))?;
+            assert!(matches!(outcome, TurnOutcome::Refused { .. }));
+            assert_eq!(model.requests().len(), 1, "no automatic retry");
+            let history = store
+                .load_history(session.id())
+                .await
+                .map_err(ctx("load notice"))?;
+            assert!(matches!(
+                history.last(),
+                Some(TurnItem::Error(error)) if !error.retryable && error.message.contains(expected)
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consecutive_truncations_still_stop_after_the_limit() -> TestResult {
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        );
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = GuardModel::new((0..6).map(|_| Ok(truncated_text("…"))).collect());
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn endet ehrlich"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Truncated), "{outcome:?}");
+        assert_eq!(model.requests().len(), 4, "1 + 3 Fortsetzungen");
+        let durable = store
+            .load_history(session.id())
+            .await
+            .map_err(ctx("truncation stays visible after replay"))?;
+        assert!(
+            durable
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::AssistantMessage(_)))
+        );
+        assert_eq!(
+            durable
+                .items()
+                .iter()
+                .filter(|item| matches!(item, TurnItem::Error(error) if error.message.starts_with("Antwort unvollständig")))
+                .count(),
+            1,
+        );
+        assert!(matches!(durable.last(), Some(TurnItem::Error(error)) if error.retryable));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_calls_after_the_retry_ask_for_smaller_calls() -> TestResult {
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let mut session = make_session(
+            StubToolProvider::with_names(&["lookup"]),
+            SessionActivation::new(ToolProfile::Full),
+        )
+        .with_auto_compact(Some(policy));
+        session.set_max_output_tokens(Some(1_000));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let truncated = || {
+            Ok(crate::model::ModelResponse {
+                stop: crate::model::StopReason::MaxTokens,
+                ..distinct_lookup(9)
+            })
+        };
+        let model = GuardModel::new(vec![
+            truncated(),
+            truncated(),
+            Ok(distinct_lookup(1)),
+            Ok(crate::model::ModelResponse::text("kleiner erledigt")),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("los"))
+            .await
+            .map_err(ctx("der Turn läuft mit kleineren Aufrufen weiter"))?;
+
+        assert!(matches!(outcome, TurnOutcome::Completed), "{outcome:?}");
+        let rendered = model.rendered();
+        assert_eq!(rendered.len(), 4);
+        assert!(!rendered[1].contains(SPLIT_MARK));
+        assert!(rendered[2].contains(SPLIT_MARK));
+        assert!(!rendered[3].contains(SPLIT_MARK));
+        let executed = session
+            .history()
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TurnItem::ToolCall(_)))
+            .count();
+        assert_eq!(executed, 1, "nur der kleinere Aufruf wird ausgeführt");
         Ok(())
     }
 
@@ -14131,6 +16564,15 @@ mod tests {
         parent: Option<harw_types::SessionId>,
         organizational_role: harw_agent_dsl::roles::AgentRoleId,
     ) -> TestResult<(usize, Vec<ToolCallResult>)> {
+        run_reads(6, parent, organizational_role).await
+    }
+
+    /// Sitzung mit `count` verschiedenen `fs.read`-Aufrufen in einer Antwort.
+    async fn run_reads(
+        count: usize,
+        parent: Option<harw_types::SessionId>,
+        organizational_role: harw_agent_dsl::roles::AgentRoleId,
+    ) -> TestResult<(usize, Vec<ToolCallResult>)> {
         let executions = Arc::new(AtomicUsize::new(0));
         let provider = StubParallelProvider::instant(&["fs.read"], Arc::clone(&executions));
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -14142,7 +16584,7 @@ mod tests {
         let mut session = AgentSession::new(AgentRole::Assistant, parent, registry, tx)
             .with_spawn_context(context);
         let store = crate::state_store::InMemoryStateStore::new();
-        let calls: Vec<ToolCall> = (0..6)
+        let calls: Vec<ToolCall> = (0..count)
             .map(|index| ToolCall {
                 id: ToolCallId::new(),
                 name: ToolName::new("fs.read"),
@@ -14172,27 +16614,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_sixth_read_of_an_orchestrator_child_is_denied() -> TestResult {
-        let (executed, results) = run_six_reads(
+    async fn the_thirteenth_read_of_an_orchestrator_child_is_denied() -> TestResult {
+        let (executed, results) = run_reads(
+            13,
             Some(harw_types::SessionId::new()),
             harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
         )
         .await?;
-        assert_eq!(executed, 5, "only five own reads may run");
-        assert_eq!(results.len(), 6);
+        assert_eq!(executed, 12, "only twelve own reads may run");
+        assert_eq!(results.len(), 13);
         let Some(ToolCallResult::Error { message }) = results.last() else {
             return Err(TestError::Unexpected(format!(
-                "the sixth read must be an error: {results:?}"
+                "the thirteenth read must be an error: {results:?}"
             )));
         };
         assert!(message.contains("Lesebudget erschöpft"), "{message}");
         assert!(message.contains("delegate_wave"), "{message}");
-        let Some(ToolCallResult::Success { value }) = results.get(3) else {
-            return Err(TestError::Unexpected("the fourth read runs".to_owned()));
+        let Some(ToolCallResult::Success { value }) = results.get(9) else {
+            return Err(TestError::Unexpected("the tenth read runs".to_owned()));
         };
         assert!(
-            value.to_string().contains("Lesezugriff 4 von 5"),
-            "the fourth read carries a warning: {value}"
+            value.to_string().contains("Lesezugriff 10 von 12"),
+            "the tenth read carries a warning: {value}"
         );
         Ok(())
     }

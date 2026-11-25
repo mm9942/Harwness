@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="local_pin_restart">PIN-Einrichtung neu starten</string>
+    <string name="local_pin_restart_confirm_detail">Harw kann nachweisen, dass bei der fehlgeschlagenen Einrichtung kein wiederherstellbarer Tresor entstanden ist. Lege in einer neuen Einrichtung eine PIN fest. Vorhandene Dateien werden nicht gelöscht. Scheitert die erneute Prüfung, startet Harw nicht neu.</string>
+    <string name="local_pin_restart_confirm">Neue PIN-Einrichtung starten</string>
+    <string name="local_pin_restart_not_confirmed">Harw konnte den Neustart nicht bestätigen. Kein bestehender Tresor wurde gelöscht. Öffne den Assistenten erneut, um den aktuellen Einrichtungsstand zu prüfen.</string>
+    <string name="local_pin_setup_failed">Die lokale PIN-Einrichtung konnte nicht abgeschlossen werden. Nichts wurde zurückgesetzt. Diagnose: %1$s.</string>
+    <string name="local_pin_assistant_handoff_failed">Der PIN-Schritt wurde abgeschlossen, aber der lokale Assistent konnte seine private Sitzung nicht öffnen. Öffne den Assistenten erneut und verwende deine bestehende PIN. Nichts wurde zurückgesetzt. Diagnose: %1$s.</string>
+    <string name="local_pin_copy_diagnostic">Diagnosecode kopieren</string>
+    <string name="local_pin_copy_diagnostic_failed">Der Code konnte nicht kopiert werden. Du kannst den oben angezeigten Code weiterhin verwenden.</string>
+</resources>

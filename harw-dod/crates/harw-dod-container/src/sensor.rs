@@ -22,6 +22,25 @@ pub const PRIVILEGED_CAP_BITS: u32 = 32;
 
 const SCOPE_PREFIXES: [&str; 3] = ["libpod-", "docker-", "crio-"];
 
+/// What a missing scope directory (`cgroup_root`) means (PL-100 WP1.8, see
+/// the crate docs, "Availability").
+///
+/// # Concurrency
+/// Plain `Copy` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MissingRoot {
+    /// [`SensorError::SourceUnavailable`] (permanent: the sentinel retires
+    /// the sensor and reports it as degraded). For a directory that must
+    /// exist.
+    #[default]
+    Unavailable,
+    /// An empty reading: the runtime is known to be installed and creates
+    /// the directory only together with its first container or machine
+    /// (systemd creates `machine.slice` on demand and may remove it once
+    /// the last scope in it has stopped).
+    Empty,
+}
+
 /// What the sensor looks at.
 #[derive(Debug, Clone)]
 pub struct ContainerSensorConfig {
@@ -31,6 +50,8 @@ pub struct ContainerSensorConfig {
     pub proc_root: PathBuf,
     /// The container ids this runner started; everything else is unowned.
     pub expected: Vec<ContainerId>,
+    /// What a missing `cgroup_root` means.
+    pub missing_root: MissingRoot,
 }
 
 /// The container sensor.
@@ -93,6 +114,28 @@ fn relative(root: &Path) -> Option<String> {
     root.to_str().map(|s| s.trim_start_matches('/').to_owned())
 }
 
+/// Whether the scope directory exists inside the read scope.
+///
+/// `Ok(true)`: it exists. A missing one is `Ok(false)` with
+/// [`MissingRoot::Empty`] and `SourceUnavailable` (permanent) with
+/// [`MissingRoot::Unavailable`]; every other resolve error passes through.
+fn scope_directory_exists(
+    scope: &ReadScope,
+    dir: &Path,
+    missing: MissingRoot,
+) -> Result<bool, SensorError> {
+    match scope.resolve(dir) {
+        Ok(_) => Ok(true),
+        Err(SensorError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            match missing {
+                MissingRoot::Empty => Ok(false),
+                MissingRoot::Unavailable => Err(SensorError::SourceUnavailable),
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
 /// First pid of a scope; `Ok(None)` when unreadable or empty.
 fn first_pid(scope: &ReadScope, dir: &Path) -> Result<Option<u32>, SensorError> {
     match harw_dod_readfs::read_first_line(scope, &dir.join("cgroup.procs")) {
@@ -147,9 +190,22 @@ impl Sensor for ContainerSensor {
         &self.handle
     }
 
+    /// Reads the container scopes below `cgroup_root`.
+    ///
+    /// # Errors
+    /// [`SensorError::SourceUnavailable`] when `cgroup_root` does not exist
+    /// and [`ContainerSensorConfig::missing_root`] is
+    /// [`MissingRoot::Unavailable`] (see the crate docs, "Availability");
+    /// [`SensorError::OutsideScope`] or [`SensorError::Io`] from resolving
+    /// it; [`SensorError::MalformedSource`] for an unparsable `status`. No
+    /// container scope at all (and a missing `cgroup_root` with
+    /// [`MissingRoot::Empty`]) is an empty reading.
     fn poll(&self, now: Timestamp) -> Result<SensorReading, SensorError> {
         let scope = self.handle.scope();
         let root = relative(&self.config.cgroup_root).ok_or(SensorError::MalformedSource)?;
+        if !scope_directory_exists(scope, &self.config.cgroup_root, self.config.missing_root)? {
+            return Ok(SensorReading::default());
+        }
         let found =
             harw_dod_readfs::glob::glob(scope, &format!("{root}/*.scope")).map_err(map_err)?;
         let mut scopes: Vec<(ContainerId, PathBuf)> = found
@@ -157,7 +213,7 @@ impl Sensor for ContainerSensor {
             .filter_map(|path| scope_id(&path).map(|id| (id, path)))
             .collect();
         if scopes.is_empty() {
-            return Err(SensorError::SourceUnavailable);
+            return Ok(SensorReading::default());
         }
         scopes.sort_by(|a, b| a.0.cmp(&b.0));
         let truncated = scopes.len() > MAX_SCOPES;
@@ -273,6 +329,14 @@ mod tests {
         }
 
         fn sensor(&self, expected: &[&str]) -> TestResult<ContainerSensor> {
+            self.sensor_with(expected, MissingRoot::Unavailable)
+        }
+
+        fn sensor_with(
+            &self,
+            expected: &[&str],
+            missing_root: MissingRoot,
+        ) -> TestResult<ContainerSensor> {
             let scope =
                 ReadScope::from_roots([self.dir.path().join("cg"), self.dir.path().join("proc")]);
             let config = ContainerSensorConfig {
@@ -282,6 +346,7 @@ mod tests {
                     .iter()
                     .map(|id| ContainerId::new(id).map_err(ctx("id")))
                     .collect::<TestResult<_>>()?,
+                missing_root,
             };
             let handle = ContainerSensor::handle_for(SensorId::from_str("container-0"), scope);
             Ok(ContainerSensor::new(handle, config))
@@ -421,14 +486,59 @@ mod tests {
         Ok(())
     }
 
+    /// PL-100 WP1.8: an existing scope directory without a container scope
+    /// is an empty reading (a runtime without running containers is not
+    /// blind), never a permanent error.
     #[test]
     fn non_container_directories_and_bad_ids_are_ignored() -> TestResult {
         let fx = Fixture::new()?;
         fs::create_dir_all(fx.dir.path().join("cg").join("user.slice")).map_err(ctx("dir"))?;
         fs::create_dir_all(fx.dir.path().join("cg").join("libpod-nothex.scope"))
             .map_err(ctx("dir"))?;
+        let reading = fx
+            .sensor(&[])?
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("an empty layout is a valid reading"))?;
+        assert!(reading.samples.is_empty());
+        assert!(reading.events.is_empty());
+        Ok(())
+    }
+
+    /// PL-100 WP1.8: a missing scope directory is `SourceUnavailable` (the
+    /// sentinel reports the sensor as degraded).
+    #[test]
+    fn a_missing_scope_directory_is_unavailable() -> TestResult {
+        let fx = Fixture::new()?;
+        fs::remove_dir(fx.dir.path().join("cg")).map_err(ctx("remove cg"))?;
         let result = fx.sensor(&[])?.poll(Timestamp::UNIX_EPOCH);
         assert!(matches!(result, Err(SensorError::SourceUnavailable)));
+        assert_eq!(
+            SensorError::SourceUnavailable.permanence(),
+            harw_dod_cap::Permanence::Permanent
+        );
+        Ok(())
+    }
+
+    /// PL-100 WP1.8 (review round 1): with [`MissingRoot::Empty`] a missing
+    /// scope directory is an empty reading on every poll, and the scopes are
+    /// read as soon as the runtime creates the directory.
+    #[test]
+    fn a_missing_on_demand_directory_is_empty_until_it_appears() -> TestResult {
+        let fx = Fixture::new()?;
+        fs::remove_dir(fx.dir.path().join("cg")).map_err(ctx("remove cg"))?;
+        let sensor = fx.sensor_with(&[], MissingRoot::Empty)?;
+        for _ in 0..2 {
+            let reading = sensor
+                .poll(Timestamp::UNIX_EPOCH)
+                .map_err(ctx("a missing on-demand directory is not an error"))?;
+            assert!(reading.samples.is_empty());
+            assert!(reading.events.is_empty());
+        }
+        fx.scope("libpod", A, None, None)?;
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("the created directory is read"))?;
+        assert_eq!(value(&reading, "container_unowned_aaaaaaaaaaaa"), Some(1.0));
         Ok(())
     }
 
@@ -442,6 +552,7 @@ mod tests {
             cgroup_root: fx.dir.path().join("cg"),
             proc_root: other.path().to_path_buf(),
             expected: vec![ContainerId::new(A).map_err(ctx("id"))?],
+            missing_root: MissingRoot::Unavailable,
         };
         let sensor = ContainerSensor::new(
             ContainerSensor::handle_for(SensorId::from_str("container-0"), scope),

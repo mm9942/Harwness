@@ -1,0 +1,102 @@
+package dev.harw.mobile
+
+import uniffi.harw_mobile_ffi.FinishedCategory
+import uniffi.harw_mobile_ffi.MobileAgent
+import uniffi.harw_mobile_ffi.MobileAgentState
+import uniffi.harw_mobile_ffi.MobileJob
+import java.time.OffsetDateTime
+import java.time.format.DateTimeParseException
+import kotlin.math.max
+import kotlin.math.min
+
+// Mirrors the terminal states of `job_outcome` in mobile/rust/src/mission.rs.
+private val TERMINAL_JOB_STATES = setOf(
+    "completed", "complete", "done", "succeeded", "success", "ok",
+    "failed", "error", "timed_out", "timeout", "dead",
+    "cancelled", "canceled", "aborted", "stopped",
+)
+
+internal fun missionCardHeightDp(sideDp: Float, availableHeightDp: Float, panelDp: Float, stripDp: Float, imeVisible: Boolean): Float =
+    // Owner decision 2026-11-22: two thirds of a square, the cards were too tall.
+    (sideDp * 2f / 3f).let { target -> if (!imeVisible) target else min(target, max(72f, availableHeightDp - panelDp - stripDp - 190f)) }
+
+internal fun missionHeaderMaxHeightDp(availableHeightDp: Float): Float = max(0f, availableHeightDp - 184f)
+
+/** Converts a monotonic tick into the wall-time domain of a freshly observed agent start. */
+internal data class MissionClockAnchor(val wallMs: Long, val elapsedMs: Long) {
+    fun wallAt(nowElapsedMs: Long): Long = wallMs + (nowElapsedMs - elapsedMs).coerceAtLeast(0)
+}
+
+/** The single-line live preview favors the newest reasoning, including after a line break. */
+internal fun reasoningPreview(reasoning: String): String =
+    reasoning.trimEnd().substringAfterLast('\n').trim()
+
+internal fun formatElapsed(startedMs: Long, nowMs: Long): String {
+    val elapsedMs = nowMs - startedMs
+    if (elapsedMs <= 0L) return "0s"
+    val seconds = elapsedMs / 1000L
+    return when {
+        seconds < 60L -> "${seconds}s"
+        seconds < 3600L -> "${seconds / 60L}m${(seconds % 60L).toString().padStart(2, '0')}s"
+        else -> "${seconds / 3600L}h${((seconds % 3600L) / 60L).toString().padStart(2, '0')}m"
+    }
+}
+
+internal fun rolePrefix(role: String, width: Int = 12): String =
+    if (role.length > width) role.take(width - 1) + "…" else role.padEnd(width)
+
+internal fun finishedSummary(categories: List<FinishedCategory>): String =
+    categories.joinToString(" · ") { category ->
+        buildString {
+            append(category.label)
+            append(" ×")
+            append(category.total)
+            if (category.ok > 0u) append(" ✓").append(category.ok)
+            if (category.failed > 0u) append(" ✗").append(category.failed)
+            if (category.cancelled > 0u) append(" ⊘").append(category.cancelled)
+        }
+    }
+
+internal fun agentStatus(agent: MobileAgent): String =
+    agent.currentTool ?: when (agent.state) {
+        MobileAgentState.RUNNING -> "thinking"
+        MobileAgentState.WAITING -> "waiting"
+        MobileAgentState.DONE -> "done"
+        MobileAgentState.FAILED -> "failed"
+    }
+
+internal fun activeAgents(agents: List<MobileAgent>): Int =
+    agents.count { it.state == MobileAgentState.RUNNING || it.state == MobileAgentState.WAITING }
+
+internal fun activeJobs(jobs: List<MobileJob>): Int =
+    jobs.count { it.state.lowercase() !in TERMINAL_JOB_STATES }
+
+internal enum class SessionFreshness { Live, Stale, Offline }
+
+internal fun sessionFreshness(online: Boolean, workspaceGeneration: Long?, windowGeneration: Long?): SessionFreshness =
+    when {
+        !online -> SessionFreshness.Offline
+        workspaceGeneration != null && windowGeneration == workspaceGeneration -> SessionFreshness.Live
+        else -> SessionFreshness.Stale
+    }
+
+internal fun approvalRemainingMs(timeoutAt: String, nowMs: Long): Long? {
+    if (timeoutAt.isBlank()) return null
+    val expiresMs = try {
+        OffsetDateTime.parse(timeoutAt.trim()).toInstant().toEpochMilli()
+    } catch (_: DateTimeParseException) {
+        return null
+    }
+    return expiresMs - nowMs
+}
+
+internal fun formatRemaining(remainingMs: Long): String =
+    if (remainingMs <= 0L) "expired" else formatElapsed(0L, remainingMs)
+
+internal fun missionSummary(activeAgents: Int, activeJobs: Int): String {
+    val parts = buildList {
+        if (activeAgents > 0) add(if (activeAgents == 1) "1 agent" else "$activeAgents agents")
+        if (activeJobs > 0) add(if (activeJobs == 1) "1 job" else "$activeJobs jobs")
+    }
+    return if (parts.isEmpty()) "idle" else parts.joinToString(" · ")
+}

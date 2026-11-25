@@ -14,6 +14,53 @@
 //! Deskriptoren prueft. [`load_config`] verwendet fuer einen explizit
 //! uebergebenen administrativen `--config`-Pfad denselben sicheren
 //! Descriptor-Walk.
+//!
+//! # Optionale Tabelle `[sentinel]` (PL-100)
+//! Neben den Profilen traegt die Datei optional Einstellungen von
+//! `harw-sentinel` ([`SentinelSettings`], [`Config::sentinel`]):
+//!
+//! ```toml
+//! [sentinel]
+//! probe_peer_users = ["harw-probe-bpf", "harw-probe-fs"]
+//! finding_cooldown_secs = 600
+//! ```
+//!
+//! Jeder Schluessel ist optional; ein fehlender Schluessel (oder die ganze
+//! Tabelle) heisst „Vorgabe des Sentinels" (dieselbe wie ohne das
+//! zugehoerige Kommandozeilenflag), und ein angegebenes Flag gewinnt immer.
+//! Die Tabelle ist additiv: `schema_version` bleibt `1`. Weil
+//! `deny_unknown_fields` gilt, lehnt ein Leser **vor** dieser Fassung eine
+//! Datei mit `[sentinel]` ab — die ausgelieferten Dateien fuehren die
+//! Tabelle deshalb nur auskommentiert (Reader-first, PL-100 I11).
+//!
+//! `container_sensor` (`"auto"`, `"on"`, `"off"`; [`ContainerSensorMode`])
+//! schaltet den Container-Sensor des Sentinels (PL-100 WP1.8).
+//!
+//! # Optionale Tabelle `[probe_fs]` (PL-100 WP1.6)
+//! Der Beobachtungsbereich von `harw-probe-fs` ([`ProbeFsSettings`],
+//! [`Config::probe_fs`]): `scope_roots` (absolute Verzeichnisse, jede
+//! Schreibaenderung darunter zaehlt), `home_roots` (absolute Verzeichnisse
+//! mit Home-Verzeichnissen; darunter zaehlen nur Pfade, die mit einem
+//! Eintrag von `home_entries` beginnen) und `home_entries` (relativ zu einem
+//! Home-Verzeichnis, z. B. `.ssh`). Dieselben Regeln wie `[sentinel]`:
+//! optional je Schluessel, das Kommandozeilenflag der Sonde gewinnt,
+//! additiv bei Schema `1`, ausgeliefert auskommentiert.
+//!
+//! # Examples
+//! ```rust
+//! use harw_dod_config::Config;
+//!
+//! # fn main() -> Result<(), harw_dod_config::ConfigError> {
+//! let config = Config::from_toml(
+//!     "schema_version = 1\nmode = \"observe\"\nactive_profile = \"host\"\n\n\
+//!      [sentinel]\nfinding_cooldown_secs = 300\n\n\
+//!      [profiles.host]\nscope = \"host\"\nsensors = [\"exec\"]\n",
+//! )?;
+//! assert_eq!(config.sentinel().finding_cooldown_secs(), Some(300));
+//! assert_eq!(config.sentinel().probe_peer_users(), None);
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 
@@ -34,6 +81,24 @@ pub const SYSTEM_CONFIG_PATH: &str = "/etc/harw-dod/config.toml";
 
 /// Obergrenze fuer eine Konfiguration, bevor TOML geparst wird.
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+/// Hoechstzahl der Eintraege von `[sentinel] probe_peer_users`.
+pub const MAX_PROBE_PEER_USERS: usize = 32;
+
+/// Hoechstlaenge eines Eintrags von `[sentinel] probe_peer_users` in Bytes
+/// (dieselbe Grenze wie `--probe-peer-user` von `harw-sentinel`).
+pub const MAX_PROBE_PEER_USER_BYTES: usize = 256;
+
+/// Groesster zulaessiger Wert von `[sentinel] finding_cooldown_secs` (7 Tage;
+/// derselbe wie `--finding-cooldown-secs` von `harw-sentinel`).
+pub const MAX_FINDING_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Hoechstzahl der Eintraege je Liste von `[probe_fs]` (`scope_roots`,
+/// `home_roots`, `home_entries`).
+pub const MAX_PROBE_FS_PATHS: usize = 64;
+
+/// Hoechstlaenge eines Pfads von `[probe_fs]` in Bytes (`PATH_MAX`).
+pub const MAX_PROBE_FS_PATH_BYTES: usize = 4096;
 
 /// Liest die feste, vertrauenswuerdige Produktionskonfiguration.
 ///
@@ -68,6 +133,10 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
 pub struct Config {
     active_profile: Option<ProfileId>,
     profiles: BTreeMap<ProfileId, ValidProfile>,
+    // Die geprueften Schluessel von `[sentinel]` (leer ohne die Tabelle).
+    sentinel: SentinelSettings,
+    // Die geprueften Schluessel von `[probe_fs]` (leer ohne die Tabelle).
+    probe_fs: ProbeFsSettings,
     digest: ConfigDigest,
 }
 
@@ -88,6 +157,8 @@ impl Config {
             schema_version,
             mode: ObservationMode::Observe,
             active_profile,
+            sentinel: raw_sentinel,
+            probe_fs: raw_probe_fs,
             profiles: raw_profiles,
         } = raw;
         if schema_version != 1 {
@@ -104,10 +175,20 @@ impl Config {
             profiles.insert(id, profile);
         }
 
+        let sentinel = raw_sentinel
+            .map(SentinelSettings::validate)
+            .transpose()?
+            .unwrap_or_default();
+        let probe_fs = raw_probe_fs
+            .map(ProbeFsSettings::validate)
+            .transpose()?
+            .unwrap_or_default();
         let active_profile = active_profile.map(ProfileId::parse).transpose()?;
         Ok(Self {
             active_profile,
             profiles,
+            sentinel,
+            probe_fs,
             digest,
         })
     }
@@ -116,6 +197,50 @@ impl Config {
     #[must_use]
     pub const fn config_digest(&self) -> ConfigDigest {
         self.digest
+    }
+
+    /// Die optionalen Einstellungen von `harw-sentinel` aus `[sentinel]`.
+    ///
+    /// # Returns
+    /// Die geprueften Werte; ohne die Tabelle ist jeder Schluessel `None`
+    /// (Vorgabe des Sentinels). Unabhaengig vom aktiven Profil.
+    ///
+    /// # Examples
+    /// Siehe Moduldoku.
+    #[must_use]
+    pub const fn sentinel(&self) -> &SentinelSettings {
+        &self.sentinel
+    }
+
+    /// Der optionale Beobachtungsbereich von `harw-probe-fs` aus
+    /// `[probe_fs]`.
+    ///
+    /// # Returns
+    /// Die geprueften Werte; ohne die Tabelle ist jeder Schluessel `None`
+    /// (Vorgabe der Sonde). Unabhaengig vom aktiven Profil.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_config::Config;
+    /// use std::path::PathBuf;
+    ///
+    /// # fn main() -> Result<(), harw_dod_config::ConfigError> {
+    /// let config = Config::from_toml(
+    ///     "schema_version = 1\nmode = \"observe\"\n\n\
+    ///      [probe_fs]\nhome_entries = [\".ssh\"]\n\n\
+    ///      [profiles.host]\nscope = \"host\"\nsensors = [\"exec\"]\n",
+    /// )?;
+    /// assert_eq!(
+    ///     config.probe_fs().home_entries(),
+    ///     Some([PathBuf::from(".ssh")].as_slice())
+    /// );
+    /// assert_eq!(config.probe_fs().scope_roots(), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn probe_fs(&self) -> &ProbeFsSettings {
+        &self.probe_fs
     }
 
     /// Loest genau das explizit gewaehlte Profil in eine unveraenderliche
@@ -194,6 +319,380 @@ impl ResolvedObservationProfile {
     pub const fn config_digest(&self) -> ConfigDigest {
         self.config_digest
     }
+}
+
+/// Optionale Einstellungen von `harw-sentinel` (Tabelle `[sentinel]`,
+/// PL-100).
+///
+/// # Description
+/// Jeder Wert ist `None`, wenn der Schluessel fehlt; dann gilt die Vorgabe
+/// des Sentinels. Ein Kommandozeilenflag des Sentinels gewinnt immer ueber
+/// den Wert hier (die Aufloesung macht der Sentinel, nicht diese Crate).
+/// Geprueft beim Parsen:
+/// - `probe_peer_users`: hoechstens [`MAX_PROBE_PEER_USERS`] Eintraege, je
+///   nicht leer, hoechstens [`MAX_PROBE_PEER_USER_BYTES`] Bytes, ohne `:`,
+///   Leer- oder Steuerzeichen, ohne Duplikat. Eine leere Liste ist gueltig
+///   (dann darf nur uid `0` Ereignisse einreichen).
+/// - `finding_cooldown_secs`: hoechstens [`MAX_FINDING_COOLDOWN_SECS`];
+///   `0` meldet jede Wiederholung.
+/// - `container_sensor`: einer der drei Werte von [`ContainerSensorMode`]
+///   (ein anderer Wert ist ein Parsefehler).
+///
+/// # Concurrency
+/// Unveraenderlicher Werttyp, `Send + Sync`.
+///
+/// # Examples
+/// Siehe Moduldoku.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SentinelSettings {
+    // `[sentinel] probe_peer_users`, wie konfiguriert (Reihenfolge erhalten).
+    probe_peer_users: Option<Vec<String>>,
+    // `[sentinel] finding_cooldown_secs`.
+    finding_cooldown_secs: Option<u64>,
+    // `[sentinel] container_sensor`.
+    container_sensor: Option<ContainerSensorMode>,
+}
+
+/// Schalter des Container-Sensors von `harw-sentinel` (`[sentinel]
+/// container_sensor`, PL-100 WP1.8).
+///
+/// # Description
+/// - `Auto` (Vorgabe des Sentinels): der Sensor laeuft fuer jede bekannte
+///   Anordnung, auch ohne beim Start erkannte Laufzeit (daemonloses Podman,
+///   Start vor dem ersten Container). Auf einer cgroup-v2-Wurzel ist ein
+///   fehlendes cgroup-Verzeichnis eine leere Messung, keine
+///   Beeintraechtigung; ohne cgroup-v2-Wurzel meldet er sich als
+///   beeintraechtigt (`SensorDegraded`).
+/// - `On`: wie `Auto`, aber Container gelten als erwartet: fehlt das
+///   cgroup-Verzeichnis einer Anordnung, deren Laufzeit beim Start nicht
+///   erkannt wurde (kein Laufzeit-Socket, kein laufender Scope), meldet er
+///   sich als beeintraechtigt.
+/// - `Off`: kein Container-Sensor.
+///
+/// # Concurrency
+/// `Copy + Send + Sync`.
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_config::{Config, ContainerSensorMode};
+///
+/// # fn main() -> Result<(), harw_dod_config::ConfigError> {
+/// let config = Config::from_toml(
+///     "schema_version = 1\nmode = \"observe\"\n\n\
+///      [sentinel]\ncontainer_sensor = \"off\"\n\n\
+///      [profiles.host]\nscope = \"host\"\nsensors = [\"exec\"]\n",
+/// )?;
+/// assert_eq!(config.sentinel().container_sensor(), Some(ContainerSensorMode::Off));
+/// assert_eq!(ContainerSensorMode::Off.label(), "off");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerSensorMode {
+    /// Laeuft fuer jede bekannte Anordnung; ein fehlendes cgroup-Verzeichnis
+    /// ist auf einer cgroup-v2-Wurzel eine leere Messung.
+    Auto,
+    /// Laeuft immer; ohne cgroup-Verzeichnis einer nicht erkannten Laufzeit
+    /// beeintraechtigt.
+    On,
+    /// Laeuft nie.
+    Off,
+}
+
+impl ContainerSensorMode {
+    /// Der Konfigurationswert (`"auto"`, `"on"`, `"off"`), auch fuer das
+    /// Journal.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl SentinelSettings {
+    /// Einstellungen ohne einen einzigen Schluessel (ueberall die Vorgabe des
+    /// Sentinels) — dasselbe wie `SentinelSettings::default()`, aber in
+    /// `const`-Kontexten nutzbar.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            probe_peer_users: None,
+            finding_cooldown_secs: None,
+            container_sensor: None,
+        }
+    }
+
+    /// Der Schalter des Container-Sensors.
+    ///
+    /// # Returns
+    /// `None` ohne den Schluessel (dann gilt die Vorgabe des Sentinels,
+    /// [`ContainerSensorMode::Auto`]).
+    #[must_use]
+    pub const fn container_sensor(&self) -> Option<ContainerSensorMode> {
+        self.container_sensor
+    }
+
+    /// Die Sonden-Konten der `SO_PEERCRED`-Zulassung des Sentinels
+    /// (Kontoname oder numerische uid je Eintrag).
+    ///
+    /// # Returns
+    /// `None` ohne den Schluessel; sonst die Eintraege in
+    /// Konfigurationsreihenfolge (auch leer).
+    #[must_use]
+    pub fn probe_peer_users(&self) -> Option<&[String]> {
+        self.probe_peer_users.as_deref()
+    }
+
+    /// Die Abklingzeit des Befund-Throttles des Sentinels in Sekunden.
+    ///
+    /// # Returns
+    /// `None` ohne den Schluessel.
+    #[must_use]
+    pub const fn finding_cooldown_secs(&self) -> Option<u64> {
+        self.finding_cooldown_secs
+    }
+
+    // Prueft die rohe Tabelle (siehe Typdoku).
+    fn validate(raw: RawSentinel) -> Result<Self, ConfigError> {
+        let RawSentinel {
+            probe_peer_users,
+            finding_cooldown_secs,
+            container_sensor,
+        } = raw;
+        if let Some(secs) = finding_cooldown_secs
+            && secs > MAX_FINDING_COOLDOWN_SECS
+        {
+            return Err(ConfigError::FindingCooldownTooLarge { secs });
+        }
+        if let Some(users) = probe_peer_users.as_deref() {
+            if users.len() > MAX_PROBE_PEER_USERS {
+                return Err(ConfigError::TooManyProbePeerUsers { count: users.len() });
+            }
+            for (index, user) in users.iter().enumerate() {
+                if !is_valid_probe_peer_user(user) {
+                    return Err(ConfigError::InvalidProbePeerUser { user: user.clone() });
+                }
+                if users
+                    .get(..index)
+                    .is_some_and(|before| before.contains(user))
+                {
+                    return Err(ConfigError::DuplicateProbePeerUser { user: user.clone() });
+                }
+            }
+        }
+        Ok(Self {
+            probe_peer_users,
+            finding_cooldown_secs,
+            container_sensor,
+        })
+    }
+}
+
+// Ein Eintrag von `probe_peer_users`: nicht leer, begrenzt, ohne den
+// `passwd(5)`-Feldtrenner `:`, ohne Leer- und Steuerzeichen (dieselbe
+// Grammatik wie `--probe-peer-user`).
+fn is_valid_probe_peer_user(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= MAX_PROBE_PEER_USER_BYTES
+        && !user
+            .chars()
+            .any(|c| c == ':' || c.is_whitespace() || c.is_control())
+}
+
+/// Optionaler Beobachtungsbereich von `harw-probe-fs` (Tabelle `[probe_fs]`,
+/// PL-100 WP1.6).
+///
+/// # Description
+/// Jeder Wert ist `None`, wenn der Schluessel fehlt; dann gilt die Vorgabe
+/// der Sonde. Ein Kommandozeilenflag der Sonde gewinnt (die Aufloesung macht
+/// die Sonde, nicht diese Crate). Geprueft beim Parsen, je Liste hoechstens
+/// [`MAX_PROBE_FS_PATHS`] Eintraege ohne Duplikat, je Eintrag hoechstens
+/// [`MAX_PROBE_FS_PATH_BYTES`] Bytes ohne Steuerzeichen:
+/// - `scope_roots`, `home_roots`: absolut, ohne leere, `.`- oder
+///   `..`-Komponente, ohne abschliessendes `/`, nie `/` selbst (die
+///   Landlock-Leseregel der Sonde umfasste sonst das ganze Dateisystem).
+/// - `home_entries`: relativ (ohne fuehrendes `/`), sonst dieselben Regeln;
+///   ein Eintrag wie `.ssh` deckt `.ssh` und alles darunter, `.bashrc` nur
+///   genau diese Datei (komponentenweise, nie `.bashrc.bak`).
+///
+/// Eine leere Liste ist gueltig (z. B. keine `home_roots`); ob am Ende
+/// ueberhaupt eine Wurzel bleibt, prueft die Sonde beim Start.
+///
+/// # Concurrency
+/// Unveraenderlicher Werttyp, `Send + Sync`.
+///
+/// # Examples
+/// Siehe [`Config::probe_fs`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeFsSettings {
+    // `[probe_fs] scope_roots`, Reihenfolge erhalten.
+    scope_roots: Option<Vec<PathBuf>>,
+    // `[probe_fs] home_roots`, Reihenfolge erhalten.
+    home_roots: Option<Vec<PathBuf>>,
+    // `[probe_fs] home_entries`, Reihenfolge erhalten.
+    home_entries: Option<Vec<PathBuf>>,
+}
+
+impl ProbeFsSettings {
+    /// Einstellungen ohne einen einzigen Schluessel (ueberall die Vorgabe der
+    /// Sonde) — dasselbe wie `ProbeFsSettings::default()`, aber in
+    /// `const`-Kontexten nutzbar.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            scope_roots: None,
+            home_roots: None,
+            home_entries: None,
+        }
+    }
+
+    /// Absolute Verzeichnisse, unter denen jede Schreibaenderung zaehlt.
+    ///
+    /// # Returns
+    /// `None` ohne den Schluessel; sonst die Eintraege in
+    /// Konfigurationsreihenfolge (auch leer).
+    #[must_use]
+    pub fn scope_roots(&self) -> Option<&[PathBuf]> {
+        self.scope_roots.as_deref()
+    }
+
+    /// Absolute Verzeichnisse mit Home-Verzeichnissen (z. B. `/home`) oder
+    /// selbst ein Home-Verzeichnis (z. B. `/root`).
+    ///
+    /// # Returns
+    /// `None` ohne den Schluessel; sonst die Eintraege in
+    /// Konfigurationsreihenfolge (auch leer).
+    #[must_use]
+    pub fn home_roots(&self) -> Option<&[PathBuf]> {
+        self.home_roots.as_deref()
+    }
+
+    /// Pfade relativ zu einem Home-Verzeichnis, die unter `home_roots`
+    /// zaehlen (z. B. `.ssh`, `.config/systemd`, `.bashrc`).
+    ///
+    /// # Returns
+    /// `None` ohne den Schluessel; sonst die Eintraege in
+    /// Konfigurationsreihenfolge (auch leer).
+    #[must_use]
+    pub fn home_entries(&self) -> Option<&[PathBuf]> {
+        self.home_entries.as_deref()
+    }
+
+    // Prueft die rohe Tabelle (siehe Typdoku).
+    fn validate(raw: RawProbeFs) -> Result<Self, ConfigError> {
+        let RawProbeFs {
+            scope_roots,
+            home_roots,
+            home_entries,
+        } = raw;
+        Ok(Self {
+            scope_roots: scope_roots
+                .map(|paths| validate_probe_fs_paths("scope_roots", paths, PathShape::Absolute))
+                .transpose()?,
+            home_roots: home_roots
+                .map(|paths| validate_probe_fs_paths("home_roots", paths, PathShape::Absolute))
+                .transpose()?,
+            home_entries: home_entries
+                .map(|paths| validate_probe_fs_paths("home_entries", paths, PathShape::Relative))
+                .transpose()?,
+        })
+    }
+}
+
+// Ob ein Eintrag von `[probe_fs]` absolut (Wurzel) oder relativ (Eintrag
+// unter einem Home-Verzeichnis) sein muss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathShape {
+    Absolute,
+    Relative,
+}
+
+// Prueft eine Liste von `[probe_fs]` (Anzahl, Form je Eintrag, Duplikate).
+fn validate_probe_fs_paths(
+    key: &'static str,
+    raw: Vec<String>,
+    shape: PathShape,
+) -> Result<Vec<PathBuf>, ConfigError> {
+    if raw.len() > MAX_PROBE_FS_PATHS {
+        return Err(ConfigError::TooManyProbeFsPaths {
+            key,
+            count: raw.len(),
+        });
+    }
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        if !is_valid_probe_fs_path(&entry, shape) {
+            return Err(ConfigError::InvalidProbeFsPath { key, path: entry });
+        }
+        let path = PathBuf::from(&entry);
+        if paths.contains(&path) {
+            return Err(ConfigError::DuplicateProbeFsPath { key, path: entry });
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+// Ein Eintrag von `[probe_fs]`: nicht leer, begrenzt, ohne Steuerzeichen,
+// nur normale Komponenten (keine leere, `.`, `..`), kein abschliessendes `/`;
+// absolut mit mindestens einer Komponente (also nie `/`) bzw. relativ.
+fn is_valid_probe_fs_path(raw: &str, shape: PathShape) -> bool {
+    if raw.is_empty() || raw.len() > MAX_PROBE_FS_PATH_BYTES || raw.chars().any(char::is_control) {
+        return false;
+    }
+    let rest = match (shape, raw.strip_prefix('/')) {
+        (PathShape::Absolute, Some(rest)) => rest,
+        (PathShape::Relative, None) => raw,
+        (PathShape::Absolute, None) | (PathShape::Relative, Some(_)) => return false,
+    };
+    !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// Ob `raw` als Wurzel von `[probe_fs]` (`scope_roots`, `home_roots`) gilt.
+///
+/// # Description
+/// Dieselbe Grammatik wie beim Parsen (siehe [`ProbeFsSettings`]): absolut,
+/// nicht `/`, nur normale Komponenten, kein abschliessendes `/`, ohne
+/// Steuerzeichen, hoechstens [`MAX_PROBE_FS_PATH_BYTES`] Bytes. Fuer die
+/// Kommandozeile von `harw-probe-fs`, damit Flag und Datei dieselbe Form
+/// verlangen.
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_config::is_valid_probe_fs_root;
+///
+/// assert!(is_valid_probe_fs_root("/etc"));
+/// assert!(!is_valid_probe_fs_root("/"));
+/// assert!(!is_valid_probe_fs_root("etc"));
+/// ```
+#[must_use]
+pub fn is_valid_probe_fs_root(raw: &str) -> bool {
+    is_valid_probe_fs_path(raw, PathShape::Absolute)
+}
+
+/// Ob `raw` als Eintrag von `[probe_fs] home_entries` gilt.
+///
+/// # Description
+/// Wie [`is_valid_probe_fs_root`], aber relativ (ohne fuehrendes `/`).
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_config::is_valid_probe_fs_home_entry;
+///
+/// assert!(is_valid_probe_fs_home_entry(".config/systemd"));
+/// assert!(!is_valid_probe_fs_home_entry("/root/.ssh"));
+/// assert!(!is_valid_probe_fs_home_entry("../.ssh"));
+/// ```
+#[must_use]
+pub fn is_valid_probe_fs_home_entry(raw: &str) -> bool {
+    is_valid_probe_fs_path(raw, PathShape::Relative)
 }
 
 /// Das Scope-Modell eines aufgeloesten Profils.
@@ -402,6 +901,25 @@ pub enum ConfigError {
     UnexpectedExplicitPathType { path: PathBuf },
     /// Der explizite Pfad enthält keine ausschließlich sicheren Komponenten.
     InvalidExplicitPath { path: PathBuf },
+    /// `[sentinel] probe_peer_users` hat mehr als [`MAX_PROBE_PEER_USERS`]
+    /// Eintraege.
+    TooManyProbePeerUsers { count: usize },
+    /// Ein Eintrag von `[sentinel] probe_peer_users` ist leer, zu lang oder
+    /// enthaelt `:`, Leer- oder Steuerzeichen.
+    InvalidProbePeerUser { user: String },
+    /// Ein Eintrag von `[sentinel] probe_peer_users` kommt mehrfach vor.
+    DuplicateProbePeerUser { user: String },
+    /// `[sentinel] finding_cooldown_secs` liegt ueber
+    /// [`MAX_FINDING_COOLDOWN_SECS`].
+    FindingCooldownTooLarge { secs: u64 },
+    /// Eine Liste von `[probe_fs]` (`key`) hat mehr als
+    /// [`MAX_PROBE_FS_PATHS`] Eintraege.
+    TooManyProbeFsPaths { key: &'static str, count: usize },
+    /// Ein Eintrag von `[probe_fs]` (`key`) verletzt die Pfadform (siehe
+    /// [`ProbeFsSettings`]).
+    InvalidProbeFsPath { key: &'static str, path: String },
+    /// Ein Eintrag von `[probe_fs]` (`key`) kommt mehrfach vor.
+    DuplicateProbeFsPath { key: &'static str, path: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -509,6 +1027,40 @@ impl fmt::Display for ConfigError {
                 "explicit DoD configuration path `{}` contains an unsafe component",
                 path.display()
             ),
+            Self::TooManyProbePeerUsers { count } => write!(
+                formatter,
+                "[sentinel] probe_peer_users has {count} entries, at most {MAX_PROBE_PEER_USERS} are allowed"
+            ),
+            // `{:?}` escapt Steuerzeichen eines abgelehnten Eintrags.
+            Self::InvalidProbePeerUser { user } => write!(
+                formatter,
+                "[sentinel] probe_peer_users entry {user:?} is empty, longer than \
+                 {MAX_PROBE_PEER_USER_BYTES} bytes or contains ':', whitespace or control characters"
+            ),
+            Self::DuplicateProbePeerUser { user } => write!(
+                formatter,
+                "[sentinel] probe_peer_users entry {user:?} is duplicated"
+            ),
+            Self::FindingCooldownTooLarge { secs } => write!(
+                formatter,
+                "[sentinel] finding_cooldown_secs = {secs} exceeds the maximum of \
+                 {MAX_FINDING_COOLDOWN_SECS} seconds"
+            ),
+            Self::TooManyProbeFsPaths { key, count } => write!(
+                formatter,
+                "[probe_fs] {key} has {count} entries, at most {MAX_PROBE_FS_PATHS} are allowed"
+            ),
+            // `{:?}` escapt Steuerzeichen eines abgelehnten Eintrags.
+            Self::InvalidProbeFsPath { key, path } => write!(
+                formatter,
+                "[probe_fs] {key} entry {path:?} is empty, longer than \
+                 {MAX_PROBE_FS_PATH_BYTES} bytes, contains control characters or an \
+                 empty, '.' or '..' component, ends with '/', is the filesystem root \
+                 or has the wrong form (roots are absolute, home entries relative)"
+            ),
+            Self::DuplicateProbeFsPath { key, path } => {
+                write!(formatter, "[probe_fs] {key} entry {path:?} is duplicated")
+            }
         }
     }
 }
@@ -529,7 +1081,45 @@ struct RawConfig {
     schema_version: u32,
     mode: ObservationMode,
     active_profile: Option<String>,
+    // Optionale Tabelle `[sentinel]` (PL-100, additiv, Schema bleibt 1).
+    #[serde(default)]
+    sentinel: Option<RawSentinel>,
+    // Optionale Tabelle `[probe_fs]` (PL-100 WP1.6, additiv, Schema bleibt 1).
+    #[serde(default)]
+    probe_fs: Option<RawProbeFs>,
     profiles: BTreeMap<String, RawProfile>,
+}
+
+// Ungepruefte Tabelle `[sentinel]`; wird ueber `SentinelSettings::validate`
+// zu `SentinelSettings`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSentinel {
+    // Siehe `SentinelSettings::probe_peer_users`.
+    #[serde(default)]
+    probe_peer_users: Option<Vec<String>>,
+    // Siehe `SentinelSettings::finding_cooldown_secs`.
+    #[serde(default)]
+    finding_cooldown_secs: Option<u64>,
+    // Siehe `SentinelSettings::container_sensor`.
+    #[serde(default)]
+    container_sensor: Option<ContainerSensorMode>,
+}
+
+// Ungepruefte Tabelle `[probe_fs]`; wird ueber `ProbeFsSettings::validate`
+// zu `ProbeFsSettings`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProbeFs {
+    // Siehe `ProbeFsSettings::scope_roots`.
+    #[serde(default)]
+    scope_roots: Option<Vec<String>>,
+    // Siehe `ProbeFsSettings::home_roots`.
+    #[serde(default)]
+    home_roots: Option<Vec<String>>,
+    // Siehe `ProbeFsSettings::home_entries`.
+    #[serde(default)]
+    home_entries: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -831,7 +1421,337 @@ egress_allow_cidrs = []
         ] {
             let config = Config::from_toml(input).map_err(ctx(name))?;
             config.resolve_active().map_err(ctx(name))?;
+            // Reader-first: ausgeliefert sind `[sentinel]` und `[probe_fs]`
+            // auskommentiert ...
+            assert_eq!(config.sentinel(), &SentinelSettings::new(), "{name}");
+            assert_eq!(config.probe_fs(), &ProbeFsSettings::new(), "{name}");
+            // ... und einkommentiert gelten genau die dokumentierten Vorgaben
+            // des Sentinels.
+            let enabled = uncomment_optional_tables(input);
+            let config = Config::from_toml(&enabled).map_err(ctx(name))?;
+            assert_eq!(
+                config.sentinel().probe_peer_users(),
+                Some(["harw-probe-bpf".to_owned(), "harw-probe-fs".to_owned()].as_slice()),
+                "{name}"
+            );
+            assert_eq!(
+                config.sentinel().finding_cooldown_secs(),
+                Some(600),
+                "{name}"
+            );
+            assert_eq!(
+                config.sentinel().container_sensor(),
+                Some(ContainerSensorMode::Auto),
+                "{name}"
+            );
+            // Die Vorgaben von `harw-probe-fs` selbst prueft deren
+            // `watch`-Modul gegen genau diese Dateien; hier nur, dass jede
+            // Liste vorhanden und nicht leer ist.
+            for (key, list) in [
+                ("scope_roots", config.probe_fs().scope_roots()),
+                ("home_roots", config.probe_fs().home_roots()),
+                ("home_entries", config.probe_fs().home_entries()),
+            ] {
+                assert!(list.is_some_and(|list| !list.is_empty()), "{name}: {key}");
+            }
         }
+        Ok(())
+    }
+
+    /// Kommentiert die ausgelieferten, auskommentierten Tabellen
+    /// `[sentinel]` und `[probe_fs]` ein (jeder Schluessel steht auf einer
+    /// Zeile).
+    fn uncomment_optional_tables(input: &str) -> String {
+        input
+            .replace("\n# [sentinel]\n", "\n[sentinel]\n")
+            .replace("\n# probe_peer_users = ", "\nprobe_peer_users = ")
+            .replace("\n# finding_cooldown_secs = ", "\nfinding_cooldown_secs = ")
+            .replace("\n# container_sensor = ", "\ncontainer_sensor = ")
+            .replace("\n# [probe_fs]\n", "\n[probe_fs]\n")
+            .replace("\n# scope_roots = ", "\nscope_roots = ")
+            .replace("\n# home_roots = ", "\nhome_roots = ")
+            .replace("\n# home_entries = ", "\nhome_entries = ")
+    }
+
+    /// `HOST_PROFILE` mit einer zusätzlichen Tabelle `[probe_fs]`.
+    fn with_probe_fs(table: &str) -> String {
+        format!("{HOST_PROFILE}\n[probe_fs]\n{table}\n")
+    }
+
+    /// PL-100 WP1.6: `[probe_fs]` ist optional; jeder Schlüssel einzeln,
+    /// leere Listen sind gültig, die Reihenfolge bleibt erhalten.
+    #[test]
+    fn probe_fs_table_is_optional_and_each_key_is_optional() -> TestResult {
+        let without = Config::from_toml(HOST_PROFILE).map_err(ctx("no probe_fs table"))?;
+        assert_eq!(without.probe_fs(), &ProbeFsSettings::default());
+        assert_eq!(without.probe_fs().scope_roots(), None);
+
+        let all = Config::from_toml(&with_probe_fs(
+            "scope_roots = [\"/etc\", \"/var/spool/cron\"]\n\
+             home_roots = [\"/home\", \"/root\"]\n\
+             home_entries = [\".ssh\", \".config/systemd\", \".bashrc\"]",
+        ))
+        .map_err(ctx("all keys"))?;
+        assert_eq!(
+            all.probe_fs().scope_roots(),
+            Some([PathBuf::from("/etc"), PathBuf::from("/var/spool/cron")].as_slice())
+        );
+        assert_eq!(
+            all.probe_fs().home_roots(),
+            Some([PathBuf::from("/home"), PathBuf::from("/root")].as_slice())
+        );
+        assert_eq!(
+            all.probe_fs().home_entries(),
+            Some(
+                [
+                    PathBuf::from(".ssh"),
+                    PathBuf::from(".config/systemd"),
+                    PathBuf::from(".bashrc")
+                ]
+                .as_slice()
+            )
+        );
+
+        let empty = Config::from_toml(&with_probe_fs("home_roots = []"))
+            .map_err(ctx("empty home roots"))?;
+        assert_eq!(empty.probe_fs().home_roots(), Some([].as_slice()));
+        assert_eq!(empty.probe_fs().scope_roots(), None);
+        assert_eq!(empty.probe_fs().home_entries(), None);
+        Ok(())
+    }
+
+    /// PL-100 WP1.6: jede Pfadform, die eine Wurzel weiten oder relativ
+    /// machen würde, lehnt schon der Parser ab.
+    #[test]
+    fn probe_fs_table_rejects_invalid_paths() {
+        for bad in [
+            "/",
+            "//",
+            "",
+            "etc",
+            "/etc/",
+            "/etc//cron.d",
+            "/etc/./cron.d",
+            "/etc/../root",
+            "/etc/\\u0007bell",
+        ] {
+            for key in ["scope_roots", "home_roots"] {
+                let input = with_probe_fs(&format!("{key} = [\"{bad}\"]"));
+                assert!(
+                    matches!(
+                        Config::from_toml(&input),
+                        Err(ConfigError::InvalidProbeFsPath { key: refused, .. }) if refused == key
+                    ),
+                    "{key} = {bad:?} must be refused"
+                );
+            }
+        }
+        for bad in [
+            "",
+            "/.ssh",
+            ".ssh/",
+            "..",
+            "./.ssh",
+            ".config//systemd",
+            ".ssh/../x",
+        ] {
+            let input = with_probe_fs(&format!("home_entries = [\"{bad}\"]"));
+            assert!(
+                matches!(
+                    Config::from_toml(&input),
+                    Err(ConfigError::InvalidProbeFsPath {
+                        key: "home_entries",
+                        ..
+                    })
+                ),
+                "home_entries = {bad:?} must be refused"
+            );
+        }
+        let too_long = with_probe_fs(&format!(
+            "scope_roots = [\"/{}\"]",
+            "a".repeat(MAX_PROBE_FS_PATH_BYTES)
+        ));
+        assert!(matches!(
+            Config::from_toml(&too_long),
+            Err(ConfigError::InvalidProbeFsPath { .. })
+        ));
+        assert!(matches!(
+            Config::from_toml(&with_probe_fs("home_entries = [\".ssh\", \".ssh\"]")),
+            Err(ConfigError::DuplicateProbeFsPath {
+                key: "home_entries",
+                ..
+            })
+        ));
+        let many: Vec<String> = (0..=MAX_PROBE_FS_PATHS)
+            .map(|index| format!("\"/srv/{index}\""))
+            .collect();
+        assert!(matches!(
+            Config::from_toml(&with_probe_fs(&format!(
+                "scope_roots = [{}]",
+                many.join(", ")
+            ))),
+            Err(ConfigError::TooManyProbeFsPaths {
+                key: "scope_roots",
+                ..
+            })
+        ));
+        assert!(matches!(
+            Config::from_toml(&with_probe_fs("scope_root = [\"/etc\"]")),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    /// Die Fehlermeldung zitiert einen abgelehnten Pfad nur escapt.
+    #[test]
+    fn probe_fs_error_display_escapes_the_entry() -> TestResult {
+        let error = Config::from_toml(&with_probe_fs(
+            "scope_roots = [\"/etc/\\u202eevil\\u001b[2J/\"]",
+        ))
+        .err()
+        .ok_or(crate::test_support::TestError::Missing("a refused entry"))?;
+        let text = error.to_string();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\u{202e}'), "{text:?}");
+        assert!(text.contains("\\u{1b}"), "{text:?}");
+        Ok(())
+    }
+
+    /// PL-100 WP1.8: `container_sensor` kennt genau drei Werte.
+    #[test]
+    fn sentinel_container_sensor_accepts_the_three_modes_only() -> TestResult {
+        for (raw, mode) in [
+            ("auto", ContainerSensorMode::Auto),
+            ("on", ContainerSensorMode::On),
+            ("off", ContainerSensorMode::Off),
+        ] {
+            let config =
+                Config::from_toml(&with_sentinel(&format!("container_sensor = \"{raw}\"")))
+                    .map_err(ctx("container mode"))?;
+            assert_eq!(config.sentinel().container_sensor(), Some(mode));
+            assert_eq!(mode.label(), raw);
+        }
+        let without = Config::from_toml(&with_sentinel("finding_cooldown_secs = 1"))
+            .map_err(ctx("no container key"))?;
+        assert_eq!(without.sentinel().container_sensor(), None);
+        for bad in ["\"yes\"", "true", "\"On\""] {
+            assert!(
+                matches!(
+                    Config::from_toml(&with_sentinel(&format!("container_sensor = {bad}"))),
+                    Err(ConfigError::Parse(_))
+                ),
+                "{bad} must be refused"
+            );
+        }
+        Ok(())
+    }
+
+    /// `HOST_PROFILE` mit einer zusätzlichen Tabelle `[sentinel]`.
+    fn with_sentinel(table: &str) -> String {
+        format!("{HOST_PROFILE}\n[sentinel]\n{table}\n")
+    }
+
+    /// PL-100: `[sentinel]` ist optional; jeder Schlüssel einzeln.
+    #[test]
+    fn sentinel_table_is_optional_and_each_key_is_optional() -> TestResult {
+        let without = Config::from_toml(HOST_PROFILE).map_err(ctx("no sentinel table"))?;
+        assert_eq!(without.sentinel(), &SentinelSettings::default());
+        assert_eq!(without.sentinel().probe_peer_users(), None);
+        assert_eq!(without.sentinel().finding_cooldown_secs(), None);
+
+        let both = Config::from_toml(&with_sentinel(
+            "probe_peer_users = [\"harw-probe-fs\", \"991\"]\nfinding_cooldown_secs = 0",
+        ))
+        .map_err(ctx("both keys"))?;
+        assert_eq!(
+            both.sentinel().probe_peer_users(),
+            Some(["harw-probe-fs".to_owned(), "991".to_owned()].as_slice())
+        );
+        assert_eq!(both.sentinel().finding_cooldown_secs(), Some(0));
+
+        let empty_list = Config::from_toml(&with_sentinel("probe_peer_users = []"))
+            .map_err(ctx("empty peer list"))?;
+        assert_eq!(
+            empty_list.sentinel().probe_peer_users(),
+            Some([].as_slice())
+        );
+        assert_eq!(empty_list.sentinel().finding_cooldown_secs(), None);
+
+        let at_maximum = Config::from_toml(&with_sentinel(&format!(
+            "finding_cooldown_secs = {MAX_FINDING_COOLDOWN_SECS}"
+        )))
+        .map_err(ctx("maximal cooldown"))?;
+        assert_eq!(
+            at_maximum.sentinel().finding_cooldown_secs(),
+            Some(MAX_FINDING_COOLDOWN_SECS)
+        );
+        Ok(())
+    }
+
+    /// PL-100: ungültige `[sentinel]`-Werte lehnt schon der Parser ab, nie
+    /// erst der Sentinel.
+    #[test]
+    fn sentinel_table_rejects_invalid_values() {
+        let too_large = with_sentinel(&format!(
+            "finding_cooldown_secs = {}",
+            MAX_FINDING_COOLDOWN_SECS.saturating_add(1)
+        ));
+        assert!(matches!(
+            Config::from_toml(&too_large),
+            Err(ConfigError::FindingCooldownTooLarge { .. })
+        ));
+        assert!(matches!(
+            Config::from_toml(&with_sentinel("finding_cooldown_secs = -1")),
+            Err(ConfigError::Parse(_))
+        ));
+        for bad in ["\"\"", "\"a:b\"", "\"two words\"", "\"evil\\n\""] {
+            let input = with_sentinel(&format!("probe_peer_users = [{bad}]"));
+            assert!(
+                matches!(
+                    Config::from_toml(&input),
+                    Err(ConfigError::InvalidProbePeerUser { .. })
+                ),
+                "{bad} must be refused"
+            );
+        }
+        let too_long = with_sentinel(&format!(
+            "probe_peer_users = [\"{}\"]",
+            "a".repeat(MAX_PROBE_PEER_USER_BYTES.saturating_add(1))
+        ));
+        assert!(matches!(
+            Config::from_toml(&too_long),
+            Err(ConfigError::InvalidProbePeerUser { .. })
+        ));
+        assert!(matches!(
+            Config::from_toml(&with_sentinel(
+                "probe_peer_users = [\"harw-probe-fs\", \"harw-probe-fs\"]"
+            )),
+            Err(ConfigError::DuplicateProbePeerUser { .. })
+        ));
+        let many: Vec<String> = (0..=MAX_PROBE_PEER_USERS)
+            .map(|index| format!("\"user{index}\""))
+            .collect();
+        assert!(matches!(
+            Config::from_toml(&with_sentinel(&format!(
+                "probe_peer_users = [{}]",
+                many.join(", ")
+            ))),
+            Err(ConfigError::TooManyProbePeerUsers { .. })
+        ));
+        assert!(matches!(
+            Config::from_toml(&with_sentinel("finding_cooldown = 600")),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    /// Die Fehlermeldung zitiert einen abgelehnten Eintrag nur escapt.
+    #[test]
+    fn sentinel_error_display_escapes_the_entry() -> TestResult {
+        let error = Config::from_toml(&with_sentinel("probe_peer_users = [\"evil\\u001b[2J\"]"))
+            .err()
+            .ok_or(crate::test_support::TestError::Missing("a refused entry"))?;
+        let text = error.to_string();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("\\u{1b}"), "{text:?}");
         Ok(())
     }
 

@@ -14,6 +14,9 @@ pub mod auth_toml;
 pub mod browser_toml;
 pub mod channel_toml;
 pub mod discovery;
+// PL-100 WP 1.9: `[dod.triage] model` und `[dod.approve] tui_tty` in
+// `<harw_home>/config.toml` schreiben.
+pub mod dod_home;
 pub mod dod_toml;
 pub mod dotenv;
 pub mod error;
@@ -37,6 +40,7 @@ pub mod retention_toml;
 mod role_models;
 pub mod scope;
 mod serde_defaults;
+pub mod admin_toml;
 pub mod session_listener_toml;
 // Runde 5, Teil N: `[shell] max_timeout_secs`.
 pub mod shell_limits;
@@ -62,7 +66,11 @@ pub use discovery::{
     discover_config_with_override, discover_config_with_restricted,
     discover_config_with_restricted_and_project_settings,
 };
-pub use dod_toml::DodSection;
+pub use dod_home::{ensure_dod_defaults, set_dod_triage_model};
+pub use dod_toml::{
+    DodApproveSection, DodSection, DodTriageSection, DodWatchMode, DodWatchSection,
+    parse_triage_model,
+};
 pub use dotenv::{
     check_dotenv_permissions, load_dotenv, load_env_layer, parse_dotenv_text, resolve_env_ref,
 };
@@ -98,7 +106,9 @@ pub use mcp_toml::{McpServerToml, McpTransportToml};
 pub use memory_toml::MemorySection;
 pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_toml_into};
 pub use mode_toml::ModeSection;
-pub use model_toml::{ChatReasoningReplay, ModelCapabilitiesToml, ModelToml, PromptCachingMode};
+pub use model_toml::{
+    ChatReasoningReplay, ModelCapabilitiesToml, ModelToml, PromptCachingMode, ReasoningReplayPolicy,
+};
 pub use network_toml::{NetworkSection, ResearchWebMode};
 pub use permissions_toml::{PermissionsSection, RuleToml};
 pub use plan_toml::{ContainerToolsSection, DocSection, PlanSection, RemoteOcrMode, ToolsSection};
@@ -112,6 +122,7 @@ pub use research_toml::ResearchSection;
 pub use retention_toml::{RetentionClassToml, RetentionSection};
 pub use role_models::*;
 pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
+pub use admin_toml::AdminSection;
 pub use session_listener_toml::SessionListenerSection;
 pub use skill_toml::SkillToml;
 pub use skills_toml::{

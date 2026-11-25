@@ -556,6 +556,14 @@ pub enum StopReason {
     ToolUse,
     /// Der Provider hat die Ausgabe wegen einer Token-Obergrenze abgeschnitten.
     MaxTokens,
+    /// A response stream ended without a terminal event or finish reason.
+    /// A visible answer prefix may be retained, but no tools may be accepted.
+    StreamInterrupted,
+    /// Native provider body transport broke or hit a stream idle timeout after text was received.
+    StreamTransportInterrupted,
+    /// The provider sent a terminal incomplete status without a recognized cause.
+    /// This is not a filter or a regular end; partial tools are never accepted.
+    IncompleteUnknown,
     /// Eine konfigurierte Stop-Sequenz wurde erreicht.
     StopSequence,
     /// Der Provider hat den Turn pausiert (z. B. Anthropic `pause_turn` bei
@@ -772,7 +780,25 @@ pub enum ModelError {
     /// W3/C-CANCEL), bevor eine Antwort vorlag.
     #[msg("model request was cancelled")]
     Cancelled,
+
+    /// Die native Reasoning-/Thinking-Kontinuität eines früheren Rundenpaars
+    /// (verschlüsseltes Reasoning, signierte Thinking-Blöcke,
+    /// `reasoning_content`) ist nicht mehr verfügbar und der Provider ist auf
+    /// `strict` konfiguriert (sonst wird ohne natives Reasoning gesendet).
+    ///
+    /// Stabiler Fehlercode: [`REPLAY_UNAVAILABLE_CODE`].
+    #[msg("reasoning replay unavailable [HARW-REPLAY-001] ({provider}): {detail}")]
+    ReplayUnavailable {
+        /// Protokoll-Familie des Caches (`responses`, `chat`, `anthropic`).
+        provider: String,
+        /// Was genau fehlt (z. B. verdrängte oder nach Kompaktierung
+        /// veränderte Runde).
+        detail: String,
+    },
 }
+
+/// Stabiler Fehlercode von [`ModelError::ReplayUnavailable`].
+pub const REPLAY_UNAVAILABLE_CODE: &str = "HARW-REPLAY-001";
 
 impl ModelError {
     /// `true`, wenn ein erneuter Versuch derselben Anfrage sinnvoll erscheint.
@@ -1232,6 +1258,7 @@ mod tests {
             StopReason::EndTurn,
             StopReason::ToolUse,
             StopReason::MaxTokens,
+            StopReason::StreamInterrupted,
             StopReason::StopSequence,
             StopReason::PauseTurn,
             StopReason::Refusal {
@@ -1395,4 +1422,24 @@ mod tests {
             "provider quota exceeded: exhausted"
         );
     }
+}
+
+tokio::task_local! {
+    /// Session, deren Turn gerade das Modell aufruft (gesetzt von der Turn-Schleife).
+    static CURRENT_SESSION: harw_types::SessionId;
+}
+
+/// Die Session, für die der aktuell laufende Modellaufruf gemacht wird; `None` außerhalb eines Turns.
+/// So kann ein Modell-Wrapper (z. B. der der Telefon-App) pro Session eine andere Persona einsetzen.
+#[must_use]
+pub fn current_session_id() -> Option<harw_types::SessionId> {
+    CURRENT_SESSION.try_with(Clone::clone).ok()
+}
+
+/// Führt `future` mit gesetzter aktueller Session aus (siehe [`current_session_id`]).
+pub(crate) async fn with_current_session<F: std::future::Future>(
+    session: harw_types::SessionId,
+    future: F,
+) -> F::Output {
+    CURRENT_SESSION.scope(session, future).await
 }

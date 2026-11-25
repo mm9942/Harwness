@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use harw_types::NodeId;
 
 use crate::error::HandshakeError;
-use crate::identity::NodeVerifier;
+use crate::identity::{NodeVerifier, verify_peer_signature};
 
 /// Handshake protocol version implemented by this crate.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -480,6 +480,20 @@ impl ClientHandshake {
         policy: &HandshakePolicy,
         now_ms: u64,
     ) -> Result<ClientPending, HandshakeError> {
+        self.on_server_hello_with_key_fingerprint(
+            server_hello, channel_binding, verifier, policy, now_ms,
+        )
+        .map(|(pending, _)| pending)
+    }
+
+    pub(crate) fn on_server_hello_with_key_fingerprint(
+        self,
+        server_hello: &ServerHello,
+        channel_binding: [u8; CHANNEL_BINDING_LEN],
+        verifier: &dyn NodeVerifier,
+        policy: &HandshakePolicy,
+        now_ms: u64,
+    ) -> Result<(ClientPending, Option<[u8; 32]>), HandshakeError> {
         if server_hello.version != PROTOCOL_VERSION {
             return Err(HandshakeError::UnsupportedVersion(server_hello.version));
         }
@@ -500,12 +514,13 @@ impl ClientHandshake {
             server_time_ms: server_hello.server_time_ms,
             channel_binding,
         };
-        verifier.verify(
+        let fingerprint = verify_peer_signature(
+            verifier,
             &transcript.server,
             &transcript.signing_bytes(Role::Server),
             &server_hello.signature,
         )?;
-        Ok(ClientPending { transcript })
+        Ok((ClientPending { transcript }, fingerprint))
     }
 }
 
@@ -618,20 +633,28 @@ impl ServerPending {
         replay: &ReplayCache,
         now_ms: u64,
     ) -> Result<AuthenticatedPeer, HandshakeError> {
-        verifier.verify(
-            &self.transcript.client,
-            &self.transcript.signing_bytes(Role::Client),
-            &finish.signature,
-        )?;
-        replay.commit(
-            &self.transcript.client,
-            &self.transcript.client_nonce,
-            now_ms,
-        )?;
-        Ok(AuthenticatedPeer {
-            node_id: self.transcript.client,
-            protocol_version: self.transcript.version,
-        })
+        self.finish_with_key_fingerprint(finish, verifier, replay, now_ms)
+            .map(|(peer, _)| peer)
+    }
+
+    pub(crate) fn finish_with_key_fingerprint(
+        self,
+        finish: &ClientFinish,
+        verifier: &dyn NodeVerifier,
+        replay: &ReplayCache,
+        now_ms: u64,
+    ) -> Result<(AuthenticatedPeer, Option<[u8; 32]>), HandshakeError> {
+        let node = &self.transcript.client;
+        let bytes = self.transcript.signing_bytes(Role::Client);
+        let fingerprint = verify_peer_signature(verifier, node, &bytes, &finish.signature)?;
+        replay.commit(node, &self.transcript.client_nonce, now_ms)?;
+        Ok((
+            AuthenticatedPeer {
+                node_id: self.transcript.client,
+                protocol_version: self.transcript.version,
+            },
+            fingerprint,
+        ))
     }
 
     /// The agreed transcript.

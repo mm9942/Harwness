@@ -195,6 +195,7 @@ async fn two_clients_race_for_one_approval_and_exactly_one_wins() -> TestResult 
         .create(CreateParams {
             workspace: None,
             title: Some("race".into()),
+            fork_from: None,
         })
         .await?
         .session_id;
@@ -208,6 +209,8 @@ async fn two_clients_race_for_one_approval_and_exactly_one_wins() -> TestResult 
             expect_head: ack.head,
             client_msg_id: "m1".into(),
             force: false,
+            images: Vec::new(),
+            rewind_before: None,
         })
         .await?;
     assert!(
@@ -263,6 +266,8 @@ async fn an_observer_can_watch_but_not_answer_or_submit() -> TestResult {
             expect_head: Cursor::default(),
             client_msg_id: "o1".into(),
             force: false,
+            images: Vec::new(),
+            rewind_before: None,
         })
         .await;
     assert!(matches!(denied, Err(PortError::Denied(_))), "{denied:?}");
@@ -274,6 +279,8 @@ async fn an_observer_can_watch_but_not_answer_or_submit() -> TestResult {
             expect_head: ack.head,
             client_msg_id: "a1".into(),
             force: false,
+            images: Vec::new(),
+            rewind_before: None,
         })
         .await?;
     let request = approval_frame(&mut op_frames).await?;
@@ -380,6 +387,8 @@ async fn remote_answers_an_approval(opt_in: bool) -> TestResult<Result<RespondRe
             expect_head: ack.head,
             client_msg_id: "r1".into(),
             force: false,
+            images: Vec::new(),
+            rewind_before: None,
         })
         .await?;
     let request = approval_frame(&mut frames).await?;

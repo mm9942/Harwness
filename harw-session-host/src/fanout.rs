@@ -8,6 +8,10 @@
 //! - The [`StreamProfile::Compact`] profile drops reasoning deltas, child
 //!   progress and every child delta, always keeps only the latest
 //!   `UsageUpdated` of a turn and always merges consecutive assistant deltas.
+//! - The [`StreamProfile::CompactReasoning`] profile behaves like compact but
+//!   keeps root reasoning deltas, child progress and child reasoning deltas
+//!   (consecutive child reasoning deltas of one agent and turn merge); it
+//!   only drops child assistant text, usage and context updates.
 //! - Above half fill (frames or bytes) the full profile merges consecutive
 //!   `AssistantDelta`/`ReasoningDelta` of the same turn and keeps only the
 //!   latest `UsageUpdated` of a turn.
@@ -139,8 +143,32 @@ fn compact_drops(frame: &SessionFrame) -> bool {
     }
 }
 
+/// True when the compact-reasoning profile drops this frame outright: only
+/// child assistant text, usage and context updates.
+fn compact_reasoning_drops(frame: &SessionFrame) -> bool {
+    matches!(
+        frame,
+        SessionFrame::Child {
+            event: TurnEvent::AssistantDelta { .. }
+                | TurnEvent::UsageUpdated { .. }
+                | TurnEvent::ContextUpdated { .. },
+            ..
+        }
+    )
+}
+
+/// True when `profile` drops this frame outright.
+fn profile_drops(profile: StreamProfile, frame: &SessionFrame) -> bool {
+    match profile {
+        StreamProfile::Full => false,
+        StreamProfile::Compact => compact_drops(frame),
+        StreamProfile::CompactReasoning => compact_reasoning_drops(frame),
+    }
+}
+
 /// Append `incoming`'s delta text to `queued` when both are the same kind of
-/// root-turn delta of the same turn. Returns true when merged.
+/// root-turn delta of the same turn, or (reasoning only, when allowed) child
+/// reasoning deltas of the same agent and turn. Returns true when merged.
 fn merge_delta(queued: &mut SessionFrame, incoming: &SessionFrame, allow_reasoning: bool) -> bool {
     match (queued, incoming) {
         (
@@ -160,6 +188,25 @@ fn merge_delta(queued: &mut SessionFrame, incoming: &SessionFrame, allow_reasoni
                 text: next_text,
             }),
         ) if allow_reasoning && *turn_id == *next_turn => {
+            text.push_str(next_text);
+            true
+        }
+        (
+            SessionFrame::Child {
+                agent,
+                event: TurnEvent::ReasoningDelta { turn_id, text },
+                ..
+            },
+            SessionFrame::Child {
+                agent: next_agent,
+                event:
+                    TurnEvent::ReasoningDelta {
+                        turn_id: next_turn,
+                        text: next_text,
+                    },
+                ..
+            },
+        ) if allow_reasoning && *agent == *next_agent && *turn_id == *next_turn => {
             text.push_str(next_text);
             true
         }
@@ -184,10 +231,15 @@ impl AttachmentQueue {
     /// queued), the attachment is closed and [`PushOutcome::Lagged`] is
     /// returned. The `Lagged` frame itself may exceed the limits.
     pub fn push(&self, envelope: FrameEnvelope) -> PushOutcome {
-        let compact = self.inner.profile == StreamProfile::Compact;
-        if compact && compact_drops(&envelope.frame) {
+        let profile = self.inner.profile;
+        if profile_drops(profile, &envelope.frame) {
             return PushOutcome::Filtered;
         }
+        let compact = matches!(
+            profile,
+            StreamProfile::Compact | StreamProfile::CompactReasoning
+        );
+        let allow_reasoning = profile != StreamProfile::Compact;
         let size = frame_bytes(&envelope);
         let limits = self.inner.limits;
         let Some(mut state) = self.inner.lock() else {
@@ -201,7 +253,7 @@ impl AttachmentQueue {
             || state.bytes.saturating_mul(2) > limits.max_bytes;
 
         let outcome = if pressure {
-            Self::coalesce(&mut state, envelope, size, compact, limits)
+            Self::coalesce(&mut state, envelope, size, allow_reasoning, limits)
         } else {
             Self::append(&mut state, envelope, size, None, limits)
         };
@@ -217,13 +269,13 @@ impl AttachmentQueue {
         state: &mut State,
         envelope: FrameEnvelope,
         size: usize,
-        compact: bool,
+        allow_reasoning: bool,
         limits: QueueLimits,
     ) -> PushOutcome {
         // Merge into the previous undelivered delta of the same turn.
         let mut merged: Option<(usize, usize)> = None;
         if let Some(last) = state.queue.back_mut()
-            && merge_delta(&mut last.envelope.frame, &envelope.frame, !compact)
+            && merge_delta(&mut last.envelope.frame, &envelope.frame, allow_reasoning)
         {
             last.envelope.cursor = envelope.cursor;
             let old = last.bytes;
@@ -788,6 +840,174 @@ mod tests {
             ),
             "expected the latest usage",
         )
+    }
+
+    fn child(agent: &str, event: TurnEvent) -> TestResult<SessionFrame> {
+        Ok(SessionFrame::Child {
+            agent: ctx(SessionId::try_from_str(agent), "child id")?,
+            parent: Some(sid()?),
+            role: "worker".into(),
+            event,
+        })
+    }
+
+    fn child_reasoning(agent: &str, turn: &str, text: &str) -> TestResult<SessionFrame> {
+        child(
+            agent,
+            TurnEvent::ReasoningDelta {
+                turn_id: tid(turn)?,
+                text: text.to_owned(),
+            },
+        )
+    }
+
+    fn child_progress(turn: &str) -> TestResult<TurnEvent> {
+        Ok(TurnEvent::ChildProgress {
+            turn_id: tid(turn)?,
+            child: ctx(SessionId::try_from_str("child"), "child id")?,
+            tool_calls: 1,
+            tokens: 2,
+        })
+    }
+
+    #[tokio::test]
+    async fn compact_reasoning_keeps_reasoning_and_progress_but_coalesces_text() -> TestResult {
+        let (queue, mut stream) = attachment(
+            sid()?,
+            StreamProfile::CompactReasoning,
+            QueueLimits::default(),
+        );
+        let child_assistant = child(
+            "child",
+            TurnEvent::AssistantDelta {
+                turn_id: tid("c")?,
+                text: "c".into(),
+            },
+        )?;
+        assert_eq!(queue.push(env(1, child_assistant)?), PushOutcome::Filtered);
+        let round = TokenUsage::default();
+        let child_usage = child(
+            "child",
+            TurnEvent::UsageUpdated {
+                turn_id: tid("c")?,
+                round: round.clone(),
+                turn_total: round,
+                final_round: false,
+            },
+        )?;
+        assert_eq!(queue.push(env(2, child_usage)?), PushOutcome::Filtered);
+        let child_context = child(
+            "child",
+            TurnEvent::ContextUpdated {
+                turn_id: tid("c")?,
+                used_tokens: 1,
+                window_tokens: 2,
+                history_items_dropped: 0,
+                estimated_next_tokens: None,
+                threshold_tokens: None,
+                reserve_tokens: None,
+            },
+        )?;
+        assert_eq!(queue.push(env(3, child_context)?), PushOutcome::Filtered);
+        assert!(queue.is_empty());
+
+        assert_eq!(
+            queue.push(env(4, reasoning("t", "a")?)?),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            queue.push(env(5, reasoning("t", "b")?)?),
+            PushOutcome::Coalesced
+        );
+        let root_progress = SessionFrame::Turn(child_progress("t")?);
+        assert_eq!(queue.push(env(6, root_progress)?), PushOutcome::Queued);
+        assert_eq!(
+            queue.push(env(7, child_reasoning("child", "c", "x")?)?),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            queue.push(env(8, child_reasoning("child", "c", "y")?)?),
+            PushOutcome::Coalesced
+        );
+        let nested_progress = child("child", child_progress("c")?)?;
+        assert_eq!(queue.push(env(9, nested_progress)?), PushOutcome::Queued);
+        assert_eq!(
+            queue.push(env(10, assistant("t", "p")?)?),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            queue.push(env(11, assistant("t", "q")?)?),
+            PushOutcome::Coalesced
+        );
+        let job = SessionFrame::Job {
+            work_id: "w".into(),
+            kind: "agent".into(),
+            state: "running".into(),
+            summary: None,
+        };
+        assert_eq!(queue.push(env(12, job)?), PushOutcome::Queued);
+
+        let (live, frame) = next_live(&mut stream).await?;
+        assert_eq!(live, 5);
+        check(
+            matches!(frame, SessionFrame::Turn(TurnEvent::ReasoningDelta { ref text, .. }) if text == "ab"),
+            "expected merged root reasoning",
+        )?;
+        let (_, frame) = next_live(&mut stream).await?;
+        check(
+            matches!(frame, SessionFrame::Turn(TurnEvent::ChildProgress { .. })),
+            "expected root child progress",
+        )?;
+        let (live, frame) = next_live(&mut stream).await?;
+        assert_eq!(live, 8);
+        check(
+            matches!(
+                frame,
+                SessionFrame::Child { event: TurnEvent::ReasoningDelta { ref text, .. }, .. }
+                    if text == "xy"
+            ),
+            "expected merged child reasoning",
+        )?;
+        let (_, frame) = next_live(&mut stream).await?;
+        check(
+            matches!(
+                frame,
+                SessionFrame::Child {
+                    event: TurnEvent::ChildProgress { .. },
+                    ..
+                }
+            ),
+            "expected child progress",
+        )?;
+        let (live, frame) = next_live(&mut stream).await?;
+        assert_eq!(live, 11);
+        check(
+            matches!(frame, SessionFrame::Turn(TurnEvent::AssistantDelta { ref text, .. }) if text == "pq"),
+            "expected merged assistant text",
+        )?;
+        let (_, frame) = next_live(&mut stream).await?;
+        check(
+            matches!(frame, SessionFrame::Job { .. }),
+            "expected the job frame",
+        )
+    }
+
+    #[test]
+    fn child_reasoning_of_different_agents_does_not_merge() -> TestResult {
+        let (queue, _stream) = attachment(
+            sid()?,
+            StreamProfile::CompactReasoning,
+            QueueLimits::default(),
+        );
+        assert_eq!(
+            queue.push(env(1, child_reasoning("one", "c", "x")?)?),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            queue.push(env(2, child_reasoning("two", "c", "y")?)?),
+            PushOutcome::Queued
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -68,6 +68,12 @@ use crate::error::FsMonError;
 /// Dateideskriptors, wie es der Bindungsteil über `/proc/self/fd/<n>`
 /// gelesen hat (siehe [`crate::fdpath`] für die Deutung dieses Werts).
 ///
+/// Ein Warteschlangen-Überlauf des Kernels (kein Deskriptor) erscheint als
+/// Ereignis mit [`crate::mask::FAN_Q_OVERFLOW`] in `mask`, `pid`/`uid` `0`
+/// und leerem `fd_target` — dieselbe Form, die fanotify selbst meldet;
+/// [`crate::sensor::FsMonSensor`] macht daraus ein `SensorDegraded`
+/// (PL-100 WP1.6).
+///
 /// # Errors
 /// Keine eigenen — dieser Typ ist ein reiner Datencontainer.
 ///

@@ -23,6 +23,7 @@ mod analyze;
 mod attach;
 mod auth;
 mod channel;
+mod cloud;
 mod completions;
 mod cycle;
 mod debug;
@@ -41,6 +42,7 @@ mod provider;
 mod sandbox;
 mod service;
 mod session;
+mod sessions_backfill;
 mod settings;
 mod skill;
 mod tool;
@@ -55,6 +57,7 @@ pub use analyze::*;
 pub use attach::*;
 pub use auth::*;
 pub use channel::*;
+pub use cloud::*;
 pub use completions::*;
 pub use cycle::*;
 pub use debug::*;
@@ -73,6 +76,7 @@ pub use provider::*;
 pub use sandbox::*;
 pub use service::*;
 pub use session::*;
+pub use sessions_backfill::*;
 pub use settings::*;
 pub use skill::*;
 pub use tool::*;
@@ -157,6 +161,7 @@ pub enum Command {
     /// Analysiert die Crate-Abhängigkeiten im Workspace und bearbeitet sie der Reihe nach.
     Analyze(AnalyzeArgs),
     /// Listet, zeigt oder setzt gespeicherte Sitzungen fort.
+    #[command(visible_alias = "sessions")]
     Session {
         /// Auszuführende Sitzungs-Aktion.
         #[command(subcommand)]
@@ -273,6 +278,12 @@ pub enum Command {
     PrReview(PrReviewArgs),
 
     // ── Dienste ─────────────────────────────────────────────────────────
+    /// Inspect a locally selected cloud workload policy; never contacts a worker.
+    Cloud {
+        /// Select an offline policy operation.
+        #[command(subcommand)]
+        action: CloudAction,
+    },
     /// Startet den Hintergrunddienst mit Agenten und Kanälen oder verwaltet seine Dienst-Einheit.
     Gateway {
         /// Dienst-Aktion; ohne Unterbefehl läuft der Dienst im Vordergrund.
@@ -358,6 +369,12 @@ pub enum Command {
         /// Auszuführende Geräte-Aktion.
         #[command(subcommand)]
         action: DeviceAction,
+    },
+    /// Verwaltet das Admin-Konto und den Geräte-Enrollment-Webdienst (`harw admin serve`).
+    Admin {
+        /// Auszuführende Admin-Aktion.
+        #[command(subcommand)]
+        action: AdminAction,
     },
     /// Zeigt den Zustand des Own-Cloud-Listeners dieses Knotens.
     Node {

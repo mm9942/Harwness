@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+helper="$root/mobile/scripts/phone-adb"
+target_dir="${CARGO_TARGET_DIR:-$root/target}"
+launcher="${HARW_MOBILE_BOOTSTRAP:-$target_dir/debug/mobile-bootstrap}"
+if [[ ! -x "$launcher" && -z "${HARW_MOBILE_BOOTSTRAP:-}" ]]; then
+    launcher="$root/mobile/rust/target/debug/mobile-bootstrap"
+    if [[ ! -x "$launcher" ]] && command -v harw-mobile-bootstrap >/dev/null; then
+        launcher=$(command -v harw-mobile-bootstrap)
+    fi
+fi
+hub="${HARW_MOBILE_AUTH_HUB:-$root/target/debug/harw-auth-hub}"
+harw="${HARW_MOBILE_CLI:-harw}"
+
+usage() {
+    echo 'Usage: usb-test [--serial SERIAL] [--port PORT] [--apk FILE] (--chatgpt-model MODEL | --smoke)' >&2
+}
+die() { echo "usb-test: $*" >&2; exit 1; }
+selection=()
+mode=()
+apk=()
+port=7443
+while (($#)); do
+    case "$1" in
+        --serial|--port|--apk|--chatgpt-model)
+            [[ $# -ge 2 && -n "$2" ]] || die "$1 needs a value"
+            case "$1" in
+                --serial) selection=(--serial "$2");;
+                --port) port="$2";;
+                --apk) apk=("$2");;
+                --chatgpt-model) [[ ${#mode[@]} == 0 ]] || die 'select one provider mode'; mode=(--chatgpt-model "$2");;
+            esac
+            shift 2;;
+        --smoke) [[ ${#mode[@]} == 0 ]] || die 'select one provider mode'; mode=(--smoke); shift;;
+        -h|--help) usage; exit 0;;
+        *) usage; exit 2;;
+    esac
+done
+[[ ${#mode[@]} -gt 0 ]] || { usage; exit 2; }
+[[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && ((port <= 65535)) || die 'invalid TCP port'
+[[ -x "$launcher" && -x "$hub" ]] || die 'build mobile-bootstrap and harw-auth-hub first (see PHONE-TEST.md)'
+command -v -- "$harw" >/dev/null || die 'installed harw executable missing'
+serial=$("$helper" "${selection[@]}" serial)
+phone=("$helper" --serial "$serial")
+"${phone[@]}" install "${apk[@]}"
+"${phone[@]}" launch
+umask 077
+state_dir=$(mktemp -d /tmp/harw-usb.XXXXXXXX)
+server=
+reverse=
+cleanup() {
+    if [[ -n "$reverse" ]]; then "${phone[@]}" remove-reverse "$port" || true; fi
+    if [[ -n "$server" ]]; then kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+echo 'In Harw, export this phone’s enrollment to Downloads as harw-device-enrollment.json. Press Enter after saving.'
+read -r
+"${phone[@]}" pull-enrollment "$state_dir/enrollment.json"
+"$launcher" serve "${mode[@]}" --state "$state_dir/gateway" --enrollment "$state_dir/enrollment.json" --port "$port" --harw "$harw" --auth-hub "$hub" &
+server=$!
+profile="$state_dir/gateway/harw-server-profile.json"
+for ((i=0; i<600; i++)); do
+    [[ ! -f "$profile" ]] || break
+    if ! kill -0 "$server" 2>/dev/null; then wait "$server" || exit $?; die 'gateway stopped before it was ready'; fi
+    sleep 0.2
+done
+[[ -f "$profile" ]] || die 'gateway readiness timed out'
+"${phone[@]}" reverse "$port"
+reverse=1
+"${phone[@]}" push-profile "$profile"
+echo 'In Harw, import Downloads/harw-server-profile.json and tap Connect.'
+printf 'Computer session: harw attach --socket %q\n' "$state_dir/gateway/session.sock"
+printf 'Test data: %s\n' "$state_dir"
+echo 'Keep this terminal open. Ctrl+C stops the test gateway and removes the USB port mapping.'
+wait "$server"

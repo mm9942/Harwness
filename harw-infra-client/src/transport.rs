@@ -122,6 +122,7 @@ pub(crate) struct UdsTransport {
     socket: PathBuf,
     token: Option<BearerToken>,
     options: ClientOptions,
+    expected_peer_uid: Option<u32>,
 }
 
 impl UdsTransport {
@@ -130,7 +131,13 @@ impl UdsTransport {
             socket,
             token,
             options,
+            expected_peer_uid: None,
         }
+    }
+
+    pub(crate) fn pin_local_peer_uid(mut self, uid: u32) -> Self {
+        self.expected_peer_uid = Some(uid);
+        self
     }
 
     pub(crate) fn socket(&self) -> &Path {
@@ -194,6 +201,12 @@ impl UdsTransport {
         let stream = UnixStream::connect(&self.socket)
             .await
             .map_err(|_| InfraClientError::Unavailable)?;
+        if let Some(expected_uid) = self.expected_peer_uid {
+            let peer = stream.peer_cred().map_err(|_| InfraClientError::Unauthenticated)?;
+            if peer.uid() != expected_uid {
+                return Err(InfraClientError::Unauthenticated);
+            }
+        }
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
                 .await

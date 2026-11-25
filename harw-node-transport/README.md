@@ -133,6 +133,32 @@ There is no per-frame signature.
 * `NodeTransportClient::connect(addr, local, expected_peer, verifier)`
   returns an authenticated HTTP/1 connection (`send_request`, `peer()`).
 
+### Connection witness for owner-process observation
+
+An authenticated HTTP client may acquire
+`NodeTransportClient::owner_process_channel_binding()`. On the server,
+`owner_process_channel_binding_of(&request)` retrieves the private extension
+inserted by the transport. Both derive the same proof-specific TLS 1.3
+exporter from that connection after pinned node authentication. The
+witness records the local direction; the Hub must be the dialling side
+when proving the selected destination. Reconnects
+derive a different exporter; closing or upgrading the HTTP connection
+invalidates old handles. No header, address, raw TLS accept, ordinary peer
+extension, or echoed proof field can mint a handle.
+
+This is not a relay, an attach grant, or proof of an owner process. The
+composition supplies its independently provisioned process pin, confirms
+current enrollment and per-operation authorization, and rechecks exact
+channel liveness before accepting any proof result. Never expose the
+exporter as an HTTP header or reuse it as a credential.
+
+On either side, `verified_peer_key_fingerprint()` returns the full BLAKE3 of
+the exact raw ML-DSA-65 key used to verify the remote handshake signature.
+The library's plain and AuthHub-wrapped pin verifiers provide this evidence;
+the role is reported separately. Custom verifiers without a sealed library
+pin verifier cannot issue an owner-process witness, and a retained witness
+cannot supply the fingerprint after its HTTP connection expires.
+
 ### DoD uplink (WP-15, `src/uplink.rs`)
 
 * **Read-only**: events flow node → hub. The hub answers the whole stream

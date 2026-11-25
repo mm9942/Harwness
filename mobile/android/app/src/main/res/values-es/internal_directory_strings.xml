@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="internal_directory_subtitle">Ejecuciones internas</string>
+    <string name="internal_directory_category_dream">Sueño</string>
+    <string name="internal_directory_category_diary">Diario</string>
+    <string name="internal_directory_category_ledger">Registro</string>
+    <string name="internal_directory_category_memory">Conciliación de memoria</string>
+    <string name="internal_directory_category_workbench">Banco de trabajo automático</string>
+    <string name="internal_directory_back_projects">Volver a proyectos</string>
+    <string name="internal_directory_disconnected">Conecta este perfil para ver sus ejecuciones internas.</string>
+    <string name="internal_directory_back">Atrás</string>
+    <string name="internal_directory_scope_local">Local</string>
+    <string name="internal_directory_scope_cloud">Nube</string>
+    <string name="internal_directory_scope_title">%1$s · %2$s</string>
+    <string name="internal_directory_refresh">Actualizar</string>
+    <string name="internal_directory_unsupported">Este servidor todavía no ofrece un catálogo separado de ejecuciones internas.</string>
+    <string name="internal_directory_dream_only">Este servidor solo ofrece ejecuciones de sueño por ahora.</string>
+    <string name="internal_directory_load_error">No se pudieron cargar las ejecuciones internas.</string>
+    <string name="internal_directory_last_activity">Última actividad: %1$s</string>
+    <string name="internal_directory_access">Acceso: solo metadatos</string>
+    <string name="internal_directory_details_note">Aquí se muestran metadatos internos, no un historial de chat.</string>
+    <string name="internal_directory_empty_group">No hay ejecuciones verificadas en esta categoría.</string>
+    <string name="internal_directory_load_more">Cargar más ejecuciones</string>
+    <string name="internal_directory_unknown_run">Ejecución interna</string>
+    <string name="internal_directory_time_unavailable">Hora no disponible</string>
+</resources>

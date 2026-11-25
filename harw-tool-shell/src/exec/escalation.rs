@@ -388,9 +388,11 @@ impl EscalatingShellExecutor {
             ),
             HostPermitVariant::SessionLease => {
                 // Dieselbe Wirkung wie `/sandbox-lease`: die Phase gilt für
-                // die ganze harw-Sitzung inkl. aller Kind-Agenten, ohne
-                // Zeitablauf — bis der Nutzer sie beendet (Strg+H oder
-                // `/sandbox-lease revoke`).
+                // die ganze harw-Sitzung inkl. aller Kind-Agenten, bis ihr
+                // Fenster abläuft (PL-100 Phase 4, B22, ADR 0002) oder der
+                // Nutzer sie vorher beendet (Strg+H oder
+                // `/sandbox-lease revoke`). `issue_and_remember` bindet den
+                // Permit an dieses Fenster.
                 registry.mark_global_approval();
                 (
                     HostApprovalScope::SessionLease,

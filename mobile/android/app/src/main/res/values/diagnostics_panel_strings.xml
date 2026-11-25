@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_diagnostics_title_local">Debug log · Local</string>
+    <string name="harw_diagnostics_title_cloud">Debug log · Cloud</string>
+    <string name="harw_diagnostics_clipboard_label">Harw debug log</string>
+    <string name="harw_diagnostics_privacy">Kept only while the app process is running. No messages, images, credentials or server addresses. Nothing is shared automatically.</string>
+    <string name="harw_diagnostics_unavailable">The debug log for this connection is unavailable.</string>
+    <string name="harw_diagnostics_failed">Could not read or change the debug log.</string>
+    <string name="harw_diagnostics_domain_chat">Chat</string>
+    <string name="harw_diagnostics_domain_stream">Streaming</string>
+    <string name="harw_diagnostics_domain_onion">Onion</string>
+    <string name="harw_diagnostics_level_off">Off</string>
+    <string name="harw_diagnostics_level_error">Error</string>
+    <string name="harw_diagnostics_level_warn">Warning</string>
+    <string name="harw_diagnostics_level_info">Info</string>
+    <string name="harw_diagnostics_level_debug">Debug</string>
+    <string name="harw_diagnostics_trace_enable">Enable Trace for 10 minutes</string>
+    <string name="harw_diagnostics_trace_extend">Extend Trace · active at last refresh</string>
+    <string name="harw_diagnostics_refreshing">Refreshing …</string>
+    <string name="harw_diagnostics_counts">Entries: %1$s · dropped: %2$s</string>
+    <string name="harw_diagnostics_empty">No entries at the selected levels yet.</string>
+    <string name="harw_diagnostics_refresh">Refresh</string>
+    <string name="harw_diagnostics_clear">Clear</string>
+    <string name="harw_diagnostics_copy">Copy</string>
+    <string name="harw_diagnostics_copy_failed">Could not copy the debug log.</string>
+    <string name="harw_diagnostics_close">Close</string>
+</resources>

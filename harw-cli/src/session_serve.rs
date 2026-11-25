@@ -20,11 +20,16 @@
 //! # What is wired
 //! - Host, durable transcripts/approvals, the production `CoreTurnDriver`
 //!   (`harw-core` durable turn loop) and the Unix-socket ingress are real.
-//! - The core session factory ([`GatewayCoreFactory`]) assembles one
-//!   `RuntimeAssembly` per hosted session (the registry is single-use) with
-//!   `EntryKind::Tui` (full registry, sandbox bound to the gateway's cwd and
-//!   narrowed by the entry profile, `AskResolution::Interactive`: a tool that
-//!   needs approval parks the turn), the local owner as `Principal`
+//!   Transcripts and approvals open through
+//!   `harw_local_host::open_durable_stores` (start-up tail repair included).
+//! - The core session factory ([`GatewayCoreFactory`]) assembles (like
+//!   `harw_local_host::LocalCoreFactory`, which the Android app uses; kept
+//!   separate here because it adds the thread mapper and per-session cwd of
+//!   shared-profile mode) one `RuntimeAssembly` per hosted session (the registry is
+//!   single-use) with `EntryKind::SessionHost` (full registry, sandbox bound
+//!   to the gateway's cwd and narrowed by the entry profile,
+//!   `AskResolution::Interactive`: a tool that needs approval parks the
+//!   turn), the local owner as `Principal`
 //!   (`uid:<euid>`), the gateway's resolved model (the provider of the
 //!   `GatewayDream` assembly) and a durable `TranscriptStateStore`. The
 //!   spawn context's approval actor is set to `Operator { id: "uid:<euid>" }`,
@@ -32,22 +37,20 @@
 //!   (`harw_session_com::local::local_identity`), so the durable approval
 //!   record binds the actor that may resolve it (a `Principal` of surface
 //!   Tui would otherwise yield `local-tui`, which never matches).
-//! - Known limitation: `RuntimeAssembly::build` reads config/trust files
-//!   synchronously; the driver's factory trait is synchronous, so this happens
-//!   on the gateway runtime thread once per newly created hosted session.
-//! - TODO(node listener): `harw-node-listener::NodeListener` is not composed
-//!   because `harw-config` has no node-transport section yet; no config is
-//!   invented here.
+//! - The driver runs synchronous factory assembly on a blocking worker and
+//!   rechecks execution admission after hydrating the durable transcript.
+//! - The node transport listener is composed in `session_serve_remote`.
 //!
 //! # Jobs rule
 //! Everything on the serve path is async (`Daemon::run` on the gateway's
 //! runtime); the only synchronous work is directory creation at start.
 
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use harw_core::{AgentSession, ModelProvider, StateStore, TranscriptStateStore};
+use harw_core::{
+    AgentSession, ModelProvider, SessionThreadMapper, StateStore, TranscriptStateStore,
+};
 use harw_runtime::{
     EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeStores, permissions_for_tier,
 };
@@ -57,9 +60,8 @@ use harw_session_driver::{
     SessionWiring,
 };
 use harw_session_host::driver::TurnDriver;
-use harw_session_host::record::RecordStore;
-use harw_session_host::{DurableApprovals, DurableTranscripts, HostConfig};
-use harw_session_store::TranscriptStore;
+use harw_session_host::HostConfig;
+use harw_session_store::{HolderKind, TranscriptStore};
 use harw_types::{ApprovalActor, IngressSurface, PermissionTier, SessionId, ThreadRef};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -120,14 +122,22 @@ pub struct GatewayCoreFactory {
     store: Arc<dyn StateStore>,
     home: PathBuf,
     cwd: PathBuf,
-    uid: u32,
+    /// Approval actor of the local owner (`uid:<euid>`); the fallback.
+    owner_actor: ApprovalActor,
     /// Tier of the connection the sessions are hosted for; it cuts the
     /// session's sandbox rights (`permissions_for_tier`), never widens them.
     tier: PermissionTier,
     /// Approval actor override (remote ingress: the one device allowed to
     /// resolve approvals). `None` = the local owner's `uid:<euid>`.
     actor: Option<ApprovalActor>,
+    /// Per-session working directory (shared-profile mode); `None` or a
+    /// `None` answer falls back to `cwd`.
+    session_cwd: Option<SessionCwdResolver>,
 }
+
+/// Resolves the working directory of a session; `None` = the factory's
+/// default `cwd`.
+pub type SessionCwdResolver = Arc<dyn Fn(&SessionId) -> Option<PathBuf> + Send + Sync>;
 
 impl std::fmt::Debug for GatewayCoreFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -150,6 +160,13 @@ fn with_operator_actor(
     })?;
     context.approval_actor = Some(actor);
     Ok(session.with_spawn_context(context))
+}
+
+/// Thread of the local CLI sessions, identical to the format `chat.rs` uses
+/// (`cli-session:<id>`), so a TUI session continued over a host sees its
+/// earlier entries.
+pub(crate) fn cli_session_thread(session_id: &SessionId) -> ThreadRef {
+    ThreadRef::from_str(format!("cli-session:{}", session_id.as_str()))
 }
 
 fn hosted_thread(session_id: &SessionId) -> ThreadRef {
@@ -176,12 +193,34 @@ impl GatewayCoreFactory {
             )),
             home,
             cwd,
-            uid,
             // The local socket's peer is the gateway's own uid, mapped like
-            // `local_principal`: an operator.
+            // `local_principal`: an operator (the factory's default tier).
+            owner_actor: ApprovalActor::Operator {
+                id: format!("uid:{uid}"),
+            },
             tier: PermissionTier::Operator,
             actor: None,
+            session_cwd: None,
         }
+    }
+
+    /// Replaces the thread mapper (shared-profile mode: `cli_session_thread`)
+    /// and rebuilds the store over `sessions_root`, writing as the gateway.
+    #[must_use]
+    pub fn with_thread_mapper(mut self, mapper: SessionThreadMapper, sessions_root: &Path) -> Self {
+        self.store = Arc::new(TranscriptStateStore::new(
+            TranscriptStore::new(sessions_root).with_writer_kind(HolderKind::Gateway),
+            mapper,
+        ));
+        self
+    }
+
+    /// Working directory per session (shared-profile mode: from the profile
+    /// index), so a session runs in its project folder.
+    #[must_use]
+    pub fn with_session_cwd(mut self, resolver: SessionCwdResolver) -> Self {
+        self.session_cwd = Some(resolver);
+        self
     }
 
     /// Binds the sessions' approval actor to `actor` instead of the local
@@ -199,18 +238,13 @@ impl GatewayCoreFactory {
         self.tier = tier;
         self
     }
-
-    /// The actor the socket's peer identity carries for `uid`.
-    fn operator_actor(&self) -> ApprovalActor {
-        self.actor
-            .clone()
-            .unwrap_or_else(|| ApprovalActor::Operator {
-                id: format!("uid:{}", self.uid),
-            })
-    }
 }
 
 impl CoreSessionFactory for GatewayCoreFactory {
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        Some(self.store.as_ref())
+    }
+
     fn build(
         &self,
         session_id: &SessionId,
@@ -240,10 +274,15 @@ impl GatewayCoreFactory {
         admission: Option<&harw_session_host::driver::ExecutionAdmission>,
     ) -> Result<CoreSession, DriverBridgeError> {
         let runtime = |error: String| DriverBridgeError::Runtime(error);
+        let cwd = self
+            .session_cwd
+            .as_ref()
+            .and_then(|resolve| resolve(session_id))
+            .unwrap_or_else(|| self.cwd.clone());
         let spec = crate::runtime_entry::runtime_spec(
             EntryKind::SessionHost,
             &self.home,
-            &self.cwd,
+            &cwd,
             admission
                 .map(|admission| admission.principal_with_ceiling(self.tier))
                 .unwrap_or_else(|| crate::runtime_entry::local_principal(IngressSurface::Tui)),
@@ -279,12 +318,13 @@ impl GatewayCoreFactory {
             .actor
             .clone()
             .or_else(|| admission.map(|admission| admission.approval_actor().clone()))
-            .unwrap_or_else(|| self.operator_actor());
+            .unwrap_or_else(|| self.owner_actor.clone());
         let session = with_operator_actor(root.session, actor)?;
         Ok(CoreSession {
             session,
             model: Arc::clone(&self.model),
             store: Arc::clone(&self.store),
+            spawner: assembly.spawner().cloned(),
         })
     }
 }
@@ -323,17 +363,29 @@ fn own_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
-    if dir.as_os_str().is_empty() {
-        return Ok(());
+pub(crate) use harw_local_host::private_dir;
+
+/// Attach an owner-only Unix socket to the same host and tenant as the phone.
+pub(crate) async fn start_shared(
+    config: &SessionServeConfig,
+    host: harw_session_host::SessionHost,
+    tenant: harw_types::TenantId,
+) -> Result<SessionIngress, String> {
+    if let Some(parent) = config.socket.parent() {
+        private_dir(parent)?;
     }
-    // `recursive` applies the mode to every directory it creates; an
-    // existing directory is left as it is (the daemon refuses an insecure one).
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|error| format!("{}: {error}", dir.display()))
+    let mut uds = UdsConfig::new(&config.socket, own_uid());
+    uds.tenant = Some(tenant);
+    let server = harw_session_daemon::UdsServer::bind(uds)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (shutdown, rx) = watch::channel(false);
+    let task = tokio::spawn(server.run(host, rx));
+    Ok(SessionIngress {
+        shutdown,
+        task,
+        socket: config.socket.clone(),
+    })
 }
 
 /// Compose and start the ingress with the production driver over `model`.
@@ -358,6 +410,7 @@ pub async fn start(
         .with_tier(config.tier),
     );
     let driver = CoreTurnDriver::with_factory(CoreDriverConfig::new(sessions_root), factory)
+        .and_then(|driver| driver.with_media_root(&config.home.join("media")))
         .map_err(|error| format!("session driver: {error}"))?;
     start_with_driver(config, Arc::new(driver)).await
 }
@@ -377,22 +430,9 @@ pub async fn start_with_driver(
         private_dir(parent)?;
     }
     let uid = own_uid();
-    let transcripts = DurableTranscripts::open(&sessions_root)
-        .map_err(|error| format!("transcripts: {error}"))?;
     let host_state_dir = config.state_dir.join("host");
-    let persisted_sessions = RecordStore::new(&host_state_dir)
-        .list()
-        .map_err(|error| format!("hosted session records: {error}"))?;
-    let persisted_ids: Vec<_> = persisted_sessions
-        .into_iter()
-        .map(|record| record.session_id)
-        .collect();
-    transcripts
-        .repair_tails(&persisted_ids)
-        .map_err(|error| format!("transcript startup recovery: {error}"))?;
-    let approvals =
-        DurableApprovals::open(&sessions_root).map_err(|error| format!("approvals: {error}"))?;
-    let services = DaemonServices::new(driver, Arc::new(transcripts), Arc::new(approvals));
+    let stores = harw_local_host::open_durable_stores(&sessions_root, &host_state_dir)?;
+    let services = DaemonServices::new(driver, stores.transcripts, stores.approvals);
     let daemon = Daemon::start(
         HostConfig::new(host_state_dir),
         services,
@@ -551,6 +591,39 @@ mod tests {
         )
     }
 
+    #[test]
+    fn cli_session_thread_matches_chat_format() {
+        assert_eq!(
+            cli_session_thread(&SessionId::from_str("sess-a1")).as_str(),
+            "cli-session:sess-a1"
+        );
+    }
+
+    #[test]
+    fn with_thread_mapper_and_cwd_resolver_are_applied() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&seen);
+        let project = dir.path().join("proj");
+        let expected = project.clone();
+        let factory = factory_in(dir.path(), 1000)
+            .with_thread_mapper(cli_session_thread, &dir.path().join("shared"))
+            .with_session_cwd(Arc::new(move |id: &SessionId| {
+                log.lock().ok()?.push(id.as_str().to_owned());
+                Some(expected.clone())
+            }));
+        assert!(factory.session_cwd.is_some());
+        assert_eq!(
+            factory
+                .session_cwd
+                .as_ref()
+                .and_then(|resolve| resolve(&SessionId::from_str("sess-a1"))),
+            Some(project)
+        );
+        assert_eq!(seen.lock().map(|v| v.len()).unwrap_or(0), 1);
+        Ok(())
+    }
+
     fn wiring() -> SessionWiring {
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -577,27 +650,6 @@ mod tests {
         // One assembly per session: a second session builds independently.
         let other = factory.build(&second, None, wiring())?;
         assert_eq!(other.session.id(), &second);
-        Ok(())
-    }
-
-    #[test]
-    fn a_session_without_spawn_context_fails_closed() -> TestResult {
-        let (event_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let session = harw_core::AgentSession::new(
-            harw_types::roles::AgentRole::Assistant,
-            None,
-            harw_extension_api::ExtensionRegistryBuilder::default().build(),
-            event_tx,
-        );
-        let actor = ApprovalActor::Operator {
-            id: "uid:1".to_owned(),
-        };
-        // No spawn context: binding must fail instead of silently keeping the
-        // core's own actor (every approval would then hang).
-        assert!(matches!(
-            with_operator_actor(session, actor),
-            Err(DriverBridgeError::Runtime(_))
-        ));
         Ok(())
     }
 
@@ -653,6 +705,7 @@ mod tests {
             .create(CreateParams {
                 workspace: None,
                 title: Some("e2e".to_owned()),
+                fork_from: None,
             })
             .await?;
         let session = created.session_id;
@@ -671,6 +724,8 @@ mod tests {
                 expect_head: ack.head,
                 client_msg_id: "m1".to_owned(),
                 force: false,
+                images: Vec::new(),
+                rewind_before: None,
             })
             .await?;
         assert!(

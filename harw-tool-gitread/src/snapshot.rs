@@ -225,8 +225,9 @@ pub struct WorktreeCtx<'a> {
     pub index_mtime: Option<u32>,
 }
 
-fn nsec_u32(value: u64) -> u32 {
-    u32::try_from(value & 0xFFFF_FFFF).unwrap_or(0)
+fn nsec_u32<T: TryInto<i128>>(value: T) -> u32 {
+    let wide: i128 = value.try_into().unwrap_or(0);
+    u32::try_from(wide.rem_euclid(1 << 32)).unwrap_or(0)
 }
 
 fn to_u32(value: i64) -> u32 {

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_local_vision_parallel_title">Análisis local de imágenes · concurrencia</string>
+    <string name="harw_local_vision_parallel_explainer">Elige de 1 a 5 (3 de forma predeterminada). Cada lote nuevo comprueba el modelo cargado, la memoria disponible y la CPU, y puede usar menos tareas. Las solicitudes API y los lotes en curso no cambian.</string>
+    <string name="harw_local_vision_parallel_requested">Máximo configurado: %1$d</string>
+    <string name="harw_local_vision_parallel_estimate">Estimación: hasta %1$d análisis simultáneos. Se vuelve a comprobar al iniciar el lote.</string>
+    <plurals name="harw_local_vision_parallel_images">
+        <item quantity="one">%d imagen</item>
+        <item quantity="other">%d imágenes</item>
+    </plurals>
+</resources>

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="knowledge_cloud_profile">Profil Cloud</string>
+    <string name="knowledge_no_profile">Aucun profil Cloud configuré.</string>
+    <string name="knowledge_offline">Le profil Cloud est hors ligne.</string>
+    <string name="knowledge_checking">Vérification de la connexion et des droits de lecture.</string>
+    <string name="knowledge_no_manage">Cette passerelle ne propose pas de gestion mobile.</string>
+    <string name="knowledge_no_observe">Cet appareil ne dispose pas des droits de lecture pour la gestion mobile.</string>
+    <string name="knowledge_no_store">Connexion établie, mais la passerelle ne fournit pas de lecture des données de connaissance dans cette vue.</string>
+    <string name="knowledge_no_scope">Ces paramètres ne sont liés à aucune conversation ni à aucun projet. Pour consulter les données existantes, ouvrez la session ou le projet correspondant dans le terminal Harw. Aucune donnée ne sera chargée ici.</string>
+    <string name="knowledge_memory">Mémoire</string>
+    <string name="knowledge_memory_scope">Aucune vue mobile ne permet de lire la mémoire dans ce périmètre.</string>
+    <string name="knowledge_diary">Journal</string>
+    <string name="knowledge_diary_scope">Les entrées du journal ne sont pas accessibles depuis cette vue mobile.</string>
+    <string name="knowledge_session_workbench">Espace de travail de la session</string>
+    <string name="knowledge_session_workbench_scope">Il faut une session ouverte et une interface de lecture compatible.</string>
+    <string name="knowledge_project_workbench">Espace de travail du projet</string>
+    <string name="knowledge_project_workbench_scope">Il faut un projet autorisé et une interface de lecture compatible.</string>
+    <string name="knowledge_goals">Objectifs</string>
+    <string name="knowledge_goals_scope">Il faut un périmètre de planification autorisé et une source de données pour les objectifs.</string>
+    <string name="knowledge_plan">Plan</string>
+    <string name="knowledge_plan_scope">Il faut un périmètre de planification autorisé et une source de données pour les plans.</string>
+</resources>

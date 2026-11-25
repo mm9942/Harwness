@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Harw</string>
+    <string name="connection_channel">Harw-Verbindung</string>
+    <string name="notification_title">Harw-Arbeitsbereich</string>
+    <string name="notification_connecting">Verbinde mit deinem Harw-Server</string>
+    <string name="notification_connected">Verbindung aktiv</string>
+    <string name="notification_reconnecting">Warte auf Wiederverbindung</string>
+    <string name="notification_reconnecting_attempt">Warte auf Wiederverbindung (Versuch %1$d)</string>
+    <string name="notification_battery">Hintergrund erlauben</string>
+    <string name="notification_disconnecting">Verbindung wird getrennt</string>
+    <string name="notification_forgetting">Gespeicherte Telefon-Einrichtung wird entfernt</string>
+    <string name="notification_stop">Trennen</string>
+
+    <!-- Projects screen (ProjectsScreen.kt) -->
+    <string name="projects_title">Projekte</string>
+    <string name="projects_search_hint">Projekte suchen</string>
+    <string name="projects_without_project">Ohne Projekt</string>
+    <string name="projects_new_session">+ Session</string>
+    <string name="projects_empty">Noch keine Projekte</string>
+    <string name="projects_empty_search">Keine Projekte passen zur Suche</string>
+    <string name="projects_last_activity">Letzte Aktivität %1$s</string>
+    <plurals name="projects_session_count">
+        <item quantity="one">%1$d Session</item>
+        <item quantity="other">%1$d Sessions</item>
+    </plurals>
+
+    <!-- Workspace screen: sessions of one project (WorkspaceScreen.kt) -->
+    <string name="workspace_title">Sessions</string>
+    <string name="workspace_empty_sessions">In diesem Projekt gibt es noch keine Sessions</string>
+    <string name="workspace_pages">Seiten</string>
+    <string name="workspace_owner_this_device">Dieses Handy</string>
+    <string name="workspace_owner_other">Anderes Gerät</string>
+    <string name="workspace_rename">Umbenennen</string>
+    <string name="workspace_archive">Archivieren</string>
+    <string name="workspace_assign_project">Projekt zuweisen</string>
+    <string name="workspace_rename_title">Session umbenennen</string>
+    <string name="workspace_archived">Session archiviert</string>
+
+    <!-- Conversation screen (SessionConversation.kt) -->
+    <string name="conv_busy_banner">Session ist gerade belegt</string>
+    <string name="conv_holder_banner">Anderswo aktiv seit %1$s</string>
+    <string name="conv_read_only">Nur lesen</string>
+    <string name="conv_read_only_hint">Diese Session kann hier nur angesehen werden.</string>
+    <string name="conv_input_hint">Nachricht</string>
+    <string name="conv_send">Senden</string>
+
+    <!-- Markdown rendering (MarkdownText.kt) -->
+    <string name="markdown_copy_code">Code kopieren</string>
+    <string name="markdown_copied">Kopiert</string>
+
+    <!-- Common actions -->
+    <string name="common_cancel">Abbrechen</string>
+    <string name="common_save">Speichern</string>
+    <string name="common_back">Zurück</string>
+
+    <!-- Notifications (HarwConnectionService.kt). Keine Session- oder Projektnamen: der Text erscheint auf dem gesperrten Bildschirm. -->
+    <string name="notification_channel_sessions">Session-Aktivität</string>
+    <string name="notification_approval_title">Freigabe nötig</string>
+    <string name="notification_approval_text">Eine Session wartet auf deine Freigabe</string>
+    <string name="notification_turn_done_title">Antwort fertig</string>
+    <string name="notification_turn_done_text">Eine Session hat ihre Antwort fertig geschrieben</string>
+    <string name="model_download_channel">Modell-Downloads</string>
+</resources>

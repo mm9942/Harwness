@@ -34,9 +34,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures_util::{SinkExt, StreamExt};
-use harw_node_transport::{LocalNode, NodeTransportClient, NodeVerifier, UpgradeError, empty_body};
+use harw_node_transport::{
+    ClientOptions, LocalNode, NodeTransportClient, NodeVerifier, UpgradeError, empty_body,
+};
 use harw_protocol::methods::{METHOD_SESSION_HELLO, NOTIF_EVENT_FRAME};
-use harw_protocol::session_wire::{HelloAck, HelloParams, SESSION_WIRE_MINOR};
+use harw_protocol::session_wire::{HelloAck, HelloParams, SESSION_WIRE_MINOR, features};
 use harw_protocol::{
     ClientCaps, Cursor, FrameEnvelope, FrameSource, PortError, PortFuture, ProtocolVersion,
     RequestEnvelope, ResponseEnvelope, SessionFrame,
@@ -90,6 +92,8 @@ pub struct ConnectOptions {
     pub client_label: String,
     /// Caps to request; `None` asks for the full ceiling (can only narrow).
     pub requested_caps: Option<ClientCaps>,
+    /// Optional features to request in `session.hello` (see `harw_protocol::session_wire::features`); the host answers with the subset it implements in `HelloAck::features`. Empty by default.
+    pub features: Vec<String>,
     /// Client-side WebSocket limits.
     pub limits: WsLimits,
 }
@@ -101,6 +105,7 @@ impl ConnectOptions {
         Self {
             client_label: client_label.into(),
             requested_caps: None,
+            features: Vec::new(),
             limits: WsLimits::default(),
         }
     }
@@ -413,6 +418,10 @@ pub struct RemoteConnection {
     shared: Arc<Shared>,
     out: mpsc::Sender<RequestEnvelope>,
     hello: HelloAck,
+    // Only set by the successful NodeTransport upgrade, never from a hello
+    // field, a Unix socket, or a caller-provided raw I/O stream.
+    authenticated_node: Option<NodeId>,
+    offered_direct_owner_status: bool,
     max_message_bytes: usize,
 }
 
@@ -429,6 +438,27 @@ impl RemoteConnection {
     #[must_use]
     pub fn hello_ack(&self) -> &HelloAck {
         &self.hello
+    }
+
+    pub(crate) fn require_direct_owner_status(&self) -> Result<(), PortError> {
+        if self.authenticated_node.is_none()
+            || !self.offered_direct_owner_status
+            || !self.hello.granted.observe
+            || !self.hello.features.iter().any(|feature| feature == features::DIRECT_OWNER_STATUS_V1)
+        {
+            return Err(PortError::Denied(
+                "direct owner status was not negotiated on an authenticated Observe connection"
+                    .to_owned(),
+            ));
+        }
+        self.require_live()
+    }
+
+    pub(crate) fn require_live(&self) -> Result<(), PortError> {
+        match lock(&self.shared.state).end.as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     /// Cursor to resume `session` from, if one was recorded (h19: the
@@ -512,6 +542,7 @@ impl RemoteConnection {
 async fn start<S>(
     ws: WebSocketStream<S>,
     options: &ConnectOptions,
+    authenticated_node: Option<NodeId>,
 ) -> Result<RemoteConnection, RemoteError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -601,12 +632,16 @@ where
             host_epoch: 0,
             granted: ClientCaps::NONE,
         },
+        authenticated_node,
+        offered_direct_owner_status: options.features.iter().any(|feature| {
+            feature == features::DIRECT_OWNER_STATUS_V1
+        }),
         max_message_bytes: limits.max_message_bytes,
     };
     let params = HelloParams {
         client_label: options.client_label.clone(),
         wire_minor: SESSION_WIRE_MINOR,
-        features: Vec::new(),
+        features: options.features.clone(),
         requested_caps: options.requested_caps,
     };
     connection.hello = connection
@@ -661,7 +696,7 @@ where
             Some(limits.tungstenite_config()),
         )
         .await;
-        start(ws, &options).await
+        start(ws, &options, None).await
     };
     match tokio::time::timeout(limits.hello_timeout, attempt).await {
         Ok(result) => result,
@@ -712,26 +747,81 @@ pub async fn connect_node(
     verifier: &dyn NodeVerifier,
     options: ConnectOptions,
 ) -> Result<RemoteConnection, RemoteError> {
-    let limits = options.limits;
     let attempt = async {
         let client =
             NodeTransportClient::connect(endpoint.addr, local, &endpoint.expected_node, verifier)
                 .await
                 .map_err(|error| RemoteError::Connect(format!("node transport: {error}")))?;
-        let (request, key) = upgrade::client_request("localhost")
-            .map_err(|error| RemoteError::Connect(format!("upgrade request: {error}")))?;
-        let request = request.map(|_| empty_body());
-        let upgraded = client.upgrade(request).await.map_err(upgrade_error)?;
-        verify(&upgraded.response, &key)?;
-        let ws = WebSocketStream::from_raw_socket(
-            upgraded.io,
-            Role::Client,
-            Some(limits.tungstenite_config()),
-        )
-        .await;
-        start(ws, &options).await
+        upgrade_node(client, &options).await
     };
-    match tokio::time::timeout(limits.hello_timeout, attempt).await {
+    bounded(options.limits.hello_timeout, attempt).await
+}
+
+/// Connect to an own-cloud node over an already established byte stream
+/// (for example a Tor onion-service stream), authenticate it with the node
+/// transport, upgrade and complete `session.hello`.
+///
+/// The stream is only a locator/transport: it proves nothing about who is on
+/// the other end. Identity is the pinned node key of `expected_node`, which
+/// the node transport verifies (TLS 1.3 plus the node handshake) before any
+/// upgraded stream exists. The whole attempt is bounded by
+/// `options.limits.hello_timeout`.
+///
+/// # Errors
+/// [`RemoteError::Connect`] for transport, identity or upgrade failures or a
+/// timeout; [`RemoteError::NotImplemented`] while the node transport upgrade
+/// is still a stub.
+pub async fn connect_node_over<I>(
+    io: I,
+    expected_node: &NodeId,
+    local: &LocalNode,
+    verifier: &dyn NodeVerifier,
+    options: ConnectOptions,
+    transport: &ClientOptions,
+) -> Result<RemoteConnection, RemoteError>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let attempt = async {
+        let client =
+            NodeTransportClient::connect_over(io, local, expected_node, verifier, transport)
+                .await
+                .map_err(|error| RemoteError::Connect(format!("node transport: {error}")))?;
+        upgrade_node(client, &options).await
+    };
+    bounded(options.limits.hello_timeout, attempt).await
+}
+
+/// Shared tail of the node connects: upgrade request, response check,
+/// websocket framing and `session.hello`.
+pub(crate) async fn upgrade_node(
+    client: NodeTransportClient,
+    options: &ConnectOptions,
+) -> Result<RemoteConnection, RemoteError> {
+    let (request, key) = upgrade::client_request("localhost")
+        .map_err(|error| RemoteError::Connect(format!("upgrade request: {error}")))?;
+    let request = request.map(|_| empty_body());
+    let upgraded = client.upgrade(request).await.map_err(upgrade_error)?;
+    verify(&upgraded.response, &key)?;
+    let authenticated_node = upgraded.peer.node_id;
+    let ws = WebSocketStream::from_raw_socket(
+        upgraded.io,
+        Role::Client,
+        Some(options.limits.tungstenite_config()),
+    )
+    .await;
+    start(ws, options, Some(authenticated_node)).await
+}
+
+/// Bounds a node connect attempt by the hello timeout.
+pub(crate) async fn bounded<F>(
+    timeout: std::time::Duration,
+    attempt: F,
+) -> Result<RemoteConnection, RemoteError>
+where
+    F: std::future::Future<Output = Result<RemoteConnection, RemoteError>>,
+{
+    match tokio::time::timeout(timeout, attempt).await {
         Ok(result) => result,
         Err(_) => Err(RemoteError::Connect(
             "timed out upgrading and completing session.hello".to_owned(),
@@ -751,6 +841,44 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(RemoteError::Connect(_))));
+    }
+
+    struct FailingSigner;
+
+    impl harw_node_transport::NodeSigner for FailingSigner {
+        fn sign<'a>(&'a self, _transcript: &'a [u8]) -> harw_node_transport::SignFuture<'a> {
+            Box::pin(async { Err(harw_node_transport::SignerError::new("test signer")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_over_a_closed_stream_is_a_typed_node_transport_error() -> Result<(), String> {
+        let node = NodeId::try_from_str("node-a").map_err(|e| format!("node id: {e}"))?;
+        let local = LocalNode::new(
+            harw_node_transport::NodeIdentity {
+                node_id: node.clone(),
+                public_key: vec![0; 1952],
+                key_ref: "test".to_owned(),
+            },
+            Arc::new(FailingSigner),
+        );
+        let peers = harw_node_transport::PinnedPeers::new();
+        let (client, server) = tokio::io::duplex(1024);
+        drop(server);
+        let result = connect_node_over(
+            client,
+            &node,
+            &local,
+            &peers,
+            ConnectOptions::new("t"),
+            &ClientOptions::default(),
+        )
+        .await;
+        match result {
+            Err(RemoteError::Connect(detail)) if detail.starts_with("node transport:") => Ok(()),
+            Err(other) => Err(format!("unexpected error: {other}")),
+            Ok(_) => Err("connected over a closed stream".to_owned()),
+        }
     }
 
     fn heartbeat(session: &SessionId, live: u32) -> FrameEnvelope {

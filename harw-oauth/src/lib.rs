@@ -44,9 +44,13 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(unix)]
+pub mod chatgpt_plan;
 mod codex_refresh;
 mod error;
 mod flow;
+#[cfg(unix)]
+pub mod oidc_login;
 mod pkce;
 mod store;
 

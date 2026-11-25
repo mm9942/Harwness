@@ -6,7 +6,8 @@
 //!   paths. There is **no** fallback to `$HOME`, the working directory or a
 //!   project path; tests pass explicit temp paths.
 //! - `allowed_uids` has no default: an empty allowlist is a configuration
-//!   error, not "allow everyone".
+//!   error, not "allow everyone". `owner_epoch_reader_uids` is separate and
+//!   empty by default; it only grants the exact non-mutating epoch read.
 //!
 //! ```toml
 //! # socket = "/run/harw/infra/network.sock"   # default
@@ -57,6 +58,8 @@ struct RawConfig {
     state_dir: Option<PathBuf>,
     allowed_uids: Vec<u32>,
     #[serde(default)]
+    owner_epoch_reader_uids: Vec<u32>,
+    #[serde(default)]
     max_body_bytes: Option<usize>,
     #[serde(default)]
     max_nodes: Option<usize>,
@@ -75,6 +78,8 @@ pub struct NetsecConfig {
     pub state_dir: PathBuf,
     /// Peer uids (`SO_PEERCRED`) allowed to use the API.
     pub allowed_uids: BTreeSet<u32>,
+    /// Peer uids allowed only the explicitly selected owner epoch lookup.
+    pub owner_epoch_reader_uids: BTreeSet<u32>,
     /// Maximum accepted request body in bytes.
     pub max_body_bytes: usize,
     /// Maximum number of registered nodes.
@@ -101,6 +106,7 @@ impl NetsecConfig {
             socket_path: socket_path.into(),
             state_dir: state_dir.into(),
             allowed_uids: allowed_uids.into_iter().collect(),
+            owner_epoch_reader_uids: BTreeSet::new(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_nodes: DEFAULT_MAX_NODES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -129,6 +135,7 @@ impl NetsecConfig {
                 .state_dir
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
             allowed_uids: raw.allowed_uids.into_iter().collect(),
+            owner_epoch_reader_uids: raw.owner_epoch_reader_uids.into_iter().collect(),
             max_body_bytes: raw.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
             max_nodes: raw.max_nodes.unwrap_or(DEFAULT_MAX_NODES),
             max_connections: raw.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),

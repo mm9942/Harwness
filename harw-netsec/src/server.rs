@@ -5,8 +5,9 @@
 //! credentials of the socket (`SO_PEERCRED`, read once right after
 //! `accept()` via `tokio::net::UnixStream::peer_cred`), never by anything in
 //! the request. A peer whose uid is not in the configured allowlist gets
-//! `403 peer_not_allowed` on **every** request, including `/v1/health`, and
-//! nothing it sends reaches the store.
+//! `403 peer_not_allowed` on ordinary requests, including `/v1/health`, and
+//! nothing it sends reaches the store, except explicitly allowlisted peers
+//! requesting one of the versioned read-only owner epoch operations.
 //!
 //! # Limits
 //! - request bodies are read through [`http_body_util::Limited`]
@@ -25,6 +26,7 @@
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -33,8 +35,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use harw_types::Clock;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::body::Incoming;
-use hyper::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
+use hyper::body::{Body, Incoming};
+use hyper::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, TRANSFER_ENCODING, UPGRADE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -47,7 +49,8 @@ use tokio::task::JoinSet;
 
 use crate::api::{
     self, CapabilitiesResponse, Endpoint, ErrorBody, ErrorDetail, HealthResponse,
-    NodeActionRequest, NodeList, PROTOCOL_VERSION, ResolveError, RouteList, SERVICE_NAME,
+    NodeActionRequest, NodeList, OwnerAuthorityResponse, OwnerEpochResponse, PROTOCOL_VERSION, ResolveError, RouteList,
+    SERVICE_NAME,
     VersionResponse, ZoneList,
 };
 use crate::config::NetsecConfig;
@@ -71,6 +74,7 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// Deadline of the liveness probe against an existing socket file.
 const STALE_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_OWNER_EPOCH_LOOKUPS: usize = 16;
 
 /// Kernel-verified identity of a connected peer (`SO_PEERCRED`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +105,8 @@ pub fn peer_identity(stream: &UnixStream) -> std::io::Result<PeerIdentity> {
 pub struct ServerSettings {
     /// Peer uids allowed to use the API.
     pub allowed_uids: BTreeSet<u32>,
+    /// Separate allowlist only for the two versioned owner epoch reads.
+    pub owner_epoch_reader_uids: BTreeSet<u32>,
     /// Maximum request body in bytes.
     pub max_body_bytes: usize,
     /// Maximum concurrently served connections.
@@ -119,6 +125,7 @@ impl ServerSettings {
     pub fn from_config(config: &NetsecConfig) -> Self {
         Self {
             allowed_uids: config.allowed_uids.clone(),
+            owner_epoch_reader_uids: config.owner_epoch_reader_uids.clone(),
             max_body_bytes: config.max_body_bytes,
             max_connections: config.max_connections,
             header_read_timeout: HEADER_READ_TIMEOUT,
@@ -255,16 +262,34 @@ pub struct NetsecService {
     store: Arc<NetsecStore>,
     clock: Arc<dyn Clock>,
     settings: ServerSettings,
+    owner_epoch_permits: Arc<Semaphore>,
+    // One ephemeral nonzero marker for this running daemon. Not persisted,
+    // not key material, and never returned by a legacy or general API route.
+    owner_authority_instance: Option<[u8; 32]>,
 }
 
 impl NetsecService {
     /// Builds the handler.
     #[must_use]
     pub fn new(store: Arc<NetsecStore>, clock: Arc<dyn Clock>, settings: ServerSettings) -> Self {
+        let owner_authority_instance = if settings.owner_epoch_reader_uids.is_empty() {
+            None
+        } else {
+            let mut marker = [0; 32];
+            // Entropy failure disables only the new lane. Do not substitute a
+            // stable integer, identity string, or previously persisted value.
+            if getrandom::fill(&mut marker).is_ok() && marker != [0; 32] {
+                Some(marker)
+            } else {
+                None
+            }
+        };
         Self {
             store,
             clock,
             settings,
+            owner_epoch_permits: Arc::new(Semaphore::new(MAX_OWNER_EPOCH_LOOKUPS)),
+            owner_authority_instance,
         }
     }
 
@@ -286,7 +311,16 @@ impl NetsecService {
         request: Request<Incoming>,
         peer: PeerIdentity,
     ) -> NetsecResponse {
-        if !self.is_authorized(&peer) {
+        let endpoint = api::resolve(request.method(), request.uri().path());
+        let authorized = if matches!(
+            &endpoint,
+            Ok(Endpoint::GetOwnerEpoch(_) | Endpoint::GetOwnerAuthority(_))
+        ) {
+            self.settings.owner_epoch_reader_uids.contains(&peer.uid)
+        } else {
+            self.is_authorized(&peer)
+        };
+        if !authorized {
             tracing::warn!(uid = peer.uid, pid = ?peer.pid, "peer uid not in allowlist; request refused");
             return ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -295,7 +329,11 @@ impl NetsecService {
             )
             .into_response();
         }
-        match self.dispatch(request, peer).await {
+        let endpoint = match endpoint {
+            Ok(endpoint) => endpoint,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
+        match self.dispatch(request, peer, endpoint).await {
             Ok(response) => response,
             Err(error) => error.into_response(),
         }
@@ -305,8 +343,8 @@ impl NetsecService {
         &self,
         request: Request<Incoming>,
         peer: PeerIdentity,
+        endpoint: Endpoint,
     ) -> Result<NetsecResponse, ApiError> {
-        let endpoint = api::resolve(request.method(), request.uri().path())?;
         match endpoint {
             Endpoint::Health => Ok(json_response(
                 StatusCode::OK,
@@ -346,6 +384,52 @@ impl NetsecService {
                 let record = self.run(move |store| store.node(&id)).await?;
                 Ok(json_response(StatusCode::OK, &record))
             }
+            Endpoint::GetOwnerEpoch(raw) => {
+                if request.uri().query().is_some() || !request.body().is_end_stream() {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        "owner epoch requests accept no query or body",
+                    ));
+                }
+                let epoch = self.lookup_owner_epoch(&raw).await?;
+                let body = match epoch {
+                    Some(epoch) => OwnerEpochResponse::Active { node: &raw, epoch },
+                    None => OwnerEpochResponse::Unavailable { node: &raw },
+                };
+                Ok(json_response(StatusCode::OK, &body))
+            }
+            Endpoint::GetOwnerAuthority(raw) => {
+                if request.uri().scheme().is_some()
+                    || request.uri().authority().is_some()
+                    || request.uri().query().is_some()
+                    || request.headers().contains_key(TRANSFER_ENCODING)
+                    || request.headers().contains_key(UPGRADE)
+                    || !request.body().is_end_stream()
+                {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        "owner authority requests accept only an origin-form path and no query, body or upgrade",
+                    ));
+                }
+                let authority_instance = self.owner_authority_instance.ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "epoch_lookup_unavailable",
+                        "owner epoch lookup unavailable",
+                    )
+                })?;
+                let body = match self.lookup_owner_epoch(&raw).await? {
+                    Some(epoch) => OwnerAuthorityResponse::Active {
+                        node: &raw,
+                        epoch,
+                        authority_instance,
+                    },
+                    None => OwnerAuthorityResponse::Unavailable { node: &raw },
+                };
+                Ok(json_response(StatusCode::OK, &body))
+            }
             Endpoint::RegisterNode => {
                 let body = self.read_body(request).await?;
                 let registration: NodeRegistration = parse_json(&body)?;
@@ -379,6 +463,23 @@ impl NetsecService {
                 Ok(json_response(StatusCode::OK, &record))
             }
         }
+    }
+
+    async fn lookup_owner_epoch(&self, raw: &str) -> Result<Option<NonZeroU64>, ApiError> {
+        let id = parse_node_id(raw)?;
+        let permit = Arc::clone(&self.owner_epoch_permits)
+            .try_acquire_owned()
+            .map_err(|_| ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "epoch_lookup_unavailable",
+                "owner epoch lookup unavailable",
+            ))?;
+        self.run(move |store| {
+            // If the peer abandons the request, keep the slot until its
+            // blocking worker exits. The versions share this one budget.
+            let _permit = permit;
+            store.active_owner_epoch(&id)
+        }).await
     }
 
     /// Runs blocking store work off the async executor.

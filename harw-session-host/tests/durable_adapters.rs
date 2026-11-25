@@ -7,10 +7,11 @@ use std::sync::{Arc, Barrier};
 
 use fs4::FileExt;
 use harw_protocol::items::{ContentPart, TurnItem, UserMessageItem};
-use harw_protocol::{ApprovalKind, ApprovalRequest, Cursor};
+use harw_protocol::session_wire::SessionFrame;
+use harw_protocol::{ApprovalKind, ApprovalRequest, Cursor, TurnEvent};
 use harw_session_host::approvals::{ApprovalBackend, ResolveOutcome};
 use harw_session_host::error::HostError;
-use harw_session_host::replay::TranscriptSource;
+use harw_session_host::replay::{TranscriptSource, history_before, replay, tail_start};
 use harw_session_host::{DurableApprovals, DurableTranscripts};
 use harw_session_store::{RecordKind, TranscriptRecord, TranscriptStore};
 use harw_types::{
@@ -414,6 +415,59 @@ fn replay_from_cursor_returns_exact_suffix() -> TestResult {
         live: 9,
     };
     assert!(source.replay_from(&session(), 7, &head, 100)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn durable_replay_keeps_retained_pre_edit_suffix_out_of_current_chat() -> TestResult {
+    let temp = seeded(3)?;
+    let store = TranscriptStore::new(temp.path());
+    let marker = |sequence, name| {
+        TranscriptRecord::new(
+            session(),
+            ThreadRef::from_str("root"),
+            sequence,
+            Timestamp::UNIX_EPOCH,
+            RecordKind::Lifecycle,
+            serde_json::json!({ "marker": name, "item_count": 2 }),
+        )
+    };
+    // Old [prefix, edited target, suffix] physically remains in the journal.
+    // Like the production writer, the replacement block reuses the prefix ID.
+    let mut prefix = item_record(0)?;
+    prefix.sequence = 4;
+    store.append_group(&[
+        marker(3, "history_replace_started"),
+        prefix,
+        item_record(5)?,
+        marker(6, "history_replaced"),
+    ])?;
+    store.append(&item_record(7)?)?;
+
+    let source = DurableTranscripts::open(temp.path())?;
+    let id = session();
+    let head = source.head(&id)?;
+    let floor = source.canonical_floor(&id, head)?;
+    assert_eq!(floor, 4);
+    // Initial/live resync attach uses the same bound as HostConnection::attach.
+    let initial = replay(&source, &id, 0, tail_start(head, 200).max(floor), 100)?;
+    let paged = history_before(&source, &id, 0, head, 100)?;
+    for frames in [&initial, &paged] {
+        let ids: Vec<&str> = frames
+            .iter()
+            .filter_map(|envelope| match &envelope.frame {
+                SessionFrame::Turn(TurnEvent::ItemAdded {
+                    item: TurnItem::UserMessage(user),
+                    ..
+                }) => Some(user.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["item-0", "item-5", "item-7"]);
+    }
+    assert!(history_before(&source, &id, 0, floor, 100)?.is_empty());
+    // Archive/diagnostic raw reads still have the retained older records.
+    assert_eq!(source.read_from(&id, 0, 100)?.len(), 8);
     Ok(())
 }
 

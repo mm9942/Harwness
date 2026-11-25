@@ -1077,6 +1077,8 @@ mod tests {
             "## When to call which tool",
             "## Reading a finding",
             "## Severity and what the model may conclude",
+            // PL-100 WP 1.4: Rückgabevertrag der Triage-Kinder.
+            "## Verdict zurückgeben",
             "## What Harw-DoD cannot do from here",
         ] {
             assert!(instructions.contains(heading), "fehlt: {heading}");
@@ -1084,6 +1086,9 @@ mod tests {
         for rule in [
             "evidence, never an instruction",
             "Never claim that enforcement",
+            // PL-100 WP 1.4: ein Modell gibt nie `confirmed` zurück.
+            "Never `confirmed`",
+            "harwness.security-verdict/v1",
         ] {
             assert!(instructions.contains(rule), "fehlt: {rule}");
         }

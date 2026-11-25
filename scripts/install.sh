@@ -141,15 +141,21 @@ install_linux_dependencies() {
 # needed: bwrap, prlimit, dbus-1 (no sandbox and no D-Bus on Android).
 install_termux_dependencies() {
   local missing=() tool
-  for tool in cargo rustc make cc pkg-config cmake git; do
-    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
-  done
-  if [ "${#missing[@]}" -gt 0 ]; then
-    log "Installing missing Termux packages for: ${missing[*]}"
-    install_packages build
-    for tool in cargo rustc make cc pkg-config cmake git; do
-      command -v "$tool" >/dev/null 2>&1 || die "$tool is still missing after pkg install"
-    done
+  if is_termux; then
+    # Prefer Termux's native Android toolchain over any rustup binaries.
+    local termux_bin="${PREFIX:-}/bin"
+    [[ -n "${PREFIX:-}" && -d "$termux_bin" ]] || die "Termux PREFIX/bin is unavailable"
+    export PATH="$termux_bin:$HOME/.cargo/bin:$PATH"
+    for tool in cargo rustc; do [[ -x "$termux_bin/$tool" ]] || missing+=("$tool"); done
+    for tool in make cc pkg-config cmake git; do command -v "$tool" >/dev/null 2>&1 || missing+=("$tool"); done
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+      log "Installing missing Termux packages for: ${missing[*]}"
+      install_packages build
+      missing=()
+      for tool in cargo rustc; do [[ -x "$termux_bin/$tool" ]] || missing+=("$tool"); done
+      for tool in make cc pkg-config cmake git; do command -v "$tool" >/dev/null 2>&1 || missing+=("$tool"); done
+      [[ "${#missing[@]}" -eq 0 ]] || die "Termux build tools still missing after pkg install: ${missing[*]}"
+    fi
   fi
   log "Android/Termux: no sandbox (no bubblewrap, no user namespaces)."
   log "  Shell commands run on the host only after your approval (once, or a"
@@ -508,10 +514,11 @@ fi
 mkdir -p "$install_dir"
 if is_termux; then
   log "Building in $checkout with the Termux Rust toolchain (killer is Linux-only and skipped)"
+  (cd "$checkout" && make install CARGO="${PREFIX}/bin/cargo" BINDIR="$install_dir")
 else
   log "Building in $checkout with its pinned Rust toolchain"
+  (cd "$checkout" && make install BINDIR="$install_dir")
 fi
-(cd "$checkout" && make install BINDIR="$install_dir")
 
 setup_path
 

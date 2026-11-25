@@ -827,45 +827,155 @@ pub struct HostPortOptions {
     pub trampoline: Option<PathBuf>,
 }
 
-/// The delegated cgroup root of the host port (PL-97 E3):
-/// `harw_job_runtime::host::resolve_delegated_root`, confirmed delegated by
-/// the host probe. A refused, missing or undelegated root means no cgroup
-/// (today's behaviour), logged once with the reason or hint.
+impl HostPortOptions {
+    /// The delegated cgroup root the host port built from these options
+    /// puts the job cgroups (`harw-job-<attempt>`) directly beneath
+    /// (PL-100 WP 3.5): resolved and probed exactly like
+    /// [`JobCommandPort::host_with`] does (`[jobs] cgroup_root` →
+    /// `HARW_CGROUP_ROOT` → own delegated cgroup, confirmed delegated by the
+    /// host probe).
+    ///
+    /// # Description
+    /// The composition root opens the `job.suspend` freezer over this root,
+    /// so it touches only cgroups the job runtime created there. Unlike the
+    /// port it logs nothing (the port already logged the outcome once).
+    /// When the executor of the port could not open the root and fell back
+    /// to no cgroup, jobs carry no proven cgroup and suspending them fails
+    /// closed in the job manager.
+    ///
+    /// # Returns
+    /// `None` when the root is refused, nothing resolves, or the root is not
+    /// a writable, delegated cgroup v2 directory.
+    ///
+    /// # Concurrency
+    /// Reads the process environment, `/proc/self/cgroup` and the cgroup
+    /// filesystem; no shared state.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # #[cfg(target_os = "linux")]
+    /// # fn main() {
+    /// let options = harw_command::HostPortOptions::default();
+    /// let _root: Option<std::path::PathBuf> = options.delegated_cgroup_root();
+    /// # }
+    /// # #[cfg(not(target_os = "linux"))]
+    /// # fn main() {}
+    /// ```
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn delegated_cgroup_root(&self) -> Option<PathBuf> {
+        match resolve_host_cgroup_root(self) {
+            HostCgroupRoot::Delegated { root, .. } => Some(root),
+            HostCgroupRoot::Refused(_)
+            | HostCgroupRoot::Unresolved { .. }
+            | HostCgroupRoot::NotDelegated { .. } => None,
+        }
+    }
+}
+
+/// How the delegated cgroup root of the host port resolved
+/// ([`resolve_host_cgroup_root`]), before anything is logged.
 #[cfg(target_os = "linux")]
-fn host_cgroup_root(options: &HostPortOptions) -> Option<PathBuf> {
+enum HostCgroupRoot {
+    /// A root the host probe confirmed as a delegated cgroup v2 root.
+    Delegated {
+        /// The root (absolute, on the cgroup v2 mount).
+        root: PathBuf,
+        /// Where it came from.
+        source: harw_job_runtime::host::RootSource,
+    },
+    /// The configured root was refused.
+    Refused(harw_job_runtime::host::DelegatedRootError),
+    /// Nothing resolved.
+    Unresolved {
+        /// The operator hint of the resolution.
+        hint: Option<String>,
+    },
+    /// The root is missing, not cgroup v2 or not writable.
+    NotDelegated {
+        /// The root (absolute, on the cgroup v2 mount).
+        root: PathBuf,
+        /// Where it came from.
+        source: harw_job_runtime::host::RootSource,
+    },
+}
+
+/// Resolves the delegated cgroup root of the host port (PL-97 E3) without
+/// logging: `harw_job_runtime::host::resolve_delegated_root`, confirmed
+/// delegated by the host probe.
+#[cfg(target_os = "linux")]
+fn resolve_host_cgroup_root(options: &HostPortOptions) -> HostCgroupRoot {
     use harw_job_runtime::host::{RootConfig, RootEnv, resolve_delegated_root};
     let config = RootConfig {
         cgroup_root: options.cgroup_root.clone(),
     };
     let resolution = match resolve_delegated_root(&config, &RootEnv::from_process()) {
         Ok(resolution) => resolution,
-        Err(error) => {
-            tracing::warn!(%error, "cgroup root refused; jobs run without their own cgroup");
-            return None;
-        }
+        Err(error) => return HostCgroupRoot::Refused(error),
     };
     let Some(root) = resolution.root else {
-        tracing::info!(
-            hint = resolution.hint.as_deref().unwrap_or_default(),
-            "command port without a delegated cgroup root"
-        );
-        return None;
+        return HostCgroupRoot::Unresolved {
+            hint: resolution.hint,
+        };
     };
     if harw_job::HostReport::probe_with_cgroup_root(Some(&root)).cgroup_v2_delegated {
-        tracing::info!(
-            root = %root.display(),
-            source = %resolution.source,
-            "command port delegated cgroup root"
-        );
-        Some(root)
+        HostCgroupRoot::Delegated {
+            root,
+            source: resolution.source,
+        }
     } else {
-        tracing::warn!(
-            root = %root.display(),
-            source = %resolution.source,
-            "cgroup root is not a delegated cgroup v2 root (missing or not writable); jobs run \
-             without their own cgroup"
-        );
-        None
+        HostCgroupRoot::NotDelegated {
+            root,
+            source: resolution.source,
+        }
+    }
+}
+
+/// The delegated cgroup root of the host port (PL-97 E3):
+/// [`resolve_host_cgroup_root`]. A refused, missing or undelegated root
+/// means no cgroup (today's behaviour), logged once with the reason or hint.
+#[cfg(target_os = "linux")]
+fn host_cgroup_root(options: &HostPortOptions) -> Option<PathBuf> {
+    match resolve_host_cgroup_root(options) {
+        HostCgroupRoot::Delegated { root, source } => {
+            tracing::info!(
+                root = %root.display(),
+                source = %source,
+                "command port delegated cgroup root"
+            );
+            Some(root)
+        }
+        HostCgroupRoot::Refused(error) => {
+            // No path at warn: the refusal names the refused value.
+            tracing::warn!(
+                reason = "refused",
+                "cgroup root refused; jobs run without their own cgroup"
+            );
+            tracing::debug!(error = %error, "command port cgroup root refused");
+            None
+        }
+        HostCgroupRoot::Unresolved { hint } => {
+            tracing::info!(
+                hint = hint.as_deref().unwrap_or_default(),
+                "command port without a delegated cgroup root"
+            );
+            None
+        }
+        HostCgroupRoot::NotDelegated { root, source } => {
+            // No path at warn; the root itself only at debug.
+            tracing::warn!(
+                reason = "not_delegated",
+                source = %source,
+                "cgroup root is not a delegated cgroup v2 root (missing or not writable); jobs run \
+                 without their own cgroup"
+            );
+            tracing::debug!(
+                root = %root.display(),
+                source = %source,
+                "command port cgroup root not delegated"
+            );
+            None
+        }
     }
 }
 
@@ -1733,6 +1843,63 @@ mod backend_tests {
         assert_eq!(
             executor.options().cgroup_root.as_deref(),
             Some(root.as_path())
+        );
+        std::fs::remove_dir_all(&dir).map_err(ctx("cleanup"))?;
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: for a configured root that is refused (relative),
+    /// missing or not delegated the accessor agrees with the port: no root,
+    /// so the composition root installs no `job.suspend` freezer.
+    #[test]
+    fn delegated_cgroup_root_is_none_for_an_unusable_config_root() -> TestResult {
+        for root in [
+            "relative/harw.slice",
+            "/tmp/harw-not-a-cgroup",
+            "/sys/fs/cgroup/harw-e3-does-not-exist.slice",
+        ] {
+            let options = HostPortOptions {
+                cgroup_root: Some(std::path::PathBuf::from(root)),
+                trampoline: None,
+            };
+            assert_eq!(options.delegated_cgroup_root(), None, "{root}");
+        }
+        Ok(())
+    }
+
+    /// PL-100 WP 3.5: the accessor returns the same delegated root the port
+    /// gives its executor, i.e. the parent of every job cgroup.
+    ///
+    /// Host-gated: set `HARW_TEST_CGROUP_ROOT` to a delegated cgroup v2
+    /// directory and run with `--ignored`. Ignored by default so a host
+    /// without one reports the test as ignored instead of passing it
+    /// silently; run with `--ignored`, a missing or undelegated root fails.
+    #[test]
+    #[ignore = "needs a delegated cgroup v2 root in HARW_TEST_CGROUP_ROOT"]
+    fn delegated_cgroup_root_is_the_root_of_the_executor() -> TestResult {
+        let root = std::env::var_os("HARW_TEST_CGROUP_ROOT")
+            .map(std::path::PathBuf::from)
+            .ok_or(TestError::Missing("HARW_TEST_CGROUP_ROOT"))?;
+        if !harw_job::HostReport::probe_with_cgroup_root(Some(&root)).cgroup_v2_delegated {
+            return Err(TestError::Missing(
+                "HARW_TEST_CGROUP_ROOT as a delegated cgroup v2 root",
+            ));
+        }
+        let dir = harw_test_support::unique_tmp_created("harw-command", "cgroup-accessor")
+            .map_err(ctx("tmp"))?;
+        let options = HostPortOptions {
+            cgroup_root: Some(root.clone()),
+            trampoline: None,
+        };
+        assert_eq!(
+            options.delegated_cgroup_root().as_deref(),
+            Some(root.as_path())
+        );
+        let port = JobCommandPort::host_with(&dir, &options).map_err(TestError::Unexpected)?;
+        let executor = port.runtime().coordinator().executor().host_executor();
+        assert_eq!(
+            executor.options().cgroup_root,
+            options.delegated_cgroup_root()
         );
         std::fs::remove_dir_all(&dir).map_err(ctx("cleanup"))?;
         Ok(())

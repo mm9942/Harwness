@@ -270,7 +270,10 @@ impl DiaryNav {
     /// Befehl, der die aktuelle Tagebuchansicht lädt.
     fn command(&self) -> String {
         if let Some(query) = &self.query {
-            return format!("{DIARY_SEARCH_COMMAND} {query}");
+            // Pass one literal value through the synthetic slash parser, even
+            // when the person searches for a quoted or option-looking string.
+            let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+            return format!("{DIARY_SEARCH_COMMAND} --query=\"{escaped}\"");
         }
         let agent = self
             .agent
@@ -2441,6 +2444,24 @@ mod tests {
     }
 
     #[test]
+    fn diary_overlay_keeps_flag_like_search_literal() -> TestResult {
+        let query = r#"--agent="x" \path"#.to_owned();
+        let nav = DiaryNav {
+            query: Some(query.clone()),
+            ..DiaryNav::default()
+        };
+        let parsed = crate::classify_input(&nav.command())?;
+        assert_eq!(
+            parsed,
+            crate::Invocation::Command {
+                name: "diary".to_owned(),
+                raw_args: vec!["search".to_owned(), format!("--query={query}")],
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn diary_search_agent_switch_and_jump() -> TestResult {
         let mut view = KnowledgeBrowser::new(KnowledgeKind::Diary);
         view.apply_data(&diary_day("root", "2026-09-24"));
@@ -2449,7 +2470,7 @@ mod tests {
         assert!(render_to_string(&view)?.contains("Suche: lock"));
         assert_eq!(
             fetch_text(view.on_key(key(KeyCode::Enter))).as_deref(),
-            Some("/diary search lock fehler")
+            Some(r#"/diary search --query="lock fehler""#)
         );
         view.apply_data(&json!({"query": "lock fehler", "truncated": true, "hits": [
             {"agent": "coder", "date": "2026-09-10", "time": "08:00:00", "trigger": "manual", "text": "lock fehler gefunden"},
@@ -2465,7 +2486,7 @@ mod tests {
         );
         assert_eq!(
             view.refresh_command().as_deref(),
-            Some("/diary search lock fehler")
+            Some(r#"/diary search --query="lock fehler""#)
         );
         // o springt in den Tag des Treffers (mit dessen Agent).
         assert_eq!(

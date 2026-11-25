@@ -31,6 +31,13 @@
 //! die Dialoge über das Kind-Relais zurück, die die Nutzerin abgeschaltet
 //! hat.
 //!
+//! Seit PL-100 Phase 4 (Bedrohung B22, Entscheidung O1) hängt jede Kette —
+//! Wurzel wie Kind — zuletzt eine [`DodTaintPolicy`] über ihrer eigenen
+//! Modus-Zelle an: nach einer DoD-Abfrage im Turn fragen Eingriffswerkzeuge
+//! nach, außer unter [`ApprovalMode::FullAccess`]. Der modusblinde Rückfall
+//! des Turn-Loops (`DodTaintPolicy::fallback_applies`) greift damit in
+//! keiner montierten Kette.
+//!
 //! # Nebenläufigkeit
 //! [`ApprovalChain`] hält nur `Arc`-Zeiger und eine [`ApprovalModeCell`];
 //! Klonen kopiert keine Innereien. Alle Handler sind `Send + Sync`.
@@ -43,6 +50,7 @@ use std::sync::Arc;
 
 use harw_config::ResolvedConfig;
 use harw_core::ConfigApprovalPolicy;
+use harw_core::policy::DodTaintPolicy;
 use harw_extension_api::allow_rules::{AllowRuleSet, RuleDecision};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
 use harw_extension_api::contributors::ApprovalHandlerKind;
@@ -301,7 +309,8 @@ fn child_default_policy(
 /// Die Freigabekette eines montierten Laufs, in Auswertungsreihenfolge.
 ///
 /// # Beschreibung
-/// Die Reihenfolge ist Config → Default → Ask-Auflösung → Responder:
+/// Die Reihenfolge ist Config → Default → Ask-Auflösung → Responder →
+/// DoD-Taint:
 /// 1. **Config** ([`ConfigApprovalPolicy`]) aus `[policy].require_approval_for`
 ///    — vorhanden genau dann, wenn die Liste nicht leer ist.
 /// 2. **Default** ([`DefaultApprovalPolicy`]) über der [`ApprovalModeCell`]
@@ -311,9 +320,23 @@ fn child_default_policy(
 /// 4. **Responder** — der interaktive Handler des Einstiegs; nur
 ///    [`AskResolution::Interactive`] darf einen mitbringen
 ///    (`RuntimeAssembly::new_root_session` weist jeden anderen ab).
+/// 5. **DoD-Taint** ([`DodTaintPolicy`], PL-100 Phase 4, Bedrohung B22,
+///    Entscheidung O1) über **derselben** [`ApprovalModeCell`] — immer
+///    vorhanden. Nach einem `dod.*`-Werkzeug im laufenden Turn fragt sie für
+///    `process.kill`, `host.sudo_exec` und jedes verändernde `job.*` nach,
+///    außer unter [`ApprovalMode::FullAccess`]. Ohne sie fiele der Turn-Loop
+///    auf seinen modusblinden Rückfall zurück, der auch unter Full Access
+///    fragt bzw. ablehnt (Verstoß gegen O1).
 ///
 /// Punkt 3 und 4 schließen einander aus: entweder jemand kann antworten, oder
 /// die Rückfrage wird deterministisch aufgelöst.
+///
+/// Der Platz des Responders gilt nur für einen Responder, der
+/// [`Self::for_root`] übergeben wird. Die Produktivmontage übergibt dort
+/// `None`; `RuntimeAssembly::new_root_session` hängt den Responder erst an
+/// die fertige Registry an (und `RuntimeAssembly::rights_snapshot` an den
+/// Snapshot). In Produktion lautet die Reihenfolge darum Config → Default →
+/// Ask-Auflösung → DoD-Taint → Responder.
 ///
 /// Die Reihenfolge ist Dokumentation, keine Priorität: `check_approval`
 /// befragt seit W1-05 **jeden** Handler und aggregiert `Deny` > `AskUser` >
@@ -339,8 +362,12 @@ pub struct ApprovalChain {
     /// Wer gefragt wird, wenn ein Handler [`harw_extension_api::ApprovalDecision::AskUser`]
     /// liefert; `None` in jedem Lauf, in dem niemand anwesend ist.
     responder: Option<Arc<dyn ApprovalHandler>>,
-    /// Der Freigabemodus dieses Laufs. Geteilt mit [`Self::default`], damit
-    /// eine Umschaltung sofort wirkt.
+    /// Die DoD-Taint-Politik über [`Self::mode`] (Entscheidung O1); in jeder
+    /// Kette genau einmal vorhanden, damit der modusblinde Rückfall des
+    /// Turn-Loops nie der Produktivpfad ist.
+    dod_taint: Arc<DodTaintPolicy>,
+    /// Der Freigabemodus dieses Laufs. Geteilt mit [`Self::default`] und
+    /// [`Self::dod_taint`], damit eine Umschaltung sofort wirkt.
     mode: ApprovalModeCell,
     /// Die geteilten Freigaberegeln dieses Laufs (Contract §2/§4). Geteilt
     /// mit [`Self::default`] (der [`DefaultApprovalPolicy`], die sie befragt)
@@ -395,7 +422,12 @@ impl ApprovalChain {
     ///
     /// # Rückgabe
     /// Die Kette in der Reihenfolge Config → Default → Ask-Auflösung →
-    /// Responder.
+    /// Responder (nur ein hier übergebener) → DoD-Taint. Ein Responder, den
+    /// erst `RuntimeAssembly::new_root_session` anhängt, landet hinter der
+    /// DoD-Taint-Politik; das ist unschädlich, weil `check_approval` jeden
+    /// Handler befragt und `Deny` > `AskUser` > `Allow` aggregiert. Die
+    /// [`DodTaintPolicy`] liest dieselbe `mode`-Zelle: unter
+    /// [`ApprovalMode::FullAccess`] fragt sie nie (Entscheidung O1).
     #[must_use]
     pub fn for_root(
         config: &ResolvedConfig,
@@ -418,6 +450,9 @@ impl ApprovalChain {
                 ConfigApprovalPolicy::new(config_tools.clone()).with_mode(mode.clone()),
             ))
         };
+        // Die Taint-Regel liest dieselbe Zelle wie die Standardpolitik:
+        // `/permissions set full` schaltet auch sie ab (Entscheidung O1).
+        let dod_taint = Arc::new(DodTaintPolicy::new().with_mode(mode.clone()));
 
         Self {
             ask: AskResolutionPolicy::new(ask, mode.clone(), config_policy.clone(), rules.clone())
@@ -429,6 +464,7 @@ impl ApprovalChain {
                 rules.clone(),
             )),
             responder,
+            dod_taint,
             mode,
             rules,
             auto: None,
@@ -566,6 +602,11 @@ impl ApprovalChain {
                 mandate,
             )),
             responder: None,
+            // Eigene Taint-Politik über der Folgezelle des Kindes: sie folgt
+            // dem Modus der Wurzel live (auch nach Full Access) wie die
+            // Kind-Standardpolitik. Den Taint selbst teilt sie nicht: die
+            // Politik liest ihn je Prüfung aus dem Turn des Kindes.
+            dod_taint: Arc::new(DodTaintPolicy::new().with_mode(child_mode.clone())),
             mode: child_mode,
             rules: self.rules.clone(),
             auto: self.auto.clone(),
@@ -588,8 +629,10 @@ impl ApprovalChain {
     ///
     /// # Rückgabe
     /// Config (falls vorhanden), dann Default, dann Ask-Auflösung (falls
-    /// vorhanden), dann Responder (falls vorhanden). Es werden nur
-    /// `Arc`-Zeiger geklont.
+    /// vorhanden), dann Responder (falls [`Self::for_root`] einen bekam),
+    /// zuletzt immer die DoD-Taint-Politik. Ein später von
+    /// `RuntimeAssembly::new_root_session` angehängter Responder steht in der
+    /// Registry hinter ihr. Es werden nur `Arc`-Zeiger geklont.
     #[must_use]
     pub fn handlers(&self) -> Vec<Arc<dyn ApprovalHandler>> {
         self.handlers_with_default(true)
@@ -601,7 +644,7 @@ impl ApprovalChain {
     /// - `with_default` (`bool`): `false` lässt [`DefaultApprovalPolicy`] aus,
     ///   weil die Zielregistry sie bereits trägt (siehe [`Self::install`]).
     fn handlers_with_default(&self, with_default: bool) -> Vec<Arc<dyn ApprovalHandler>> {
-        let mut handlers: Vec<Arc<dyn ApprovalHandler>> = Vec::with_capacity(4);
+        let mut handlers: Vec<Arc<dyn ApprovalHandler>> = Vec::with_capacity(5);
         if let Some(config) = &self.config {
             handlers.push(Arc::clone(config) as Arc<dyn ApprovalHandler>);
         }
@@ -614,6 +657,9 @@ impl ApprovalChain {
         if let Some(responder) = &self.responder {
             handlers.push(Arc::clone(responder));
         }
+        // Immer zuletzt: die Taint-Regel kann nur weiter einschränken
+        // (`AskUser` statt `Allow`), die Stelle ist daher Dokumentation.
+        handlers.push(Arc::clone(&self.dod_taint) as Arc<dyn ApprovalHandler>);
         handlers
     }
 
@@ -709,7 +755,12 @@ impl ApprovalChain {
     /// `"unnamed"`/[`ApprovalHandlerKind::Other`]. Der Responder wird
     /// dagegen gefragt: nur er selbst weiß, ob er ein TUI-Prompt
     /// ([`ApprovalHandlerKind::Interactive`]), ein Kanal
-    /// ([`ApprovalHandlerKind::Channel`]) oder etwas anderes ist.
+    /// ([`ApprovalHandlerKind::Channel`]) oder etwas anderes ist. Auch die
+    /// [`DodTaintPolicy`] benennt sich selbst
+    /// (`harw_core::policy::DOD_TAINT_POLICY_LABEL`,
+    /// [`ApprovalHandlerKind::Other`]); sie steht am Ende dieser Kette.
+    /// `RuntimeAssembly::rights_snapshot` hängt einen erst bei
+    /// `new_root_session` gesetzten Responder dahinter an.
     ///
     /// # Rückgabe
     /// Dieselbe Reihenfolge wie [`Self::handlers`]. Die Standardpolitik
@@ -719,7 +770,7 @@ impl ApprovalChain {
     /// derselben Zelle.
     #[must_use]
     pub fn snapshot(&self) -> Vec<(&'static str, ApprovalHandlerKind)> {
-        let mut entries: Vec<(&'static str, ApprovalHandlerKind)> = Vec::with_capacity(4);
+        let mut entries: Vec<(&'static str, ApprovalHandlerKind)> = Vec::with_capacity(5);
         if self.config.is_some() {
             entries.push((CONFIG_POLICY_LABEL, ApprovalHandlerKind::ConfigPolicy));
         }
@@ -730,6 +781,7 @@ impl ApprovalChain {
         if let Some(responder) = &self.responder {
             entries.push((responder.label(), responder.kind()));
         }
+        entries.push((self.dod_taint.label(), self.dod_taint.kind()));
         entries
     }
 
@@ -772,6 +824,8 @@ mod tests {
     use super::*;
     use crate::test_support::{TestError, TestResult};
     use harw_config::ResolvedConfig;
+    use harw_core::dod_taint::with_review_taint;
+    use harw_core::policy::DOD_TAINT_POLICY_LABEL;
     use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};
     use harw_extension_api::{ApprovalDecision, ExtFuture, ToolCall, ToolName};
     use std::task::{Context, Poll, Waker};
@@ -855,9 +909,10 @@ mod tests {
             vec![
                 (CONFIG_POLICY_LABEL, ApprovalHandlerKind::ConfigPolicy),
                 (DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy),
+                (DOD_TAINT_POLICY_LABEL, ApprovalHandlerKind::Other),
             ]
         );
-        assert_eq!(chain.handlers().len(), 2);
+        assert_eq!(chain.handlers().len(), 3);
     }
 
     /// Die Config-Politik greift auch dann, wenn die Standardpolitik das
@@ -887,15 +942,20 @@ mod tests {
     }
 
     /// Eine leere Liste erzeugt keinen Handler — kein Rauschen im Snapshot.
+    /// Es bleiben die Standardpolitik und die immer vorhandene
+    /// DoD-Taint-Politik.
     #[test]
     fn an_empty_policy_list_adds_no_config_handler() {
         let chain = root_chain(&[], ApprovalMode::Delegated);
 
         assert!(chain.config_policy_tools().is_empty());
-        assert_eq!(chain.handlers().len(), 1);
+        assert_eq!(chain.handlers().len(), 2);
         assert_eq!(
             chain.snapshot(),
-            vec![(DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy)]
+            vec![
+                (DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy),
+                (DOD_TAINT_POLICY_LABEL, ApprovalHandlerKind::Other),
+            ]
         );
     }
 
@@ -928,9 +988,10 @@ mod tests {
                 (CONFIG_POLICY_LABEL, ApprovalHandlerKind::ConfigPolicy),
                 (DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy),
                 ("test-responder", ApprovalHandlerKind::Interactive),
+                (DOD_TAINT_POLICY_LABEL, ApprovalHandlerKind::Other),
             ]
         );
-        assert_eq!(chain.handlers().len(), 3);
+        assert_eq!(chain.handlers().len(), 4);
     }
 
     /// Nutzerentscheidung 2026-09-24 (ersetzt G-009): `FullAccess` der
@@ -951,9 +1012,10 @@ mod tests {
         assert_eq!(child.mode().get(), ApprovalMode::FullAccess);
         assert_eq!(root.mode().get(), ApprovalMode::FullAccess);
 
-        // Config (geerbte Pflichtliste) und Default des Kindes erlauben.
+        // Config (geerbte Pflichtliste), Default und DoD-Taint des Kindes
+        // erlauben.
         let handlers = child.handlers();
-        assert_eq!(handlers.len(), 2, "ein Kind hat keinen Responder");
+        assert_eq!(handlers.len(), 3, "ein Kind hat keinen Responder");
         for tool in ["fs.write", "shell.exec", "process.kill", "host.sudo_exec"] {
             for handler in &handlers {
                 assert!(
@@ -1091,9 +1153,12 @@ mod tests {
 
         assert_eq!(
             child.snapshot(),
-            vec![(DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy)]
+            vec![
+                (DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy),
+                (DOD_TAINT_POLICY_LABEL, ApprovalHandlerKind::Other),
+            ]
         );
-        assert_eq!(child.handlers().len(), 1);
+        assert_eq!(child.handlers().len(), 2);
     }
 
     /// `install` registriert in genau der Reihenfolge aus [`ApprovalChain::handlers`].
@@ -1114,7 +1179,7 @@ mod tests {
         let registry = chain.install(ExtensionRegistryBuilder::default()).build();
         let handlers = registry.approval_handlers();
 
-        assert_eq!(handlers.len(), 3);
+        assert_eq!(handlers.len(), 4);
         assert!(
             matches!(
                 block_on(handlers[0].review(&call("fs.read")))?,
@@ -1134,6 +1199,11 @@ mod tests {
             ApprovalHandlerKind::Interactive,
             "Platz 2 gehört dem Responder"
         );
+        assert_eq!(
+            handlers.get(3).map(|handler| handler.label()),
+            Some(DOD_TAINT_POLICY_LABEL),
+            "Platz 3 gehört der DoD-Taint-Politik"
+        );
         Ok(())
     }
 
@@ -1147,12 +1217,17 @@ mod tests {
         let registry = chain.install(builder).build();
         let handlers = registry.approval_handlers();
 
-        assert_eq!(handlers.len(), 2);
+        assert_eq!(handlers.len(), 3);
         assert_eq!(handlers[0].kind(), ApprovalHandlerKind::Interactive);
         assert_eq!(
             handlers[1].label(),
             "unnamed",
             "die Standardpolitik benennt sich nicht selbst"
+        );
+        assert_eq!(
+            handlers.get(2).map(|handler| handler.label()),
+            Some(DOD_TAINT_POLICY_LABEL),
+            "die DoD-Taint-Politik steht hinter allem Vorhandenen"
         );
     }
 
@@ -1211,10 +1286,11 @@ mod tests {
                 vec![
                     (DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy),
                     (label, ApprovalHandlerKind::Other),
+                    (DOD_TAINT_POLICY_LABEL, ApprovalHandlerKind::Other),
                 ],
                 "{resolution:?}"
             );
-            assert_eq!(chain.handlers().len(), 2, "{resolution:?}");
+            assert_eq!(chain.handlers().len(), 3, "{resolution:?}");
         }
     }
 
@@ -1225,7 +1301,10 @@ mod tests {
         assert_eq!(chain.ask_resolution(), None);
         assert_eq!(
             chain.snapshot(),
-            vec![(DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy)]
+            vec![
+                (DEFAULT_POLICY_LABEL, ApprovalHandlerKind::DefaultPolicy),
+                (DOD_TAINT_POLICY_LABEL, ApprovalHandlerKind::Other),
+            ]
         );
     }
 
@@ -1367,8 +1446,9 @@ mod tests {
 
         let registry = chain.install_over_default(assembled).build();
 
-        // Standardpolitik (aus der Kette) + Config + Ask — keine vierte.
-        assert_eq!(registry.approval_handlers().len(), 3);
+        // Standardpolitik (aus der Kette) + Config + Ask + DoD-Taint — keine
+        // fünfte.
+        assert_eq!(registry.approval_handlers().len(), 4);
         assert_eq!(registry.approval_handlers().len(), chain.snapshot().len());
     }
 
@@ -1408,7 +1488,8 @@ mod tests {
         Ok(())
     }
 
-    /// Eine Registry anderer Gestalt bekommt die Grundlinie trotzdem.
+    /// Eine Registry anderer Gestalt bekommt die Grundlinie trotzdem (samt
+    /// DoD-Taint-Politik).
     #[test]
     fn install_over_default_still_adds_the_baseline_to_an_empty_registry() -> TestResult {
         let chain = root_chain(&[], ApprovalMode::Delegated);
@@ -1416,9 +1497,151 @@ mod tests {
             .install_over_default(ExtensionRegistryBuilder::default().build())
             .build();
 
-        assert_eq!(registry.approval_handlers().len(), 1);
+        assert_eq!(registry.approval_handlers().len(), 2);
         assert!(matches!(
             block_on(registry.approval_handlers()[0].review(&call("shell.exec")))?,
+            ApprovalDecision::AskUser(_)
+        ));
+        Ok(())
+    }
+
+    // ── PL-100 Phase 4 (B22, O1): DoD-Taint-Politik in der Kette ─────────────
+
+    /// Befragt `handler` so, wie `check_approval` es in einem Turn tut, in
+    /// dem schon ein `dod.*`-Werkzeug (etwa `dod.findings`) lief.
+    fn review_tainted(
+        handler: &Arc<dyn ApprovalHandler>,
+        call: &ToolCall,
+    ) -> TestResult<ApprovalDecision> {
+        block_on::<ApprovalDecision>(Box::pin(with_review_taint(true, handler.review(call))))
+    }
+
+    /// Die DoD-Taint-Politik einer Kette; es muss genau eine darin stehen.
+    fn dod_taint_handler(chain: &ApprovalChain) -> TestResult<Arc<dyn ApprovalHandler>> {
+        let policies: Vec<Arc<dyn ApprovalHandler>> = chain
+            .handlers()
+            .into_iter()
+            .filter(|handler| handler.label() == DOD_TAINT_POLICY_LABEL)
+            .collect();
+        let [policy] = policies.as_slice() else {
+            return Err(TestError::Unexpected(format!(
+                "erwartet genau eine DoD-Taint-Politik, gefunden {}",
+                policies.len()
+            )));
+        };
+        Ok(Arc::clone(policy))
+    }
+
+    /// Ob irgendein Handler von `handlers` `call` in einem getainteten Turn
+    /// zur Rückfrage macht.
+    fn any_asks_tainted(
+        handlers: &[Arc<dyn ApprovalHandler>],
+        call: &ToolCall,
+    ) -> TestResult<bool> {
+        handlers.iter().try_fold(false, |asks, handler| {
+            review_tainted(handler, call)
+                .map(|decision| asks || matches!(decision, ApprovalDecision::AskUser(_)))
+        })
+    }
+
+    /// Entscheidung O1 über die echte Kette: nach `dod.findings` im Turn
+    /// fragt `job.stop` im Auto-Modus nach — auch gegen eine gelernte
+    /// Allow-Regel —, unter Full Access fragt kein Handler der Kette. Die
+    /// Umschaltung über die Zelle der Wurzel wirkt sofort, in beide
+    /// Richtungen.
+    #[test]
+    fn full_access_after_a_dod_query_does_not_ask_for_job_stop_but_auto_does() -> TestResult {
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "job.stop".to_owned(),
+            pattern: None,
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Project,
+        });
+        let chain = ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::Interactive,
+            ApprovalModeCell::new(ApprovalMode::Delegated),
+            None,
+            rules,
+        );
+        let policy = dod_taint_handler(&chain)?;
+        let stop = call("job.stop");
+
+        // Auto-Modus ohne DoD-Abfrage im Turn: die Taint-Regel schweigt.
+        assert!(matches!(
+            block_on(policy.review(&stop))?,
+            ApprovalDecision::Allow
+        ));
+        // Auto-Modus nach `dod.findings`: die Taint-Regel fragt.
+        assert!(matches!(
+            review_tainted(&policy, &stop)?,
+            ApprovalDecision::AskUser(_)
+        ));
+        assert!(any_asks_tainted(&chain.handlers(), &stop)?);
+
+        // Full Access nach `dod.findings`: kein Handler der Kette fragt, auch
+        // nicht für die Host-Eingriffe.
+        chain.mode().set(ApprovalMode::FullAccess);
+        for tool in ["job.stop", "process.kill", "host.sudo_exec"] {
+            for handler in chain.handlers() {
+                assert!(
+                    matches!(
+                        review_tainted(&handler, &call(tool))?,
+                        ApprovalDecision::Allow
+                    ),
+                    "{tool} darf unter Full Access nach einer DoD-Abfrage nicht fragen \
+                     ({})",
+                    handler.label()
+                );
+            }
+        }
+
+        // Zurück auf `auto`: dieselbe montierte Politik fragt wieder.
+        chain.mode().set(ApprovalMode::Delegated);
+        assert!(matches!(
+            review_tainted(&policy, &stop)?,
+            ApprovalDecision::AskUser(_)
+        ));
+        Ok(())
+    }
+
+    /// Das Kind trägt eine eigene DoD-Taint-Politik über seiner Folgezelle:
+    /// es folgt der Wurzel live nach Full Access und zurück; ein lokales
+    /// `set` im Kind wirkt nur dort.
+    #[test]
+    fn a_child_dod_taint_policy_follows_the_root_mode_live() -> TestResult {
+        let root = root_chain(&[], ApprovalMode::Delegated);
+        let child = root.for_child();
+        let grandchild = child.for_child_with_mandate(None);
+        let stop = call("job.stop");
+
+        for (label, chain) in [("Kind", &child), ("Enkel", &grandchild)] {
+            let policy = dod_taint_handler(chain)?;
+            assert!(
+                matches!(
+                    review_tainted(&policy, &stop)?,
+                    ApprovalDecision::AskUser(_)
+                ),
+                "{label}: auto fragt nach einer DoD-Abfrage"
+            );
+            root.mode().set(ApprovalMode::FullAccess);
+            assert!(
+                matches!(review_tainted(&policy, &stop)?, ApprovalDecision::Allow),
+                "{label}: Full Access der Wurzel erreicht die Taint-Regel"
+            );
+            root.mode().set(ApprovalMode::Delegated);
+        }
+
+        // Ein lokal auf Full Access gesetztes Kind fragt nicht mehr, die
+        // Wurzel schon.
+        child.mode().set(ApprovalMode::FullAccess);
+        assert!(matches!(
+            review_tainted(&dod_taint_handler(&child)?, &stop)?,
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            review_tainted(&dod_taint_handler(&root)?, &stop)?,
             ApprovalDecision::AskUser(_)
         ));
         Ok(())

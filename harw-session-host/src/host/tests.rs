@@ -49,6 +49,8 @@ struct FakeDriver {
     admissions: std::sync::Mutex<Vec<crate::driver::ExecutionAdmission>>,
     /// Results returned (in order) instead of running a normal turn.
     failures: std::sync::Mutex<std::collections::VecDeque<Result<TurnOutcome, HostError>>>,
+    /// Sink of the most recent turn, kept to emit live events between legs.
+    last_sink: std::sync::Mutex<Option<Arc<dyn EventSink>>>,
 }
 
 impl FakeDriver {
@@ -64,7 +66,12 @@ impl FakeDriver {
             settings: std::sync::Mutex::new(Vec::new()),
             admissions: std::sync::Mutex::new(Vec::new()),
             failures: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            last_sink: std::sync::Mutex::new(None),
         }
+    }
+
+    fn sink(&self) -> Option<Arc<dyn EventSink>> {
+        self.last_sink.lock().ok().and_then(|sink| sink.clone())
     }
 
     fn script_failure(&self, result: Result<TurnOutcome, HostError>) {
@@ -128,6 +135,9 @@ impl TurnDriver for FakeDriver {
         sink: Arc<dyn EventSink>,
     ) -> DriverFuture<'_, TurnOutcome> {
         Box::pin(async move {
+            if let Ok(mut last) = self.last_sink.lock() {
+                *last = Some(Arc::clone(&sink));
+            }
             self.turns.fetch_add(1, Ordering::SeqCst);
             let scripted = self.failures.lock().ok().and_then(|mut f| f.pop_front());
             if let Some(result) = scripted {
@@ -253,6 +263,8 @@ fn submit(session: &SessionId, text: &str, msg: &str, head: Cursor) -> SubmitPar
         expect_head: head,
         client_msg_id: msg.into(),
         force: false,
+        images: Vec::new(),
+        rewind_before: None,
     }
 }
 
@@ -620,6 +632,74 @@ async fn reattach_replays_the_exact_durable_suffix() -> TestResult {
         }
     }
     assert_eq!(durable, vec![2, 3]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn attach_replays_across_hidden_durable_pages_without_stalling() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let transcripts = Arc::new(MemoryTranscripts::new());
+    let approvals = Arc::new(MemoryApprovals::new());
+    let driver = Arc::new(FakeDriver::new(
+        Arc::clone(&transcripts),
+        Arc::clone(&approvals),
+    ));
+    let mut config = HostConfig::new(dir.path().to_path_buf());
+    config.queue.max_frames = 4; // 2 transcript records per attach page
+    let host = SessionHost::open(config, driver.clone(), transcripts.clone(), approvals)?;
+    let phone = connect(&host, local(1, PermissionTier::Operator)).await?;
+    let session = phone.create(CreateParams::default()).await?.session_id;
+    driver.append_item(&session, "before");
+    for sequence in 1..=4 {
+        transcripts.append(TranscriptRecord::new(
+            session.clone(),
+            ThreadRef::from_str("root"),
+            sequence,
+            jiff::Timestamp::now(),
+            RecordKind::Turn,
+            serde_json::Value::Null,
+        ));
+    }
+    driver.append_item(&session, "after");
+
+    let mut projected = Cursor::default();
+    let mut items = Vec::new();
+    for (start, next) in [(0, 2), (2, 4), (4, 6)] {
+        let (ack, mut frames) = phone
+            .attach(AttachParams {
+                profile: StreamProfile::CompactReasoning,
+                ..attach(&session, Some(projected))
+            })
+            .await?;
+        assert_eq!(ack.replay_from.durable, start);
+        assert_eq!(ack.head.durable, 6);
+        loop {
+            let envelope = next_frame(&mut frames).await?;
+            match envelope.frame {
+                SessionFrame::Lagged { resume_from } => {
+                    // Android conservatively takes the older of its last
+                    // applied frame and the advertised re-attachment cursor.
+                    projected = projected.min(resume_from);
+                    assert_eq!(projected.durable, next, "page {start} stalled");
+                    assert!(next < ack.head.durable, "caught-up page must not lag");
+                    break;
+                }
+                SessionFrame::Presence { .. } => {
+                    projected = envelope.cursor;
+                    assert_eq!(next, ack.head.durable, "premature ready frame");
+                    assert_eq!(projected.durable, next);
+                    break;
+                }
+                SessionFrame::Turn(TurnEvent::ItemAdded { .. }) => {
+                    projected = envelope.cursor;
+                    items.push(projected.durable);
+                }
+                SessionFrame::Heartbeat => projected = envelope.cursor,
+                other => return Err(format!("unexpected attach frame: {other:?}").into()),
+            }
+        }
+    }
+    assert_eq!(items, [1, 6], "no missing or duplicate visible items");
     Ok(())
 }
 
@@ -1205,5 +1285,213 @@ async fn policy_invalidation_expires_detached_device_facts_and_allows_fresh_narr
         .ok_or("missing admission")?;
     assert_eq!(admission.maximum_tier(), PermissionTier::Observer);
     drop(fresh);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hello_grants_compact_reasoning_and_job_frames() -> TestResult {
+    let fx = fixture()?;
+    let connection = fx.host.connect(local(1, PermissionTier::Operator))?;
+    let ack = connection
+        .hello(HelloParams {
+            client_label: "phone".into(),
+            wire_minor: 2,
+            features: vec![
+                "compact_reasoning".into(),
+                "job_frames".into(),
+                "child_frames".into(),
+            ],
+            requested_caps: None,
+        })
+        .await?;
+    assert_eq!(
+        ack.features,
+        vec![
+            "compact_reasoning".to_owned(),
+            "job_frames".to_owned(),
+            "child_frames".to_owned()
+        ]
+    );
+    Ok(())
+}
+
+fn child_reasoning(session: &SessionId, text: &str) -> DriverEvent {
+    DriverEvent::Child {
+        agent: SessionId::new(),
+        parent: Some(session.clone()),
+        role: "explorer".into(),
+        event: TurnEvent::ReasoningDelta {
+            turn_id: TurnId::new(),
+            text: text.into(),
+        },
+    }
+}
+
+fn job_event(work_id: &str) -> DriverEvent {
+    DriverEvent::Job {
+        work_id: work_id.into(),
+        kind: "agent".into(),
+        state: "completed".into(),
+        summary: Some("explorer".into()),
+    }
+}
+
+#[tokio::test]
+async fn background_child_and_job_frames_reach_clients_after_the_turn() -> TestResult {
+    let fx = fixture()?;
+    let connection = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let session = connection.create(CreateParams::default()).await?.session_id;
+    let (_, mut frames) = connection.attach(attach(&session, None)).await?;
+    connection
+        .submit(submit(&session, "hi", "m1", Cursor::default()))
+        .await?;
+    wait_idle(&connection, &session).await?;
+
+    let sink = fx.driver.sink().ok_or("no sink captured")?;
+    sink.emit(child_reasoning(&session, "thinking"));
+    sink.emit(job_event("w-1"));
+
+    wait_for(&mut frames, |frame| {
+        matches!(frame, SessionFrame::Child { role, event: TurnEvent::ReasoningDelta { text, .. }, .. }
+            if text == "thinking" && role == "explorer")
+    })
+    .await?;
+    wait_for(&mut frames, |frame| {
+        matches!(frame, SessionFrame::Job { work_id, state, .. }
+            if work_id == "w-1" && state == "completed")
+    })
+    .await?;
+
+    // The turn is over: the ring is gone, so a late joiner replaying from the
+    // start of the generation must not see the after-turn frames again.
+    let viewer = connect(&fx.host, local(2, PermissionTier::Operator)).await?;
+    let (_, mut replayed) = viewer
+        .attach(attach(&session, Some(Cursor::default())))
+        .await?;
+    assert_no_side_frames(&mut replayed).await?;
+    Ok(())
+}
+
+/// Drain a freshly attached stream until it goes quiet; Child/Job frames are
+/// not allowed to show up in it.
+async fn assert_no_side_frames(source: &mut Box<dyn FrameSource>) -> TestResult {
+    while let Ok(next) = tokio::time::timeout(Duration::from_millis(150), source.next()).await {
+        let Some(envelope) = next? else { break };
+        assert!(
+            !matches!(
+                envelope.frame,
+                SessionFrame::Child { .. } | SessionFrame::Job { .. }
+            ),
+            "unexpected replayed frame: {:?}",
+            envelope.frame
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn child_frames_during_a_turn_are_ring_buffered_but_job_frames_are_not() -> TestResult {
+    let gate = Arc::new(Notify::new());
+    let gate_for_driver = Arc::clone(&gate);
+    let fx = fixture_with(move |driver| driver.gate = Some(gate_for_driver))?;
+    let owner = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let session = owner.create(CreateParams::default()).await?.session_id;
+    let (_, mut frames) = owner.attach(attach(&session, None)).await?;
+    owner
+        .submit(submit(&session, "hold", "m1", Cursor::default()))
+        .await?;
+    // The scripted delta is the last frame before the driver parks on the gate.
+    let delta = wait_for(&mut frames, |frame| {
+        matches!(frame, SessionFrame::Turn(TurnEvent::AssistantDelta { .. }))
+    })
+    .await?;
+
+    let sink = fx.driver.sink().ok_or("no sink captured")?;
+    sink.emit(child_reasoning(&session, "during"));
+    sink.emit(job_event("w-3"));
+    wait_for(
+        &mut frames,
+        |frame| matches!(frame, SessionFrame::Job { work_id, .. } if work_id == "w-3"),
+    )
+    .await?;
+
+    let viewer = connect(&fx.host, local(2, PermissionTier::Operator)).await?;
+    let (_, mut replayed) = viewer.attach(attach(&session, Some(delta.cursor))).await?;
+    let mut saw_child = false;
+    for _ in 0..16 {
+        let Ok(next) = tokio::time::timeout(Duration::from_millis(300), replayed.next()).await
+        else {
+            break;
+        };
+        let Some(envelope) = next? else { break };
+        match envelope.frame {
+            SessionFrame::Child {
+                event: TurnEvent::ReasoningDelta { text, .. },
+                ..
+            } if text == "during" => saw_child = true,
+            SessionFrame::Job { .. } => return Err("job frame was ring-buffered".into()),
+            _ => {}
+        }
+    }
+    assert!(saw_child, "child frame of an active turn must be replayed");
+
+    gate.notify_one();
+    wait_idle(&owner, &session).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_drops_child_reasoning_but_compact_reasoning_keeps_it() -> TestResult {
+    let fx = fixture()?;
+    let owner = connect(&fx.host, local(1, PermissionTier::Operator)).await?;
+    let viewer = connect(&fx.host, local(2, PermissionTier::Operator)).await?;
+    let session = owner.create(CreateParams::default()).await?.session_id;
+    owner
+        .submit(submit(&session, "hi", "m1", Cursor::default()))
+        .await?;
+    wait_idle(&owner, &session).await?;
+
+    let (_, mut compact) = owner
+        .attach(AttachParams {
+            profile: StreamProfile::Compact,
+            ..attach(&session, None)
+        })
+        .await?;
+    let (_, mut reasoning) = viewer
+        .attach(AttachParams {
+            profile: StreamProfile::CompactReasoning,
+            ..attach(&session, None)
+        })
+        .await?;
+
+    let sink = fx.driver.sink().ok_or("no sink captured")?;
+    sink.emit(child_reasoning(&session, "r"));
+    sink.emit(job_event("w-2"));
+
+    wait_for(&mut reasoning, |frame| {
+        matches!(frame, SessionFrame::Child { event: TurnEvent::ReasoningDelta { text, .. }, .. } if text == "r")
+    })
+    .await?;
+    wait_for(
+        &mut reasoning,
+        |frame| matches!(frame, SessionFrame::Job { work_id, .. } if work_id == "w-2"),
+    )
+    .await?;
+
+    let saw_reasoning = std::cell::Cell::new(false);
+    wait_for(&mut compact, |frame| {
+        if matches!(
+            frame,
+            SessionFrame::Child {
+                event: TurnEvent::ReasoningDelta { .. },
+                ..
+            }
+        ) {
+            saw_reasoning.set(true);
+        }
+        matches!(frame, SessionFrame::Job { work_id, .. } if work_id == "w-2")
+    })
+    .await?;
+    assert!(!saw_reasoning.get(), "compact must drop child reasoning");
     Ok(())
 }

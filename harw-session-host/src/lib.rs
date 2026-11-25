@@ -14,8 +14,12 @@
 //!
 //! Module map:
 //! - [`identity`]: who is calling and what they may do (never from payloads).
+//! - [`index`]: profile index rows and share settings for hosted sessions.
 //! - [`record`]: durable `HostedSessionRecord` files.
 //! - [`replay`]: transcript records → durable frames.
+//! - [`stepup`]: step-up for remote global writes (nonce, hash, expiry, audit).
+//! - [`ops`]: operations backend of the minor-4 `manage`/`stepup` methods (OpsPort).
+//! - [`overview`]: backend of the global `jobs.*`/`agents.*` views (feature `overview`).
 //! - [`live_ring`]: bounded live buffer of the running turn.
 //! - [`fanout`]: per-attachment bounded queues with coalescing and `Lagged`.
 //! - [`arbiter`]: per-session FIFO, compare-and-swap on the head, idempotency.
@@ -35,27 +39,44 @@
 pub mod agents;
 pub mod approvals;
 pub mod arbiter;
+#[allow(dead_code, reason = "archive admission and transport are not exposed in this isolated foundation")]
+pub(crate) mod archived_fork;
+mod cloud_library;
 pub mod driver;
 pub mod durable_approvals;
+pub mod cloud_assistant;
+pub mod membership;
 pub mod durable_replay;
 pub mod error;
 pub mod fanout;
 pub mod host;
 pub mod identity;
+pub mod index;
 pub mod live_ring;
+pub mod ops;
+pub mod overview;
+pub mod owner_creation;
+pub mod owner_readiness_contract;
 pub mod record;
 pub mod replay;
+pub mod stepup;
 pub mod tool_host;
 
 pub use agents::{AgentCredential, AgentRegistry, Delegation, ResolvedAgent};
 pub use durable_approvals::DurableApprovals;
 pub use durable_replay::DurableTranscripts;
 pub use error::HostError;
-pub use host::{HostConfig, HostConnection, SessionHost};
+pub use host::{
+    ClaimedOwnerObservation, CurrentOwnerPlacement, DirectOwnerPlacementAuthority, HostConfig, HostConnection,
+    OwnerObservationScope, OwnerObservationStatus, OwnerProcessPin, SessionHost,
+};
 pub use identity::{
     AgentPrincipal, ClientIdentity, ConnectionId, ToolGrant, ToolGrantError, caps_for_tier,
     gateway_caps_for_tier,
 };
+pub use index::{ProfileIndex, ProfileRow, ProfileShare, ShareMode, ShareSettings};
+pub use ops::{OpsCaller, OpsPort, OpsRun, OpsSession, SessionAction, tier_for_caps};
+pub use record::CreateOutcome;
 pub use tool_host::{
     GatewaySandbox, NoGatewaySandbox, SessionScope, ToolApprovalIssuer, ToolHost, ToolHostBuilder,
     ToolRegistration, WorkspaceGatewaySandbox, WorkspaceSandboxConfig,

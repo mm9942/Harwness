@@ -30,7 +30,8 @@ use crate::RemoteError;
 pub struct HostAlias {
     /// Operator-chosen alias name.
     pub alias: String,
-    /// Locator: `unix:<path>` or `node:<host:port>`.
+    /// Locator: `unix:<path>`, `node:<v3.onion:port>`, or explicitly opted-in `node-direct:<host:port>`.
+    /// Legacy direct `node:` locators still load, but the CLI refuses to dial them.
     pub endpoint: String,
     /// Node id the host must prove (node endpoints only).
     pub expected_node: Option<String>,
@@ -143,7 +144,9 @@ pub fn validate_record(record: &HostAlias) -> Result<(), RemoteError> {
                 "expected_node applies to node endpoints only",
             ));
         }
-    } else if let Some(authority) = endpoint.strip_prefix("node:") {
+    } else if let Some(authority) = endpoint.strip_prefix("node:")
+        .or_else(|| endpoint.strip_prefix("node-direct:"))
+    {
         validate_node_authority(authority)?;
         match record.expected_node.as_deref() {
             Some(node) => validate_node_id(node)?,
@@ -157,7 +160,7 @@ pub fn validate_record(record: &HostAlias) -> Result<(), RemoteError> {
     } else {
         return Err(state_err(
             "invalid endpoint",
-            "expected `unix:<path>` or `node:<host:port>`",
+            "expected `unix:<path>`, `node:<v3.onion:port>`, or `node-direct:<host:port>`",
         ));
     }
     Ok(())

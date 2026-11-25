@@ -28,6 +28,13 @@
 //! canonical cell by identity ([`SegmentGeometry`]). Back at the tail, ranking
 //! resumes.
 //!
+//! # Body bound
+//! Every live cell shows the tail of its run's child block, bounded by
+//! `body_rows` with a `… N lines above` row. The one exception is a
+//! `root-orchestrator` run (owner decision 2026-11-22): its cell is
+//! uncapped, grows with its content, never shows that row and is scrolled by
+//! the normal chat scroll.
+//!
 //! # Display only
 //! The projection never touches the canonical cell vector, the export
 //! (`export_capture.rs`, `export_entries`), session persistence, model
@@ -51,7 +58,7 @@ use super::live_order_glue::{self, ChildActivity};
 use super::{ChatApp, Role, ToolCellHandle};
 use crate::agent_monitor::{AgentLive, AgentPhase};
 use crate::chat_scroll::{CellAnchor, CellId};
-use crate::child_stream::{ChildStreamMode, SharedChildBlock};
+use crate::child_stream::{ChildStreamMode, SharedChildBlock, uncapped_role};
 use crate::history_cell::{HistoryCell, ToolVerbosity};
 use crate::live_ranker::{ActivityTier, LiveActivityRanker, LiveCandidate, RankerConfig};
 use crate::sanitize::sanitize_inline;
@@ -539,8 +546,25 @@ fn body_rows(history_rows: u16) -> usize {
     (usize::from(history_rows) / 4).clamp(LIVE_CELL_MIN_BODY, LIVE_CELL_MAX_BODY)
 }
 
+/// Body rows of the virtual live cell of `slot`.
+///
+/// # Description
+/// A `root-orchestrator` run is uncapped (owner decision 2026-11-22): its
+/// cell grows with the chat and is scrolled by the normal chat scroll, so it
+/// never gets a `… N lines above` row. Its child block is uncapped by the
+/// same rule ([`crate::child_stream::uncapped_role`]). Every other run keeps
+/// the compact [`body_rows`] bound.
+fn slot_body_rows(slot: &LiveSlot, history_rows: u16) -> usize {
+    if uncapped_role(&slot.role) {
+        usize::MAX
+    } else {
+        body_rows(history_rows)
+    }
+}
+
 /// Lines of one virtual live cell: header (`◆ live · role · phase`, plus the
-/// pinned marker) and the bounded tail of the run's child block.
+/// pinned marker) and the tail of the run's child block, at most `max_body`
+/// rows (`usize::MAX`: all of it).
 fn live_cell_lines(
     slot: &LiveSlot,
     block: Option<&SharedChildBlock>,
@@ -619,6 +643,11 @@ impl ChatApp {
 
     /// Tracks a child block about to be appended as canonical cell (hook of
     /// the child stream glue).
+    ///
+    /// A `root-orchestrator` block arrives here already uncapped
+    /// ([`crate::child_stream::ChildStreamRegistry::attach_root_child`] sets
+    /// it before replaying early events); its live cell is uncapped by
+    /// [`slot_body_rows`].
     pub(super) fn track_live_child_block(
         &mut self,
         child_id: &str,
@@ -782,7 +811,7 @@ impl ChatApp {
                     self.agent_monitor.agent(&slot.run_id),
                     width,
                     theme,
-                    body_rows(history_rows),
+                    slot_body_rows(slot, history_rows),
                 ),
             });
         }
@@ -920,6 +949,7 @@ mod tests {
                     arguments: serde_json::json!({ "path": "src/lib.rs", "content": "x" }),
                 },
                 timeout: Duration::from_secs(600),
+                reason: None,
             })
             .ok_or(TestError::Missing("Frage zugestellt"))?;
         child_approvals::poll(app);
@@ -962,10 +992,14 @@ mod tests {
     }
 
     fn bus(app: &mut ChatApp, id: &str, event: TurnEvent) {
+        bus_as(app, id, role_names::ROOT_ORCHESTRATOR, event);
+    }
+
+    fn bus_as(app: &mut ChatApp, id: &str, role: &str, event: TurnEvent) {
         let event = AgentEvent {
             agent: SessionId::from_str(id),
             parent: Some(app.session_id().clone()),
-            role: role_names::ROOT_ORCHESTRATOR.to_owned(),
+            role: role.to_owned(),
             kind: AgentEventKind::Turn(event),
         };
         app.agent_monitor.apply(&event);
@@ -979,21 +1013,30 @@ mod tests {
     /// Eintrag im Hintergrund-Register, `ChildSpawned` der Wurzel
     /// (Agent-Zeile + Block), dann ein erstes Bus-Ereignis.
     fn spawn(app: &mut ChatApp, id: &str, text: &str) -> TestResult {
+        spawn_as(app, id, role_names::ROOT_ORCHESTRATOR, text)
+    }
+
+    /// Wie [`spawn`], aber mit frei gewählter Rolle des Hintergrund-Laufs.
+    fn spawn_as(app: &mut ChatApp, id: &str, role: &str, text: &str) -> TestResult {
         let registered = spawner(app)?.background_children().register(
             &SessionId::from_str(id),
             app.session_id(),
-            role_names::ROOT_ORCHESTRATOR,
+            role,
             Some("Baue X"),
         );
         if !registered {
             return Err(TestError::Missing("neuer Hintergrund-Lauf"));
         }
-        spawn_foreground(app, id, text)
+        spawn_foreground_as(app, id, role, text)
     }
 
     /// Startet ein synchrones Kind (Worker, `background:false`-Übergabe):
     /// Block im Verlauf, aber kein Eintrag im Hintergrund-Register.
     fn spawn_foreground(app: &mut ChatApp, id: &str, text: &str) -> TestResult {
+        spawn_foreground_as(app, id, role_names::ROOT_ORCHESTRATOR, text)
+    }
+
+    fn spawn_foreground_as(app: &mut ChatApp, id: &str, role: &str, text: &str) -> TestResult {
         let mut state = TurnEventState::default();
         if !handle_turn_event(
             app,
@@ -1001,15 +1044,16 @@ mod tests {
             TurnEvent::ChildSpawned {
                 turn_id: TurnId::new(),
                 child: SessionId::from_str(id),
-                role: role_names::ROOT_ORCHESTRATOR.to_owned(),
+                role: role.to_owned(),
                 question: Some("Baue X".to_owned()),
             },
         ) {
             return Err(TestError::Missing("ChildSpawned behandelt"));
         }
-        bus(
+        bus_as(
             app,
             id,
+            role,
             TurnEvent::AssistantDelta {
                 turn_id: TurnId::new(),
                 text: text.to_owned(),
@@ -1450,12 +1494,13 @@ mod tests {
     fn short_terminals_get_one_bounded_live_cell() -> TestResult {
         let mut app = bg_app()?;
         app.push_line(Role::User, "los");
-        spawn(&mut app, "run-1", "eins")?;
-        spawn(&mut app, "run-2", "zwei")?;
+        spawn_as(&mut app, "run-1", role_names::CODING_ORCHESTRATOR, "eins")?;
+        spawn_as(&mut app, "run-2", role_names::CODING_ORCHESTRATOR, "zwei")?;
         let long: String = (0..60).map(|index| format!("zeile {index}\n")).collect();
-        bus(
+        bus_as(
             &mut app,
             "run-1",
+            role_names::CODING_ORCHESTRATOR,
             TurnEvent::AssistantDelta {
                 turn_id: TurnId::new(),
                 text: long,
@@ -1474,6 +1519,72 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Owner-Entscheidung 2026-11-22: die Live-Zelle des
+    /// `root-orchestrator` zeigt alle Zeilen ihres Blocks und nie die
+    /// `… N lines above`-Zeile; jeder andere Lauf bleibt kompakt begrenzt.
+    fn tool_events(app: &mut ChatApp, id: &str, role: &str, count: usize) {
+        for index in 0..count {
+            bus_as(
+                app,
+                id,
+                role,
+                TurnEvent::ToolCallRequested {
+                    turn_id: TurnId::new(),
+                    call_id: ToolCallId::new(),
+                    tool_name: "fs.write".to_owned(),
+                    arguments: serde_json::json!({
+                        "path": format!("f{index}.rs"),
+                        "content": "x",
+                    }),
+                },
+            );
+        }
+    }
+
+    fn live_segment_lines(app: &ChatApp, id: &str) -> TestResult<Vec<String>> {
+        let p = projection(app, Instant::now());
+        let segments = app.history_segments(&p, 100, style::Theme::Dark, 40);
+        let segment = segments
+            .iter()
+            .find(|segment| matches!(&segment.id, SegmentId::Live(run) if run == id))
+            .ok_or(TestError::Missing("Live-Zelle"))?;
+        Ok(segment.lines.iter().map(line_text).collect())
+    }
+
+    #[test]
+    fn root_orchestrator_live_cell_is_uncapped_without_hidden_row() -> TestResult {
+        let mut app = bg_app()?;
+        app.push_line(Role::User, "los");
+        spawn(&mut app, "run-r", "start")?;
+        tool_events(&mut app, "run-r", role_names::ROOT_ORCHESTRATOR, 40);
+        let lines = live_segment_lines(&app, "run-r")?;
+        assert!(
+            lines.len() > 40,
+            "alle 40 Tool-Ereignisse sichtbar: {}",
+            lines.len()
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("lines above")),
+            "keine Versteckt-Zeile: {lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_root_live_cell_keeps_the_hidden_lines_row() -> TestResult {
+        let mut app = bg_app()?;
+        app.push_line(Role::User, "los");
+        spawn_as(&mut app, "run-w", role_names::CODING_ORCHESTRATOR, "start")?;
+        tool_events(&mut app, "run-w", role_names::CODING_ORCHESTRATOR, 40);
+        let lines = live_segment_lines(&app, "run-w")?;
+        assert!(
+            lines.iter().any(|line| line.contains("lines above")),
+            "Versteckt-Zeile fehlt: {lines:?}"
+        );
+        assert!(lines.len() <= 1 + LIVE_CELL_MAX_BODY, "{lines:?}");
         Ok(())
     }
 

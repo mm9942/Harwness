@@ -134,6 +134,8 @@ fn titled(title: &str) -> CreateParams {
     CreateParams {
         workspace: None,
         title: Some(title.to_owned()),
+    fork_from: None,
+        fork_from: None,
     }
 }
 
@@ -171,6 +173,8 @@ async fn turn_round_trip(port: &RemotePort, title: &str) -> TestResult {
             expect_head: ack.head,
             client_msg_id: format!("m-{title}"),
             force: false,
+            images: Vec::new(),
+            rewind_before: None,
         })
         .await?;
     assert!(
@@ -287,6 +291,8 @@ async fn a_resubmitted_message_after_a_reconnect_does_not_run_twice() -> TestRes
         expect_head: head,
         client_msg_id: id.to_owned(),
         force: false,
+        images: Vec::new(),
+        rewind_before: None,
     };
     let accepted = first.submit(submit(ack.head, "same-id")).await?;
     assert!(

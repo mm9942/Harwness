@@ -31,6 +31,38 @@
 //! runner share. The table is informational: it never changes the exit
 //! code of `doctor`.
 //!
+//! # Triage model (PL-100 WP 1.9)
+//! `model show|set <provider>/<model>|clear` (a bare `model` is `show`)
+//! reads or changes `[dod.triage] model` in the home layer
+//! (`<home>/config.toml`) through `harw_ops::dod_model`, so the output equals
+//! `/dod model`. `set` and
+//! `clear` are refused under `sudo` (exit 3): the resolved home would be
+//! root's, or a user's home would get a root-owned `0600` config file.
+//! `show` re-reads the configuration and also states the provider locality
+//! (`lokal`/`remote`/`unbekannt`) and the notify fallback without a model;
+//! it fails (exit 1) when the harw home does not exist and notes under
+//! `sudo` that the home shown is root's. None of this is a model tool; only
+//! a human at the terminal runs it. `doctor` ends with the triage lines of
+//! `harw_ops::dod::triage_checks` read from the same home: model, provider
+//! locality and whether the provider is enabled, limits, the egress
+//! allowlist of the active `/etc/harw-dod` profile (`triage blockiert:
+//! egress_allow_cidrs leer → effektiv notify`), the configured and effective
+//! watch mode, `autoconnect` and `tui_tty` (`schwächere Bindung, nur
+//! Freeze/Thaw`). Under `sudo` the home would be root's, so the doctor
+//! leaves these lines out and says why (`triage-config`,
+//! `harw_ops::dod::TRIAGE_CONFIG_SUDO`); the egress line stays, because only
+//! root can read the system configuration. Without an existing harw home
+//! (e.g. a mistyped `--home`) the defaults would read as real settings, so
+//! the doctor does the same with `harw_ops::dod::TRIAGE_CONFIG_NO_HOME`,
+//! like `model show` refuses that state. They are never MISS and do not
+//! change the exit code.
+//!
+//! All triage views read the home and its active profile only
+//! (`harw_ops::dod_model::trusted_config`), never the project of the working
+//! directory: `[dod.triage]` and the provider of the triage model count only
+//! from these layers (threats B14/B15), and they are what the per-host
+//! `harw-dod-watch` reads.
+//!
 //! # Service control (root only)
 //! The mutating actions mirror `harw-dod/Makefile` and `harw-dod/scripts/service.sh`
 //! step by step; they only call `systemctl` and write the one Warden flag
@@ -44,7 +76,18 @@
 //! | `warden enable` | `install -d -m 0750 /etc/harw-dod` (only when missing), create `/etc/harw-dod/warden.enable`, `systemctl daemon-reload`, `systemctl enable --now harw-warden.socket` |
 //! | `warden disable` | `systemctl disable --now harw-warden.socket harw-warden.service`, remove the flag file |
 //!
-//! `warden disable` has no Makefile target; it undoes `enable-warden`.
+//! `warden disable` has no Makefile target; it undoes `enable-warden`. A
+//! test compares the `systemctl` calls of `enable`, `restart` and `disable`
+//! with the `"$systemctl_bin"` lines of the matching `service.sh` arms.
+//!
+//! `disable` deliberately does not name the opt-in
+//! `harw-probe-netlink.service` (PL-100 WP1.8): its `PartOf=harw-dod.target`
+//! stops it together with the target, and its only `[Install]` edge is
+//! `WantedBy=harw-dod.target`, so nothing starts it at boot while the target
+//! is disabled; an operator's enablement survives for the next `enable`.
+//! Naming it in the first, failure-fatal call would make `disable` fail
+//! (and skip the Warden step) on a host whose installed package predates
+//! the netlink unit file.
 //!
 //! # Exit codes (PL-95 §3.4)
 //! 0 ok, 1 failure, 2 usage (clap), 3 refused: not root, or no valid
@@ -63,7 +106,7 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use harw_config::DodSection;
+use harw_config::{DodSection, DodWatchMode};
 use harw_dod_client::{
     ChainBinary, ChainDod, ChainHost, ChainInputs, ChainRoot, ConfigReport, DodClientContext,
     DodClientError, DodStatus, ExecutionChainReport, ExportState, ProfileCoverage, ServeWorkspace,
@@ -75,11 +118,13 @@ use harw_job_runtime::host::{
     resolve_delegated_root_with,
 };
 use harw_ops::dod as ops;
+use harw_ops::dod_model;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::cli::{
-    DodAction, DodConfigAction, DodFindingsArgs, DodSeverity, DodWardenAction, GlobalArgs,
+    DodAction, DodConfigAction, DodFindingsArgs, DodModelAction, DodSeverity, DodWardenAction,
+    GlobalArgs,
 };
 use crate::output::Printer;
 
@@ -92,7 +137,11 @@ pub(crate) const EXIT_USAGE: i32 = 2;
 /// Exit code: refused (not root, no valid `active_profile`).
 pub(crate) const EXIT_REFUSED: i32 = 3;
 
-/// Units stopped by `disable` (`service.sh disable`, first call).
+/// Units stopped by `disable` (`service.sh disable`, first call; a test
+/// keeps both equal). The opt-in `harw-probe-netlink.service` is
+/// deliberately missing: `PartOf=harw-dod.target` stops it with the target,
+/// and a unit file that an older installed package does not ship would make
+/// this whole failure-fatal call fail (see the module docs).
 const OBSERVATION_UNITS: [&str; 4] = [
     "harw-dod.target",
     "harw-sentinel.service",
@@ -133,6 +182,9 @@ impl Outcome {
 pub(crate) trait System {
     /// Effective uid of this process.
     fn euid(&self) -> u32;
+    /// Whether this process runs as root through `sudo` (real uid 0 and
+    /// `SUDO_UID` set).
+    fn under_sudo(&self) -> bool;
     /// Runs `systemctl <args>`; `Err` with a bounded reason when it cannot
     /// be started or exits non-zero.
     fn systemctl(&mut self, args: &[&str]) -> Result<(), String>;
@@ -144,6 +196,10 @@ struct HostSystem;
 impl System for HostSystem {
     fn euid(&self) -> u32 {
         rustix::process::geteuid().as_raw()
+    }
+
+    fn under_sudo(&self) -> bool {
+        rustix::process::getuid().as_raw() == 0 && std::env::var_os("SUDO_UID").is_some()
     }
 
     fn systemctl(&mut self, args: &[&str]) -> Result<(), String> {
@@ -185,6 +241,10 @@ pub(crate) struct DodEnv {
     pub(crate) cgroup_root: Result<RootResolution, String>,
     /// `[dod] allowed_cgroup_prefixes` of the harw config.
     pub(crate) allowed_cgroup_prefixes: Vec<String>,
+    /// PL-100 WP0.3: the effective `[dod.watch]` mode of the harw config
+    /// ([`DodSection::effective_watch_mode`]); `doctor` refuses `triage`
+    /// while the active Harw-DoD profile allows no egress CIDR.
+    pub(crate) watch_mode: DodWatchMode,
     /// The cgroups of the harw service units ([`service_root_candidates`])
     /// and whether each exists; shown when no root resolves.
     pub(crate) root_candidates: Vec<(PathBuf, bool)>,
@@ -261,6 +321,7 @@ fn host_env(home_override: Option<PathBuf>) -> DodEnv {
             (path, exists)
         })
         .collect();
+    let watch_mode = section.effective_watch_mode();
     DodEnv {
         client: ops::client_context(&home, &section, OffsetDateTime::now_utc()),
         doctor: ops::DoctorEnv::host(),
@@ -268,6 +329,7 @@ fn host_env(home_override: Option<PathBuf>) -> DodEnv {
         notes,
         cgroup_root,
         allowed_cgroup_prefixes: section.allowed_cgroup_prefixes,
+        watch_mode,
         root_candidates,
         service_root,
         chain: Some(Box::new(move |root| {
@@ -333,6 +395,28 @@ pub(crate) fn execute(action: DodAction, env: &DodEnv, system: &mut dyn System) 
                 &mut report,
                 cgroup_root_checks(&root, &env.allowed_cgroup_prefixes, &snapshot.status.config),
             );
+            add_checks(
+                &mut report,
+                egress_allowlist_checks(env.watch_mode, &snapshot.status.config),
+            );
+            // PL-100 WP 1.9 / WP 0.3: die Triage-Zeilen aus der Config des
+            // Homes (wie `harw dod model show`); nie MISS, also ohne
+            // Einfluss auf den Exit-Code. Unter sudo wäre das Home das von
+            // root, ohne Home (z. B. `--home` vertippt) läsen sich die
+            // Vorgaben wie echte Einstellungen: dann nur der Hinweis und
+            // die Egress-Zeile.
+            let triage = if system.under_sudo() {
+                ops::triage_checks_without_config(ops::TRIAGE_CONFIG_SUDO, &snapshot.status.config)
+            } else if !env.client.harw_home.is_dir() {
+                ops::triage_checks_without_config(
+                    ops::TRIAGE_CONFIG_NO_HOME,
+                    &snapshot.status.config,
+                )
+            } else {
+                let settings = triage_settings(&env.client.harw_home).ok();
+                ops::triage_checks(settings.as_ref(), &snapshot.status.config)
+            };
+            add_checks(&mut report, triage);
             let code = if report.passed() {
                 EXIT_OK
             } else {
@@ -387,6 +471,8 @@ pub(crate) fn execute(action: DodAction, env: &DodEnv, system: &mut dyn System) 
             DodWardenAction::Disable => warden_disable(env, system),
         },
         DodAction::Install { print_systemd } => install(print_systemd),
+        // A bare `harw dod model` shows, like `/dod model`.
+        DodAction::Model { action } => model(env, system, &action.unwrap_or(DodModelAction::Show)),
     }
 }
 
@@ -832,6 +918,49 @@ fn cgroup_root_checks(
         )
     });
     checks
+}
+
+/// The PL-100 WP0.3 `egress-allowlist` doctor check.
+///
+/// # Description
+/// While the effective `[dod.watch]` mode is `triage`, an empty
+/// `egress_allow_cidrs` list in the active Harw-DoD profile is a missing
+/// prerequisite: the sentinel's network scope is then empty, every outgoing
+/// connection is a High finding, and each one would start an automatic
+/// triage run. A configuration without a valid active profile counts as an
+/// empty list. Any other mode adds no check.
+///
+/// # Returns
+/// No check, or exactly one `egress-allowlist` check (`Ok` with the CIDR
+/// count, or `Miss`).
+fn egress_allowlist_checks(mode: DodWatchMode, config: &ConfigReport) -> Vec<ops::DoctorCheck> {
+    use ops::CheckLevel::{Miss, Ok as Pass};
+    if mode != DodWatchMode::Triage {
+        return Vec::new();
+    }
+    let allowed = match config {
+        ConfigReport::Valid {
+            active_profile: Some(profile),
+            ..
+        } => profile.egress_allow_cidrs,
+        _ => 0,
+    };
+    let check = if allowed > 0 {
+        doctor_check(
+            "egress-allowlist",
+            Pass,
+            &format!("{allowed} egress CIDR(s) allowed for [dod.watch] mode = \"triage\""),
+        )
+    } else {
+        doctor_check(
+            "egress-allowlist",
+            Miss,
+            "[dod.watch] mode = \"triage\" needs a non-empty egress_allow_cidrs list in the \
+             active Harw-DoD profile (otherwise every egress flow is a High finding); add the \
+             allowed networks or set [dod.watch] mode = \"notify\"",
+        )
+    };
+    vec![check]
 }
 
 // ── PL-97 E5: execution chain ───────────────────────────────────────────────
@@ -1516,6 +1645,102 @@ fn install(print_systemd: Option<Option<String>>) -> Outcome {
     }
 }
 
+/// The triage settings of `home` and its active profile only
+/// (`dod_model::trusted_config`), independent of the working directory: a
+/// project can neither set `[dod.triage]` nor redefine its provider (threats
+/// B14/B15). `Err` with a fixed text (config errors may quote config lines or
+/// paths).
+fn triage_settings(home: &Path) -> Result<dod_model::TriageSettings, &'static str> {
+    const UNREADABLE: &str = "the harw configuration could not be read (see `harw doctor`)";
+    let profile = harw_home::profile_dir(home, &harw_home::active_profile_name(home))
+        .map_err(|_| UNREADABLE)?;
+    dod_model::trusted_triage_settings(home, &profile).map_err(|_| UNREADABLE)
+}
+
+/// Exit code of a failed `harw dod model` action.
+fn model_error_code(error: &harw_operations::OpError) -> i32 {
+    match error {
+        harw_operations::OpError::InvalidArguments(_) => EXIT_USAGE,
+        _ => EXIT_FAILURE,
+    }
+}
+
+/// `harw dod model show|set|clear` (PL-100 WP 1.9): the home layer of
+/// `env.client.harw_home`; `show` fails without an existing home and notes
+/// `sudo`, `set`/`clear` refuse under `sudo`.
+fn model(env: &DodEnv, system: &dyn System, action: &DodModelAction) -> Outcome {
+    const HOME_MISSING: &str = "harw home does not exist; nothing to show";
+    let home = env.client.harw_home.as_path();
+    let requested = match action {
+        DodModelAction::Show if !home.is_dir() => {
+            // Without a home the defaults would read as "no model set".
+            return Outcome::new(
+                EXIT_FAILURE,
+                HOME_MISSING,
+                json!({ "action": "show", "ok": false, "error": HOME_MISSING }),
+            );
+        }
+        DodModelAction::Show => {
+            return match triage_settings(home) {
+                Ok(settings) => {
+                    let mut text = dod_model::model_text(&settings);
+                    let mut view = dod_model::model_view(&settings);
+                    if system.under_sudo() {
+                        text.push_str(
+                            "\nnote: under sudo this is root's harw home (or --home), not the \
+                             invoking user's; run without sudo to see yours",
+                        );
+                        if let Some(object) = view.as_object_mut() {
+                            object.insert("under_sudo".to_owned(), json!(true));
+                        }
+                    }
+                    Outcome::new(EXIT_OK, text, view)
+                }
+                Err(reason) => Outcome::new(
+                    EXIT_FAILURE,
+                    reason,
+                    json!({ "action": "show", "ok": false, "error": reason }),
+                ),
+            };
+        }
+        DodModelAction::Set { model } => match dod_model::parse_model_ref(model) {
+            Ok(model) => Some(model),
+            Err(error) => {
+                return Outcome::new(
+                    EXIT_USAGE,
+                    error.to_string(),
+                    json!({ "action": "set", "ok": false, "error": error.to_string() }),
+                );
+            }
+        },
+        DodModelAction::Clear => None,
+    };
+    let verb = if requested.is_some() { "set" } else { "clear" };
+    if system.under_sudo() {
+        return Outcome::new(
+            EXIT_REFUSED,
+            format!(
+                "`harw dod model {verb}` refused under sudo: the triage model belongs to your own \
+                 harw home; run it as that user without sudo. Nothing was changed."
+            ),
+            json!({ "action": verb, "ok": false, "refused": "sudo" }),
+        );
+    }
+    match dod_model::write_model(home, requested) {
+        Ok(outcome) => {
+            let effective = triage_settings(home).ok();
+            let (text, json) =
+                dod_model::model_change_output(requested, outcome, effective.as_ref());
+            Outcome::new(EXIT_OK, text, json)
+        }
+        Err(error) => Outcome::new(
+            model_error_code(&error),
+            error.to_string(),
+            json!({ "action": verb, "ok": false, "error": error.to_string() }),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use harw_dod_client::{ActiveProfile, ExportSource, ProfileScope};
@@ -1526,6 +1751,7 @@ mod tests {
     /// Fake host: a fixed euid, recorded `systemctl` calls, optional failures.
     struct FakeSystem {
         euid: u32,
+        sudo: bool,
         calls: Vec<Vec<String>>,
         fail_when: Option<&'static str>,
     }
@@ -1534,6 +1760,7 @@ mod tests {
         fn new(euid: u32) -> Self {
             Self {
                 euid,
+                sudo: false,
                 calls: Vec::new(),
                 fail_when: None,
             }
@@ -1543,6 +1770,10 @@ mod tests {
     impl System for FakeSystem {
         fn euid(&self) -> u32 {
             self.euid
+        }
+
+        fn under_sudo(&self) -> bool {
+            self.sudo
         }
 
         fn systemctl(&mut self, args: &[&str]) -> Result<(), String> {
@@ -1613,11 +1844,137 @@ mod tests {
                 hint: Some(harw_job_runtime::host::NO_ROOT_HINT.to_owned()),
             }),
             allowed_cgroup_prefixes: Vec::new(),
+            watch_mode: DodWatchMode::Notify,
             root_candidates: Vec::new(),
             service_root: Ok(None),
             chain: None,
             jobs_dir: None,
         }
+    }
+
+    /// `harw dod model …` with the given action.
+    fn model_action(action: DodModelAction) -> DodAction {
+        DodAction::Model {
+            action: Some(action),
+        }
+    }
+
+    /// PL-100 WP 1.9: `harw dod model set|show|clear` edits only the home
+    /// layer, renders like `/dod model` and never calls systemctl.
+    #[test]
+    fn dod_model_set_show_and_clear_edit_the_home_layer() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let env = env_in(dir.path());
+        let home = env.client.harw_home.clone();
+        fs::create_dir_all(home.join("providers")).map_err(ctx("providers"))?;
+        fs::write(
+            home.join("providers").join("cloud.toml"),
+            "name = \"cloud\"\napi = \"openai\"\nbase_url = \"https://api.example.com/v1\"\n",
+        )
+        .map_err(ctx("provider"))?;
+        let mut system = FakeSystem::new(1000);
+
+        let set = execute(
+            model_action(DodModelAction::Set {
+                model: "cloud/GPT-x".to_owned(),
+            }),
+            &env,
+            &mut system,
+        );
+        assert_eq!(set.code, EXIT_OK, "{}", set.text);
+        let config = fs::read_to_string(home.join("config.toml")).map_err(ctx("config"))?;
+        assert!(config.contains("model = \"cloud/GPT-x\""), "{config}");
+        assert_eq!(set.json["action"], json!("set"));
+        assert_eq!(set.json["effective"]["triage"]["locality"], json!("remote"));
+
+        let show = execute(model_action(DodModelAction::Show), &env, &mut system);
+        assert_eq!(show.code, EXIT_OK, "{}", show.text);
+        assert!(show.text.contains("cloud (remote)"), "{}", show.text);
+        assert_eq!(show.json["triage"]["model"], json!("cloud/GPT-x"));
+        assert_eq!(show.json["approve"]["note"], json!(dod_model::TUI_TTY_NOTE));
+        // A bare `harw dod model` is `show`, like `/dod model`.
+        let bare = execute(DodAction::Model { action: None }, &env, &mut system);
+        assert_eq!(bare.code, EXIT_OK, "{}", bare.text);
+        assert_eq!(bare.text, show.text);
+        assert_eq!(bare.json, show.json);
+
+        let clear = execute(model_action(DodModelAction::Clear), &env, &mut system);
+        assert_eq!(clear.code, EXIT_OK, "{}", clear.text);
+        assert!(
+            clear.text.contains(dod_model::NO_TRIAGE_MODEL_NOTE),
+            "{}",
+            clear.text
+        );
+        let config = fs::read_to_string(home.join("config.toml")).map_err(ctx("cleared"))?;
+        assert!(!config.contains("GPT-x"), "{config}");
+        assert!(system.calls.is_empty(), "no systemctl: {:?}", system.calls);
+        Ok(())
+    }
+
+    #[test]
+    fn dod_model_refuses_sudo_bad_references_and_a_missing_home() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let env = env_in(dir.path());
+        let home = env.client.harw_home.clone();
+        fs::create_dir_all(&home).map_err(ctx("home"))?;
+        let seed = "[dod.triage]\nmodel = \"local/keep\"\n";
+        fs::write(home.join("config.toml"), seed).map_err(ctx("seed"))?;
+
+        let mut sudo = FakeSystem::new(0);
+        sudo.sudo = true;
+        for action in [
+            DodModelAction::Set {
+                model: "local/x".to_owned(),
+            },
+            DodModelAction::Clear,
+        ] {
+            let outcome = execute(model_action(action), &env, &mut sudo);
+            assert_eq!(outcome.code, EXIT_REFUSED, "{}", outcome.text);
+            assert_eq!(outcome.json["refused"], json!("sudo"));
+        }
+        let show = execute(model_action(DodModelAction::Show), &env, &mut sudo);
+        assert_eq!(show.code, EXIT_OK, "show stays read-only: {}", show.text);
+        assert_eq!(show.json["triage"]["model"], json!("local/keep"));
+        assert_eq!(show.json["under_sudo"], json!(true));
+        assert!(show.text.contains("under sudo"), "{}", show.text);
+
+        let mut user = FakeSystem::new(1000);
+        for bad in ["noslash", "local/", "local/a b", "../x", "p/a//b"] {
+            let outcome = execute(
+                model_action(DodModelAction::Set {
+                    model: bad.to_owned(),
+                }),
+                &env,
+                &mut user,
+            );
+            assert_eq!(outcome.code, EXIT_USAGE, "{bad}: {}", outcome.text);
+            assert!(!outcome.text.contains("noslash"), "{}", outcome.text);
+        }
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).map_err(ctx("after"))?,
+            seed
+        );
+
+        let elsewhere = dir.path().join("elsewhere");
+        let missing = env_in(&elsewhere);
+        let outcome = execute(
+            model_action(DodModelAction::Set {
+                model: "local/x".to_owned(),
+            }),
+            &missing,
+            &mut user,
+        );
+        assert_eq!(outcome.code, EXIT_FAILURE, "{}", outcome.text);
+        assert!(!elsewhere.join("home").exists());
+
+        // `show` without a home fails instead of printing the defaults as
+        // "no model set".
+        let show = execute(model_action(DodModelAction::Show), &missing, &mut user);
+        assert_eq!(show.code, EXIT_FAILURE, "{}", show.text);
+        assert!(show.text.contains("does not exist"), "{}", show.text);
+        assert_eq!(show.json["ok"], json!(false));
+        assert!(!elsewhere.join("home").exists());
+        Ok(())
     }
 
     #[test]
@@ -1724,6 +2081,195 @@ mod tests {
         let outcome = execute(DodAction::Disable, &env, &mut system);
         assert_eq!(outcome.code, EXIT_FAILURE, "{}", outcome.text);
         assert_eq!(system.calls.len(), 1, "stops at the first failure");
+
+        // A host whose installed package predates the netlink unit: a
+        // `systemctl` call naming `harw-probe-netlink.service` fails there
+        // ("Unit file … does not exist"). `disable` never names it, so it
+        // still stops and disables everything and reaches the Warden step.
+        let mut system = FakeSystem::new(0);
+        system.fail_when = Some("harw-probe-netlink.service");
+        let outcome = execute(DodAction::Disable, &env, &mut system);
+        assert_eq!(outcome.code, EXIT_OK, "{}", outcome.text);
+        assert_eq!(system.calls.len(), 2, "{:?}", system.calls);
+        let warden = calls(&[&[
+            "disable",
+            "--now",
+            "harw-warden.socket",
+            "harw-warden.service",
+        ]]);
+        assert_eq!(system.calls.last(), warden.first(), "{:?}", system.calls);
+        assert!(outcome.json.pointer("/warden/ran").is_some());
+        assert!(outcome.json.pointer("/warden/ignored_error").is_none());
+        Ok(())
+    }
+
+    /// `disable` stops every unit the DoD package ships (PL-100 WP1.8):
+    /// each unit it names is shipped, and the one shipped unit it does not
+    /// name, the opt-in `harw-probe-netlink.service`, is `PartOf=` the
+    /// target, so stopping `harw-dod.target` stops it too.
+    #[test]
+    fn dod_disable_stops_every_shipped_unit() -> TestResult {
+        let shipped: Vec<&str> = harw_install::DOD_PACKAGE_ASSETS
+            .iter()
+            .filter_map(|path| path.strip_prefix("deploy/systemd/"))
+            .collect();
+        for unit in OBSERVATION_UNITS.iter().chain(WARDEN_UNITS.iter()) {
+            assert!(shipped.contains(unit), "{unit} is disabled but not shipped");
+        }
+        let unnamed: Vec<&str> = shipped
+            .iter()
+            .copied()
+            .filter(|unit| !OBSERVATION_UNITS.contains(unit) && !WARDEN_UNITS.contains(unit))
+            .collect();
+        assert_eq!(
+            unnamed,
+            ["harw-probe-netlink.service"],
+            "a newly shipped unit needs a deliberate place in `disable`"
+        );
+        for unit in unnamed {
+            let asset = harw_install::DEPLOYMENT_ASSETS
+                .iter()
+                .find(|asset| asset.file_name() == unit)
+                .ok_or(TestError::Missing("embedded copy of a shipped unit"))?;
+            let parsed = harw_install::dod_units::parse_unit(asset.contents);
+            let part_of: Vec<&str> = parsed
+                .values("Unit", "PartOf")
+                .into_iter()
+                .flat_map(str::split_whitespace)
+                .collect();
+            assert!(
+                part_of.contains(&"harw-dod.target"),
+                "{unit} is not stopped with harw-dod.target: PartOf={part_of:?}"
+            );
+            // Only the target enables it, so it stays inert while the
+            // target is disabled.
+            let install: Vec<&str> = ["WantedBy", "RequiredBy", "Also"]
+                .into_iter()
+                .flat_map(|key| parsed.values("Install", key))
+                .flat_map(str::split_whitespace)
+                .collect();
+            assert_eq!(install, ["harw-dod.target"], "{unit}: [Install] edges");
+        }
+        Ok(())
+    }
+
+    /// The arguments of every `"$systemctl_bin" …` call in the `arm)` branch
+    /// of `harw-dod/scripts/service.sh`, in order.
+    ///
+    /// Conservative reader: the arm runs from the line `arm)` to the next
+    /// `;;`; a call's arguments end at the first redirection or `||`/`&&`;
+    /// any other line mentioning `systemctl`, and any argument with a quote
+    /// or an expansion, is an error instead of being skipped.
+    fn service_sh_calls(script: &str, arm: &str) -> TestResult<Vec<Vec<String>>> {
+        let head = format!("{arm})");
+        let mut lines = script
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| *line != head.as_str());
+        if lines.next().is_none() {
+            return Err(TestError::Unexpected(format!(
+                "service.sh has no `{head}` arm"
+            )));
+        }
+        let mut found = Vec::new();
+        for line in lines {
+            if line == ";;" {
+                return Ok(found);
+            }
+            if line.starts_with('#') || !line.contains("systemctl") {
+                continue;
+            }
+            let rest = line.strip_prefix("\"$systemctl_bin\" ").ok_or_else(|| {
+                TestError::Unexpected(format!("unparsable systemctl line in `{head}`: {line}"))
+            })?;
+            let mut args = Vec::new();
+            for word in rest.split_whitespace() {
+                if word.starts_with(['>', '|', '&', ';']) || word.starts_with("2>") {
+                    break;
+                }
+                if word.contains(['"', '\'', '$', '`', '\\']) {
+                    return Err(TestError::Unexpected(format!(
+                        "unparsable systemctl argument in `{head}`: {word}"
+                    )));
+                }
+                args.push(word.to_owned());
+            }
+            found.push(args);
+        }
+        Err(TestError::Unexpected(format!(
+            "the `{head}` arm of service.sh is not closed"
+        )))
+    }
+
+    /// `harw dod enable|restart|disable` run exactly the `systemctl` calls of
+    /// `make -C harw-dod enable|restart|disable` (`service.sh`), in order;
+    /// in particular the units of both `disable` calls are
+    /// [`OBSERVATION_UNITS`] and [`WARDEN_UNITS`].
+    #[test]
+    fn dod_service_control_matches_service_sh() -> TestResult {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../harw-dod/scripts/service.sh");
+        let script = fs::read_to_string(path).map_err(ctx("read harw-dod/scripts/service.sh"))?;
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let mut env = env_in(dir.path());
+        env.read_config = valid_config;
+        for (action, arm) in [
+            (DodAction::Enable, "enable"),
+            (DodAction::Restart, "restart"),
+            (DodAction::Disable, "disable"),
+        ] {
+            let mut system = FakeSystem::new(0);
+            let outcome = execute(action, &env, &mut system);
+            assert_eq!(outcome.code, EXIT_OK, "{arm}: {}", outcome.text);
+            assert_eq!(
+                system.calls,
+                service_sh_calls(&script, arm)?,
+                "`harw dod {arm}` and `service.sh {arm}` differ"
+            );
+        }
+        let mut stop: Vec<&str> = vec!["disable", "--now"];
+        stop.extend(OBSERVATION_UNITS);
+        let mut warden: Vec<&str> = vec!["disable", "--now"];
+        warden.extend(WARDEN_UNITS);
+        assert_eq!(
+            service_sh_calls(&script, "disable")?,
+            calls(&[stop.as_slice(), warden.as_slice()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn service_sh_reader_reads_only_the_named_arm() -> TestResult {
+        // The reader trims every line, so the fixture needs no indentation.
+        let script = "case \"$action\" in\n\
+                      enable)\n\
+                      \"$systemctl_bin\" enable --now a.target\n\
+                      ;;\n\
+                      disable)\n\
+                      require_root\n\
+                      # a comment about systemctl\n\
+                      \"$systemctl_bin\" disable --now a.target b.service\n\
+                      \"$systemctl_bin\" disable --now c.socket 2>/dev/null || true\n\
+                      ;;\n\
+                      esac\n";
+        assert_eq!(
+            service_sh_calls(script, "disable")?,
+            calls(&[
+                &["disable", "--now", "a.target", "b.service"],
+                &["disable", "--now", "c.socket"],
+            ])
+        );
+        assert_eq!(
+            service_sh_calls(script, "enable")?,
+            calls(&[&["enable", "--now", "a.target"]])
+        );
+        assert!(service_sh_calls(script, "restart").is_err(), "missing arm");
+        for bad in [
+            "    disable)\n        systemctl disable --now a.target\n        ;;\n",
+            "    disable)\n        \"$systemctl_bin\" disable --now \"$unit\"\n        ;;\n",
+            "    disable)\n        \"$systemctl_bin\" disable --now a.target\n",
+        ] {
+            assert!(service_sh_calls(bad, "disable").is_err(), "{bad}");
+        }
         Ok(())
     }
 
@@ -2512,6 +3058,66 @@ egress_allow_cidrs = []
         assert_eq!(report.warnings, 1);
     }
 
+    #[test]
+    fn dod_doctor_refuses_triage_while_the_egress_allowlist_is_empty() {
+        use ops::CheckLevel;
+        let with_cidrs = |count: usize| ConfigReport::Valid {
+            path: PathBuf::from("/etc/harw-dod/config.toml"),
+            config_digest: "ab".to_owned(),
+            active_profile: Some(ActiveProfile {
+                id: "harw-jobs".to_owned(),
+                scope: ProfileScope::Host,
+                sensors: vec!["tcp-connect".to_owned()],
+                egress_allow_cidrs: count,
+            }),
+        };
+        let levels = |checks: &[ops::DoctorCheck]| -> Vec<(String, CheckLevel)> {
+            checks
+                .iter()
+                .map(|check| (check.id.clone(), check.level))
+                .collect()
+        };
+
+        // Triage with an empty allowlist: a missing prerequisite, so the
+        // doctor fails.
+        let empty = egress_allowlist_checks(DodWatchMode::Triage, &with_cidrs(0));
+        assert_eq!(
+            levels(&empty),
+            [("egress-allowlist".to_owned(), CheckLevel::Miss)]
+        );
+        let mut report = ops::DoctorReport {
+            checks: Vec::new(),
+            ok: 0,
+            warnings: 0,
+            missing: 0,
+        };
+        add_checks(&mut report, empty);
+        assert!(!report.passed());
+
+        // No valid config or no active profile counts as empty.
+        let missing = ConfigReport::Missing {
+            path: PathBuf::from("/etc/harw-dod/config.toml"),
+        };
+        assert_eq!(
+            levels(&egress_allowlist_checks(DodWatchMode::Triage, &missing)),
+            [("egress-allowlist".to_owned(), CheckLevel::Miss)]
+        );
+
+        // Triage with allowed networks passes.
+        assert_eq!(
+            levels(&egress_allowlist_checks(
+                DodWatchMode::Triage,
+                &with_cidrs(2)
+            )),
+            [("egress-allowlist".to_owned(), CheckLevel::Ok)]
+        );
+
+        // Without triage the allowlist is not a doctor prerequisite.
+        for mode in [DodWatchMode::Off, DodWatchMode::Notify] {
+            assert!(egress_allowlist_checks(mode, &with_cidrs(0)).is_empty());
+        }
+    }
+
     // ── PL-97 E5: execution chain ──
 
     #[test]
@@ -2707,6 +3313,229 @@ egress_allow_cidrs = []
             .filter(|line| line.contains("harw-control.service (source: service-unit)"))
             .count();
         assert_eq!(service_rows, 2, "{}", doctor.text);
+        Ok(())
+    }
+
+    // ── PL-100 WP 1.9 / WP 0.3: triage lines ──
+
+    /// `doctor` ends with the triage lines of the home configuration: the
+    /// notify fallback without a model, the egress warning (the system
+    /// config of `env_in` is missing or untrusted, depending on the host),
+    /// provider locality and `tui_tty` once configured. The exit code stays
+    /// that of the suite checks.
+    #[test]
+    fn dod_doctor_ends_with_the_triage_lines_of_the_home() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let env = env_in(dir.path());
+        fs::create_dir_all(&env.client.harw_home).map_err(ctx("home"))?;
+        let mut system = FakeSystem::new(1000);
+        let plain = execute(DodAction::Doctor, &env, &mut system);
+        for marker in [dod_model::NO_TRIAGE_MODEL_NOTE, dod_model::TUI_TTY_NOTE] {
+            assert!(plain.text.contains(marker), "{marker}: {}", plain.text);
+        }
+        let level_of = |outcome: &Outcome, id: &str| -> Option<String> {
+            outcome
+                .json
+                .get("checks")
+                .and_then(Value::as_array)
+                .and_then(|checks| {
+                    checks
+                        .iter()
+                        .find(|check| check.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .and_then(|check| check.get("level").and_then(Value::as_str))
+                .map(str::to_owned)
+        };
+        assert_eq!(level_of(&plain, "triage-model").as_deref(), Some("warn"));
+        assert_eq!(level_of(&plain, "triage-egress").as_deref(), Some("warn"));
+        let ids = |outcome: &Outcome| -> Vec<String> {
+            outcome
+                .json
+                .get("checks")
+                .and_then(Value::as_array)
+                .map(|checks| {
+                    checks
+                        .iter()
+                        .filter_map(|check| check.get("id").and_then(Value::as_str))
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let plain_ids = ids(&plain);
+        assert_eq!(plain_ids.last().map(String::as_str), Some("approve-tty"));
+        assert!(!plain_ids.iter().any(|id| id == "triage-provider"));
+
+        let home = env.client.harw_home.clone();
+        fs::create_dir_all(home.join("providers")).map_err(ctx("providers"))?;
+        fs::write(
+            home.join("providers").join("local.toml"),
+            "name = \"local\"\napi = \"openai\"\nbase_url = \"http://localhost:11434/v1\"\n",
+        )
+        .map_err(ctx("provider"))?;
+        fs::write(
+            home.join("config.toml"),
+            "[dod.triage]\nmodel = \"local/qwen2.5\"\n\n[dod.approve]\ntui_tty = false\n",
+        )
+        .map_err(ctx("config"))?;
+        let doctor = execute(DodAction::Doctor, &env, &mut system);
+        assert_eq!(doctor.code, plain.code, "{}", doctor.text);
+        assert!(
+            !doctor.text.contains(dod_model::NO_TRIAGE_MODEL_NOTE),
+            "{}",
+            doctor.text
+        );
+        assert!(doctor.text.contains("local: lokal"), "{}", doctor.text);
+        assert!(doctor.text.contains("tui_tty aus"), "{}", doctor.text);
+        assert_eq!(level_of(&doctor, "triage-model").as_deref(), Some("ok"));
+        assert_eq!(level_of(&doctor, "triage-egress").as_deref(), Some("warn"));
+        let doctor_ids = ids(&doctor);
+        assert!(doctor_ids.iter().any(|id| id == "triage-provider"));
+        assert_eq!(doctor_ids.last().map(String::as_str), Some("approve-tty"));
+        assert!(system.calls.is_empty(), "no systemctl: {:?}", system.calls);
+        Ok(())
+    }
+
+    /// Without an existing harw home (a mistyped `--home`, or the fallback
+    /// when none resolves) the doctor does not print the defaults as
+    /// settings: one `triage-config` WARN, the egress line, no `triage-model`;
+    /// the home is not created and the exit code is unchanged.
+    #[test]
+    fn dod_doctor_without_a_home_leaves_the_triage_settings_out() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let env = env_in(dir.path());
+        let mut system = FakeSystem::new(1000);
+        let doctor = execute(DodAction::Doctor, &env, &mut system);
+        assert!(!env.client.harw_home.exists(), "the home is not created");
+        let checks: Vec<(String, String, String)> = doctor
+            .json
+            .get("checks")
+            .and_then(Value::as_array)
+            .map(|checks| {
+                checks
+                    .iter()
+                    .map(|check| {
+                        let field = |key: &str| {
+                            check
+                                .get(key)
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned()
+                        };
+                        (field("id"), field("level"), field("detail"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ids: Vec<&str> = checks.iter().map(|(id, _, _)| id.as_str()).collect();
+        for absent in [
+            "triage-model",
+            "triage-provider",
+            "triage-limits",
+            "watch-mode",
+            "watch-connect",
+            "approve-tty",
+        ] {
+            assert!(!ids.contains(&absent), "{absent}: {ids:?}");
+        }
+        assert_eq!(
+            ids.iter().rev().take(2).collect::<Vec<_>>(),
+            [&"triage-egress", &"triage-config"]
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|(id, level, detail)| id == "triage-config"
+                    && level == "warn"
+                    && detail == ops::TRIAGE_CONFIG_NO_HOME),
+            "{checks:?}"
+        );
+        assert!(
+            !doctor.text.contains(dod_model::NO_TRIAGE_MODEL_NOTE),
+            "{}",
+            doctor.text
+        );
+        assert!(
+            !doctor.text.contains(dod_model::TUI_TTY_NOTE),
+            "{}",
+            doctor.text
+        );
+
+        fs::create_dir_all(&env.client.harw_home).map_err(ctx("home"))?;
+        let with_home = execute(DodAction::Doctor, &env, &mut system);
+        assert_eq!(with_home.code, doctor.code, "{}", with_home.text);
+        assert!(
+            with_home.text.contains(dod_model::NO_TRIAGE_MODEL_NOTE),
+            "{}",
+            with_home.text
+        );
+        assert!(system.calls.is_empty(), "no systemctl: {:?}", system.calls);
+        Ok(())
+    }
+
+    /// `sudo harw dod doctor` resolves root's home: the triage lines are left
+    /// out with a `triage-config` WARN instead of showing root's settings;
+    /// the egress line (readable as root) stays, the exit code is unchanged.
+    #[test]
+    fn dod_doctor_under_sudo_skips_the_triage_settings_of_roots_home() -> TestResult {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let env = env_in(dir.path());
+        let home = env.client.harw_home.clone();
+        fs::create_dir_all(&home).map_err(ctx("home"))?;
+        fs::write(
+            home.join("config.toml"),
+            "[dod.triage]\nmodel = \"local/qwen2.5\"\n",
+        )
+        .map_err(ctx("config"))?;
+        let mut user = FakeSystem::new(1000);
+        let plain = execute(DodAction::Doctor, &env, &mut user);
+        let mut sudo = FakeSystem::new(0);
+        sudo.sudo = true;
+        let doctor = execute(DodAction::Doctor, &env, &mut sudo);
+        assert_eq!(doctor.code, plain.code, "{}", doctor.text);
+        let checks: Vec<(String, String, String)> = doctor
+            .json
+            .get("checks")
+            .and_then(Value::as_array)
+            .map(|checks| {
+                checks
+                    .iter()
+                    .map(|check| {
+                        let field = |key: &str| {
+                            check
+                                .get(key)
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned()
+                        };
+                        (field("id"), field("level"), field("detail"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ids: Vec<&str> = checks.iter().map(|(id, _, _)| id.as_str()).collect();
+        for absent in [
+            "triage-model",
+            "triage-provider",
+            "watch-mode",
+            "approve-tty",
+        ] {
+            assert!(!ids.contains(&absent), "{absent}: {ids:?}");
+        }
+        assert_eq!(
+            ids.iter().rev().take(2).collect::<Vec<_>>(),
+            [&"triage-egress", &"triage-config"]
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|(id, level, detail)| id == "triage-config"
+                    && level == "warn"
+                    && detail == ops::TRIAGE_CONFIG_SUDO),
+            "{checks:?}"
+        );
+        assert!(!doctor.text.contains("local/qwen2.5"), "{}", doctor.text);
+        assert!(sudo.calls.is_empty(), "no systemctl: {:?}", sudo.calls);
         Ok(())
     }
 }

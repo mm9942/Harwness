@@ -211,8 +211,10 @@ harw_tools::tool_provider! {
                 ASK_USER_TOOL,
                 "Ask the user 1-4 multiple-choice questions (2-4 options each, free text \
                  'Other' is always offered) in a selection window and get her answers. Use it \
-                 to clarify requirements instead of guessing. Read-only. Not available outside \
-                 the interactive TUI: then make an assumption and state it.",
+                 to clarify requirements instead of guessing, and for every decision the user has \
+                 to make: never end a message with a question in plain text when this tool is \
+                 available. Read-only. Not available outside the interactive TUI: then make an \
+                 assumption and state it.",
                 ask_user::parameter_schema(),
             ),
             permission: Permission::ReadWorkspace,

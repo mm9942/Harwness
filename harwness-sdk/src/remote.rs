@@ -221,6 +221,7 @@ impl RemoteHarwness {
             .create(CreateParams {
                 workspace: None,
                 title: title.map(str::to_owned),
+                fork_from: None,
             })
             .await
             .map_err(session_error)?;
@@ -463,6 +464,8 @@ impl RemoteSession {
                     expect_head: self.tracker.expect_head(),
                     client_msg_id: key.clone(),
                     force: false,
+                    images: Vec::new(),
+                    rewind_before: None,
                 })
                 .await
                 .map_err(|error| SdkError::Turn {
@@ -667,6 +670,9 @@ fn to_sdk_request(
         call_id: summary.call_id,
         tool: summary.tool,
         arguments: summary.arguments,
+        // PL-100 O1: `harw_session_client::ApprovalSummary` trägt den Grund
+        // (bzw. die `summary` der Leitung) nicht; offen.
+        reason: None,
     }
 }
 
@@ -698,6 +704,8 @@ mod tests {
         );
         assert_eq!(asked.tool, "shell");
         assert_eq!(asked.arguments, serde_json::json!({"cmd": "ls"}));
+        // PL-100 O1: über eine Remote-Sitzung kommt (noch) kein Kern-Grund an.
+        assert_eq!(asked.reason, None);
         Ok(())
     }
 
@@ -982,6 +990,7 @@ mod tests {
                     turn_id: TurnId::from_str("t"),
                     assistant_text: "partial".to_owned(),
                     reasoning_collapsed: false,
+                    reasoning_text: None,
                 },
             ),
             at(0, 0, 1, done()),

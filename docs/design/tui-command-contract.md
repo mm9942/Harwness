@@ -198,7 +198,7 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | `/config` | `<path> [value]` | Read or write a config key on disk | Maint | - |
 | `/policy` | `<PolicyRef> [value]` | Inspect or set a policy value | Maint (read: Op) | - |
 | `/sandbox` | `[--status] [--profile=name]` | Inspect or switch the active sandbox profile | Maint | - |
-| `/sandbox-lease` | `[status \| revoke]` | Host permission for `shell.exec`: `status` shows the active grant (session/single-call/off), `revoke` ends an active session grant immediately (`busy = "immediate"`). A session grant has no expiry and only the user ends it — `Ctrl+H` or this typed `revoke`; the model tool cannot revoke; the grant itself is not requested through this command but through the identically named model tool `sandbox-lease` (argument `reason`) and confirmed in the `HostPermitDialog` — see `interaction-contract.md` §2.6 and `mediated-process-execution.md` | Maint | - |
+| `/sandbox-lease` | `[status \| revoke]` | Host permission for `shell.exec`: `status` shows the active grant (session/single-call/off), `revoke` ends an active session grant immediately (`busy = "immediate"`). A session grant expires after `[sandbox] host_lease_ttl_secs` (default 8 h, ADR 0002; `status` shows the remaining time or "abgelaufen") and only the user ends it earlier — `Ctrl+H` or this typed `revoke`; the model tool cannot revoke; the grant itself is not requested through this command but through the identically named model tool `sandbox-lease` (argument `reason`) and confirmed in the `HostPermitDialog` — see `interaction-contract.md` §2.6 and `mediated-process-execution.md` | Maint | - |
 | `/plugins` | `[--list \| --enable=name \| --disable=name]` | Manage extension-api plugins | Maint | - |
 
 ### 2.6 Knowledge surfaces
@@ -984,7 +984,7 @@ Rebindable via `[tui].keybindings_file` (a flat TOML table `action =
 | `F11` | maximize the panel (`maximize_panel`) |
 | `Ctrl+E` | focus the explorer (`focus_explorer`) |
 | `Ctrl+O` | toggle tool cells (`toggle_tool_cells`), also mid-turn |
-| `Ctrl+H` | end a host work phase (`end_host_mode`), also a process-wide one from `/sandbox-lease` or `request_host`; together with the typed `/sandbox-lease revoke` the only way to end one (no expiry, the model cannot end it) |
+| `Ctrl+H` | end a host work phase (`end_host_mode`), also a process-wide one from `/sandbox-lease` or `request_host`; together with the typed `/sandbox-lease revoke` the only way to end one early (it expires after `[sandbox] host_lease_ttl_secs`, ADR 0002; the model cannot end or extend it); also cleans up an expired phase |
 | `Ctrl+L` | redraw the whole screen (`redraw_screen`), also mid-turn; every terminal resize does the same once. Clears leftovers when a terminal emulator (tmux, phone terminals) counts a glyph width differently than ratatui |
 | `Ctrl+K` | delete the input line (`delete_line`) |
 | `Ctrl+J` | insert a newline (`insert_newline`) |
@@ -998,8 +998,8 @@ The three `Alt` defaults (PL-97 C2) came after existing keybindings files:
 when a file already binds one of these chords to another action, the file
 wins and the unnamed Mission Control action only loses that chord.
 
-`F4` cycles Chat → Agents → Jobs → Finished → LIVE (only where LIVE is a
-focusable window, outside the portrait stack) → Explorer → Workbench;
+`F4` cycles Chat → Agents → Jobs → Finished → LIVE (in portrait the
+boxed Reasoning window, focusable since 2026-11-22) → Explorer → Workbench;
 `Esc` returns to the chat. A left click focuses the Mission Control window
 under the pointer.
 
@@ -1018,8 +1018,12 @@ Mission Control windows, when focused (fixed keys, PL-97 C2–C4):
   expands, and in the expanded list acknowledges the selected category and
   opens its runs (newest first); `a` acknowledges the selected category
   (collapsed: all), `c` all failures. Acknowledging deletes nothing.
-- **LIVE** (focusable outside the portrait stack): scrolls on its own; `Alt+L` shows the agent
-  detail in place.
+- **LIVE / Reasoning** (landscape: LIVE; portrait: the boxed Reasoning window
+  with the time-ordered, role-prefixed stream of all agents, 2026-11-22):
+  focusable and scrolls on its own (also with the mouse wheel). In the
+  landscape three-column layout `Alt+L` shows the agent detail in place; in
+  portrait `Alt+L`/`Enter` open the maximized agent detail. `p` pinned agent
+  limits the stream to it.
 
 Agent panel, when focused (`F4`, fixed): `↑`/`↓`, `k`/`j` and `w`/`s`
 select, `PageUp`/`PageDown` page, `Home`/`End` jump, `Enter` opens the
@@ -1032,9 +1036,12 @@ always visible; the dialog body scrolls (`Ctrl+↑↓`, wheel), and `↑`/`↓`
 stay option selection.
 
 Small windows: the Mission Control geometry (`harw_tui_layout::classify_mission`,
-PL-97 C1) picks a portrait stack (Agents and Jobs as two windows from 68
-columns, combined below; a one-row collapsed Finished/Failed strip; a LIVE
-strip; chat below), three landscape columns (Chat left and widest,
+PL-97 C1) picks a portrait stack (from 30×20 and for physically portrait terminals, at every
+zoom level: Agents and Jobs as two square windows side by side, never
+combined; a boxed Reasoning window of 8 rows mixing all agents with a role
+prefix; the one-row collapsed Finished/Failed strip below it; chat below with
+at least 8 rows; agent lists show no reasoning/preview lines; the cell aspect
+comes from `[tui] cell_aspect`, else the measured pixel size, else 0.5), three landscape columns (Chat left and widest,
 Finished/Failed top-centre, LIVE below it, Agents above Jobs on the right),
 a shallow landscape (Agents above Jobs on the right, one-row Finished strip,
 LIVE header above the chat) or, at the smallest sizes, a compact summary

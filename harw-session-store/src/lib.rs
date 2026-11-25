@@ -29,18 +29,26 @@ mod test_support;
 
 pub mod approval;
 pub mod child_lease;
+pub mod dod_verdict;
 pub mod error;
 pub mod freeze;
 pub mod injection;
 pub mod job_store;
+pub mod lease;
 pub mod meta;
 pub mod reader;
 pub mod record;
 pub mod retention;
 pub mod store;
+pub mod title_seed;
 
 pub use approval::{ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, DEFAULT_APPROVAL_TTL};
 pub use child_lease::{ChildLeaseCompletionRecord, ChildLeaseRecord, ChildLeaseStore};
+pub use dod_verdict::{
+    ChainBreak, NewVerdict, StoredClassification, StoredResponse, StoredSeverity,
+    VerdictChainSummary, VerdictRecord, VerdictRef, VerdictRetentionReport, VerdictStore,
+    VerdictStoreError, VerdictStoreResult, genesis_prev_hash, sanitize_rationale,
+};
 pub use error::{SessionStoreError, SessionStoreResult};
 pub use freeze::{Freeze, FreezeResolution, FreezeResolutionOutcome, FreezeStore};
 pub use injection::{INJECTION_MARKER, InjectionRecord, is_injection_payload};
@@ -49,7 +57,11 @@ pub use job_store::{
     JobEventSink, JobLifecycleEvent, JobListQuery, JobPage, JobStore, NoopJobEventSink,
     RenewalRequest, RetryRequest,
 };
-pub use meta::{SESSION_META_VERSION, SessionMeta, TitleSource};
+pub use lease::{
+    HolderKind, LEASE_EXT, LEASE_RETRY_WINDOW, LeaseHolder, SessionLease, TranscriptHead, head,
+    lease_path, peek_holder,
+};
+pub use meta::{LastOrigin, SESSION_META_VERSION, SessionMeta, TitleSource};
 pub use reader::TranscriptReader;
-pub use record::{RecordKind, TranscriptRecord};
+pub use record::{RecordKind, SessionPurpose, TranscriptRecord};
 pub use store::TranscriptStore;

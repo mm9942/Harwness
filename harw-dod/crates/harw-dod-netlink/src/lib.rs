@@ -14,6 +14,10 @@
 //!   Typen bilden. Reine Funktionen auf Bytes und Zeichenketten. **Braucht
 //!   keine Berechtigung und keinen Kernel** — der weitaus größte Teil dieser
 //!   Crate läuft in jeder CI, in jedem Entwicklungscontainer, ohne Root.
+//!   [`parse_record`] versteht beide Eingabeformen: die auditd-Textform
+//!   (`type=… msg=audit(…): …`) und die Kernel-Netlink-Nutzlast
+//!   (`audit(…): …`, Recordart aus dem `nlmsghdr`, siehe
+//!   [`RawRecord::from_netlink`] und [`audit_type_name`]).
 //! - **Bindungsteil** ([`socket`], nur `#[cfg(target_os = "linux")]`): der
 //!   eigentliche `AUDIT`-Netlink-Socket. Klein, hinter [`AuditSource`]
 //!   verborgen, in einer eigenen Datei. **Braucht `CAP_AUDIT_READ`
@@ -37,8 +41,9 @@
 //!
 //! # Exportierte Typen
 //! [`AuditSource`], [`FixtureAuditSource`], [`RawRecord`], [`AuditFields`],
-//! die freie Funktion [`parse_record`], sowie [`error::NetlinkError`] /
-//! `error::NetlinkResult`. [`socket::NetlinkAuditSource`] ist bewusst
+//! die freien Funktionen [`parse_record`] und [`audit_type_name`], sowie
+//! [`error::NetlinkError`] / `error::NetlinkResult`.
+//! [`socket::NetlinkAuditSource`] ist bewusst
 //! **nicht** an der Crate-Wurzel re-exportiert — sie existiert nur unter
 //! `#[cfg(target_os = "linux")]`, ein Re-Export an der Wurzel würde diese
 //! Bedingung für Aufrufer verschleiern, die stattdessen über den vollen Pfad
@@ -66,11 +71,12 @@
 //! )]);
 //!
 //! let records = source.read_records(Duration::from_secs(1))?;
-//! let fields = parse_record(&records[0])?;
-//!
-//! // Der Sentinelwert 4294967295 heißt "keine Anmelde-UID gesetzt".
-//! assert_eq!(fields.auid, None);
-//! assert_eq!(fields.record_type, "SYSCALL");
+//! for record in &records {
+//!     let fields = parse_record(record)?;
+//!     // Der Sentinelwert 4294967295 heißt "keine Anmelde-UID gesetzt".
+//!     assert_eq!(fields.auid, None);
+//!     assert_eq!(fields.record_type, "SYSCALL");
+//! }
 //! # Ok::<(), harw_dod_netlink::error::NetlinkError>(())
 //! ```
 
@@ -84,5 +90,5 @@ pub mod source;
 mod test_support;
 
 pub use error::NetlinkError;
-pub use record::{AuditFields, RawRecord, parse_record};
+pub use record::{AuditFields, RawRecord, audit_type_name, parse_record};
 pub use source::{AuditSource, FixtureAuditSource};

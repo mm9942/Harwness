@@ -587,6 +587,42 @@
     "hi": "भूमिका के लिए मॉडल चयन खोलें",
     "de": "Modellauswahl für eine Rolle öffnen"
   },
+  "commands.subcommand.models.settings": {
+    "en": "Open the Models tab in Settings",
+    "de": "Modell-Tab in den Einstellungen öffnen",
+    "es": "Abrir la pestaña Modelos en Ajustes",
+    "fr": "Ouvrir l’onglet Modèles dans les paramètres",
+    "pt": "Abrir a aba Modelos nas configurações",
+    "ja": "設定のモデルタブを開く",
+    "zh-CN": "打开设置中的模型选项卡",
+    "ko": "설정의 모델 탭 열기",
+    "vi": "Mở thẻ Mô hình trong Cài đặt",
+    "hi": "सेटिंग में मॉडल टैब खोलें"
+  },
+  "commands.subcommand.models.session": {
+    "en": "Open the active session model picker",
+    "de": "Modellauswahl für die laufende Sitzung öffnen",
+    "es": "Abrir el selector de modelo de la sesión activa",
+    "fr": "Ouvrir le sélecteur de modèle de la session active",
+    "pt": "Abrir o seletor de modelo da sessão ativa",
+    "ja": "現在のセッションのモデル選択を開く",
+    "zh-CN": "打开当前会话的模型选择器",
+    "ko": "현재 세션의 모델 선택기 열기",
+    "vi": "Mở bộ chọn mô hình của phiên hiện tại",
+    "hi": "सक्रिय सत्र का मॉडल चयन खोलें"
+  },
+  "commands.subcommand.models.uia": {
+    "en": "Open the UIA model picker (not the UIA profile)",
+    "de": "UIA-Modellauswahl öffnen (nicht das UIA-Profil)",
+    "es": "Abrir el selector de modelo de la UIA (no el perfil)",
+    "fr": "Ouvrir le sélecteur de modèle de l’UIA (pas le profil)",
+    "pt": "Abrir o seletor de modelo da UIA (não o perfil)",
+    "ja": "UIAのモデル選択を開く（プロファイルではない）",
+    "zh-CN": "打开 UIA 模型选择器（并非 UIA 配置文件）",
+    "ko": "UIA 모델 선택기 열기 (UIA 프로필 아님)",
+    "vi": "Mở bộ chọn mô hình UIA (không phải hồ sơ UIA)",
+    "hi": "UIA मॉडल चयन खोलें (UIA प्रोफ़ाइल नहीं)"
+  },
   "commands.subcommand.models.worker": {
     "en": "Show or set UIA worker models (uia means same as UIA)",
     "es": "Mostrar o establecer modelos de trabajadores UIA (uia significa igual que UIA)",

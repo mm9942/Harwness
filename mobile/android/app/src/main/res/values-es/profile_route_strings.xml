@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_route_settings_title">Tipo de conexión</string>
+    <string name="harw_route_onion">Solo Onion</string>
+    <string name="harw_route_direct">Solo IP directa</string>
+    <string name="harw_route_auto">Primero Tor, luego IP directa</string>
+    <string name="harw_route_direct_address">IP directa: %1$s</string>
+    <string name="harw_route_onion_address">Onion: %1$s</string>
+    <string name="harw_route_hint_onion_only">Perfil solo Onion. No hay una IP directa guardada y Harw nunca cambia a una conexión directa.</string>
+    <string name="harw_route_hint_no_onion">Este perfil no tiene dirección Onion. Importa una dirección Onion o autoriza explícitamente la IP directa para este perfil antes de conectarte.</string>
+    <string name="harw_route_hint_onion">Solo Onion. Harw no usa la IP directa guardada, ni siquiera si Tor no puede conectar.</string>
+    <string name="harw_route_hint_direct">Solo IP directa. El tráfico va a la IP guardada de este perfil sin pasar por Tor.</string>
+    <string name="harw_route_hint_auto">Harw intenta usar Onion primero y puede usar la IP directa guardada si Tor falla. Esto solo se aplica a este perfil exacto.</string>
+    <string name="harw_route_consent_title">¿Permitir una conexión directa?</string>
+    <string name="harw_route_consent_direct">Conéctate a %1$s directamente a través de su IP guardada, sin Tor. El servidor y la red pueden ver tu IP. Esta elección solo se guarda para este perfil exacto.</string>
+    <string name="harw_route_consent_auto">Intenta usar Onion para %1$s primero. Si falla, Harw puede conectar a la IP directa guardada y exponer tu IP al servidor y a la red. Esta elección solo se guarda para este perfil exacto.</string>
+    <string name="harw_route_consent_confirm">Permitir para este perfil</string>
+    <string name="harw_route_profile_changed">El perfil guardado cambió. Revisa el perfil nuevo antes de elegir el tipo de conexión.</string>
+    <string name="harw_route_save_failed">No se pudo guardar el tipo de conexión.</string>
+    <string name="harw_route_unavailable">El tipo de conexión seleccionado no está disponible en este perfil. No se usó otro tipo de conexión.</string>
+</resources>

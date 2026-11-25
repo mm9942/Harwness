@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Baut die App, hebt die Version an (ausser sie wird vorgegeben) und schiebt eine geaenderte APK
+# automatisch in den Update-Kanal (upd.harw.dev).
+#
+#   mobile/scripts/release-apk [--version X.Y.Z] [--code N] [--bump patch|minor|major]
+#                              [--notes "Text" | --notes-file DATEI] [--no-publish] [--skip-native]
+#                              [--variant debug|release]
+#
+# Ohne --version: Patch-Stelle +1 und Versionscode +1. Ist die Version im Quelltext noch nicht
+# veroeffentlicht (z. B. nach einem fehlgeschlagenen Bau), wird sie wiederverwendet statt erneut angehoben.
+# Veroeffentlicht wird nur, wenn die APK die Pruefung besteht und ihr SHA-256 vom Kanal abweicht.
+# OTA und --variant release setzen HARW_LOCAL_UIA=1 voraus (automatisch, wenn nicht gesetzt).
+# Nur OTA, nicht fuer GitHub-Release-Artefakte. Das getrennte Staging: mobile/RELEASE-APK.md.
+set -euo pipefail
+
+mobile_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+repo_root=$(cd -- "$mobile_root/.." && pwd -P)
+gradle_file="$mobile_root/android/app/build.gradle.kts"
+upd_root="${HARW_UPD_ROOT:-$HOME/harw-updates}"
+
+version="" code="" bump="patch" notes="" publish=1 native=1 variant="debug"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version) version="$2"; shift 2 ;;
+        --code) code="$2"; shift 2 ;;
+        --bump) bump="$2"; shift 2 ;;
+        --notes) notes="$2"; shift 2 ;;
+        --notes-file) notes="$(cat "$2")"; shift 2 ;;
+        --variant) variant="$2"; shift 2 ;;
+        --no-publish) publish=0; shift ;;
+        --skip-native) native=0; shift ;;
+        -h|--help) sed -n 2,13p "${BASH_SOURCE[0]}"; exit 0 ;;
+        *) echo "Unbekannte Option: $1" >&2; exit 2 ;;
+    esac
+done
+[[ "$variant" == debug || "$variant" == release ]] || { echo "--variant: debug oder release" >&2; exit 2; }
+
+# Keep the bridge and Gradle BuildConfig on the same setting. Only a local,
+# unpublished debug build may opt out. Refuse before touching source/OTA.
+uia_verify=()
+if [[ "$publish" == 1 || "$variant" == release ]]; then
+    if [[ "${HARW_LOCAL_UIA:-1}" != 1 ]]; then
+        echo "OTA- und Release-APKs benoetigen HARW_LOCAL_UIA=1." >&2
+        exit 2
+    fi
+    export HARW_LOCAL_UIA=1
+fi
+case "${HARW_LOCAL_UIA:-0}" in
+    0) ;;
+    1) uia_verify+=(--require-local-uia) ;;
+    *) echo "HARW_LOCAL_UIA muss 0 oder 1 sein." >&2; exit 2 ;;
+esac
+
+cur_code=$(sed -nE 's/^[[:space:]]*versionCode = ([0-9]+).*/\1/p' "$gradle_file" | head -1)
+cur_name=$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' "$gradle_file" | head -1)
+[[ -n "$cur_code" && -n "$cur_name" ]] || { echo "versionCode/versionName nicht gefunden" >&2; exit 1; }
+
+pub_code=0 pub_sha="" pub_commit=""
+if [[ -f "$upd_root/latest.json" ]]; then
+    pub_code=$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1])).get("versionCode",0))' "$upd_root/latest.json")
+    pub_sha=$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1])).get("sha256",""))' "$upd_root/latest.json")
+fi
+[[ -f "$upd_root/last-commit" ]] && pub_commit=$(cat "$upd_root/last-commit")
+
+if [[ -z "$version" && "$cur_code" -le "$pub_code" ]]; then
+    IFS=. read -r ma mi pa <<<"$cur_name"
+    case "$bump" in
+        major) ma=$((ma + 1)); mi=0; pa=0 ;;
+        minor) mi=$((mi + 1)); pa=0 ;;
+        patch) pa=$((${pa:-0} + 1)) ;;
+        *) echo "--bump: patch|minor|major" >&2; exit 2 ;;
+    esac
+    version="$ma.$mi.$pa"
+fi
+version="${version:-$cur_name}"
+if [[ -z "$code" ]]; then
+    code=$cur_code
+    [[ "$version" != "$cur_name" || "$cur_code" -le "$pub_code" ]] && code=$((pub_code > cur_code ? pub_code + 1 : cur_code + 1))
+fi
+[[ "$code" =~ ^[0-9]+$ && "$version" =~ ^[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.]+)?$ ]] || { echo "Ungueltige Version/Code" >&2; exit 2; }
+
+echo "Version: $cur_name ($cur_code) -> $version ($code)   Kanal: ${pub_code:-0}"
+sed -i -E "s/^([[:space:]]*versionCode = )[0-9]+/\1$code/; s/^([[:space:]]*versionName = )\"[^\"]*\"/\1\"$version\"/" "$gradle_file"
+
+export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+[[ $native == 1 ]] && "$mobile_root/scripts/build-native"
+(cd "$mobile_root/android" && ./gradlew --no-daemon --max-workers="${MOBILE_BUILD_JOBS:-2}" -q ":app:assemble${variant^}")
+apk="$mobile_root/android/app/build/outputs/apk/$variant/app-$variant.apk"
+[[ -f "$apk" ]] || { echo "APK fehlt: $apk" >&2; exit 1; }
+"$mobile_root/scripts/verify-apk" "${uia_verify[@]}" "$apk" || {
+    status=$?
+    echo "APK-Pruefung fehlgeschlagen (verify-apk: $status). Nichts im Update-Kanal veroeffentlicht." >&2
+    exit "$status"
+}
+
+new_sha=$(sha256sum "$apk" | cut -d' ' -f1)
+echo "APK: $apk ($new_sha)"
+if [[ $publish == 0 ]]; then echo "Nicht veroeffentlicht (--no-publish)."; exit 0; fi
+if [[ "$new_sha" == "$pub_sha" ]]; then echo "APK ist identisch zum Update-Kanal, nichts zu veroeffentlichen."; exit 0; fi
+
+if [[ -z "$notes" ]]; then
+    range=${pub_commit:+$pub_commit..HEAD}
+    notes=$(git -C "$repo_root" log ${range:--n 15} --no-merges --pretty='- %s' -- mobile | head -15)
+    notes="${notes:-Fehlerbehebungen und Verbesserungen.}"
+fi
+"$mobile_root/scripts/publish-update" "$apk" "$notes"
+git -C "$repo_root" rev-parse HEAD > "$upd_root/last-commit"
+echo "Im Update-Kanal veroeffentlicht: $version ($code)."

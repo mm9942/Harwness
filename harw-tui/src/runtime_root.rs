@@ -1140,6 +1140,8 @@ fn build_root_runtime(
             assembly.config_agents().executable_agents.values(),
         ),
     );
+    app = app.with_footer_counts(assembly.config().harness.tui.footer_counts);
+    app = app.with_cell_aspect(assembly.config().harness.tui.cell_aspect);
     app.refresh_display_preferences();
     // Runde 5, Teil F: Plan-Fragekanal (`plan.exit`/`plan.enter`/`ask_user`,
     // nur TUI-Montage) und geteilter Plan-Zustand (Sperre, `/plan …`).
@@ -1371,6 +1373,8 @@ fn session_entry_from_meta(id: SessionId, session_meta: &SessionMeta) -> Session
         last_active: SystemTime::from(session_meta.last_opened_at),
         project_label,
         turns: (session_meta.turns > 0).then_some(session_meta.turns),
+        // Lease-Halter wird noch nicht durchgereicht (OFFEN-6), daher `None`.
+        badge: crate::session_picker::badge_for(session_meta, None),
     }
 }
 
@@ -1874,6 +1878,9 @@ pub(crate) mod tests {
             usage_rounds: 0,
             total_usage: harw_types::TokenUsage::default(),
             drift_events: std::collections::BTreeMap::new(),
+            archived: false,
+            last_origin: None,
+            last_activity_at: None,
         }
     }
 

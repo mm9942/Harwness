@@ -231,6 +231,7 @@ where
         .create(CreateParams {
             workspace: None,
             title: Some("term e2e".to_owned()),
+            fork_from: None,
         })
         .await?
         .session_id;

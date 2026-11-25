@@ -73,7 +73,8 @@ use std::sync::Arc;
 use crate::context::OpContext;
 use crate::error::OpError;
 use crate::operation::{
-    CommandVisibility, OpInput, OpOutput, Operation, OperationMeta, PermissionTier, Surface,
+    CommandVisibility, OpInput, OpOutput, Operation, OperationMeta, PermissionTier, RemoteGrant,
+    RemotePolicy, RemoteRefusal, RemoteSlice, RemoteVerb, Surface,
 };
 
 /// Adapter, der eine [`Operation`] als `/`-Slash-Command exponiert.
@@ -260,6 +261,128 @@ impl CommandAdapter {
         }
     }
 
+    /// Prüft einen Remote-Aufruf (Handy) gegen die Remote-Allowlist des Befehls.
+    ///
+    /// # Beschreibung
+    /// Die Remote-Fläche ist eine eigene Achse neben [`CommandVisibility`]: auch ein
+    /// `TuiOnly`-Befehl ist mit passender [`RemotePolicy`] remote-fähig, und ein
+    /// `ChannelParity`-Befehl ohne Policy ist es nicht (fail-closed).
+    /// [`Self::allows_channel_invocation`] bleibt davon unberührt.
+    ///
+    /// Reihenfolge der Prüfungen (der erste Fehlschlag gewinnt):
+    /// 1. `policy` ist `None` oder `policy.path != self.path()` → [`RemoteRefusal::NotRemote`]
+    /// 2. ein Token aus `policy.denied_tokens` an beliebiger Position → [`RemoteRefusal::DeniedToken`]
+    /// 3. `policy.find_verb(raw_args)` ist `None` → [`RemoteRefusal::VerbNotRemote`]
+    /// 4. `verb.slice > enabled` → [`RemoteRefusal::SliceDisabled`]
+    /// 5. `!grant.has(verb.cap)` → [`RemoteRefusal::MissingCap`]
+    /// 6. `grant.tier < verb.tier` → [`RemoteRefusal::TierTooLow`]
+    /// 7. sonst `Ok(verb)`
+    ///
+    /// Step-up (`verb.stepup`) prüft der Aufrufer, nicht der Adapter.
+    ///
+    /// # Arguments
+    /// - `policy`: Remote-Allowlist des Befehls, `None` = nicht remote.
+    /// - `grant`: wirksame Rechte des Remote-Aufrufers.
+    /// - `enabled`: höchste freigeschaltete Lieferscheibe.
+    /// - `raw_args`: Argument-Tokens ohne Befehlsnamen.
+    ///
+    /// # Errors
+    /// [`RemoteRefusal`] nach der obigen Reihenfolge. Bei Ablehnung wird
+    /// `operation.command.remote_refused` auf `debug` geloggt — ohne Argumente,
+    /// da diese Werte enthalten können.
+    ///
+    /// # Concurrency
+    /// Rein lesend, lock-frei, keine Allokation im Erfolgsfall.
+    pub fn allows_remote_invocation(
+        &self,
+        policy: Option<&RemotePolicy>,
+        grant: &RemoteGrant,
+        enabled: RemoteSlice,
+        raw_args: &[String],
+    ) -> Result<&'static RemoteVerb, RemoteRefusal> {
+        let result = self.check_remote_invocation(policy, grant, enabled, raw_args);
+        if let Err(refusal) = &result {
+            tracing::debug!(
+                op = self.operation_name,
+                path = self.path,
+                code = refusal.code(),
+                "operation.command.remote_refused"
+            );
+        }
+        result
+    }
+
+    /// Ob der Befehl für diesen Aufrufer überhaupt eine erlaubte Remote-Form hat
+    /// (für `commands.list.available`).
+    ///
+    /// # Returns
+    /// - `Ok(())`, wenn mindestens ein Verb die Prüfungen 4-6 aus
+    ///   [`Self::allows_remote_invocation`] besteht.
+    /// - sonst die Ablehnung des **ersten** Verbs in Deklarationsreihenfolge
+    ///   (deterministisch).
+    /// - ohne Policy, mit fremdem Pfad oder ohne ein einziges Verb: [`RemoteRefusal::NotRemote`].
+    ///
+    /// Gesperrte Tokens spielen hier keine Rolle (es gibt keine Argumente).
+    /// Kein Logging: die Listen-Projektion fragt jeden Befehl ab.
+    ///
+    /// # Errors
+    /// Siehe Returns.
+    pub fn remote_availability(
+        &self,
+        policy: Option<&RemotePolicy>,
+        grant: &RemoteGrant,
+        enabled: RemoteSlice,
+    ) -> Result<(), RemoteRefusal> {
+        let policy = self.matching_policy(policy)?;
+        let mut first_refusal: Option<RemoteRefusal> = None;
+        for verb in policy.verbs {
+            match check_remote_verb(verb, grant, enabled) {
+                Ok(()) => return Ok(()),
+                Err(refusal) => {
+                    if first_refusal.is_none() {
+                        first_refusal = Some(refusal);
+                    }
+                }
+            }
+        }
+        Err(first_refusal.unwrap_or(RemoteRefusal::NotRemote))
+    }
+
+    /// Prüfung 1: Policy vorhanden und für genau diesen Pfad.
+    fn matching_policy<'p>(
+        &self,
+        policy: Option<&'p RemotePolicy>,
+    ) -> Result<&'p RemotePolicy, RemoteRefusal> {
+        match policy {
+            Some(policy) if policy.path == self.path => Ok(policy),
+            _ => Err(RemoteRefusal::NotRemote),
+        }
+    }
+
+    /// Prüfungen 1-7 ohne Logging (siehe [`Self::allows_remote_invocation`]).
+    fn check_remote_invocation(
+        &self,
+        policy: Option<&RemotePolicy>,
+        grant: &RemoteGrant,
+        enabled: RemoteSlice,
+        raw_args: &[String],
+    ) -> Result<&'static RemoteVerb, RemoteRefusal> {
+        let policy = self.matching_policy(policy)?;
+        if let Some(token) = raw_args
+            .iter()
+            .find(|t| policy.denied_tokens.contains(&t.as_str()))
+        {
+            return Err(RemoteRefusal::DeniedToken {
+                token: token.clone(),
+            });
+        }
+        let verb = policy
+            .find_verb(raw_args)
+            .ok_or(RemoteRefusal::VerbNotRemote)?;
+        check_remote_verb(verb, grant, enabled)?;
+        Ok(verb)
+    }
+
     /// Gibt den maschinellen Namen der zugrundeliegenden Operation zurück.
     ///
     /// # Beschreibung
@@ -364,6 +487,27 @@ impl CommandAdapter {
     }
 }
 
+/// Prüfungen 4-6 des Remote-Gates für ein einzelnes Verb: Scheibe, Cap, Stufe.
+///
+/// Die Cap kommt vor der Stufe, damit ein Beobachter-Gerät „braucht Recht Steuern"
+/// sieht und nicht eine Stufen-Meldung.
+fn check_remote_verb(
+    verb: &RemoteVerb,
+    grant: &RemoteGrant,
+    enabled: RemoteSlice,
+) -> Result<(), RemoteRefusal> {
+    if verb.slice > enabled {
+        return Err(RemoteRefusal::SliceDisabled { slice: verb.slice });
+    }
+    if !grant.has(verb.cap) {
+        return Err(RemoteRefusal::MissingCap { cap: verb.cap });
+    }
+    if grant.tier < verb.tier {
+        return Err(RemoteRefusal::TierTooLow { need: verb.tier });
+    }
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -382,7 +526,8 @@ mod tests {
     use crate::error::OpError;
     use crate::operation::{
         ApprovalPolicy, BusyAvailability, CommandVisibility, OpFuture, OpInput, OpOutput,
-        Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
+        Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier, RemoteCap,
+        RemoteEffect, RemoteGrant, RemotePolicy, RemoteRefusal, RemoteSlice, RemoteVerb, Surface,
     };
     use crate::test_support::{TestError, TestResult, ctx};
 
@@ -965,5 +1110,404 @@ mod tests {
     fn test_command_adapter_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CommandAdapter>();
+    }
+
+    // ── remote gate tests ─────────────────────────────────────────────────────
+
+    /// Adapter `/single` (`TuiOnly`, Operator).
+    fn tui_only_adapter() -> CommandAdapter {
+        let mut adapters = CommandAdapter::from_operation(Arc::new(SingleCommandOp));
+        assert_eq!(adapters.len(), 1);
+        let adapter = adapters.remove(0);
+        assert_eq!(adapter.visibility(), CommandVisibility::TuiOnly);
+        adapter
+    }
+
+    /// Adapter `/mixed` (`ChannelParity`, Owner).
+    fn parity_adapter() -> CommandAdapter {
+        let mut adapters = CommandAdapter::from_operation(Arc::new(MixedSurfaceOp));
+        assert_eq!(adapters.len(), 1);
+        let adapter = adapters.remove(0);
+        assert_eq!(adapter.visibility(), CommandVisibility::ChannelParity);
+        adapter
+    }
+
+    fn args(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|t| (*t).to_owned()).collect()
+    }
+
+    /// Nur Beobachten, Stufe Observer.
+    const OBSERVER: RemoteGrant = RemoteGrant {
+        observe: true,
+        steer: false,
+        control: false,
+        tier: PermissionTier::Observer,
+    };
+
+    /// Beobachten und Steuern, Stufe Operator, ohne Control.
+    const OPERATOR_NO_CONTROL: RemoteGrant = RemoteGrant {
+        observe: true,
+        steer: true,
+        control: false,
+        tier: PermissionTier::Operator,
+    };
+
+    /// Alle Caps, Stufe Owner.
+    const FULL: RemoteGrant = RemoteGrant {
+        observe: true,
+        steer: true,
+        control: true,
+        tier: PermissionTier::Owner,
+    };
+
+    static SINGLE_SHOW: RemotePolicy = RemotePolicy {
+        path: "/single",
+        verbs: &[RemoteVerb::read(&["show", "-"])],
+        denied_tokens: &[],
+    };
+
+    static SINGLE_STEER: RemotePolicy = RemotePolicy {
+        path: "/single",
+        verbs: &[RemoteVerb::steer(&["*"], RemoteEffect::Applied)],
+        denied_tokens: &[],
+    };
+
+    static SINGLE_CONTROL: RemotePolicy = RemotePolicy {
+        path: "/single",
+        verbs: &[RemoteVerb::control(&["*"], RemoteEffect::Applied)],
+        denied_tokens: &[],
+    };
+
+    static SINGLE_GLOBAL_SET: RemotePolicy = RemotePolicy {
+        path: "/single",
+        verbs: &[RemoteVerb::global(&["set", "*"], RemoteEffect::Staged)],
+        denied_tokens: &[],
+    };
+
+    static SINGLE_READ_THEN_STOP: RemotePolicy = RemotePolicy {
+        path: "/single",
+        verbs: &[
+            RemoteVerb::read(&["-"]),
+            RemoteVerb::steer(&["stop", "*"], RemoteEffect::Applied),
+        ],
+        denied_tokens: &[],
+    };
+
+    static SINGLE_DENIED: RemotePolicy = RemotePolicy {
+        path: "/single",
+        verbs: &[RemoteVerb::read(&["*"])],
+        denied_tokens: &["--allow-insecure-lan"],
+    };
+
+    static SINGLE_EMPTY: RemotePolicy = RemotePolicy {
+        path: "/single",
+        verbs: &[],
+        denied_tokens: &[],
+    };
+
+    static OTHER_PATH: RemotePolicy = RemotePolicy {
+        path: "/other",
+        verbs: &[RemoteVerb::read(&["*"])],
+        denied_tokens: &[],
+    };
+
+    static MIXED_READ: RemotePolicy = RemotePolicy {
+        path: "/mixed",
+        verbs: &[RemoteVerb::read(&["*"])],
+        denied_tokens: &[],
+    };
+
+    #[test]
+    fn remote_without_policy_is_refused() {
+        let tui = tui_only_adapter();
+        assert_eq!(
+            tui.allows_remote_invocation(None, &FULL, RemoteSlice::Global, &[]),
+            Err(RemoteRefusal::NotRemote)
+        );
+        let parity = parity_adapter();
+        assert_eq!(
+            parity.allows_remote_invocation(None, &FULL, RemoteSlice::Global, &args(&["x"])),
+            Err(RemoteRefusal::NotRemote),
+            "ChannelParity ist ohne Policy nicht remote (eigene Achse, fail-closed)"
+        );
+        assert_eq!(
+            parity.remote_availability(None, &FULL, RemoteSlice::Global),
+            Err(RemoteRefusal::NotRemote)
+        );
+    }
+
+    #[test]
+    fn remote_policy_path_must_match() {
+        let tui = tui_only_adapter();
+        assert_eq!(
+            tui.allows_remote_invocation(Some(&OTHER_PATH), &FULL, RemoteSlice::Global, &[]),
+            Err(RemoteRefusal::NotRemote)
+        );
+        assert_eq!(
+            tui.remote_availability(Some(&OTHER_PATH), &FULL, RemoteSlice::Global),
+            Err(RemoteRefusal::NotRemote)
+        );
+        // Gegenprobe: dieselbe Form-Policy unter dem richtigen Pfad greift.
+        let parity = parity_adapter();
+        assert!(
+            parity
+                .allows_remote_invocation(Some(&MIXED_READ), &OBSERVER, RemoteSlice::Read, &[])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn remote_tui_only_with_policy_runs_read_form() -> TestResult {
+        let tui = tui_only_adapter();
+        let verb = tui
+            .allows_remote_invocation(
+                Some(&SINGLE_SHOW),
+                &OBSERVER,
+                RemoteSlice::Read,
+                &args(&["show"]),
+            )
+            .map_err(|r| TestError::Unexpected(format!("unerwartete Ablehnung: {r:?}")))?;
+        assert_eq!(verb.cap, RemoteCap::Observe);
+        assert!(
+            std::ptr::eq(verb, &SINGLE_SHOW.verbs[0]),
+            "das 'static Verb der Policy wird zurückgegeben"
+        );
+        // Kanal-Gate bleibt davon unberührt.
+        assert!(!tui.allows_channel_invocation(&args(&["show"])));
+        // Andere Form derselben Policy: nicht remote.
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&SINGLE_SHOW),
+                &OBSERVER,
+                RemoteSlice::Read,
+                &args(&["show", "x"]),
+            ),
+            Err(RemoteRefusal::VerbNotRemote)
+        );
+        assert_eq!(
+            tui.allows_remote_invocation(Some(&SINGLE_SHOW), &OBSERVER, RemoteSlice::Read, &[]),
+            Err(RemoteRefusal::VerbNotRemote)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observer_cannot_steer_or_control() {
+        let tui = tui_only_adapter();
+        let a = args(&["stop"]);
+        assert_eq!(
+            tui.allows_remote_invocation(Some(&SINGLE_STEER), &OBSERVER, RemoteSlice::Global, &a),
+            Err(RemoteRefusal::MissingCap {
+                cap: RemoteCap::Steer
+            })
+        );
+        assert_eq!(
+            tui.allows_remote_invocation(Some(&SINGLE_CONTROL), &OBSERVER, RemoteSlice::Global, &a),
+            Err(RemoteRefusal::MissingCap {
+                cap: RemoteCap::Control
+            })
+        );
+    }
+
+    #[test]
+    fn operator_without_control_cannot_manage() {
+        let tui = tui_only_adapter();
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&SINGLE_GLOBAL_SET),
+                &OPERATOR_NO_CONTROL,
+                RemoteSlice::Global,
+                &args(&["set", "theme", "dark"]),
+            ),
+            Err(RemoteRefusal::MissingCap {
+                cap: RemoteCap::Control
+            })
+        );
+        // Gegenprobe: mit Control läuft die Form; Step-up meldet das Verb, prüft der Aufrufer.
+        let verb = tui.allows_remote_invocation(
+            Some(&SINGLE_GLOBAL_SET),
+            &FULL,
+            RemoteSlice::Global,
+            &args(&["set", "theme", "dark"]),
+        );
+        assert!(matches!(verb, Ok(v) if v.stepup));
+    }
+
+    #[test]
+    fn tier_is_checked_after_caps() {
+        let tui = tui_only_adapter();
+        let all_caps_observer = RemoteGrant {
+            tier: PermissionTier::Observer,
+            ..FULL
+        };
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&SINGLE_STEER),
+                &all_caps_observer,
+                RemoteSlice::Global,
+                &args(&["stop"]),
+            ),
+            Err(RemoteRefusal::TierTooLow {
+                need: PermissionTier::Operator
+            })
+        );
+        // Fehlen Cap und Stufe zugleich, gewinnt die Cap.
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&SINGLE_STEER),
+                &OBSERVER,
+                RemoteSlice::Global,
+                &args(&["stop"]),
+            ),
+            Err(RemoteRefusal::MissingCap {
+                cap: RemoteCap::Steer
+            })
+        );
+    }
+
+    #[test]
+    fn slice_gate() {
+        let tui = tui_only_adapter();
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&SINGLE_GLOBAL_SET),
+                &FULL,
+                RemoteSlice::Session,
+                &args(&["set", "x"]),
+            ),
+            Err(RemoteRefusal::SliceDisabled {
+                slice: RemoteSlice::Global
+            })
+        );
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&SINGLE_STEER),
+                &FULL,
+                RemoteSlice::Read,
+                &args(&["stop"]),
+            ),
+            Err(RemoteRefusal::SliceDisabled {
+                slice: RemoteSlice::Session
+            })
+        );
+        // Scheibe vor Cap: auch ein Beobachter sieht zuerst die Scheibe.
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&SINGLE_GLOBAL_SET),
+                &OBSERVER,
+                RemoteSlice::Session,
+                &args(&["set", "x"]),
+            ),
+            Err(RemoteRefusal::SliceDisabled {
+                slice: RemoteSlice::Global
+            })
+        );
+    }
+
+    #[test]
+    fn denied_token_anywhere() {
+        let tui = tui_only_adapter();
+        let token = "--allow-insecure-lan";
+        for a in [
+            args(&["scan", "p", token]),
+            args(&[token]),
+            args(&["scan", token, "p"]),
+        ] {
+            assert_eq!(
+                tui.allows_remote_invocation(Some(&SINGLE_DENIED), &FULL, RemoteSlice::Global, &a),
+                Err(RemoteRefusal::DeniedToken {
+                    token: token.to_owned()
+                })
+            );
+        }
+        assert!(
+            tui.allows_remote_invocation(
+                Some(&SINGLE_DENIED),
+                &FULL,
+                RemoteSlice::Global,
+                &args(&["scan", "p"]),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn remote_availability_reports_first_refusal() {
+        let tui = tui_only_adapter();
+        assert_eq!(
+            tui.remote_availability(Some(&SINGLE_STEER), &OBSERVER, RemoteSlice::Global),
+            Err(RemoteRefusal::MissingCap {
+                cap: RemoteCap::Steer
+            })
+        );
+        assert_eq!(
+            tui.remote_availability(Some(&SINGLE_READ_THEN_STOP), &OBSERVER, RemoteSlice::Global),
+            Ok(())
+        );
+        // Mehrere Ablehnungen: die des ersten Verbs gewinnt (Scheibe vor Cap).
+        assert_eq!(
+            tui.remote_availability(Some(&SINGLE_READ_THEN_STOP), &OBSERVER, RemoteSlice::Read),
+            Ok(())
+        );
+        static STEER_THEN_GLOBAL: RemotePolicy = RemotePolicy {
+            path: "/single",
+            verbs: &[
+                RemoteVerb::steer(&["stop", "*"], RemoteEffect::Applied),
+                RemoteVerb::global(&["set", "*"], RemoteEffect::Staged),
+            ],
+            denied_tokens: &[],
+        };
+        assert_eq!(
+            tui.remote_availability(Some(&STEER_THEN_GLOBAL), &OBSERVER, RemoteSlice::Session),
+            Err(RemoteRefusal::MissingCap {
+                cap: RemoteCap::Steer
+            })
+        );
+        // Leere Verbliste: nicht remote.
+        assert_eq!(
+            tui.remote_availability(Some(&SINGLE_EMPTY), &FULL, RemoteSlice::Global),
+            Err(RemoteRefusal::NotRemote)
+        );
+    }
+
+    #[test]
+    fn remote_gate_order_is_policy_then_denied_then_verb() {
+        let tui = tui_only_adapter();
+        // Gesperrtes Token vor unbekannter Form.
+        static DENIED_NO_VERB: RemotePolicy = RemotePolicy {
+            path: "/single",
+            verbs: &[RemoteVerb::read(&["show", "-"])],
+            denied_tokens: &["--force"],
+        };
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&DENIED_NO_VERB),
+                &FULL,
+                RemoteSlice::Global,
+                &args(&["wipe", "--force"]),
+            ),
+            Err(RemoteRefusal::DeniedToken {
+                token: "--force".to_owned()
+            })
+        );
+        // Unbekannte Form vor Scheibe/Cap/Stufe.
+        assert_eq!(
+            tui.allows_remote_invocation(
+                Some(&DENIED_NO_VERB),
+                &OBSERVER,
+                RemoteSlice::Read,
+                &args(&["wipe"]),
+            ),
+            Err(RemoteRefusal::VerbNotRemote)
+        );
+    }
+
+    #[test]
+    fn channel_gate_is_unchanged_by_remote_axis() {
+        // Kanal-Ergebnisse wie vor der Remote-Achse (siehe channel policy tests oben).
+        let tui = tui_only_adapter();
+        assert!(!tui.allows_channel_invocation(&[]));
+        let parity = parity_adapter();
+        assert!(parity.allows_channel_invocation(&args(&["anything"])));
     }
 }

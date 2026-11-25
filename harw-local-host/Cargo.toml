@@ -1,0 +1,35 @@
+[package]
+publish.workspace = true
+name = "harw-local-host"
+description = "In-process harw session host: the core session factory and host composition shared by the gateway and the Android app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-authority = { path = "../harw-authority" }
+harw-config = { path = "../harw-config" }
+harw-core = { path = "../harw-core" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-registry-defaults = { path = "../harw-registry-defaults" }
+# Phone-portable: no `browser` default feature (concept AP 1.1).
+harw-runtime = { path = "../harw-runtime", default-features = false }
+harw-operations = { path = "../harw-operations" }
+harw-ops = { path = "../harw-ops" }
+harw-protocol = { path = "../harw-protocol" }
+harw-session-driver = { path = "../harw-session-driver" }
+harw-session-host = { path = "../harw-session-host" }
+harw-session-store = { path = "../harw-session-store" }
+harw-tools = { path = "../harw-tools" }
+harw-types = { path = "../harw-types" }
+jiff = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true

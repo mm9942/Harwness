@@ -25,7 +25,8 @@
 //! Testhelfer, nur unter `cfg(test)` gebaut) fehlt. Eine neue
 //! Implementierungsdatei — zuletzt `profile.rs` und `scope_rescan.rs`, die
 //! beide im privilegierten Laufpfad liegen (Konfiguration laden, cgroup-Walk,
-//! Map-Updates) — kann so nicht unbemerkt aus der Prüfung fallen.
+//! Map-Updates), und `bpf_manifest.rs` (Manifest lesen und Objekte prüfen) —
+//! kann so nicht unbemerkt aus der Prüfung fallen.
 //!
 //! **Diese Datei selbst ist bewusst nicht Teil der durchsuchten Liste:** die
 //! beiden gesuchten Zeichenketten müssen hier als Zeichenkettenliterale
@@ -66,6 +67,7 @@ mod tests {
         ("sink.rs", include_str!("sink.rs")),
         ("profile.rs", include_str!("profile.rs")),
         ("scope_rescan.rs", include_str!("scope_rescan.rs")),
+        ("bpf_manifest.rs", include_str!("bpf_manifest.rs")),
     ];
 
     /// Files of `src/` that are deliberately not in [`SOURCE_FILES`]: this

@@ -384,6 +384,11 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("job.logs", JOB, Meta),
     row!("job.stop", JOB, Meta),
     row!("job.list", JOB, Meta),
+    // PL-100 §3.5: freeze / thaw an own job through its cgroup, rights-free
+    // `Meta` like `job.stop` (ownership checked in the tool); both always ask
+    // (`crate::ALWAYS_ASK_TOOLS`, autonomy step A2).
+    row!("job.suspend", JOB, Meta),
+    row!("job.resume", JOB, Meta),
     // agent compiler (#22 wave 2B): compiles an agent definition as a
     // background job, same launch path as `job.start`/`shell.exec`. Never
     // granted to a built-in role by default (no `RegistryProfile` registers
@@ -539,6 +544,13 @@ pub const CATALOG: &[CapabilityEntry] = &[
     row!("dod.status", DOD, Meta),
     row!("dod.findings", DOD, Meta),
     row!("dod.sensors", DOD, Meta),
+    // Harw-DoD triage reads (PL-100 WP1.2): one finding with its escaped
+    // evidence card, the findings related by dedup key or cgroup id, the
+    // human labels of a dedup key. Same class as the reads above; served
+    // only to the four triage children, never to a root session.
+    row!("dod.finding", DOD, Meta),
+    row!("dod.related", DOD, Meta),
+    row!("dod.labels", DOD, Meta),
     // Tool index (PL-97 B2): static data of this binary (catalog, profiles,
     // tool specs, bundled skill manifests); read-only, auto-approved.
     row!("tool.index", TOOL, Meta),
@@ -633,6 +645,7 @@ mod tests {
             SUDO_TOOLS,
             MATRIX_GAME_MASTER_TOOLS,
             crate::profile::DOD_READ_TOOLS,
+            crate::profile::DOD_TRIAGE_TOOLS,
             crate::profile::TOOL_INDEX_TOOLS,
             KNOWLEDGE_READ_TOOLS,
             KANBAN_READ_TOOLS,
@@ -985,10 +998,11 @@ mod tests {
         }
     }
 
-    /// PL-97 D3: the Harw-DoD tools have `Meta` rows of the `dod` provider
-    /// (agent core feature), are auto-approved, never always-ask and not
-    /// served by every runner by default; the catalog rows of the provider are
-    /// exactly [`crate::profile::DOD_READ_TOOLS`].
+    /// PL-97 D3, PL-100 WP1.2: the Harw-DoD tools have `Meta` rows of the
+    /// `dod` provider (agent core feature), are auto-approved, never
+    /// always-ask and not served by every runner by default; the catalog rows
+    /// of the provider are exactly [`crate::profile::DOD_TRIAGE_ROLE_TOOLS`]
+    /// (the three reads and the three triage tools).
     #[test]
     fn test_dod_tools_are_classified() {
         let rows: BTreeSet<&str> = CATALOG
@@ -999,9 +1013,14 @@ mod tests {
                 ToolPattern::Prefix(_) => None,
             })
             .collect();
-        let expected: BTreeSet<&str> = crate::profile::DOD_READ_TOOLS.iter().copied().collect();
+        let expected: BTreeSet<&str> = crate::profile::DOD_READ_TOOLS
+            .iter()
+            .chain(crate::profile::DOD_TRIAGE_TOOLS)
+            .copied()
+            .collect();
         assert_eq!(rows, expected);
-        for tool in crate::profile::DOD_READ_TOOLS {
+        assert_eq!(rows.len(), 6);
+        for tool in crate::profile::DOD_TRIAGE_ROLE_TOOLS {
             let entry = lookup(tool);
             assert_eq!(
                 entry.map(|entry| entry.class),
@@ -1021,6 +1040,45 @@ mod tests {
             );
             assert!(crate::AUTO_APPROVED_TOOLS.contains(tool), "{tool}");
             assert!(!ALWAYS_ASK_TOOLS.contains(tool), "{tool}");
+        }
+    }
+
+    /// PL-100 §3.5: `job.suspend`/`job.resume` are classified exactly like
+    /// `job.stop` (`job` provider, `Meta`, no manifest right, not always
+    /// available), but always ask and are never auto-approved.
+    #[test]
+    fn test_job_suspend_and_resume_are_classified_like_job_stop() {
+        let stop = lookup("job.stop");
+        for tool in ["job.suspend", "job.resume"] {
+            let entry = lookup(tool);
+            assert_eq!(
+                entry.map(|entry| entry.provider),
+                Some(&providers::JOB),
+                "{tool}"
+            );
+            assert_eq!(
+                entry.map(|entry| entry.class),
+                stop.map(|entry| entry.class),
+                "{tool}"
+            );
+            assert_eq!(
+                entry.map(|entry| entry.class),
+                Some(CapabilityClass::Meta),
+                "{tool}"
+            );
+            assert_eq!(
+                entry.map(CapabilityEntry::feature),
+                stop.map(CapabilityEntry::feature),
+                "{tool}"
+            );
+            assert!(entry.is_some_and(|entry| !entry.always_available), "{tool}");
+            assert_eq!(
+                CapabilityCatalog.classify(tool),
+                Some(CapabilityClass::Meta.tool_classes()),
+                "{tool} carries no manifest right"
+            );
+            assert!(ALWAYS_ASK_TOOLS.contains(&tool), "{tool}");
+            assert!(!crate::AUTO_APPROVED_TOOLS.contains(&tool), "{tool}");
         }
     }
 

@@ -4,7 +4,7 @@ Abgegrenzter Teilauftrag des Root oder eines exakt freigegebenen Sub-Orchestrato
 ## Delegation
 Nur Worker im eigenen Teilbaum; Child-Orchestratoren nur mit exakter namentlicher
 Freigabe. Spawn: `complexity: "simple"`/`"complex"`.
-Erst Projektgedächtnis, Überblick max. 5 Lesezugriffe; Details per `delegate_wave`
+Erst Projektgedächtnis, Überblick max. 12 Lesezugriffe; Details per `delegate_wave`
 an Explorer/Worker. Vorher Teilfragen, Scope, Budget, Belege, Fertigkriterien und
 disjunkte Schreibbereiche festlegen; Abhängigkeiten nacheinander.
 Nur sichtbar verfügbare, freigegebene Worker wählen.

@@ -27,6 +27,8 @@ http-body-util = "0.1"
 bytes = "1"
 
 [dev-dependencies]
+harw-media = { path = "../harw-media" }
+harw-session-store = { path = "../harw-session-store" }
 jiff = { workspace = true }
 # End-to-end tests drive the real host through the upgrade path.
 harw-session-host = { path = "../harw-session-host" }

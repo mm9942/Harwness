@@ -40,9 +40,10 @@
 //! lock serialises processes. All methods are blocking — async callers run
 //! them on `spawn_blocking`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::num::NonZeroU64;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -64,7 +65,8 @@ pub const LOCK_FILE: &str = "state.lock";
 /// Format tag written into every state file.
 pub const STATE_FORMAT: &str = "harw-netsec.state";
 /// Current state file version.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
+const LEGACY_STATE_VERSION: u32 = 1;
 /// Upper bound for a state file that will be read at all.
 pub const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 /// `context` of the [`NetsecError::Io`] a mutation returns when its rename
@@ -75,7 +77,20 @@ pub const MAX_STATE_BYTES: u64 = 32 * 1024 * 1024;
 /// the only place the text may be spelled out.
 pub(crate) const DIR_FSYNC_CONTEXT: &str = "fsync state directory (state file already replaced)";
 
-/// On-disk form of the state.
+/// Version 1 had no authoritative activation metadata. Its field set
+/// stays strict so malformed version 2 state cannot fall back to legacy.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStateFile {
+    format: String,
+    version: u32,
+    zones: Vec<Zone>,
+    nodes: Vec<NodeRecord>,
+    routes: Vec<Route>,
+}
+
+/// Current on-disk form. The global watermark and per-node history share
+/// the topology rename and lifetime writer lock, never a sidecar file.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateFile {
@@ -84,6 +99,22 @@ struct StateFile {
     zones: Vec<Zone>,
     nodes: Vec<NodeRecord>,
     routes: Vec<Route>,
+    activation_high_water: u64,
+    activation_epochs: Vec<ActivationEpoch>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationEpoch {
+    node: String,
+    epoch: NonZeroU64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ReadStateFile {
+    Current(StateFile),
+    Legacy(LegacyStateFile),
 }
 
 /// In-memory topology.
@@ -92,6 +123,8 @@ pub struct NetworkState {
     zones: BTreeMap<String, Zone>,
     nodes: BTreeMap<String, NodeRecord>,
     routes: BTreeMap<String, Route>,
+    activation_high_water: u64,
+    activation_epochs: BTreeMap<String, NonZeroU64>,
 }
 
 impl NetworkState {
@@ -122,22 +155,30 @@ impl NetworkState {
         self.nodes.len()
     }
 
-    fn from_file(file: StateFile) -> Result<Self, String> {
-        if file.format != STATE_FORMAT {
-            return Err(format!("unexpected format tag {:?}", file.format));
-        }
-        if file.version != STATE_VERSION {
-            return Err(format!("unsupported version {}", file.version));
+    fn from_file(file: ReadStateFile) -> Result<Self, String> {
+        let (format, zones, nodes, routes, activation_high_water, activation_epochs) = match file {
+            ReadStateFile::Current(file) if file.version == STATE_VERSION => (
+                file.format, file.zones, file.nodes, file.routes,
+                file.activation_high_water, file.activation_epochs,
+            ),
+            ReadStateFile::Legacy(file) if file.version == LEGACY_STATE_VERSION => (
+                file.format, file.zones, file.nodes, file.routes, 0, Vec::new(),
+            ),
+            ReadStateFile::Current(file) => return Err(format!("unsupported version {}", file.version)),
+            ReadStateFile::Legacy(file) => return Err(format!("unsupported version {}", file.version)),
+        };
+        if format != STATE_FORMAT {
+            return Err(format!("unexpected format tag {format:?}"));
         }
         let mut state = Self::default();
-        for zone in file.zones {
+        for zone in zones {
             zone.validate().map_err(|error| error.to_string())?;
             let key = zone.id.as_str().to_owned();
             if state.zones.insert(key.clone(), zone).is_some() {
                 return Err(format!("duplicate zone {key:?}"));
             }
         }
-        for node in file.nodes {
+        for node in nodes {
             node.validate().map_err(|error| error.to_string())?;
             if !state.zones.contains_key(node.zone.as_str()) {
                 return Err(format!(
@@ -150,7 +191,7 @@ impl NetworkState {
                 return Err(format!("duplicate node {key:?}"));
             }
         }
-        for route in file.routes {
+        for route in routes {
             state
                 .check_route(&route)
                 .map_err(|error| format!("route {:?}: {error}", route.id.as_str()))?;
@@ -159,6 +200,27 @@ impl NetworkState {
                 return Err(format!("duplicate route {key:?}"));
             }
         }
+        let mut unique = BTreeSet::new();
+        for row in activation_epochs {
+            let node = state.nodes.get(&row.node)
+                .ok_or_else(|| format!("activation epoch references unknown node {:?}", row.node))?;
+            if node.state == NodeState::Pending
+                || !node.last_transition.as_ref().is_some_and(|transition| {
+                    transition.to == node.state
+                        && (transition.from != NodeState::Pending || transition.event == NodeEvent::Activate)
+                        && next_state(transition.from, transition.event).ok() == Some(transition.to)
+                })
+                || row.epoch.get() > activation_high_water
+                || !unique.insert(row.epoch)
+                || state.activation_epochs.insert(row.node, row.epoch).is_some()
+            {
+                return Err("inconsistent activation epoch history".to_owned());
+            }
+        }
+        if unique.last().map_or(0, |epoch| epoch.get()) != activation_high_water {
+            return Err("activation high-water mark does not match history".to_owned());
+        }
+        state.activation_high_water = activation_high_water;
         Ok(state)
     }
 
@@ -169,6 +231,11 @@ impl NetworkState {
             zones: self.zones.values().cloned().collect(),
             nodes: self.nodes.values().cloned().collect(),
             routes: self.routes.values().cloned().collect(),
+            activation_high_water: self.activation_high_water,
+            activation_epochs: self.activation_epochs.iter().map(|(node, epoch)| ActivationEpoch {
+                node: node.clone(),
+                epoch: *epoch,
+            }).collect(),
         }
     }
 
@@ -204,13 +271,22 @@ impl NetworkState {
     }
 }
 
+#[derive(Debug)]
+struct StoreView {
+    topology: NetworkState,
+    // Only explicit activations known to have passed directory fsync in
+    // this writer's lifetime are eligible for relay. On writer restart,
+    // the historic counter is kept but no old relay observation revives.
+    confirmed_active: BTreeMap<String, NonZeroU64>,
+}
+
 /// The durable topology store.
 #[derive(Debug)]
 pub struct NetsecStore {
     dir: PathBuf,
     path: PathBuf,
     max_nodes: usize,
-    state: Mutex<NetworkState>,
+    state: Mutex<StoreView>,
     /// Held for the store's lifetime; dropping it releases the fs4 lock.
     _lock: File,
 }
@@ -257,7 +333,7 @@ impl NetsecStore {
             dir: dir.to_path_buf(),
             path,
             max_nodes,
-            state: Mutex::new(state),
+            state: Mutex::new(StoreView { topology: state, confirmed_active: BTreeMap::new() }),
             _lock: lock,
         })
     }
@@ -275,7 +351,7 @@ impl NetsecStore {
     pub fn snapshot(&self) -> NetsecResult<NetworkState> {
         self.state
             .lock()
-            .map(|state| state.clone())
+            .map(|state| state.topology.clone())
             .map_err(|_| NetsecError::Poisoned)
     }
 
@@ -285,12 +361,30 @@ impl NetsecStore {
     /// [`NetsecError::NodeNotFound`] or [`NetsecError::Poisoned`].
     pub fn node(&self, id: &NodeId) -> NetsecResult<NodeRecord> {
         let state = self.state.lock().map_err(|_| NetsecError::Poisoned)?;
-        state
+        state.topology
             .node(id.as_str())
             .cloned()
             .ok_or_else(|| NetsecError::NodeNotFound {
                 id: id.as_str().to_owned(),
             })
+    }
+
+    /// Read-only active owner epoch from this live, authoritative writer.
+    /// No epoch is exported for an absent, inactive, legacy, or unconfirmed
+    /// node. A writer restart requires a fresh explicit activation; it does
+    /// not reset the persisted high-water mark or change ordinary NetSec
+    /// lifecycle queries. This API does not establish identity or open traffic.
+    ///
+    /// # Errors
+    /// Returns a poisoned-state error if the topology lock is unavailable.
+    pub fn active_owner_epoch(&self, id: &NodeId) -> NetsecResult<Option<NonZeroU64>> {
+        let state = self.state.lock().map_err(|_| NetsecError::Poisoned)?;
+        let node = id.as_str();
+        let confirmed = state.confirmed_active.get(node).copied();
+        Ok(confirmed.filter(|epoch| {
+            state.topology.node(node).is_some_and(|record| record.state == NodeState::Active)
+                && state.topology.activation_epochs.get(node) == Some(epoch)
+        }))
     }
 
     /// Inserts or updates the configured zones (never removes one, since
@@ -384,6 +478,15 @@ impl NetsecStore {
                 reason,
             });
             let record = node.clone();
+            if to == NodeState::Active && matches!(event, NodeEvent::Activate | NodeEvent::Undrain) {
+                let epoch = state.activation_high_water.checked_add(1).and_then(NonZeroU64::new)
+                    .ok_or_else(|| NetsecError::Io {
+                        context: "allocate owner activation epoch",
+                        source: std::io::Error::other("activation epoch exhausted"),
+                    })?;
+                state.activation_high_water = epoch.get();
+                state.activation_epochs.insert(id.as_str().to_owned(), epoch);
+            }
             if to == NodeState::Revoked {
                 state.routes.retain(|_, route| !route.references(id));
             }
@@ -425,12 +528,32 @@ impl NetsecStore {
         change: impl FnOnce(&mut NetworkState) -> NetsecResult<T>,
     ) -> NetsecResult<T> {
         let mut current = self.state.lock().map_err(|_| NetsecError::Poisoned)?;
-        let mut next = current.clone();
+        let StoreView { topology, confirmed_active } = &mut *current;
+        let mut next = topology.clone();
         let output = change(&mut next)?;
-        if next != *current {
+        if next != *topology {
+            let new_activation = if next.activation_high_water > topology.activation_high_water {
+                next.activation_epochs.iter()
+                    .find(|(_, epoch)| epoch.get() == next.activation_high_water)
+                    .map(|(node, epoch)| (node.clone(), *epoch))
+            } else {
+                None
+            };
             write_and_rename(&self.dir, &self.path, &next)?;
-            *current = next;
-            fsync_state_dir(&self.dir)?;
+            *topology = next;
+            if let Err(error) = fsync_state_dir(&self.dir) {
+                // The existing topology API still reflects the successful
+                // rename. The new relay authority cannot rely on it.
+                confirmed_active.clear();
+                return Err(error);
+            }
+            confirmed_active.retain(|node, epoch| {
+                topology.node(node).is_some_and(|record| record.state == NodeState::Active)
+                    && topology.activation_epochs.get(node).is_some_and(|saved| *saved == *epoch)
+            });
+            if let Some((node, epoch)) = new_activation {
+                confirmed_active.insert(node, epoch);
+            }
         }
         Ok(output)
     }
@@ -491,7 +614,7 @@ fn load(path: &Path) -> NetsecResult<NetworkState> {
             limit: MAX_STATE_BYTES,
         });
     }
-    let file: StateFile =
+    let file: ReadStateFile =
         serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;
     NetworkState::from_file(file).map_err(corrupt)
 }
@@ -511,6 +634,12 @@ fn write_and_rename(dir: &Path, path: &Path, state: &NetworkState) -> NetsecResu
             source: std::io::Error::other(error),
         })?;
     bytes.push(b'\n');
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STATE_BYTES {
+        return Err(NetsecError::StoreTooLarge {
+            path: path.to_path_buf(),
+            limit: MAX_STATE_BYTES,
+        });
+    }
     reject_symlink(path)?;
     let mut temp = tempfile::Builder::new()
         .prefix(".state.")

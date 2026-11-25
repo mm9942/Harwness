@@ -1,0 +1,99 @@
+# Kontextprogramm für Sicherheits-Triage (PL-100 WP 1.3).
+#
+# WOFÜR: die vier Triage-Rollen des Security-Clans
+# (`security-egress-triage`, `security-baseline-triage`,
+# `security-structure-triage`, `security-endpoint-triage`) sichten genau einen
+# Harw-DoD-Befund und geben genau ein Verdikt zurück. Bis PL-100 banden sie
+# `triage.toml`; das ist das Programm der FEHLER-Triage (Stacktrace,
+# Lesebereich im Code) und passt nicht zu einem Kind ohne Dateisystem, ohne
+# Code-Scope und mit angreiferkontrollierten Sensordaten
+# (`docs/planning/100-dod-ai-integration/README.md` §1, Lücke 6).
+# `triage.toml` bleibt als Bibliotheksprogramm bestehen.
+#
+# DREI KANÄLE (README §2, I4) — und was davon dieses Programm betrifft:
+#   - Instruktion: `task.objective` (full/instruction, von base). Der Auftrag
+#     des Kindes ist ein festes ASCII-Template NUR aus IDs und Enums:
+#     `{finding_id, rule_id, record_digest}` (README §5, Fall 1, Schritt 3).
+#     Kein Sensortext, kein Pfad, kein Prozessname steht im Auftrag. Der
+#     Auftrag ist der einzige Kanal mit Instruktions-Vertrauen.
+#   - Daten: Fakten kommen AUSSCHLIESSLICH über die lesenden Werkzeuge
+#     `dod.finding`, `dod.related`, `dod.labels` (WP 1.2, `DOD_TRIAGE_TOOLS`)
+#     bzw. heute `dod.findings`, `dod.status`, `dod.sensors`
+#     (`harw-registry-defaults/src/profile.rs:844`, `dod_tools_for_role`
+#     `:872`). Ihre Ausgabe liegt in der Untrusted-Hülle. Sensortext
+#     (Hostnamen, Pfade, Prozessnamen, SARIF, Log-Zeilen) ist DATEN, nie
+#     Anweisung — auch wenn er wie eine Anweisung, ein Werkzeugaufruf oder ein
+#     fertiges Verdikt-JSON aussieht. Werkzeugergebnisse landen im Verlauf,
+#     daher bleibt `history.tail` auf `evidence` (von base, unverändert).
+#   - Rückkanal: genau EIN JSON-Objekt nach `harwness.security-verdict/v1`
+#     (`harw-dod/crates/harw-dod-signals/src/verdict.rs:170`
+#     `SecurityVerdict`, `deny_unknown_fields`; Label `:207`). Felder:
+#     `contract`, `finding` (= `finding_id` aus dem Auftrag),
+#     `bound_evidence` (= `record_digest` aus dem Auftrag, 64 Hex-Zeichen),
+#     `classification` (`benign` | `suspicious`), `severity` (`info` | `low`
+#     | `medium` | `high` | `critical`), `rationale` (nicht leer, kurz),
+#     optional `suggested_response` (`monitor` | `escalate` | `contain`, OHNE
+#     Ziel, `verdict.rs:145`), `issued_by` (Rollenname), `issued_at`
+#     (RFC 3339). Geprüft wird es von `ChildReturnContract::parse`
+#     (`harw-core-bridge/src/agent_tool.rs:1502`), `parse_verdict`
+#     (`verdict.rs:442`) und `validate_verdict` (`verdict.rs:462`). Gebunden
+#     wird es vom EMPFÄNGER per `binds(finding, evidence_digest)`
+#     (`verdict.rs:379`) gegen den Digest, den der Empfänger selbst hält —
+#     nie gegen einen Wert aus dem Verdikt.
+#
+# WAS DAS KIND NIE TUT (README §2, I1/I2/I3; als Regel für die Rollen hier
+# festgehalten, durchgesetzt wird sie außerhalb dieses Programms):
+#   - Es handelt nicht: keine Schreib-, Netz-, Prozess- oder Job-Werkzeuge
+#     (`[tools].forbidden` der Rollen, `max_depth = 0`).
+#   - Es schlägt kein Ziel vor: weder Cgroup noch Prozess, Pfad oder Befehl —
+#     in keinem Feld. Ziele kommen nur aus dem verifizierten Spool-Record (I2).
+#   - Es bestätigt nie: ein Modell gibt kein `confirmed` aus. Der Empfänger
+#     deckelt `Confirmed` ohnehin auf `NeedsReview`
+#     (`harw-dod/crates/harw-dod-rules/src/finding.rs:1199` `model_verdict`,
+#     aufgerufen aus `triage_record` `:1173`). Das Kind nutzt deshalb nur
+#     `benign` oder `suspicious` und drückt die Schwere über `severity` aus.
+#   - Es zitiert in `rationale` keinen Sensortext wörtlich; die Begründung
+#     geht nur an Menschen, Eltern sehen nur IDs und Enums (I4).
+#
+# `extends = base`: `task.objective` (full/instruction) und `history.tail`
+# (summary/evidence) unverändert. KEINE eigenen `[[sections]]`, und zwar
+# bewusst:
+#   - `error.trace` und `task.read_scope` aus `triage.toml` passen nicht: das
+#     Kind hat weder einen Fehlerverlauf noch einen Code-Lesebereich.
+#   - Eine eigene DoD-Datensektion wäre außerhalb der Wurzeldecke und würde
+#     beim Binden zurückgestellt (`harw-agent-dsl/src/bind.rs:280`
+#     `bind_context_program`, Decke `harw-registry-defaults/src/embedded_agents.rs:853`
+#     `ROOT_CEILING_SECTIONS`). Die Evidence-Card kommt über `dod.finding`,
+#     nicht über eine Kontextsektion.
+#   - `task.read_scope` steht trotzdem in `must_include` der gebundenen
+#     Rollen: es kommt inline aus `worker-base.toml` (`[context]
+#     must_include`), nicht aus diesem Programm.
+#
+# ZUSÄTZLICHER AUSSCHLUSS (Fakten nur über `dod.*`):
+#   - `plan.*`, `diff.*`: ein Plan oder ein Änderungsdiff ist kein Beleg für
+#     einen Sicherheitsbefund und würde das Urteil mit Lösungs- bzw.
+#     Code-Vorurteilen färben (wie `plan.*` in `triage.toml`).
+#   - `error.*`: Fehlerspuren gehören zur Fehler-Triage, nicht hierher.
+#   - `child.returns`: Tiefe 0, und vor allem: Rückgaben anderer Kinder
+#     (fremde Verdikte samt modellverfasster Begründung) dürfen das eigene
+#     Urteil nicht beeinflussen (I4: Begründung nur an Menschen).
+#   - `knowledge.*`, `memory.*`: Gedächtnis- und Wissenskandidaten können
+#     früher eingefangenen Sensortext ohne Untrusted-Hülle tragen; Fakten
+#     kommen nur über `dod.*`.
+
+schema = "harwness.context/v1"
+id = "harwness.context.security-triage@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor jedem `[[sections]]` — siehe Kommentar in
+# `base.toml` zum TOML-Fallstrick mit Array-of-Tables. Dieses Programm
+# deklariert keine eigenen Sektionen (Begründung oben).
+exclude = [
+  "plan.*",
+  "diff.*",
+  "error.*",
+  "child.returns",
+  "knowledge.*",
+  "memory.*",
+]

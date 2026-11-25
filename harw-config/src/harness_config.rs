@@ -8,6 +8,7 @@ use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 use crate::retention_toml::RetentionSection;
+use crate::admin_toml::AdminSection;
 use crate::session_listener_toml::SessionListenerSection;
 use crate::skills_toml::SkillsSection;
 use crate::uia_worker_models::UiaWorkerModelsToml;
@@ -92,6 +93,10 @@ pub struct HarnessConfig {
     /// (nur global). Siehe `session_listener_toml.rs`.
     #[serde(default)]
     pub session_listener: SessionListenerSection,
+    /// `[admin]` — Geräte-Enrollment-Webdienst `harw admin serve` (nur global).
+    /// Siehe `admin_toml.rs`.
+    #[serde(default)]
+    pub admin: AdminSection,
     /// `[retention]` — Aufbewahrungsgrenzen je Datenklasse (Logs, Caches,
     /// Spools); sicherheitsrelevante Klassen sind opt-in. Siehe
     /// `retention_toml.rs`.
@@ -516,11 +521,11 @@ pub struct GuardsToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_stale_rounds: Option<u32>,
     /// Runde 7, Teil A2: eigene Lesezugriffe eines Orchestrators (über die
-    /// ganze Kind-Sitzung), ab denen gewarnt wird. Vorgabe `4`.
+    /// ganze Kind-Sitzung), ab denen gewarnt wird. Vorgabe `10`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_read_warn: Option<u32>,
     /// Runde 7, Teil A2: höchstens so viele eigene Lesezugriffe eines
-    /// Orchestrators; jeder weitere wird abgelehnt. Vorgabe `5`, `0` schaltet
+    /// Orchestrators; jeder weitere wird abgelehnt. Vorgabe `12`, `0` schaltet
     /// das Lesebudget ab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_read_limit: Option<u32>,
@@ -543,7 +548,33 @@ pub struct SandboxSection {
     /// (`ProfileReplaces`): an untrusted project layer cannot set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<SandboxExecutionToml>,
+    /// `host_lease_ttl_secs` — Dauer einer Host-Arbeitsphase in Sekunden
+    /// (PL-100 Phase 4, Bedrohung B22; `docs/adr/0002-session-lease-expiry.md`).
+    /// `None` → [`DEFAULT_HOST_LEASE_TTL_SECS`] (8 h). Erlaubt ist
+    /// [`HOST_LEASE_TTL_SECS_RANGE`] (1 s bis 7 Tage); `0` oder ein größerer
+    /// Wert ist ein Konfigurationsfehler beim Parsen, kein Klemmen. Die
+    /// Laufzeit-Montage setzt damit die Dauer jeder neuen Phase in der
+    /// `HostPermitSessionRegistry` und die Höchstdauer ihrer Ledger-Permits;
+    /// gelesen über [`SandboxSection::effective_host_lease_ttl`]. Eine
+    /// laufende Phase wird nie verlängert. Profilebene (`ProfileReplaces`,
+    /// sicherheitsrelevant): eine nicht vertraute Projektebene setzt den
+    /// Wert nie.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_host_lease_ttl_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub host_lease_ttl_secs: Option<u64>,
 }
+
+/// Vorgabe für `[sandbox] host_lease_ttl_secs`: 8 h (28 800 s).
+///
+/// Gleich `harw_sandbox::DEFAULT_SESSION_LEASE_TTL` (PL-100 Phase 4, B22);
+/// die Konfigurations-Crate hängt bewusst nicht von `harw-sandbox` ab.
+pub const DEFAULT_HOST_LEASE_TTL_SECS: u64 = 28_800;
+/// Erlaubter Bereich für `[sandbox] host_lease_ttl_secs` in Sekunden
+/// (inklusive): 1 s bis 7 Tage.
+pub const HOST_LEASE_TTL_SECS_RANGE: (u64, u64) = (1, 604_800);
 
 impl SandboxSection {
     /// The configured execution path, [`SandboxExecutionToml::Chain`] when
@@ -552,6 +583,56 @@ impl SandboxSection {
     pub fn effective_execution(&self) -> SandboxExecutionToml {
         self.execution.unwrap_or_default()
     }
+
+    /// Wirksame Dauer einer Host-Arbeitsphase in Sekunden.
+    ///
+    /// # Returns
+    /// `host_lease_ttl_secs` oder [`DEFAULT_HOST_LEASE_TTL_SECS`], defensiv
+    /// auf [`HOST_LEASE_TTL_SECS_RANGE`] geklemmt (falls der Wert nicht aus
+    /// TOML stammt); daher nie `0`.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_config::harness_config::{DEFAULT_HOST_LEASE_TTL_SECS, SandboxSection};
+    ///
+    /// let section = SandboxSection::default();
+    /// assert_eq!(section.effective_host_lease_ttl_secs(), DEFAULT_HOST_LEASE_TTL_SECS);
+    /// ```
+    #[must_use]
+    pub fn effective_host_lease_ttl_secs(&self) -> u64 {
+        self.host_lease_ttl_secs
+            .unwrap_or(DEFAULT_HOST_LEASE_TTL_SECS)
+            .clamp(HOST_LEASE_TTL_SECS_RANGE.0, HOST_LEASE_TTL_SECS_RANGE.1)
+    }
+
+    /// Wirksame Dauer einer Host-Arbeitsphase als [`std::time::Duration`]
+    /// (siehe [`Self::effective_host_lease_ttl_secs`]); nie null.
+    ///
+    /// # Description
+    /// Für `ProcessPermitLedger::with_lease_ttl` und
+    /// `HostPermitSessionRegistry::with_lease_ttl` in der Laufzeit-Montage.
+    #[must_use]
+    pub fn effective_host_lease_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.effective_host_lease_ttl_secs())
+    }
+}
+
+// Lehnt `[sandbox] host_lease_ttl_secs` außerhalb von
+// `HOST_LEASE_TTL_SECS_RANGE` beim Parsen ab (wie
+// `deserialize_jobs_max_running`): der Fehler wird zu
+// `ConfigError::TomlParse`.
+fn deserialize_host_lease_ttl_secs<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if !(HOST_LEASE_TTL_SECS_RANGE.0..=HOST_LEASE_TTL_SECS_RANGE.1).contains(&value) {
+        return Err(serde::de::Error::custom(format!(
+            "[sandbox] host_lease_ttl_secs must be between {} and {}, got {value}",
+            HOST_LEASE_TTL_SECS_RANGE.0, HOST_LEASE_TTL_SECS_RANGE.1
+        )));
+    }
+    Ok(Some(value))
 }
 
 /// `[sandbox] execution` — the execution path of model-driven processes
@@ -797,6 +878,41 @@ pub struct TuiSection {
     /// eingeklappt auf eine Zeile (`collapsed`) oder gar nicht (`hidden`).
     #[serde(default)]
     pub reasoning: ReasoningDisplayMode,
+    /// Agentenzahlen-Fußzeile unter dem Composer (`[tui] footer_counts`,
+    /// Vorgabe: aus). Rein darstellend.
+    #[serde(default)]
+    pub footer_counts: bool,
+    /// Zellseitenverhältnis (Zellbreite / Zellhöhe) für die Quadrat-Geometrie
+    /// im Hochformat (`[tui] cell_aspect`, z. B. `0.48`). `None` (Vorgabe)
+    /// bedeutet: die TUI misst es zur Laufzeit oder nimmt 0.5. Gültig sind
+    /// Werte im Bereich [`TUI_CELL_ASPECT_MIN`]..=[`TUI_CELL_ASPECT_MAX`].
+    #[serde(default)]
+    pub cell_aspect: Option<f32>,
+}
+
+/// Kleinster zulässiger Wert für `[tui] cell_aspect`.
+pub const TUI_CELL_ASPECT_MIN: f32 = 0.2;
+/// Größter zulässiger Wert für `[tui] cell_aspect`.
+pub const TUI_CELL_ASPECT_MAX: f32 = 1.5;
+
+impl TuiSection {
+    /// Prüft Wertebereiche, die reine Deserialisierung nicht ausdrückt.
+    ///
+    /// # Errors
+    /// Liefert `Err(String)` mit einer menschenlesbaren Begründung, wenn
+    /// `cell_aspect` gesetzt ist, aber nicht im Bereich
+    /// [`TUI_CELL_ASPECT_MIN`]..=[`TUI_CELL_ASPECT_MAX`] liegt (`NaN` und
+    /// unendliche Werte fallen ebenfalls hinein).
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(aspect) = self.cell_aspect
+            && !(TUI_CELL_ASPECT_MIN..=TUI_CELL_ASPECT_MAX).contains(&aspect)
+        {
+            return Err(format!(
+                "tui.cell_aspect muss zwischen {TUI_CELL_ASPECT_MIN} und {TUI_CELL_ASPECT_MAX} liegen, gefunden {aspect}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for TuiSection {
@@ -809,6 +925,8 @@ impl Default for TuiSection {
             status_expiry: StatusExpiryMode::default(),
             goal_mode: false,
             reasoning: ReasoningDisplayMode::default(),
+            footer_counts: false,
+            cell_aspect: None,
         }
     }
 }
@@ -1053,6 +1171,60 @@ mod tests {
             TuiSection::default().status_expiry,
             StatusExpiryMode::Consolidate
         );
+    }
+
+    /// `[tui] footer_counts` ist standardmäßig aus und lässt sich per TOML einschalten.
+    #[test]
+    fn test_tui_footer_counts_defaults_off_and_parses() -> TestResult {
+        assert!(!TuiSection::default().footer_counts);
+        let src = "default_provider = \"anthropic\"\ndefault_model = \"m\"\n[tui]\nfooter_counts = true\n";
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse tui.footer_counts"))?;
+        assert!(cfg.tui.footer_counts);
+        Ok(())
+    }
+
+    /// `[tui] cell_aspect` ist standardmäßig nicht gesetzt, parst Gleitkommawerte
+    /// und wird im gültigen Bereich 0.2..=1.5 akzeptiert.
+    #[test]
+    fn test_tui_cell_aspect_defaults_none_and_parses() -> TestResult {
+        assert_eq!(TuiSection::default().cell_aspect, None);
+        assert!(TuiSection::default().validate().is_ok());
+        let src =
+            "default_provider = \"anthropic\"\ndefault_model = \"m\"\n[tui]\ncell_aspect = 0.48\n";
+        let cfg: HarnessConfig = toml::from_str(src).map_err(ctx("parse tui.cell_aspect"))?;
+        assert_eq!(cfg.tui.cell_aspect, Some(0.48));
+        assert!(cfg.tui.validate().is_ok());
+        for edge in ["cell_aspect = 0.2", "cell_aspect = 1.5"] {
+            let src = format!("[tui]\n{edge}\n");
+            let cfg: HarnessConfig = toml::from_str(&src).map_err(ctx("parse cell_aspect edge"))?;
+            assert!(cfg.tui.validate().is_ok(), "{edge} must be accepted");
+        }
+        Ok(())
+    }
+
+    /// `[tui] cell_aspect` außerhalb von 0.2..=1.5 (inklusive NaN) wird
+    /// von `TuiSection::validate` mit einer Begründung abgelehnt.
+    #[test]
+    fn test_tui_cell_aspect_out_of_range_is_rejected() -> TestResult {
+        for value in ["0.19", "1.51", "0.0", "-0.5", "nan", "inf"] {
+            let src = format!("[tui]\ncell_aspect = {value}\n");
+            let cfg: HarnessConfig = toml::from_str(&src).map_err(ctx("parse cell_aspect"))?;
+            let Err(message) = cfg.tui.validate() else {
+                return Err(TestError::Unexpected(format!(
+                    "cell_aspect = {value} must be rejected"
+                )));
+            };
+            assert!(message.contains("tui.cell_aspect"), "{message}");
+        }
+        Ok(())
+    }
+
+    /// `[tui] cell_aspect` ist ein bekannter Schlüssel: ein Tippfehler im
+    /// Namen bleibt wegen `deny_unknown_fields` ein Parsefehler.
+    #[test]
+    fn test_tui_cell_aspect_typo_is_unknown_field() {
+        let src = "[tui]\ncell_aspet = 0.5\n";
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
     }
 
     /// PL-97 R1: `[tui] reasoning` hat die Vorgabe `message`, parst die
@@ -1499,6 +1671,89 @@ mod tests {
             execution = "host"
         "#;
         assert!(toml::from_str::<HarnessConfig>(src).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_host_lease_ttl_defaults_to_eight_hours() -> TestResult {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                default_provider = "anthropic"
+            "#,
+        )
+        .map_err(ctx("parse config without host_lease_ttl_secs"))?;
+        assert_eq!(cfg.sandbox.host_lease_ttl_secs, None);
+        assert_eq!(cfg.sandbox.effective_host_lease_ttl_secs(), 28_800);
+        assert_eq!(
+            cfg.sandbox.effective_host_lease_ttl(),
+            std::time::Duration::from_secs(28_800)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_host_lease_ttl_parses_values_in_range() -> TestResult {
+        for (src, expected) in [
+            ("[sandbox]\nhost_lease_ttl_secs = 3600\n", 3_600),
+            ("[sandbox]\nhost_lease_ttl_secs = 1\n", 1),
+            ("[sandbox]\nhost_lease_ttl_secs = 604800\n", 604_800),
+        ] {
+            let cfg: HarnessConfig =
+                toml::from_str(src).map_err(ctx("parse host_lease_ttl_secs in range"))?;
+            assert_eq!(cfg.sandbox.host_lease_ttl_secs, Some(expected), "{src}");
+            assert_eq!(cfg.sandbox.effective_host_lease_ttl_secs(), expected);
+            assert_eq!(
+                cfg.sandbox.effective_host_lease_ttl(),
+                std::time::Duration::from_secs(expected)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_host_lease_ttl_rejects_zero_negative_and_more_than_seven_days() -> TestResult {
+        for src in [
+            "[sandbox]\nhost_lease_ttl_secs = 0\n",
+            "[sandbox]\nhost_lease_ttl_secs = 604801\n",
+            "[sandbox]\nhost_lease_ttl_secs = -5\n",
+            "[sandbox]\nhost_lease_ttl_secs = \"8h\"\n",
+        ] {
+            match toml::from_str::<HarnessConfig>(src) {
+                Ok(_) => {
+                    return Err(TestError::Unexpected(format!(
+                        "expected rejection of {src:?}"
+                    )));
+                }
+                Err(err) => {
+                    // Der Bereichsfehler nennt den Schlüssel; Typfehler
+                    // (negativ, Text) stammen aus serde selbst.
+                    if src.contains(" 0\n") || src.contains("604801") {
+                        assert!(
+                            err.to_string().contains("host_lease_ttl_secs"),
+                            "range error must name the key: {err}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sandbox_effective_host_lease_ttl_clamps_values_not_from_toml() {
+        let mut section = SandboxSection {
+            host_lease_ttl_secs: Some(0),
+            ..SandboxSection::default()
+        };
+        assert_eq!(
+            section.effective_host_lease_ttl_secs(),
+            HOST_LEASE_TTL_SECS_RANGE.0
+        );
+        assert!(!section.effective_host_lease_ttl().is_zero());
+        section.host_lease_ttl_secs = Some(u64::MAX);
+        assert_eq!(
+            section.effective_host_lease_ttl_secs(),
+            HOST_LEASE_TTL_SECS_RANGE.1
+        );
     }
 
     #[test]

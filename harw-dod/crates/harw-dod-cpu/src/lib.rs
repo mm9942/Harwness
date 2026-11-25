@@ -48,9 +48,10 @@
 //!
 //! **Diese Crate meldet deshalb die rohen kumulativen Zähler, unverändert,
 //! als zehn `HostSample`s je Poll.** Die Bildung einer Rate (Differenz durch
-//! Zeitspanne zwischen zwei Polls) ist bewusst **Sache des Verbrauchers**
-//! (z. B. `harw-dod-rules`), der ohnehin schon Zustand über mehrere
-//! Beobachtungen hinweg hält. Wer das hier „verbessert", indem er zwei
+//! Zeitspanne zwischen zwei Polls) ist bewusst **Sache des Verbrauchers**,
+//! der ohnehin schon Zustand über mehrere Beobachtungen hinweg hält — heute
+//! die Zähler→Raten-Stufe `RateStage` in `harw-sentinel` (`src/rates.rs`,
+//! PL-100 WP0.14), die `<metric>.rate` vor den Regeln erzeugt. Wer das hier „verbessert", indem er zwei
 //! interne Polls vergleicht, bricht sowohl die Objektsicherheit als
 //! `&self`-Trait als auch die Fixture-Prüfbarkeit — deshalb steht das hier
 //! ausdrücklich, nicht nur als Kommentar im Code.

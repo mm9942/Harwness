@@ -43,12 +43,31 @@
 //! [`map_read_fs_error`] übersetzt die zusätzlichen Fehlerformen von
 //! `harw-dod-readfs` (Größengrenze, Glob-Mustergültigkeit) verlustfrei in
 //! dieselbe, bereits bestehende Fehlermenge, ohne eine eigene zu erfinden.
+//!
+//! # Ein kaputter Bericht blendet den Sensor nicht (PL-100 WP0.15)
+//! Früher brach der erste nicht lesbare oder nicht deutbare Bericht den
+//! ganzen Abruf mit `MalformedSource` ab — eine einzige kaputte (oder
+//! absichtlich abgelegte) Datei im Berichtsordner machte damit **alle**
+//! übrigen Berichte unsichtbar. Jetzt gilt je Datei:
+//! - Lese- oder Deutungsfehler → die Datei wird übersprungen und gezählt,
+//!   der Abruf läuft weiter.
+//! - Wurde mindestens eine Datei übersprungen, meldet der Abruf genau ein
+//!   `EventKind::SensorDegraded { sensor }` (ein Ereignis je Abruf, nicht
+//!   je Datei: das Schema trägt keinen Dateibezug, und ein Pfad darf den
+//!   Sensor nicht verlassen).
+//! - Hat der Abruf mindestens eine Berichtsdatei geprüft, meldet er genau
+//!   ein `HostSample` [`MALFORMED_REPORTS_METRIC`] mit der Zahl der
+//!   übersprungenen Dateien (`0`, wenn alle lesbar waren).
+//!
+//! Nur Fehler, die den **Ordner** betreffen (Glob über den Lesebereich),
+//! lassen den Abruf weiterhin scheitern.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
-use harw_dod_signals::{Hardness, Sensor, SensorReading};
+use harw_dod_signals::{EventKind, Hardness, HostSample, SecurityEvent, Sensor, SensorReading};
 use harw_types::SensorId;
 use jiff::Timestamp;
 
@@ -85,6 +104,24 @@ const REPORT_EXTENSIONS: [&str; 2] = ["json", "sarif"];
 /// ein falsch-positiver Scanner-Befund bleibt möglich, solange niemand ihn
 /// bestätigt hat.
 pub const REPORT_HARDNESS: Hardness = Hardness::Inferred;
+
+/// Metrikname: wie viele Berichtsdateien ein Abruf übersprungen hat, weil
+/// sie nicht lesbar oder nicht deutbar waren (PL-100 WP0.15).
+///
+/// # Description
+/// Siehe Moduldoku, Abschnitt „Ein kaputter Bericht blendet den Sensor
+/// nicht". Gemeldet, sobald der Abruf mindestens eine Berichtsdatei geprüft
+/// hat; ein leerer oder fehlender Berichtsordner liefert weiterhin ein
+/// leeres [`SensorReading`].
+///
+/// # Examples
+/// ```rust
+/// assert_eq!(
+///     harw_dod_scanreport::MALFORMED_REPORTS_METRIC,
+///     "scanreport.malformed_reports"
+/// );
+/// ```
+pub const MALFORMED_REPORTS_METRIC: &str = "scanreport.malformed_reports";
 
 /// Ein Sensor, der Berichte fremder Scanner liest.
 ///
@@ -171,18 +208,29 @@ impl Sensor for ScanReportSensor {
 
     /// Liest jede passende Berichtsdatei im Lesebereich genau einmal aus.
     ///
-    /// # Errors
-    /// [`SensorError::MalformedSource`], wenn eine gefundene Datei kein
-    /// syntaktisch gültiges JSON ist oder keiner der beiden unterstützten
-    /// Formen entspricht ([`crate::report::parse_report`]);
-    /// [`SensorError::OutsideScope`]/[`SensorError::Io`], wenn das Lesen
-    /// selbst scheitert ([`harw_dod_readfs::read_to_string`]). Ein leerer
-    /// oder (noch) nicht existierender Berichtsordner liefert ein leeres
-    /// [`SensorReading`], **keinen** Fehler. Ein Kandidat, der sich beim
+    /// # Description
+    /// Eine Datei, die kein syntaktisch gültiges JSON ist, keiner der beiden
+    /// unterstützten Formen entspricht ([`crate::report::parse_report`]) oder
+    /// sich nicht lesen lässt ([`harw_dod_readfs::read_to_string`]: außerhalb
+    /// des Bereichs, zu groß, E/A-Fehler), wird übersprungen und gezählt —
+    /// sie lässt den Abruf **nicht** scheitern (siehe Moduldoku, Abschnitt
+    /// „Ein kaputter Bericht blendet den Sensor nicht"). Die Ereignisse
+    /// aller übrigen Dateien kommen trotzdem an; zusätzlich meldet der
+    /// Abruf ein `SensorDegraded` (sobald eine Datei übersprungen wurde) und
+    /// das Sample [`MALFORMED_REPORTS_METRIC`] (sobald eine Datei geprüft
+    /// wurde). Ein leerer oder (noch) nicht existierender Berichtsordner
+    /// liefert ein leeres [`SensorReading`]. Ein Kandidat, der sich beim
     /// Öffnen nicht als reguläre Datei erweist (FIFO, Gerätedatei oder ein
     /// Verzeichnis, dessen Name zufällig auf `.json`/`.sarif` endet — F-064),
-    /// wird stillschweigend übersprungen statt den Abruf scheitern zu
-    /// lassen oder unbegrenzt zu blockieren; siehe [`open_if_regular_file`].
+    /// wird übersprungen, ohne gezählt zu werden: er ist kein Bericht; siehe
+    /// [`open_if_regular_file`].
+    ///
+    /// # Errors
+    /// Nur Fehler beim Auflisten des Berichtsordners
+    /// ([`harw_dod_readfs::glob::glob`], übersetzt über
+    /// [`map_read_fs_error`]), etwa [`SensorError::MalformedSource`], wenn
+    /// der Ordner die Kandidatengrenze überschreitet. Kein Fehler einer
+    /// einzelnen Datei erreicht den Aufrufer.
     fn poll(&self, now: Timestamp) -> Result<SensorReading, SensorError> {
         let scope = self.handle.scope();
 
@@ -196,6 +244,9 @@ impl Sensor for ScanReportSensor {
         }
 
         let mut events = Vec::new();
+        // Geprüfte Berichtsdateien (reguläre Dateien) und davon übersprungene.
+        let mut examined: usize = 0;
+        let mut malformed: usize = 0;
         for path in paths {
             // F-064: vor jedem Lesen erst per nicht-blockierendem Öffnen +
             // `fstat` sicherstellen, dass der Kandidat tatsächlich eine
@@ -207,17 +258,43 @@ impl Sensor for ScanReportSensor {
             if open_if_regular_file(&path).is_none() {
                 continue;
             }
+            examined = examined.saturating_add(1);
 
-            let content =
-                harw_dod_readfs::read_to_string(scope, &path).map_err(map_read_fs_error)?;
-            let mut parsed = parse_report(&content, self.handle.id(), now)?;
-            events.append(&mut parsed);
+            let parsed = harw_dod_readfs::read_to_string(scope, &path)
+                .map_err(map_read_fs_error)
+                .and_then(|content| parse_report(&content, self.handle.id(), now));
+            match parsed {
+                Ok(mut found) => events.append(&mut found),
+                // PL-100 WP0.15: eine kaputte Datei überspringen statt den
+                // ganzen Sensor zu blenden. Der Fehler ist inhaltsfrei und
+                // wird bewusst nur gezählt; Pfad und Inhalt verlassen den
+                // Sensor nie.
+                Err(_) => malformed = malformed.saturating_add(1),
+            }
         }
 
-        Ok(SensorReading {
-            samples: Vec::new(),
-            events,
-        })
+        if malformed > 0 {
+            events.push(SecurityEvent {
+                sensor: self.handle.id().clone(),
+                observed_at: now,
+                actor: None,
+                kind: EventKind::SensorDegraded {
+                    sensor: self.handle.id().clone(),
+                },
+            });
+        }
+        let samples = if examined > 0 {
+            vec![HostSample {
+                sensor: self.handle.id().clone(),
+                observed_at: now,
+                metric: Cow::Borrowed(MALFORMED_REPORTS_METRIC),
+                value: malformed as f64,
+            }]
+        } else {
+            Vec::new()
+        };
+
+        Ok(SensorReading { samples, events })
     }
 }
 
@@ -425,7 +502,8 @@ mod tests {
             .poll(Timestamp::UNIX_EPOCH)
             .map_err(ctx("gültiger Bericht muss erfolgreich gelesen werden"))?;
 
-        assert_eq!(reading.samples.len(), 0);
+        // Einzige Messung: null übersprungene Berichte.
+        assert_malformed_count(&reading, 0)?;
         assert_eq!(reading.events.len(), 2);
         for event in &reading.events {
             assert_eq!(event.sensor, sensor_id());
@@ -528,8 +606,38 @@ mod tests {
         Ok(())
     }
 
+    /// Prüft das Sample [`MALFORMED_REPORTS_METRIC`] eines Abrufs: genau
+    /// eines, mit dem Wert `expected`.
+    fn assert_malformed_count(reading: &SensorReading, expected: u32) -> TestResult {
+        let counters: Vec<&HostSample> = reading
+            .samples
+            .iter()
+            .filter(|s| s.metric == MALFORMED_REPORTS_METRIC)
+            .collect();
+        assert_eq!(counters.len(), 1, "genau ein Zähler je Abruf");
+        assert_eq!(reading.samples.len(), 1, "keine weiteren Samples");
+        let counter = counters
+            .first()
+            .ok_or(TestError::Missing("Zähler übersprungener Berichte"))?;
+        assert!(
+            (counter.value - f64::from(expected)).abs() < f64::EPSILON,
+            "erwartet {expected}, erhalten {}",
+            counter.value
+        );
+        Ok(())
+    }
+
+    /// Zahl der `SensorDegraded`-Ereignisse eines Abrufs.
+    fn degraded_count(reading: &SensorReading) -> usize {
+        reading
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::SensorDegraded { .. }))
+            .count()
+    }
+
     #[test]
-    fn test_malformed_json_error_message_does_not_contain_report_content() -> TestResult {
+    fn test_malformed_json_reading_does_not_contain_report_content() -> TestResult {
         let dir = temp_dir()?;
         let secret_marker = "GEHEIMNIS-1234567890";
         write_fixture(
@@ -539,15 +647,90 @@ mod tests {
         )?;
 
         let sensor = sensor_for(dir.path());
-        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
-            return Err(TestError::Unexpected(
-                "kaputtes JSON muss scheitern".to_owned(),
-            ));
-        };
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "ein kaputter Bericht darf den Abruf nicht scheitern lassen",
+        ))?;
 
-        let message = err.to_string();
-        assert!(!message.contains(secret_marker));
-        assert!(matches!(err, SensorError::MalformedSource));
+        let rendered = format!("{reading:?}");
+        assert!(!rendered.contains(secret_marker));
+        assert_malformed_count(&reading, 1)?;
+        assert_eq!(degraded_count(&reading), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_one_malformed_report_does_not_blind_the_sensor() -> TestResult {
+        // PL-100 WP0.15: früher blendete die eine kaputte Datei auch den
+        // gültigen Nachbarn aus.
+        let dir = temp_dir()?;
+        write_fixture(
+            &dir.path().join("a-broken.json"),
+            "{ kaputt",
+            "write broken",
+        )?;
+        write_fixture(
+            &dir.path().join("b-valid.sarif"),
+            VALID_SARIF,
+            "write valid",
+        )?;
+        write_fixture(
+            &dir.path().join("c-unknown.json"),
+            r#"{"not_a_known_format": 1}"#,
+            "write unknown",
+        )?;
+
+        let sensor = sensor_for(dir.path());
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "kaputte Berichte dürfen den Abruf nicht scheitern lassen",
+        ))?;
+
+        let drifts = reading
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::StructureDrift { .. }))
+            .count();
+        assert_eq!(
+            drifts, 2,
+            "die zwei Befunde des gültigen Berichts kommen an"
+        );
+        assert_eq!(degraded_count(&reading), 1, "ein SensorDegraded je Abruf");
+        assert_malformed_count(&reading, 2)?;
+        let degraded = reading
+            .events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::SensorDegraded { .. }))
+            .ok_or(TestError::Missing("SensorDegraded"))?;
+        assert_eq!(
+            degraded.kind,
+            EventKind::SensorDegraded {
+                sensor: sensor_id()
+            }
+        );
+        assert!(degraded.actor.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_oversized_report_is_skipped_and_counted() -> TestResult {
+        let dir = temp_dir()?;
+        let too_large = usize::try_from(harw_dod_readfs::MAX_READ_BYTES)
+            .map_err(ctx("MAX_READ_BYTES passt in usize"))?
+            .saturating_add(1);
+        write_fixture(
+            &dir.path().join("huge.json"),
+            "a".repeat(too_large),
+            "write huge",
+        )?;
+        write_fixture(&dir.path().join("ok.sarif"), VALID_SARIF, "write valid")?;
+
+        let sensor = sensor_for(dir.path());
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "ein übergroßer Bericht darf den Abruf nicht scheitern lassen",
+        ))?;
+
+        assert_malformed_count(&reading, 1)?;
+        assert_eq!(degraded_count(&reading), 1);
+        assert_eq!(reading.events.len(), 3, "2 Befunde + 1 SensorDegraded");
         Ok(())
     }
 
@@ -580,10 +763,10 @@ mod tests {
         Ok(())
     }
 
-    /// 2. Inhaltsfreiheit: der Fehlertext bei kaputtem JSON nennt weder den
+    /// 2. Inhaltsfreiheit: das Ergebnis bei kaputtem JSON nennt weder den
     ///    Berichtsinhalt noch den aufgelösten Pfad der betroffenen Datei.
     #[test]
-    fn test_check_content_freedom_error_never_echoes_source_paths() -> TestResult {
+    fn test_check_content_freedom_reading_never_echoes_source_paths() -> TestResult {
         let dir = temp_dir()?;
         write_fixture(
             &dir.path().join("broken.json"),
@@ -592,11 +775,13 @@ mod tests {
         )?;
         let sensor = sensor_for(dir.path());
 
-        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
-            return Err(TestError::Unexpected("muss scheitern".to_owned()));
-        };
-        let message = err.to_string();
-        assert!(!message.contains(dir.path().to_string_lossy().as_ref()));
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).map_err(ctx(
+            "ein kaputter Bericht darf den Abruf nicht scheitern lassen",
+        ))?;
+        let rendered = format!("{reading:?}");
+        assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
+        assert!(!rendered.contains("broken.json"));
+        assert!(!rendered.contains("nicht valide"));
         Ok(())
     }
 
@@ -682,11 +867,11 @@ mod tests {
         Ok(())
     }
 
-    /// 6. Fehlerfall: eine erkennbare, aber nicht unterstützte Form
-    ///    scheitert mit `MalformedSource`, nicht mit Panik oder stillem
-    ///    Verwerfen.
+    /// 6. Fehlerfall: eine erkennbare, aber nicht unterstützte Form wird
+    ///    weder mit Panik noch still verworfen — sie degradiert den Sensor
+    ///    sichtbar (`SensorDegraded` + Zähler), ohne ihn zu blenden.
     #[test]
-    fn test_check_error_case_unrecognized_shape_fails_with_malformed_source() -> TestResult {
+    fn test_check_error_case_unrecognized_shape_degrades_visibly() -> TestResult {
         let dir = temp_dir()?;
         write_fixture(
             &dir.path().join("unknown.json"),
@@ -695,13 +880,25 @@ mod tests {
         )?;
 
         let sensor = sensor_for(dir.path());
-        let Err(err) = sensor.poll(Timestamp::UNIX_EPOCH) else {
-            return Err(TestError::Unexpected(
-                "unbekannte Form muss scheitern".to_owned(),
-            ));
-        };
-        assert!(matches!(err, SensorError::MalformedSource));
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .map_err(ctx("unbekannte Form darf den Abruf nicht scheitern lassen"))?;
+        assert_malformed_count(&reading, 1)?;
+        assert_eq!(degraded_count(&reading), 1);
+        assert_eq!(reading.events.len(), 1, "nur das SensorDegraded");
         Ok(())
+    }
+
+    /// Unverändert ein Fehler: die Report-Deutung selbst bleibt strikt —
+    /// nur der Sensor überspringt, was sie ablehnt.
+    #[test]
+    fn test_parse_report_still_rejects_unrecognized_shape() {
+        let result = parse_report(
+            r#"{"not_a_known_format": 1}"#,
+            &sensor_id(),
+            Timestamp::UNIX_EPOCH,
+        );
+        assert!(matches!(result, Err(SensorError::MalformedSource)));
     }
 
     // --- F-064: reguläre-Datei-Prüfung vor jedem Lesezugriff ---------------

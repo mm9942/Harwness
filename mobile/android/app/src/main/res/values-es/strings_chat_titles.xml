@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_title_heading">Títulos automáticos de los chats</string>
+    <string name="chat_title_purpose">Para chats locales y en la nube que abras en la aplicación. El modelo recibe los tres primeros intercambios completos, sin imágenes ni el resto de la conversación. Tus títulos manuales no cambian.</string>
+    <string name="chat_title_load_failed">No se ha podido cargar la lista de modelos.</string>
+    <string name="chat_title_loading">Cargando modelos…</string>
+    <string name="chat_title_on">Activado</string>
+    <string name="chat_title_off">Desactivado</string>
+    <string name="chat_title_pick_provider">Elegir proveedor o modo local</string>
+    <string name="chat_title_pick_model">Elegir modelo para los títulos</string>
+    <string name="chat_title_selected_missing">El modelo guardado no está disponible. Harw no cambiará de modelo automáticamente.</string>
+    <string name="chat_title_allow_loaded">Usar el modelo local cargado como alternativa</string>
+    <string name="chat_title_preferred_unloaded">El modelo preferido no está cargado. Harw no cambiará el modelo del chat.</string>
+    <string name="chat_title_empty_catalog">Carga un modelo local o configura un proveedor de texto.</string>
+    <string name="chat_title_refresh">Actualizar la lista de modelos</string>
+    <string name="chat_title_fallback_heading">API de respaldo para títulos locales</string>
+    <string name="chat_title_pick_fallback">Elegir API de respaldo</string>
+    <string name="chat_title_no_fallback">Sin API de respaldo</string>
+    <string name="chat_title_fallback_missing">La API de respaldo guardada no está disponible.</string>
+    <string name="chat_title_fallback_consent">Solo se contactará con este proveedor tras tu confirmación en el chat correspondiente.</string>
+    <string name="chat_title_provider_consent">Al activar esta opción se permite enviar estos fragmentos de texto a %1$s. Harw no cambiará de proveedor automáticamente.</string>
+    <string name="chat_title_can_use_loaded">Harw puede usar %1$s sin cambiar el modelo del chat.</string>
+    <string name="chat_title_provider_local">Local en este dispositivo</string>
+    <string name="chat_title_provider_linked">Cuenta de ChatGPT · %1$s</string>
+</resources>

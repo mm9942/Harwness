@@ -77,7 +77,8 @@ use harw_types::NodeId;
 use crate::error::{SignerError, VerifyError};
 use crate::handshake::TRANSCRIPT_DOMAIN;
 use crate::identity::{
-    ML_DSA_65_PUBLIC_KEY_LEN, ML_DSA_65_SIGNATURE_LEN, NodeSigner, NodeVerifier, SignFuture,
+    ML_DSA_65_PUBLIC_KEY_LEN, ML_DSA_65_SIGNATURE_LEN, NodeSigner, NodeVerifier, SealedPeerVerifier,
+    SignFuture,
 };
 
 /// Tag of the one field that carries the raw transport transcript inside
@@ -339,6 +340,10 @@ impl<V: NodeVerifier> NodeVerifier for TranscriptWrappedVerifier<V> {
         let wrapped =
             wrap_transcript(transcript).map_err(|_| VerifyError::BadSignature(node.clone()))?;
         self.inner.verify(node, &wrapped, signature)
+    }
+
+    fn sealed_peer_verifier(&self) -> Option<SealedPeerVerifier<'_>> {
+        self.inner.sealed_peer_verifier()?.with_transcript_wrapper()
     }
 }
 

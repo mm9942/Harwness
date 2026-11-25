@@ -63,3 +63,71 @@ pub enum NodeAction {
     /// Liest und erzeugt keinen Schlüssel im Auth-Hub.
     Status,
 }
+
+/// Aktionen des `harw admin`-Subcommands (Admin-Konto und Enrollment-Webdienst).
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum AdminAction {
+    /// Legt das Admin-Konto an (Benutzername, E-Mail, Passwort zweimal, optional TOTP).
+    Init,
+    /// Setzt das Passwort neu und löscht Fehlversuchszähler und Sperre.
+    Passwd,
+    /// Richtet TOTP ein (zeigt otpauth-URI und QR) oder schaltet es mit `--disable` ab.
+    Totp {
+        /// TOTP abschalten und das versiegelte Geheimnis vergessen.
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Zeigt Konto, TOTP, Sperrstatus, Adressen und Dateirechte (nie Geheimnisse).
+    Status,
+    /// Startet den Webdienst (nur Loopback, Adresse aus `[admin] listen`).
+    Serve,
+    /// Lokale Benutzer-Geräte-Bindungen im aktiven Gateway-Profil; erteilt keine Gateway-Rechte.
+    Membership {
+        #[command(subcommand)]
+        action: AdminMembershipAction,
+    },
+    /// Rotiert die Onion-Identität bewusst: neue .onion-Adresse beim nächsten Gateway-Start.
+    /// Alle Geräte müssen danach einmal direkt neu verbunden werden. Ohne `--yes` passiert nichts.
+    OnionRotate {
+        /// Rotation tatsächlich ausführen.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Explizite Mitgliedschaftsverwaltung durch den lokalen Eigentümer des Gateway-Zustands.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum AdminMembershipAction {
+    /// Liest exakte Geräte-, Node-, Mandanten-ID und vollständigen Fingerabdruck.
+    Inspect {
+        #[arg(long)]
+        device: String,
+    },
+    /// Bindet ein bestehendes enrolltes Gerät; ohne --user wird eine neue Benutzer-ID ausgegeben.
+    Issue {
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        key_fingerprint: String,
+        /// Vorhandene, lokal ausgestellte Benutzer-ID im selben Mandanten.
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Widerruft exakt diese Mitgliedschaft, nicht die Geräteanmeldung.
+    Revoke {
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        key_fingerprint: String,
+        #[arg(long)]
+        user: String,
+    },
+}

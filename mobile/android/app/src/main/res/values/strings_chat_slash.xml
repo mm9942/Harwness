@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_slash_title">Chat commands</string>
+    <string name="chat_slash_ok">OK</string>
+    <string name="chat_slash_help">Use /export or /transcript to save the messages from this chat. The Commands button lists actions made available by the host.</string>
+    <string name="chat_slash_unknown">Unknown command. Use /help to see supported chat commands, or start your message with a sentence to send it to the agent. No message was sent.</string>
+    <string name="chat_slash_export_needs_chat">Open an existing chat before using /export. No message was sent.</string>
+    <string name="chat_slash_export_wait">Wait until the current conversation has finished loading and responding.</string>
+    <string name="chat_slash_export_current_version">Switch to the current version of this chat before exporting.</string>
+    <string name="chat_slash_export_changed">The active chat or its connection changed. No transcript was written.</string>
+    <string name="chat_slash_export_saved">Transcript saved.</string>
+    <string name="chat_slash_export_failed">Could not save the transcript. Try another destination.</string>
+    <string name="chat_slash_export_user">User</string>
+    <string name="chat_slash_export_agent">Agent</string>
+    <string name="chat_slash_export_images">[%1$d images not included]</string>
+    <string name="chat_slash_export_empty">There are no displayed messages to export.</string>
+    <string name="chat_slash_export_too_large">The displayed transcript is too large to export at once.</string>
+    <string name="chat_slash_host_loading">Loading commands for this chat…</string>
+    <string name="chat_slash_host_unavailable">This command is unavailable for this chat or connection. No message was sent.</string>
+    <string name="chat_slash_host_run">Run command</string>
+    <string name="chat_slash_host_discover">Browse available read-only commands. Selecting one does not run it.</string>
+    <string name="chat_slash_host_filter">Filter commands</string>
+    <string name="chat_slash_host_no_match">No supported read-only command matches. No message was sent.</string>
+    <string name="chat_slash_host_all">Show all commands</string>
+</resources>

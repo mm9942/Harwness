@@ -18,8 +18,22 @@
 //! `tool.*` methods for agent principals, `gateway.*` methods for gateway
 //! inspection/administration and the caps `tool_call`, `gateway_read`,
 //! `gateway_admin`. There is still no generic operation execution (W00 D5).
+//!
+//! Wire minor 3 adds the `projects` feature: `session.projects`,
+//! `session.page`, `session.adopt`, `session.create_in`,
+//! `session.set_project`, `session.rename`, `session.archive`, the
+//! [`SessionFrame::Holder`] frame and the vocabulary types for them
+//! ([`ProjectSummary`], [`SessionRow`], [`ShareInfo`], ...). Minor 2 bytes
+//! are unchanged; `SessionSummary` is not touched.
+//!
+//! Wire minor 4 adds the `manage` and `stepup` features: typed, allow-listed
+//! operation execution (`command.run`, W00 D5 amendment), read-only
+//! catalog/config views, and step-up confirmed global writes. Minor 3 bytes
+//! are unchanged.
 
-use harw_types::{ApprovalId, DeviceId, ReviewDecision, SessionId, TenantId, ToolCallId, TurnId};
+use harw_types::{
+    ApprovalId, DeviceId, PermissionTier, ReviewDecision, SessionId, TenantId, ToolCallId, TurnId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::approvals::ApprovalRequest;
@@ -32,7 +46,46 @@ use crate::items::{ResultTrust, ToolCallResult, ToolPlacement};
 /// - 1: W00 session control plane.
 /// - 2: R18 tool gateway (`tool.*`, `gateway.*`, caps `tool_call`,
 ///   `gateway_read`, `gateway_admin`).
-pub const SESSION_WIRE_MINOR: u32 = 2;
+/// - 3: projects (`session.projects`, `session.page`, ..., frame `holder`,
+///   feature `projects`).
+/// - 4: manage (`commands.list`, `command.run`, `catalog.get`, `config.get`),
+///   stepup (`config.set`/`reset`, `secret.put`, `stepup.confirm`/`cancel`,
+///   frame `stepup_request`).
+/// - 5: optional durable archive checkpoint and exact inclusive fork (no edit).
+pub const SESSION_WIRE_MINOR: u32 = 5;
+
+/// First wire minor with feature `archive_checkpoint_v1`.
+pub const ARCHIVE_CHECKPOINT_WIRE_MINOR: u32 = 5;
+
+/// First wire minor with the opt-in direct owner status capability.
+pub const DIRECT_OWNER_STATUS_WIRE_MINOR: u32 = 5;
+
+/// First wire minor with the features `manage` and `stepup`.
+pub const MANAGE_WIRE_MINOR: u32 = 4;
+
+/// Upper bound for `client_msg_id` of `command.run`, `config.set`, `config.reset` (bytes).
+pub const MAX_CLIENT_MSG_ID_BYTES: usize = 128;
+
+/// Upper bound for `command.run.line` (bytes).
+pub const MAX_COMMAND_LINE_BYTES: usize = 512;
+
+/// Upper bound for `secret.put.value` (bytes).
+pub const MAX_SECRET_VALUE_BYTES: usize = 8194;
+
+/// Upper bound for the number of `config.get.keys`.
+pub const MAX_CONFIG_KEYS: usize = 32;
+
+/// First wire minor with feature `projects` and the project/page methods.
+pub const PROJECTS_WIRE_MINOR: u32 = 3;
+
+/// Default `limit` of `session.projects` and `session.page`.
+pub const DEFAULT_PAGE_LIMIT: u32 = 50;
+
+/// Upper bound for `limit` of `session.projects` and `session.page`.
+pub const MAX_PAGE_LIMIT: u32 = 200;
+
+/// Pseudo project key for sessions without a project ("Ohne Projekt").
+pub const NO_PROJECT_KEY: &str = "";
 
 /// First wire minor that knows the R18 caps and methods. A host masks the
 /// R18 caps out of every grant negotiated below this minor
@@ -54,10 +107,61 @@ pub mod features {
     pub const HISTORY: &str = "history";
     /// The host emits [`super::SessionFrame::Child`] frames.
     pub const CHILD_FRAMES: &str = "child_frames";
+    /// The host honours [`super::StreamProfile::CompactReasoning`]. A client sends that profile only when the host granted this feature.
+    pub const COMPACT_REASONING: &str = "compact_reasoning";
+    /// The host emits [`super::SessionFrame::Job`] frames (agent jobs of the session).
+    pub const JOB_FRAMES: &str = "job_frames";
     /// The host serves `tool.list`/`tool.call`/`tool.cancel` (R18 D-A).
     pub const TOOLS: &str = "tools";
     /// The host serves the `gateway.*` methods (R18 D-B).
     pub const GATEWAY: &str = "gateway";
+    /// Projects and pages (`session.projects`, `session.page`, ...) and the `holder` frame. Minor >= 3.
+    pub const PROJECTS: &str = "projects";
+    /// `commands.list`, `command.run`, `catalog.get`, `config.get`. Minor >= 4.
+    pub const MANAGE: &str = "manage";
+    /// `config.set`, `config.reset`, `secret.put`, `stepup.confirm`, `stepup.cancel` and the
+    /// `stepup_request` frame. Minor >= 4, only together with `manage`.
+    pub const STEPUP: &str = "stepup";
+    /// `turn.submit` honours [`super::SubmitParams::images`]. A client sends images only when the host granted this feature (an older host rejects the unknown field).
+    pub const IMAGES: &str = "images";
+    /// The host serves `media.get`: the stored bytes of a prompt image of a session the caller may observe. A client calls it only when the host granted this feature.
+    pub const MEDIA: &str = "media";
+    pub const SESSION_MEDIA_PREVIEW_V1: &str = "session_media_preview_v1";
+    /// Global jobs and agents views (`jobs.list`, `jobs.get`, `jobs.cancel`, `jobs.retry`,
+    /// `agents.list`, `agents.stop`). Additive; needs no session.
+    pub const OVERVIEW: &str = "overview";
+    /// Host-owned exact archive checkpoint, verified pages and inclusive fork (minor >= 5).
+    pub const ARCHIVE_CHECKPOINT_V1: &str = "archive_checkpoint_v1";
+    /// Explicit reassignment to a pre-existing project; never creates a directory.
+    pub const EXISTING_PROJECT_ASSIGNMENT_V1: &str = "existing_project_assignment_v1";
+    /// Owner-scoped title probe and compare-and-set publication.
+    pub const AUTO_TITLE_CAS_V1: &str = "auto_title_cas_v1";
+    pub const AUTO_TITLE_SEED_V1: &str = "auto_title_seed_v1";
+    /// Opt-in, metadata-only Dream rows in `session.page`.
+    pub const SESSION_DREAM_ROWS_V1: &str = "session_dream_rows_v1";
+    /// Dedicated, metadata-only System session page.
+    pub const SESSION_SYSTEM_ROWS_V1: &str = "session_system_rows_v1";
+    pub const CLOUD_ASSISTANT_V1: &str = "cloud_assistant_v1";
+    /// Explicit, bounded recall of completed pairs from the same Cloud Assistant room.
+    pub const CLOUD_ASSISTANT_RECALL_V1: &str = "cloud_assistant_recall_v1";
+    /// Explicit newly created shared room, separate from device-room v1.
+    pub const CLOUD_ASSISTANT_SHARED_V1: &str = "cloud_assistant_shared_v1";
+    pub const ARCHIVE_RETAINED_REWRITE_V1: &str = "archive_retained_rewrite_v1";
+    /// Exact retained edit/retry, atomic prompt replacement and live resync (minor >= 5).
+    pub const EXACT_REWIND_V1: &str = "exact_rewind_v1";
+    /// A retransmission at an old displayed revision can recover the exact
+    /// durable edit receipt, but may not execute a new stale edit.
+    pub const EXACT_REWIND_RECEIPT_V1: &str = "exact_rewind_receipt_v1";
+    /// The host enforces the exact optional TurnId in session.interrupt.
+    pub const EXACT_TURN_INTERRUPT_V1: &str = "exact_turn_interrupt_v1";
+    /// Explicitly installed, gateway-owned profile-bound encrypted Library.
+    pub const CLOUD_LIBRARY_V1: &str = "cloud_library_v1";
+    /// Explicit device-owner empty Cloud work publication with durable operation receipts.
+    pub const MANUAL_CLOUD_WORK_V1: &str = "manual_cloud_work_v1";
+    /// Optional direct owner connection: one exact status, no stream or control.
+    pub const DIRECT_OWNER_STATUS_V1: &str = "direct_owner_status_v1";
+    /// Separately negotiated exact selected placement, requiring an installed Hub verifier.
+    pub const DIRECT_OWNER_STATUS_FENCED_V1: &str = "direct_owner_status_fenced_v1";
 }
 
 /// Position in a session stream.
@@ -298,6 +402,8 @@ pub enum StreamProfile {
     Full,
     /// Phone profile: no reasoning/child deltas, coalesced assistant text.
     Compact,
+    /// Phone profile with live reasoning: like `Compact` (coalesced assistant text, no child assistant/usage/context deltas) but delivers reasoning deltas of the root and of child agents and child progress. Only sent when `HelloAck::features` contains [`features::COMPACT_REASONING`]; an older host cannot decode it.
+    CompactReasoning,
 }
 
 /// Durable state of a hosted session.
@@ -322,6 +428,294 @@ impl HostedState {
     }
 }
 
+/// Share mode of the gateway for TUI (profile) sessions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareMode {
+    #[default]
+    Off,
+    Read,
+    Continue,
+}
+
+impl ShareMode {
+    /// `"off" | "read" | "continue"`, otherwise `None`.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "off" => Some(Self::Off),
+            "read" => Some(Self::Read),
+            "continue" => Some(Self::Continue),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Read => "read",
+            Self::Continue => "continue",
+        }
+    }
+}
+
+/// Holder of a session lease as a client sees it. Never a pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HolderKind {
+    Tui,
+    Gateway,
+    Job,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Current lease holder of a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HolderInfo {
+    pub kind: HolderKind,
+    pub since: jiff::Timestamp,
+}
+
+/// Where the last turn of a session ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LastOrigin {
+    Tui,
+    Gateway,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Where a row of `session.page` comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowOrigin {
+    /// Has a host record.
+    Hosted,
+    /// Only in the profile store (TUI session without a record).
+    Profile,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Trusted purpose of a session-page row, independent of title and storage origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRowPurpose {
+    /// A Harw Dream transcript. Its internal prompt is not part of this surface.
+    Dream,
+    Diary,
+    Ledger,
+    MemoryReconciliation,
+    AutomaticWorkbench,
+    /// The server makes no purpose assertion about the row.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl SessionRowPurpose {
+    const fn is_unknown(value: &Self) -> bool {
+        matches!(value, Self::Unknown)
+    }
+}
+
+/// Why a row cannot be continued. Clients translate it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOnlyReason {
+    /// The gateway shares read-only.
+    ShareReadOnly,
+    /// Origin is not a CLI session (web, run, gateway channel).
+    ForeignOrigin,
+    /// No valid working directory.
+    NoWorkdir,
+    /// The connection has no `steer` cap.
+    NoSteer,
+    /// The session is closed.
+    Closed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a client needs to know about sharing (tier badge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareInfo {
+    pub mode: ShareMode,
+    /// Effective tier: min(device tier, listener tier).
+    pub tier: PermissionTier,
+}
+
+/// One project in `session.projects`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    /// `""` = sessions without a project.
+    pub project_key: String,
+    pub label: String,
+    /// Only on basename collisions: shortened parent path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_hint: Option<String>,
+    pub session_count: u32,
+    pub last_activity: jiff::Timestamp,
+    pub active_count: u32,
+}
+
+/// One row in `session.page`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRow {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    pub updated_at: jiff::Timestamp,
+    /// Only when greater than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u64>,
+    pub state: HostedState,
+    pub attached: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub origin: RowOrigin,
+    #[serde(default, skip_serializing_if = "SessionRowPurpose::is_unknown")]
+    pub purpose: SessionRowPurpose,
+    pub continuable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ReadOnlyReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<HolderInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_origin: Option<LastOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<String>,
+}
+
+/// `session.projects`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectsParams {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Result of `session.projects`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectsResult {
+    pub projects: Vec<ProjectSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub share: ShareInfo,
+}
+
+/// `session.page`. `project_key`: `None` = all projects, `Some("")` = no project.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageParams {
+    #[serde(default)]
+    pub project_key: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub include_archived: bool,
+    /// Send only after negotiating `session_dream_rows_v1`. False stays off the old wire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_dreams: bool,
+    /// Dedicated system-only page, never a request against a real project.
+    /// Requires `session_system_rows_v1` and excludes `include_dreams`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_system: bool,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Result of `session.page`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageResult {
+    pub sessions: Vec<SessionRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// `session.create_in`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateInParams {
+    pub project_key: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// `session.set_project`. `project_key = ""` removes the assignment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetProjectParams {
+    pub session_id: SessionId,
+    pub project_key: String,
+}
+
+/// The caller may specify only an observed session and transcript generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoTitleSession {
+    pub session_id: SessionId,
+    pub expected_generation: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoTitlePublish {
+    pub scope: AutoTitleSession,
+    pub title: String,
+    /// Opaque digest of the exact authorized input, not the input itself.
+    pub seed_digest: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoTitleSeedPair {
+    pub user: String,
+    pub assistant: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoTitleSeed {
+    pub pairs: [AutoTitleSeedPair; 3],
+    pub digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoTitlePublication {
+    Applied,
+    AlreadyTitled,
+    Stale,
+}
+
+/// `session.rename`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameParams {
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+/// `session.archive`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveParams {
+    pub session_id: SessionId,
+    pub archived: bool,
+}
+
 /// One attached client as other clients see it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -331,6 +725,9 @@ pub struct PresenceEntry {
     pub caps: ClientCaps,
     pub since: jiff::Timestamp,
 }
+
+/// Limit for the user-visible reasoning preview in a live snapshot.
+pub const MAX_VISIBLE_REASONING_BYTES: usize = 16 * 1024;
 
 /// One frame of a session stream.
 ///
@@ -379,6 +776,9 @@ pub enum SessionFrame {
         turn_id: TurnId,
         assistant_text: String,
         reasoning_collapsed: bool,
+        /// Provider-facing UI text, never encrypted or opaque reasoning payloads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_text: Option<String>,
     },
     /// The durable history was replaced (compaction marker).
     HistoryReplaced { item_count: u32 },
@@ -392,7 +792,14 @@ pub enum SessionFrame {
     Revoked,
     /// Keep-alive.
     Heartbeat,
-    /// A frame kind this client does not know (additive evolution).
+    /// Lease change of a session (feature `projects`). `holder: None` = free.
+    Holder {
+        session_id: SessionId,
+        holder: Option<HolderInfo>,
+    },
+    /// A step-up challenge (feature `stepup`). Only to the requesting connection.
+    StepupRequest(StepUpChallenge),
+    /// A frame kind this client does not know (additive evolution). Must stay last.
     Unknown,
 }
 
@@ -413,6 +820,8 @@ const KNOWN_FRAME_KINDS: &[&str] = &[
     "host_draining",
     "revoked",
     "heartbeat",
+    "holder",
+    "stepup_request",
     "unknown",
 ];
 
@@ -435,6 +844,8 @@ impl SessionFrame {
             Self::HostDraining { .. } => "host_draining",
             Self::Revoked => "revoked",
             Self::Heartbeat => "heartbeat",
+            Self::Holder { .. } => "holder",
+            Self::StepupRequest(_) => "stepup_request",
             Self::Unknown => "unknown",
         }
     }
@@ -556,6 +967,73 @@ pub struct CreateParams {
     pub workspace: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Fork: the new session starts with the history of `fork_from.session_id` up to (excluding) the user message
+    /// `fork_from.before_item`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_from: Option<ForkFrom>,
+}
+
+/// Request has no title, workspace, model, prompt or local transcript fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManualCloudWorkCommandV1 {
+    CreateEmpty { operation_id: String },
+    Resolve { operation_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManualCloudWorkReplyV1 {
+    Created { session: SessionSummary },
+    /// No durable intent in this exact scope; never implies the client should re-submit.
+    Missing,
+    /// Intent exists, but its original target cannot be confirmed; never create a replacement.
+    OutcomeUnknown,
+}
+
+/// Source of a forked session (`session.create` with `fork_from`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkFrom {
+    pub session_id: SessionId,
+    /// Legacy fork boundary (exclusive). In displayed mode this names the final included row.
+    pub before_item: String,
+    /// Optional exact current display request. An older host must reject rather than
+    /// silently interpreting this as a legacy exclusive fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<DisplayedForkV1>,
+}
+
+/// Either the complete displayed prefix or no fork; exceeding this bound is an error.
+pub const DISPLAYED_FORK_MAX_ROWS: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayedForkRoleV1 { User, Assistant }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayedForkRowV1 {
+    pub item_id: String,
+    pub role: DisplayedForkRoleV1,
+    /// Exact visible text and scoped canonical media identity, never content supplied for import.
+    pub body_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayedForkV1 {
+    pub head: Cursor,
+    pub rows: Vec<DisplayedForkRowV1>,
+    /// Requires the host to reserve a durable operation before creation.
+    /// Older hosts reject this field rather than making another child.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub durable_receipt: bool,
+}
+
+/// Canonical encoding shared by the phone projection and host verifier.
+pub fn displayed_fork_body_v1(text: &str, media: &[crate::MediaRef]) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&("harw/displayed-fork-body/v1", text, media))
 }
 
 /// Default number of durable items sent on an attach without a cursor.
@@ -596,6 +1074,154 @@ pub struct SessionRef {
     pub session_id: SessionId,
 }
 
+/// Status only, with no session selector or reusable authority in the response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerObservationStatus {
+    Idle,
+    Active,
+    Interrupted,
+    Failed,
+}
+
+/// A client observation used only for compare-and-capture. The host verifies
+/// its own current writer fence and never interprets this as archive authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivePositionV1 {
+    pub generation: u32,
+    pub durable_next: u64,
+}
+
+/// `session.revision_checkpoint.issue` captures a current server revision.
+/// The expected position is a freshness check, not proof of what a device
+/// displayed at that position. This does not enqueue an edit or run anything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointIssueV1 {
+    pub session_id: SessionId,
+    pub expected: ArchivePositionV1,
+}
+
+/// `session.revision_checkpoint.describe` re-authorizes a server-issued ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointDescribeV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+}
+
+/// Stable opaque revision handle. Not a bearer capability. No history,
+/// provider state, media bytes, or writable inputs are carried here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointInfoV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    pub revision: ArchivePositionV1,
+}
+
+/// Discover a fully retained predecessor of a completed source rewrite.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointPreviousV1 {
+    pub session_id: SessionId,
+    /// Optional exclusive continuation returned as before_sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sequence: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveRewriteCauseV1 {
+    UserEdit,
+    HistoryRewrite,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRetainedRevisionV1 {
+    pub checkpoint: ArchiveCheckpointInfoV1,
+    pub before_sequence: u64,
+    /// Timestamp of the replacement END record, not client time.
+    pub recorded_at: jiff::Timestamp,
+    pub cause: ArchiveRewriteCauseV1,
+}
+
+/// Exact occurrence inside one verified revision, never matched by text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRowLocatorV1 {
+    pub sequence: u64,
+    pub item_id: harw_types::ItemId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveVisibleRoleV1 {
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveVerifiedRowV1 {
+    pub locator: ArchiveRowLocatorV1,
+    pub role: ArchiveVisibleRoleV1,
+    pub text_parts: Vec<String>,
+    pub recorded_at: jiff::Timestamp,
+    // Images remain source-scoped; this response conveys no media grant.
+    pub image_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointPageV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveCheckpointRowsV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    /// Ascending record order in this page.
+    pub rows: Vec<ArchiveVerifiedRowV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_sequence: Option<u64>,
+}
+
+/// Creates one durable target for this bound operation ID. Retry an unknown
+/// outcome with this exact request, never synthesize a second operation ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkInclusiveV1 {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    pub row: ArchiveRowLocatorV1,
+    pub client_operation_id: String,
+    /// Optional exact display proof. An older host rejects the new field;
+    /// it must never fall back to exporting an unseen archived prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed_prefix: Option<ArchivedDisplayedPrefixV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchivedDisplayedPrefixV1 {
+    pub row_count: u16,
+    pub digest: [u8; 32],
+}
+
+pub fn archived_displayed_prefix_v1(rows: &[DisplayedForkRowV1]) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&("harw/archived-displayed-fork-prefix/v1", rows))
+}
+
 /// `session.history`: page older durable frames.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -625,6 +1251,122 @@ pub struct SubmitParams {
     /// "I have seen the newer head": skip the stale check.
     #[serde(default)]
     pub force: bool,
+    /// Images attached to the prompt (feature `images`). Empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<SubmitImage>,
+    /// Item id of an earlier user message of this session: the history is cut before it and replaced,
+    /// then `text` runs as a new turn, retaining the original stored media. For
+    /// negotiated `exact_rewind_v1`, empty text retries the entire old prompt,
+    /// and client image payloads are not allowed when a rewind target is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewind_before: Option<String>,
+}
+
+/// Largest image (stored bytes) `media.get` returns; bigger ones are refused so the answer fits the 1 MiB transport message.
+pub const MAX_MEDIA_GET_BYTES: u64 = 512 * 1024;
+
+/// `media.get`: the stored bytes of one image a transcript item of the session references.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaGetParams {
+    pub session_id: SessionId,
+    /// The reference as carried by the transcript item.
+    pub media: crate::media::MediaRef,
+}
+
+/// Result of `media.get`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaGetResult {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    /// Standard base64 (with padding) of the stored image.
+    pub data_b64: String,
+}
+
+/// Each original-media part remains below the existing media.get envelope cap.
+pub const MEDIA_PREVIEW_PART_BYTES: usize = 256 * 1024;
+/// Maximum known retained original under the current prompt media-store policy.
+pub const MEDIA_PREVIEW_MAX_BYTES: usize = 7 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionMediaSourceV1 {
+    Canonical { item_id: harw_types::ItemId },
+    Archive { checkpoint_id: String, row: ArchiveRowLocatorV1 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMediaModeV1 {
+    Thumbnail,
+    VisiblePreview,
+    Viewer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMediaPreviewV1 {
+    pub session_id: SessionId,
+    pub source: SessionMediaSourceV1,
+    /// Zero-based among stored Media parts of that exact user item.
+    pub attachment_index: u32,
+    pub mode: SessionMediaModeV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionMediaPreviewReplyV1 {
+    Part {
+        mime: String,
+        total_bytes: u32,
+        offset: u32,
+        data_b64: String,
+        continuation: Option<String>,
+    },
+    OpenRequired,
+    Missing,
+    Unsupported,
+    Busy,
+    Unreadable,
+}
+
+/// Predicts the item identity for a receipt-aware exact replacement. This
+/// identifies the resulting prompt, not authority or evidence of a commit.
+/// The caller may present a version only once this exact ID is durable.
+#[must_use]
+pub fn exact_rewrite_item_id(
+    session: &SessionId,
+    target: &str,
+    observed: crate::Cursor,
+    request_id: &str,
+) -> harw_types::ItemId {
+    let mut material = b"harw exact rewrite item v1\0".to_vec();
+    material.extend_from_slice(&observed.generation.to_be_bytes());
+    material.extend_from_slice(&observed.durable.to_be_bytes());
+    for value in [session.as_str(), target, request_id] {
+        material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        material.extend_from_slice(value.as_bytes());
+    }
+    harw_types::ItemId::from_str(format!("rewrite-{}", harw_types::ContentDigest::of(&material)))
+}
+
+/// Most images one `turn.submit` may carry.
+pub const MAX_SUBMIT_IMAGES: usize = 1000;
+/// Most base64 bytes over all images of one `turn.submit` (the transport message limit is 1 MiB).
+pub const MAX_SUBMIT_IMAGE_B64_BYTES: usize = 512 * 1024 * 1024;
+
+/// One image of a `turn.submit`: the bytes travel inline (base64), the host
+/// checks, sanitizes and stores them; transcripts only carry a media reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitImage {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    /// Standard base64 (RFC 4648, with padding) of the image bytes.
+    pub data_b64: String,
 }
 
 /// Result of `turn.submit`.
@@ -1028,6 +1770,525 @@ pub mod error_codes {
     pub const INTERNAL: i32 = -32603;
 }
 
+// ---------------------------------------------------------------------------
+// Wire minor 4: `manage` and `stepup` features.
+// ---------------------------------------------------------------------------
+
+/// Origin of a command (mirror of the ops command metadata kind).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOrigin {
+    Operation,
+    TuiLocal,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Effect of `command.run` / `config.set` / `stepup.confirm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandEffect {
+    /// Effective immediately.
+    Applied,
+    /// Effective from the next turn of the session.
+    Staged,
+    /// Effective from the next session (roles, default model, provider).
+    NextSession,
+    /// Not executed; `reason_code`/`text` say why. `ok = false`.
+    Refused,
+    /// Nothing written yet; `stepup` carries the challenge. `ok = true`.
+    StepupRequired,
+    #[serde(other)]
+    Unknown,
+}
+
+/// How a provider authenticates (mirror of the ops `AuthKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthKind {
+    None,
+    Env,
+    File,
+    Keyring,
+    Secrets,
+    FileJson,
+    InlineKey,
+    #[serde(other)]
+    Unknown,
+}
+
+/// `commands.list` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandsListParams {
+    /// Session for which `available` is computed. `None` = profile wide.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+/// A sub-command hint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandHint {
+    pub name: String,
+    pub args: String,
+    pub summary: String,
+}
+
+/// A command as shown in the TUI popup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandEntry {
+    /// Without the leading `/`.
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    pub summary: String,
+    pub usage: String,
+    /// Operation domain in snake_case. A string so new domains do not break old clients.
+    pub domain: String,
+    pub permission: PermissionTier,
+    /// `immediate` | `staged` | `deferred`.
+    pub busy: String,
+    pub origin: CommandOrigin,
+    pub remote: bool,
+    pub available: bool,
+    /// Reason text, only when `!available`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Stable machine id, only when `!available`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub subcommands: Vec<CommandHint>,
+}
+
+/// `commands.list` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandsListResult {
+    /// Sorted by `name`.
+    pub commands: Vec<CommandEntry>,
+    /// 16 hex digits; a string because a u64 may lose precision in JSON parsers.
+    pub rev: String,
+}
+
+/// `command.run` parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandRunParams {
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    /// Whole line with `/`, at most [`MAX_COMMAND_LINE_BYTES`].
+    pub line: String,
+    /// Idempotency across reconnects, 1..=[`MAX_CLIENT_MSG_ID_BYTES`].
+    pub client_msg_id: String,
+}
+
+/// A step-up challenge. Contains nothing secret. Also the payload of the
+/// `stepup_request` frame.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepUpChallenge {
+    /// 32 lowercase hex.
+    pub stepup_id: String,
+    /// For example `config.set`, `models.set`, `provider.add`.
+    pub action: String,
+    pub target: String,
+    /// Canonical text the app shows completely before the biometric prompt.
+    pub text: String,
+    /// 64 lowercase hex.
+    pub nonce: String,
+    /// `hex(sha256(b"harw-stepup-v1\0" || nonce_bytes || 0x00 || text_utf8))`, 64 lowercase hex.
+    pub hash: String,
+    pub expires_at: jiff::Timestamp,
+}
+
+/// Result of `command.run`, `config.set`, `config.reset`, `stepup.confirm`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CommandRunResult {
+    pub ok: bool,
+    /// Human readable text.
+    pub text: String,
+    /// Operation output data, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    pub effect: CommandEffect,
+    /// With `effect = refused`: a refusal code (see [`refusal_codes`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// With `effect = stepup_required`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepup: Option<StepUpChallenge>,
+}
+
+/// Refusal codes that do not come from the ops allow-list (gateway side). Stable.
+pub mod refusal_codes {
+    /// Session command without a `session_id`.
+    pub const SESSION_REQUIRED: &str = "session_required";
+    /// Session action on a profile session without a host record.
+    pub const SESSION_NOT_HOSTED: &str = "session_not_hosted";
+    /// The operation reports `NotAvailable` (service missing in the gateway).
+    pub const NOT_AVAILABLE: &str = "not_available";
+    /// The operation failed.
+    pub const OP_FAILED: &str = "op_failed";
+    /// The value changed since the confirmation.
+    pub const STALE: &str = "stale";
+    /// Step-up writes are not enabled on this gateway.
+    pub const STEPUP_DISABLED: &str = "stepup_disabled";
+}
+
+/// `catalog.get` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogGetParams {
+    /// For `live` (model of the session). `None` = profile only.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+/// A redacted provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogProvider {
+    pub name: String,
+    pub api: String,
+    /// `scheme://host[:port]/path` without userinfo/query/fragment; empty if unparsable.
+    pub base_url: String,
+    pub enabled: bool,
+    pub auth_kind: ProviderAuthKind,
+    /// Only a name/entry for `env`/`keyring`/`secrets`, else `None`. Never a path, never a value.
+    #[serde(default)]
+    pub auth_name: Option<String>,
+    pub has_secret: bool,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub max_concurrency: Option<u64>,
+}
+
+/// A model of the catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogModel {
+    pub key: String,
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub provider: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    pub reasoning: bool,
+    #[serde(default)]
+    pub input_types: Vec<String>,
+    /// `active` | `deprecated` | `retirement_window` | `retired` | `unknown` (string, additive).
+    pub lifecycle: String,
+}
+
+/// A role binding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogRole {
+    pub role: String,
+    pub label: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub source: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// The live model of the session.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogLive {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// `catalog.get` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogResult {
+    pub providers: Vec<CatalogProvider>,
+    pub models: Vec<CatalogModel>,
+    pub roles: Vec<CatalogRole>,
+    pub live: CatalogLive,
+    /// For example "applies from the next session".
+    pub note: String,
+}
+
+/// `config.get` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigGetParams {
+    /// `None` = all allow-listed keys. At most [`MAX_CONFIG_KEYS`].
+    #[serde(default)]
+    pub keys: Option<Vec<String>>,
+}
+
+/// One config row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigEntry {
+    pub key: String,
+    pub value: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
+    /// Always `profile`.
+    pub scope: String,
+    /// `now` | `next_session`.
+    pub apply: String,
+}
+
+/// `config.get` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigGetResult {
+    pub entries: Vec<ConfigEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// Feature `overview`: global jobs and agents views (additive, no session needed)
+// ---------------------------------------------------------------------------
+
+/// Upper bound for [`JobsListParams::limit`] and the row count of an answer.
+pub const MAX_OVERVIEW_ROWS: u32 = 200;
+
+/// `jobs.list` parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsListParams {
+    /// State codes to keep (`queued|running|blocked|succeeded|failed|timed_out|cancelled`);
+    /// empty keeps every state.
+    #[serde(default)]
+    pub states: Vec<String>,
+    /// At most [`MAX_OVERVIEW_ROWS`]; `None` = the maximum.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// One durable job of the profile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRow {
+    pub work_id: String,
+    /// `worker`, `dream` or a custom kind name.
+    pub kind: String,
+    /// `queued|running|blocked|succeeded|failed|timed_out|cancelled`.
+    pub state: String,
+    /// Short title taken from the job input, else the kind.
+    pub title: String,
+    /// First line of the reason or result, when known.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Session the job belongs to, when its input names one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Unix milliseconds.
+    pub submitted_ms: u64,
+    #[serde(default)]
+    pub started_ms: Option<u64>,
+    #[serde(default)]
+    pub finished_ms: Option<u64>,
+    /// Run time (finished or still running).
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    pub attempts: u32,
+    /// `cancel` would be accepted by the store.
+    pub can_cancel: bool,
+    /// `retry` would be accepted by the store.
+    pub can_retry: bool,
+}
+
+/// `jobs.list` result: newest first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobsListResult {
+    pub jobs: Vec<JobRow>,
+    /// More jobs matched than were returned.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// `jobs.get`, `jobs.cancel`, `jobs.retry` parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobTargetParams {
+    pub work_id: String,
+    /// Idempotency key of the mutating calls (`jobs.cancel`, `jobs.retry`); at most
+    /// [`MAX_CLIENT_MSG_ID_BYTES`].
+    #[serde(default)]
+    pub client_msg_id: String,
+}
+
+/// One step of the status history of a job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobHistoryEntry {
+    pub at_ms: u64,
+    /// `submitted|claimed|heartbeat|cancelled|succeeded|failed|blocked`.
+    pub event: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// `jobs.get` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobDetail {
+    pub job: JobRow,
+    /// Bounded `key: value` lines of the job input (secret-looking keys left out).
+    pub spec_summary: String,
+    pub history: Vec<JobHistoryEntry>,
+    /// Holder of the active lease.
+    #[serde(default)]
+    pub holder: Option<String>,
+    /// Tail of the stored result or failure reason.
+    #[serde(default)]
+    pub output_tail: Option<String>,
+}
+
+/// `agents.list` parameters (none yet; keeps the shape extensible).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsListParams {}
+
+/// A running child agent of a hosted session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningAgent {
+    pub agent_id: String,
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub parent: Option<String>,
+    pub role: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `running|waiting|done|failed`.
+    pub state: String,
+    #[serde(default)]
+    pub current_tool: Option<String>,
+    pub started_ms: u64,
+    pub tool_calls: u32,
+    pub can_stop: bool,
+}
+
+/// A startable agent definition (built-in roster entry or custom definition).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDefinition {
+    pub name: String,
+    pub role: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `builtin` or `custom`.
+    pub source: String,
+    pub read_only: bool,
+    /// The profile starts new sessions with this definition.
+    pub active: bool,
+}
+
+/// `agents.list` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsListResult {
+    pub running: Vec<RunningAgent>,
+    pub library: Vec<AgentDefinition>,
+}
+
+/// `agents.stop` parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStopParams {
+    pub session_id: SessionId,
+    pub agent_id: String,
+    #[serde(default)]
+    pub client_msg_id: String,
+}
+
+/// `config.set` (feature `stepup`). Result: [`CommandRunResult`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSetParams {
+    pub key: String,
+    pub value: String,
+    pub client_msg_id: String,
+}
+
+/// `config.reset` (feature `stepup`). Result: [`CommandRunResult`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigResetParams {
+    pub key: String,
+    pub client_msg_id: String,
+}
+
+/// A secret on its way to the server. `Debug` redacts; no `Display`,
+/// no `PartialEq`, no `Clone`. Serde transparent (JSON string).
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WireSecret(String);
+
+impl WireSecret {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// The only access; the server moves the value into a secret type at once.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Length in bytes (for the upper bound without reading the value).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for WireSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WireSecret([redacted])")
+    }
+}
+
+/// `secret.put` (feature `stepup`).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretPutParams {
+    /// Name in the secret store, `[A-Za-z0-9._-]`, 1..=64.
+    pub name: String,
+    /// The NEW provider of this operation the key is bound to.
+    pub for_provider: String,
+    pub value: WireSecret,
+}
+
+/// `secret.put` result. Never contains the value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretPutResult {
+    /// 32 hex; for `--key <handle>` of a following provider add.
+    pub handle: String,
+    pub key_name: String,
+    pub for_provider: String,
+    pub expires_at: jiff::Timestamp,
+}
+
+/// `stepup.confirm` parameters. Result: [`CommandRunResult`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepUpConfirmParams {
+    pub stepup_id: String,
+    /// The hash of the challenge (64 hex), sent after a fresh biometric prompt.
+    pub hash: String,
+}
+
+/// `stepup.cancel` parameters. Result `()`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepUpCancelParams {
+    pub stepup_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,6 +2310,398 @@ mod tests {
         let bare = r#"{"kind":"another_new_kind"}"#;
         let frame: SessionFrame = ctx(serde_json::from_str(bare), "decode bare unknown kind")?;
         assert!(matches!(frame, SessionFrame::Unknown));
+        Ok(())
+    }
+
+    #[test]
+    fn holder_frame_round_trips_and_old_clients_see_unknown() -> TestResult {
+        let since: jiff::Timestamp = ctx("2026-01-02T03:04:05Z".parse(), "timestamp")?;
+        let frame = SessionFrame::Holder {
+            session_id: sid("sess-a1")?,
+            holder: Some(HolderInfo {
+                kind: HolderKind::Tui,
+                since,
+            }),
+        };
+        let value = ctx(serde_json::to_value(&frame), "encode")?;
+        assert_eq!(value["kind"], "holder");
+        assert_eq!(value["data"]["session_id"], "sess-a1");
+        assert_eq!(value["data"]["holder"]["kind"], "tui");
+        let back: SessionFrame = ctx(serde_json::from_value(value), "decode")?;
+        assert_eq!(back.kind(), "holder");
+        assert!(!back.is_disposable());
+        let free = SessionFrame::Holder {
+            session_id: sid("sess-a1")?,
+            holder: None,
+        };
+        let back: SessionFrame = ctx(
+            serde_json::from_str(&ctx(serde_json::to_string(&free), "encode free")?),
+            "decode free",
+        )?;
+        assert!(matches!(back, SessionFrame::Holder { holder: None, .. }));
+        Ok(())
+    }
+
+    fn sample_challenge() -> StepUpChallenge {
+        StepUpChallenge {
+            stepup_id: "0".repeat(32),
+            action: "config.set".into(),
+            target: "theme".into(),
+            text: "Set theme to dark".into(),
+            nonce: "a".repeat(64),
+            hash: "b".repeat(64),
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn minor_four_constants() {
+        assert_eq!(MANAGE_WIRE_MINOR, 4);
+        assert_eq!(features::MANAGE, "manage");
+        assert_eq!(features::STEPUP, "stepup");
+        assert_eq!(MAX_CLIENT_MSG_ID_BYTES, 128);
+        assert_eq!(MAX_COMMAND_LINE_BYTES, 512);
+        assert_eq!(MAX_SECRET_VALUE_BYTES, 8194);
+        assert_eq!(MAX_CONFIG_KEYS, 32);
+    }
+
+    #[test]
+    fn stepup_frame_round_trips_and_future_kinds_are_unknown() -> TestResult {
+        let frame = SessionFrame::StepupRequest(sample_challenge());
+        let value = ctx(serde_json::to_value(&frame), "encode")?;
+        assert_eq!(value["kind"], "stepup_request");
+        assert_eq!(value["data"]["action"], "config.set");
+        let back: SessionFrame = ctx(serde_json::from_value(value), "decode")?;
+        assert!(matches!(back, SessionFrame::StepupRequest(_)));
+        assert!(!back.is_disposable());
+        let future: SessionFrame = ctx(
+            serde_json::from_str(r#"{"kind":"stepup_request_v9","data":{}}"#),
+            "decode future",
+        )?;
+        assert!(matches!(future, SessionFrame::Unknown));
+        Ok(())
+    }
+
+    #[test]
+    fn minor_four_params_reject_unknown_fields() {
+        fn rejects<T: serde::de::DeserializeOwned>(json: &str) -> bool {
+            serde_json::from_str::<T>(json).is_err()
+        }
+        assert!(rejects::<CommandsListParams>(r#"{"tenant":"tenant-test"}"#));
+        assert!(rejects::<CommandRunParams>(
+            r#"{"line":"/status","client_msg_id":"m-1","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<CommandRunParams>(
+            r#"{"line":"/status","client_msg_id":"m-1","tier":"owner"}"#
+        ));
+        assert!(rejects::<CatalogGetParams>(r#"{"tenant":"tenant-test"}"#));
+        assert!(rejects::<ConfigGetParams>(r#"{"tenant":"tenant-test"}"#));
+        assert!(rejects::<ConfigSetParams>(
+            r#"{"key":"k","value":"v","client_msg_id":"m","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<ConfigResetParams>(
+            r#"{"key":"k","client_msg_id":"m","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<SecretPutParams>(
+            r#"{"name":"n","for_provider":"p","value":"fake-SECRET-marker","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<StepUpConfirmParams>(
+            r#"{"stepup_id":"x","hash":"y","actor":"x"}"#
+        ));
+        assert!(rejects::<StepUpConfirmParams>(
+            r#"{"stepup_id":"x","hash":"y","tenant":"tenant-test"}"#
+        ));
+        assert!(rejects::<StepUpCancelParams>(
+            r#"{"stepup_id":"x","tenant":"tenant-test"}"#
+        ));
+    }
+
+    #[test]
+    fn minor_four_params_accept_plain_shape() -> TestResult {
+        let _: CommandsListParams = ctx(serde_json::from_str("{}"), "commands.list")?;
+        let _: CatalogGetParams = ctx(serde_json::from_str("{}"), "catalog.get")?;
+        let _: ConfigGetParams = ctx(serde_json::from_str("{}"), "config.get")?;
+        let run: CommandRunParams = ctx(
+            serde_json::from_str(r#"{"line":"/status","client_msg_id":"m-1"}"#),
+            "command.run",
+        )?;
+        assert_eq!(run.line, "/status");
+        assert!(run.session_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn minor_four_results_accept_additional_fields() -> TestResult {
+        let challenge = serde_json::to_value(sample_challenge());
+        let mut challenge = ctx(challenge, "encode challenge")?;
+        challenge["future"] = serde_json::json!(1);
+        let _: StepUpChallenge = ctx(serde_json::from_value(challenge), "challenge")?;
+        let _: CommandsListResult = ctx(
+            serde_json::from_str(r#"{"commands":[],"rev":"0000000000000000","future":1}"#),
+            "list result",
+        )?;
+        let _: CommandEntry = ctx(
+            serde_json::from_str(
+                r#"{"name":"status","summary":"s","usage":"/status","domain":"session","permission":"observer","busy":"immediate","origin":"operation","remote":true,"available":true,"future":1}"#,
+            ),
+            "entry",
+        )?;
+        let _: CommandRunResult = ctx(
+            serde_json::from_str(r#"{"ok":true,"text":"t","effect":"applied","future":1}"#),
+            "run result",
+        )?;
+        let _: CatalogResult = ctx(
+            serde_json::from_str(
+                r#"{"providers":[],"models":[],"roles":[],"live":{},"note":"n","future":1}"#,
+            ),
+            "catalog",
+        )?;
+        let _: CatalogProvider = ctx(
+            serde_json::from_str(
+                r#"{"name":"p","api":"a","base_url":"https://x.example.test","enabled":true,"auth_kind":"env","has_secret":false,"future":1}"#,
+            ),
+            "provider",
+        )?;
+        let _: ConfigGetResult = ctx(
+            serde_json::from_str(r#"{"entries":[],"future":1}"#),
+            "config result",
+        )?;
+        let _: SecretPutResult = ctx(
+            serde_json::from_str(
+                r#"{"handle":"h","key_name":"k","for_provider":"p","expires_at":"2026-01-01T00:00:00Z","future":1}"#,
+            ),
+            "secret result",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn minor_four_enums_decode_unknown() -> TestResult {
+        let origin: CommandOrigin = ctx(serde_json::from_str("\"future\""), "origin")?;
+        assert_eq!(origin, CommandOrigin::Unknown);
+        let effect: CommandEffect = ctx(serde_json::from_str("\"future\""), "effect")?;
+        assert_eq!(effect, CommandEffect::Unknown);
+        let auth: ProviderAuthKind = ctx(serde_json::from_str("\"future\""), "auth")?;
+        assert_eq!(auth, ProviderAuthKind::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn command_effect_names_are_stable() -> TestResult {
+        for (effect, name) in [
+            (CommandEffect::Applied, "applied"),
+            (CommandEffect::Staged, "staged"),
+            (CommandEffect::NextSession, "next_session"),
+            (CommandEffect::Refused, "refused"),
+            (CommandEffect::StepupRequired, "stepup_required"),
+        ] {
+            assert_eq!(ctx(serde_json::to_value(effect), "encode")?, name);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wire_secret_debug_is_redacted_but_wire_carries_value() -> TestResult {
+        let params = SecretPutParams {
+            name: "key-a".into(),
+            for_provider: "prov-a".into(),
+            value: WireSecret::new("sk-test-FAKE-0000000000000000".into()),
+        };
+        let debug = format!("{params:?}");
+        assert!(!debug.contains("FAKE"));
+        assert!(debug.contains("[redacted]"));
+        let json = ctx(serde_json::to_string(&params), "encode")?;
+        assert!(json.contains("sk-test-FAKE-0000000000000000"));
+        assert_eq!(params.value.len(), 29);
+        assert!(!params.value.is_empty());
+        assert_eq!(params.value.expose().len(), params.value.len());
+        let result = SecretPutResult {
+            handle: "0".repeat(32),
+            key_name: "key-a".into(),
+            for_provider: "prov-a".into(),
+            expires_at: jiff::Timestamp::UNIX_EPOCH,
+        };
+        let value = ctx(serde_json::to_value(&result), "encode result")?;
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        assert_eq!(keys, ["expires_at", "for_provider", "handle", "key_name"]);
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_provider_has_no_secret_fields() -> TestResult {
+        let provider = CatalogProvider {
+            name: "p".into(),
+            api: "a".into(),
+            base_url: "https://x.example.test".into(),
+            enabled: true,
+            auth_kind: ProviderAuthKind::Env,
+            auth_name: None,
+            has_secret: false,
+            models: vec![],
+            max_concurrency: None,
+        };
+        let value = ctx(serde_json::to_value(&provider), "encode")?;
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "api",
+                "auth_kind",
+                "auth_name",
+                "base_url",
+                "enabled",
+                "has_secret",
+                "max_concurrency",
+                "models",
+                "name"
+            ]
+        );
+        for forbidden in ["api_key", "headers", "auth_header", "auth"] {
+            assert!(!keys.contains(&forbidden));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn minor_three_constants() {
+        assert_eq!(SESSION_WIRE_MINOR, 4);
+        assert_eq!(PROJECTS_WIRE_MINOR, 3);
+        assert_eq!(features::PROJECTS, "projects");
+        const { assert!(DEFAULT_PAGE_LIMIT <= MAX_PAGE_LIMIT) };
+        assert_eq!(NO_PROJECT_KEY, "");
+    }
+
+    #[test]
+    fn share_mode_parse_and_default() {
+        assert_eq!(ShareMode::default(), ShareMode::Off);
+        for mode in [ShareMode::Off, ShareMode::Read, ShareMode::Continue] {
+            assert_eq!(ShareMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(ShareMode::parse("Read"), None);
+        assert_eq!(ShareMode::parse(""), None);
+    }
+
+    #[test]
+    fn unknown_enum_values_decode_to_unknown() -> TestResult {
+        let kind: HolderKind = ctx(serde_json::from_str("\"future\""), "holder kind")?;
+        assert_eq!(kind, HolderKind::Unknown);
+        let reason: ReadOnlyReason = ctx(serde_json::from_str("\"future\""), "reason")?;
+        assert_eq!(reason, ReadOnlyReason::Unknown);
+        let origin: RowOrigin = ctx(serde_json::from_str("\"future\""), "origin")?;
+        assert_eq!(origin, RowOrigin::Unknown);
+        let last: LastOrigin = ctx(serde_json::from_str("\"future\""), "last origin")?;
+        assert_eq!(last, LastOrigin::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn project_params_reject_unknown_fields_results_tolerate_them() -> TestResult {
+        assert!(serde_json::from_str::<PageParams>(r#"{"tenant":"x"}"#).is_err());
+        assert!(serde_json::from_str::<ProjectsParams>(r#"{"actor":"x"}"#).is_err());
+        assert!(serde_json::from_str::<CreateInParams>(r#"{"project_key":"p","uid":1}"#).is_err());
+        let page: PageParams = ctx(serde_json::from_str("{}"), "empty page params")?;
+        assert_eq!(page, PageParams::default());
+        let result: PageResult = ctx(
+            serde_json::from_str(r#"{"sessions":[],"added_later":true}"#),
+            "result with extra field",
+        )?;
+        assert!(result.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn session_row_omits_empty_options_and_round_trips() -> TestResult {
+        let at: jiff::Timestamp = ctx("2026-01-02T03:04:05Z".parse(), "timestamp")?;
+        let row = SessionRow {
+            session_id: sid("sess-a1")?,
+            title: None,
+            project_key: Some(NO_PROJECT_KEY.to_owned()),
+            updated_at: at,
+            turns: None,
+            state: HostedState::Idle,
+            attached: 0,
+            model: None,
+            origin: RowOrigin::Profile,
+            purpose: SessionRowPurpose::Unknown,
+            continuable: false,
+            reason: Some(ReadOnlyReason::ShareReadOnly),
+            holder: None,
+            last_origin: None,
+            first_message: None,
+        };
+        let value = ctx(serde_json::to_value(&row), "encode row")?;
+        for absent in [
+            "title",
+            "turns",
+            "model",
+            "holder",
+            "last_origin",
+            "first_message",
+        ] {
+            assert!(value.get(absent).is_none(), "{absent} must be omitted");
+        }
+        assert_eq!(value["reason"], "share_read_only");
+        let back: SessionRow = ctx(serde_json::from_value(value), "decode row")?;
+        assert_eq!(back, row);
+        Ok(())
+    }
+
+    #[test]
+    fn dream_page_defaults_keep_strict_legacy_shape() -> TestResult {
+        let old: PageParams = ctx(serde_json::from_str("{}"), "old page request")?;
+        assert!(!old.include_dreams);
+        let encoded = ctx(serde_json::to_value(&old), "default page request")?;
+        assert!(encoded.get("include_dreams").is_none());
+        let opted: PageParams = ctx(
+            serde_json::from_str(r#"{"include_dreams":true}"#),
+            "opt-in page request",
+        )?;
+        assert!(opted.include_dreams);
+        assert!(serde_json::from_str::<PageParams>(r#"{"include_dreams":true,"tenant":"test"}"#).is_err());
+        assert_eq!(ctx(serde_json::to_value(SessionRowPurpose::Dream), "Dream purpose")?, "dream");
+        assert_eq!(
+            ctx(serde_json::from_str::<SessionRowPurpose>(r#""future_purpose""#), "future purpose")?,
+            SessionRowPurpose::Unknown,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn system_page_flag_is_strict_and_wire_compatible_by_default() -> TestResult {
+        let default = ctx(serde_json::to_value(PageParams::default()), "default page")?;
+        assert!(default.get("include_system").is_none());
+        let system: PageParams = ctx(serde_json::from_str(r#"{"include_system":true}"#), "System page")?;
+        assert!(system.include_system && !system.include_dreams);
+        assert!(serde_json::from_str::<PageParams>(r#"{"include_system":true,"scope":"other"}"#).is_err());
+        for (purpose, tag) in [
+            (SessionRowPurpose::Dream, "dream"),
+            (SessionRowPurpose::Diary, "diary"),
+            (SessionRowPurpose::Ledger, "ledger"),
+            (SessionRowPurpose::MemoryReconciliation, "memory_reconciliation"),
+            (SessionRowPurpose::AutomaticWorkbench, "automatic_workbench"),
+        ] {
+            assert_eq!(ctx(serde_json::to_value(purpose), "System tag")?, tag);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn share_info_round_trips() -> TestResult {
+        let info = ShareInfo {
+            mode: ShareMode::Continue,
+            tier: PermissionTier::Operator,
+        };
+        let json = ctx(serde_json::to_string(&info), "encode share")?;
+        let back: ShareInfo = ctx(serde_json::from_str(&json), "decode share")?;
+        assert_eq!(back, info);
         Ok(())
     }
 
@@ -1075,6 +2728,7 @@ mod tests {
             },
             SessionFrame::HistoryReplaced { item_count: 3 },
             SessionFrame::Presence { attached: vec![] },
+            SessionFrame::StepupRequest(sample_challenge()),
             SessionFrame::Job {
                 work_id: "w".into(),
                 kind: "work".into(),
@@ -1189,6 +2843,21 @@ mod tests {
         assert_eq!(params.tail_items, DEFAULT_TAIL_ITEMS);
         assert_eq!(params.profile, StreamProfile::Full);
         assert_eq!(params.from, None);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_reasoning_profile_uses_its_snake_case_name() -> TestResult {
+        let value = ctx(
+            serde_json::to_value(StreamProfile::CompactReasoning),
+            "encode profile",
+        )?;
+        assert_eq!(value, serde_json::json!("compact_reasoning"));
+        let json = r#"{"session_id":"s-9","profile":"compact_reasoning"}"#;
+        let params: AttachParams = ctx(serde_json::from_str(json), "decode attach")?;
+        assert_eq!(params.profile, StreamProfile::CompactReasoning);
+        assert_eq!(features::COMPACT_REASONING, "compact_reasoning");
+        assert_eq!(features::JOB_FRAMES, "job_frames");
         Ok(())
     }
 
@@ -1331,4 +3000,92 @@ mod tests {
         assert_eq!(json, r#"{"result":"accepted","position":0}"#);
         Ok(())
     }
+}
+
+
+/// No target, source history, attachments or permissions in Assistant requests.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantSubmit {
+    pub client_message_id: String,
+    pub text: String,
+}
+
+/// Explicit opt-in for one request to replay exact earlier pairs from this
+/// room. IDs are room-local references, never a new target or client text.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantRecallSubmit {
+    pub client_message_id: String,
+    pub text: String,
+    pub recall_message_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudAssistantStatus {
+    Unprovisioned,
+    Ready,
+    Revoked,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantTurn {
+    pub client_message_id: String,
+    pub text: String,
+    pub answer: String,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantSnapshot {
+    pub status: CloudAssistantStatus,
+    pub turns: Vec<CloudAssistantTurn>,
+}
+
+/// No account or tenant selector: these come only from live gateway membership.
+/// Request IDs select earlier gateway-recorded join requests in this same room.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CloudAssistantSharedCommandV1 {
+    Status,
+    Provision,
+    RequestJoin,
+    Approve { request_id: String },
+    WithdrawOrRemove { request_id: String },
+    RevokeRoom,
+    Submit { client_message_id: String, text: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudAssistantSharedStatusV1 {
+    Unprovisioned,
+    NotGranted,
+    Pending,
+    Owner,
+    Participant,
+    Revoked,
+}
+
+/// Owner-only device verification metadata. Never account discovery or a
+/// credential; a request ID alone cannot admit a connection.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantSharedDeviceV1 {
+    pub request_id: String,
+    pub device_id: String,
+    pub node_id: String,
+    pub key_fingerprint_hex: String,
+    pub pending: bool,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantSharedSnapshotV1 {
+    pub status: CloudAssistantSharedStatusV1,
+    pub turns: Vec<CloudAssistantTurn>,
+    pub own_request_id: Option<String>,
+    pub devices: Vec<CloudAssistantSharedDeviceV1>,
 }

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cloud_assistant_recall_clear">Borrar selección</string>
+    <string name="cloud_assistant_recall_choose">Seleccionar intercambios anteriores para este mensaje</string>
+    <string name="cloud_assistant_recall_disclosure">Elige hasta cuatro intercambios (8 KiB en total). Solo para este mensaje, el proveedor configurado en tu puerta de enlace recibe esos intercambios junto con la conversación reciente.</string>
+    <string name="cloud_assistant_recall_include">Incluir este intercambio</string>
+    <string name="cloud_assistant_recall_count">%1$d de %2$d intercambios seleccionados para este mensaje</string>
+    <string name="cloud_assistant_recall_send">Enviar con los intercambios seleccionados</string>
+</resources>

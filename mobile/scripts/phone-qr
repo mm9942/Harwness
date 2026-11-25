@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Render a public gateway profile or decode a scanned phone enrollment."""
+import argparse
+import json
+import re
+import sys
+import unicodedata
+
+from public_profile import read_profile
+
+ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+
+
+def encode(raw):
+    chars = []
+    for index in range(0, len(raw), 2):
+        group = raw[index:index + 2]
+        number = int.from_bytes(group, "big")
+        for _ in range(len(group) + 1):
+            number, digit = divmod(number, 45)
+            chars.append(ALPHABET[digit])
+    return "".join(chars)
+
+
+def decode(encoded):
+    raw = bytearray()
+    for index in range(0, len(encoded), 3):
+        digits = encoded[index:index + 3]
+        if len(digits) == 1:
+            raise ValueError("truncated Base45 group")
+        number = sum(ALPHABET.index(c) * 45 ** pos for pos, c in enumerate(digits))
+        raw.extend(number.to_bytes(len(digits) - 1, "big"))
+    return raw
+
+
+def profile_text(path):
+    profile = read_profile(path)
+    fields = [profile[name].encode("utf-8") for name in ("label", "server_node_id", "endpoint")]
+    onion = profile.get("onion")
+    if not onion:
+        raw = bytes(map(len, fields)) + b"".join(fields) + bytes.fromhex(profile["server_public_key_hex"])
+        return "HARW:PROFILE:1:" + encode(raw)
+    fields.append(onion.encode("ascii"))
+    raw = bytes(map(len, fields)) + b"".join(fields) + bytes.fromhex(profile["server_public_key_hex"])
+    return "HARW:PROFILE:2:" + encode(raw)
+
+
+def read_enrollment():
+    text = sys.stdin.buffer.read(4097)
+    if len(text) > 4096:
+        raise ValueError("enrollment exceeds size limit")
+    prefix = "HARW:ENROLL:1:"
+    data = text.decode("ascii").removesuffix("\n").removesuffix("\r")
+    if not data.startswith(prefix):
+        raise ValueError("expected a Harw enrollment")
+    raw = decode(data[len(prefix):])
+    label_len, node_len = raw[:2]
+    end = 2 + label_len + node_len
+    if not 1 <= label_len <= 128 or len(raw) != end + 1952:
+        raise ValueError("invalid enrollment length")
+    label = raw[2:2 + label_len].decode("utf-8")
+    node = raw[2 + label_len:end].decode("ascii")
+    if not label.strip() or any(unicodedata.category(c) == "Cc" for c in label) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", node):
+        raise ValueError("invalid phone label or node")
+    return dict(version=1, label=label, node_id=node, public_key_hex=raw[end:].hex())
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    profile = commands.add_parser("profile", help="write a scannable gateway profile SVG")
+    profile.add_argument("profile_json")
+    profile.add_argument("output_svg")
+    commands.add_parser("enrollment", help="decode scanned text from stdin to public JSON on stdout")
+    args = parser.parse_args()
+    if args.action == "enrollment":
+        print(json.dumps(read_enrollment(), ensure_ascii=False))
+        return
+    text = profile_text(args.profile_json)
+    import segno
+    try:
+        qr = segno.make_qr(text, error="M", mode="alphanumeric")
+    except segno.DataOverflowError:
+        qr = segno.make_qr(text, error="L", mode="alphanumeric")
+    with open(args.output_svg, "xb") as output:
+        qr.save(output, kind="svg", scale=8, border=4, light="white")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ImportError:
+        sys.exit("Install python3-segno to render a profile QR code.")
+    except (OSError, ValueError, OverflowError, RecursionError) as error:
+        sys.exit(f"phone-qr: {error}")

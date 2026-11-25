@@ -1515,6 +1515,21 @@ impl AgentMonitor {
         counts
     }
 
+    /// Kennzahlen unter dem Composer: alle fehlgeschlagenen Agenten, auch gesehene;
+    /// Jobs gehören nicht zu diesen Agentenzahlen.
+    #[must_use]
+    pub(crate) fn footer_counts(&self) -> (usize, usize) {
+        let mut counts = (0, 0);
+        for live in self.agents.values().filter(|live| live.parent.is_some()) {
+            if live.phase.is_active() {
+                counts.0 += 1;
+            } else if live.phase == AgentPhase::Failed {
+                counts.1 += 1;
+            }
+        }
+        counts
+    }
+
     /// `true`, sobald mindestens ein Kind-Agent (mit Elternteil) bekannt ist.
     #[must_use]
     pub(crate) fn has_children(&self) -> bool {
@@ -2235,8 +2250,9 @@ struct PanelRow {
 /// Baut alle Zeilen des Panels (ohne Rahmen) für `width` × `height`.
 ///
 /// Pflichtzeilen: eine Zeile je Auswahl-Einheit. Nur wenn danach Platz
-/// bleibt, kommen (in dieser Reihenfolge) Kontextbalken laufender Agenten,
-/// interne Nutzung und die Live-Vorschau des ausgewählten Agenten dazu.
+/// bleibt, kommen (in dieser Reihenfolge) Kontextbalken laufender Agenten
+/// und die interne Nutzung dazu; Reasoning-/Antwort-Vorschauen gibt es in
+/// der Liste nicht (nur in der Detailansicht).
 fn panel_rows(
     monitor: &AgentMonitor,
     width: usize,
@@ -2398,73 +2414,12 @@ fn panel_rows(
                 entry: None,
             });
         }
-        room = height.saturating_sub(rows.len());
     }
-    let live_preview = if focused {
-        monitor
-            .selected_live()
-            .filter(|live| live.phase.is_active())
-    } else {
-        monitor
-            .rows()
-            .into_iter()
-            .map(|(_, live)| live)
-            .find(|live| {
-                live.phase.is_active()
-                    && (!live.preview.is_empty() || !live.reasoning_preview.is_empty())
-            })
-    };
-    if let Some(live) = live_preview
-        && (!live.preview.is_empty() || !live.reasoning_preview.is_empty())
-    {
-        // Fokus bekommt weiterhin den Trenner/Details-Hinweis. Ohne Fokus
-        // bleibt die Live-Projektion kompakt und nutzt nur tatsächlich freien
-        // Platz im Panel.
-        if focused && room >= 3 {
-            rows.push(PanelRow {
-                line: Line::default(),
-                entry: None,
-            });
-            rows.push(PanelRow {
-                line: Line::styled(
-                    fit_width(
-                        &crate::i18n::tr_args(
-                            "agents.live_detail",
-                            "── {p0} live · Enter details ──",
-                            &[("p0", &(sanitize_inline(&live.role)).to_string())],
-                        ),
-                        width,
-                    ),
-                    style::dim_style(theme),
-                ),
-                entry: None,
-            });
-        }
-
-        let mut preview_room = height.saturating_sub(rows.len());
-        if preview_room > 0 && !live.reasoning_preview.is_empty() {
-            let text = format!("∴ {}", sanitize_inline(&live.reasoning_preview));
-            let count = text.chars().count();
-            let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
-            rows.push(PanelRow {
-                line: Line::styled(
-                    fit_width(&tail, width),
-                    style::dim_style(theme).add_modifier(Modifier::ITALIC),
-                ),
-                entry: None,
-            });
-            preview_room = preview_room.saturating_sub(1);
-        }
-        if preview_room > 0 && !live.preview.is_empty() {
-            let text = format!("» {}", sanitize_inline(&live.preview));
-            let count = text.chars().count();
-            let tail: String = text.chars().skip(count.saturating_sub(width)).collect();
-            rows.push(PanelRow {
-                line: Line::styled(fit_width(&tail, width), Style::default()),
-                entry: None,
-            });
-        }
-    }
+    // Agentenlisten zeigen keine `∴`-Reasoning- oder `»`-Vorschauzeilen
+    // mehr (Owner-Entscheidung 2026-11-22, PL-68:271): die Liste bleibt
+    // eine Zeile je Lauf. Reasoning und Antworttext gehören in die
+    // Detailansicht (`render_agent_detail`) bzw. das LIVE-/Reasoning-Fenster;
+    // `AgentLive::preview`/`reasoning_preview` bleiben dafür erhalten.
     rows
 }
 
@@ -2770,59 +2725,8 @@ fn render_agents_only_panel(
         });
     }
 
-    // Split-Dock: Live-Reasoning gehört in die Agenten-Spalte und darf nicht
-    // vom Fokus abhängen. Pflicht-/Auswahlzeilen bleiben unverändert vorne;
-    // Preview-Zeilen werden ausschließlich in den noch freien Raum angehängt,
-    // sodass Selection- und Scroll-Indizes weiterhin auf den echten Agenten-
-    // Einträgen liegen.
-    let max_rows = usize::from(inner.height);
-    let mut preview_room = max_rows.saturating_sub(rows.len());
-    if preview_room > 0 {
-        let active: Vec<&AgentLive> = monitor
-            .rows()
-            .into_iter()
-            .map(|(_, live)| live)
-            .filter(|live| live.phase.is_active())
-            .collect();
-        let show_role = active.len() > 1;
-        for live in active {
-            if preview_room == 0 {
-                break;
-            }
-            if !live.reasoning_preview.is_empty() {
-                let body = sanitize_inline(&live.reasoning_preview);
-                let text = if show_role {
-                    format!("∴ {} · {body}", sanitize_inline(&live.role))
-                } else {
-                    format!("∴ {body}")
-                };
-                rows.push(PanelRow {
-                    line: Line::styled(
-                        fit_width(&text, inner_width),
-                        style::dim_style(theme).add_modifier(Modifier::ITALIC),
-                    ),
-                    entry: None,
-                });
-                preview_room -= 1;
-            }
-            if preview_room == 0 {
-                break;
-            }
-            if !live.preview.is_empty() {
-                let body = sanitize_inline(&live.preview);
-                let text = if show_role {
-                    format!("» {} · {body}", sanitize_inline(&live.role))
-                } else {
-                    format!("» {body}")
-                };
-                rows.push(PanelRow {
-                    line: Line::styled(fit_width(&text, inner_width), Style::default()),
-                    entry: None,
-                });
-                preview_room -= 1;
-            }
-        }
-    }
+    // Keine `∴`-/`»`-Füllzeilen in der Agentenliste (siehe `panel_rows`):
+    // freie Zeilen bleiben leer, Reasoning steht in der Detailansicht.
     render_dock_rows(monitor, rows, inner, buf)
 }
 
@@ -3727,8 +3631,11 @@ mod tests {
         Ok(())
     }
 
+    /// Owner-Entscheidung 2026-11-22: die (kombinierte bzw. F11-)Agentenliste
+    /// zeigt auch im Fokus keine `∴`-Reasoning- oder `»`-Antwortzeilen mehr;
+    /// beides bleibt in der Detailansicht und in den Live-Daten erhalten.
     #[test]
-    fn focused_agent_keeps_reasoning_visible_with_answer_text() -> TestResult {
+    fn focused_agent_list_hides_reasoning_but_detail_keeps_it() -> TestResult {
         let mut monitor = AgentMonitor::default();
         let turn_id = TurnId::new();
         monitor.apply(&ev(
@@ -3749,9 +3656,23 @@ mod tests {
                 text: "Runtime sieht gut aus".to_owned(),
             },
         )?);
-        let shown = panel_screen(&monitor, 72, 12, true)?.join("\n");
-        assert!(shown.contains("∴ Prüfe zuerst die Runtime"), "{shown}");
-        assert!(shown.contains("Runtime sieht gut aus"), "{shown}");
+        for focused in [true, false] {
+            let shown = panel_screen(&monitor, 72, 12, focused)?.join("\n");
+            assert!(shown.contains("root-orchestrator"), "{shown}");
+            assert!(!shown.contains('∴'), "focused={focused}: {shown}");
+            assert!(!shown.contains('»'), "focused={focused}: {shown}");
+            assert!(!shown.contains("Prüfe zuerst die Runtime"), "{shown}");
+            assert!(!shown.contains("Runtime sieht gut aus"), "{shown}");
+            assert!(!shown.contains("Enter details"), "{shown}");
+        }
+
+        let live = monitor.agent("a").ok_or("agent a")?;
+        assert_eq!(live.reasoning_preview, "Prüfe zuerst die Runtime");
+        assert_eq!(live.preview, "Runtime sieht gut aus");
+
+        let detail = render_to_string(&monitor, 72, 16, 0, true)?;
+        assert!(detail.contains("∴ Prüfe zuerst die Runtime"), "{detail}");
+        assert!(detail.contains("Runtime sieht gut aus"), "{detail}");
         Ok(())
     }
     #[test]
@@ -3804,6 +3725,8 @@ mod tests {
             } else {
                 harw_tool_job::JobState::Succeeded
             },
+            suspended: false,
+            suspension_unresolved: false,
             progress: if active {
                 "ninja 120/900 13%".to_owned()
             } else {
@@ -3938,6 +3861,30 @@ mod tests {
         let seen = panel_screen(&monitor, 60, 20, false)?.join("\n");
         assert!(!seen.contains("Budget erschöpft"), "{seen}");
         assert!(seen.contains("✓ 7 finished"), "{seen}");
+        Ok(())
+    }
+
+    #[test]
+    fn footer_counts_include_seen_failures() -> TestResult {
+        let mut monitor = busy_monitor()?;
+        let (active_before, failed_before) = monitor.footer_counts();
+        assert_eq!(failed_before, 0);
+        monitor.apply(&ev(
+            "f1",
+            Some("root"),
+            "uia-tester",
+            TurnEvent::TurnFailed {
+                turn_id: t1()?,
+                reason: "Budget erschöpft".into(),
+                retryable: false,
+            },
+        )?);
+        let (active, failed) = monitor.footer_counts();
+        assert_eq!(failed, 1);
+        assert!(active <= active_before + 1);
+        // Gesehene Fehler bleiben in der Fußzeile gezählt.
+        monitor.mark_seen("f1");
+        assert_eq!(monitor.footer_counts().1, 1);
         Ok(())
     }
 
@@ -4127,8 +4074,11 @@ mod tests {
         Ok(())
     }
 
+    /// Owner-Entscheidung 2026-11-22: die Agenten-Spalte des geteilten Docks
+    /// füllt freie Zeilen nicht mehr mit `∴`-/`»`-Vorschauen auf; die
+    /// Detailansicht des Agenten zeigt Reasoning und Antworttext weiterhin.
     #[test]
-    fn render_dock_split_shows_live_reasoning_without_focus() -> TestResult {
+    fn render_dock_split_lists_agents_without_reasoning_filler() -> TestResult {
         let mut monitor = AgentMonitor::default();
         let turn = TurnId::new();
         monitor.apply(&orch(
@@ -4179,9 +4129,20 @@ mod tests {
             .map(|row| row.chars().skip(40).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(left.contains("∴ Prüfe zuerst die DoD"), "{left}");
-        assert!(left.contains("» Validator ist geprüft"), "{left}");
+        assert!(left.contains("root-orchestrator"), "{left}");
+        assert!(!left.contains('∴'), "{left}");
+        assert!(!left.contains('»'), "{left}");
+        assert!(!left.contains("Prüfe zuerst die DoD"), "{left}");
+        assert!(!left.contains("Validator ist geprüft"), "{left}");
         assert!(!right.contains("Prüfe zuerst die DoD"), "{right}");
+
+        let id = SessionId::try_from_str("a1")?;
+        let detail_area = Rect::new(0, 0, 72, 16);
+        let mut detail_buf = Buffer::empty(detail_area);
+        monitor.render_agent_detail(&id, detail_area, &mut detail_buf, &ChatScroll::new(), true);
+        let detail = buffer_rows(&detail_buf).join("\n");
+        assert!(detail.contains("∴ Prüfe zuerst die DoD"), "{detail}");
+        assert!(detail.contains("Validator ist geprüft"), "{detail}");
         Ok(())
     }
     #[test]

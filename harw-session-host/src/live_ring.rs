@@ -20,6 +20,8 @@
 
 use std::collections::VecDeque;
 
+use harw_protocol::items::TurnItem;
+use harw_protocol::session_wire::MAX_VISIBLE_REASONING_BYTES;
 use harw_protocol::{SessionFrame, TurnEvent};
 use harw_types::TurnId;
 
@@ -56,6 +58,7 @@ pub struct LiveRing {
     turn: Option<TurnId>,
     assistant_text: String,
     reasoning_seen: bool,
+    reasoning_text: String,
 }
 
 impl Default for LiveRing {
@@ -77,6 +80,7 @@ impl LiveRing {
             turn: None,
             assistant_text: String::new(),
             reasoning_seen: false,
+            reasoning_text: String::new(),
         }
     }
 
@@ -86,6 +90,7 @@ impl LiveRing {
         self.clear_frames();
         self.assistant_text.clear();
         self.reasoning_seen = false;
+        self.reasoning_text.clear();
         self.turn = Some(turn_id);
     }
 
@@ -139,6 +144,7 @@ impl LiveRing {
             turn_id: turn_id.clone(),
             assistant_text: self.assistant_text.clone(),
             reasoning_collapsed: self.reasoning_seen,
+            reasoning_text: (!self.reasoning_text.is_empty()).then(|| self.reasoning_text.clone()),
         })
     }
 
@@ -147,6 +153,7 @@ impl LiveRing {
         self.clear_frames();
         self.assistant_text.clear();
         self.reasoning_seen = false;
+        self.reasoning_text.clear();
         self.turn = None;
     }
 
@@ -198,9 +205,15 @@ impl LiveRing {
                 self.assistant_text.push_str(text);
                 trim_to_tail(&mut self.assistant_text, MAX_SNAPSHOT_TEXT_BYTES);
             }
-            SessionFrame::Turn(TurnEvent::ReasoningDelta { turn_id, .. }) if turn_id == active => {
+            SessionFrame::Turn(TurnEvent::ReasoningDelta { turn_id, text }) if turn_id == active => {
                 self.reasoning_seen = true;
+                self.reasoning_text.push_str(text);
+                trim_to_tail(&mut self.reasoning_text, MAX_VISIBLE_REASONING_BYTES);
             }
+            SessionFrame::Turn(TurnEvent::ItemAdded {
+                turn_id,
+                item: TurnItem::Reasoning(_) | TurnItem::AssistantMessage(_),
+            }) if turn_id == active => self.reasoning_text.clear(),
             _ => {}
         }
     }
@@ -247,9 +260,31 @@ mod tests {
                 turn_id,
                 assistant_text,
                 reasoning_collapsed,
+                ..
             }) => Ok((turn_id, assistant_text, reasoning_collapsed)),
             other => Err(format!("expected snapshot, got {other:?}").into()),
         }
+    }
+
+    #[test]
+    fn active_snapshot_carries_only_the_current_turns_visible_reasoning() -> TestResult {
+        let mut ring = LiveRing::default();
+        let active = turn("active")?;
+        let stale = turn("stale")?;
+        ring.begin_turn(active.clone());
+        for (turn_id, text) in [(active.clone(), "Visible "), (stale, "not active"), (active, "text")] {
+            ring.push(SessionFrame::Turn(TurnEvent::ReasoningDelta {
+                turn_id,
+                text: text.into(),
+            }));
+        }
+        assert!(matches!(
+            ring.snapshot(),
+            Some(SessionFrame::Snapshot { reasoning_text: Some(ref text), .. }) if text == "Visible text"
+        ));
+        ring.begin_turn(turn("next")?);
+        assert!(matches!(ring.snapshot(), Some(SessionFrame::Snapshot { reasoning_text: None, .. })));
+        Ok(())
     }
 
     #[test]

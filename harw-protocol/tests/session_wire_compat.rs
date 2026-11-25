@@ -2,11 +2,24 @@
 //! is a wire change: bump `SESSION_WIRE_MINOR` or keep the old shape.
 
 use harw_protocol::items::ToolPlacement;
+use harw_protocol::session_port::PortError;
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, GatewayStatus, HelloAck, HelloParams,
-    PlacementGeneration, RespondResult, SESSION_WIRE_MINOR, SESSION_WS_PATH,
-    SESSION_WS_SUBPROTOCOL, SubmitResult, TOOL_GATEWAY_WIRE_MINOR, ToolCallParams,
-    ToolCallResultFrame, ToolListResult, error_codes,
+    ARCHIVE_CHECKPOINT_WIRE_MINOR, ArchiveCheckpointDescribeV1, ArchiveCheckpointInfoV1,
+    ArchiveCheckpointIssueV1, ArchiveCheckpointPageV1, ArchiveCheckpointRowsV1, ForkInclusiveV1,
+};
+use harw_protocol::session_wire::{
+    ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams,
+    CatalogProvider, CatalogResult, CommandEffect, CommandEntry, CommandOrigin, CommandRunParams,
+    CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams, ConfigGetResult,
+    ConfigResetParams, ConfigSetParams, CreateInParams, GatewayStatus, HelloAck, HelloParams,
+    HolderInfo, HolderKind, LastOrigin, MANAGE_WIRE_MINOR, MAX_CLIENT_MSG_ID_BYTES,
+    MAX_COMMAND_LINE_BYTES, MAX_CONFIG_KEYS, MAX_SECRET_VALUE_BYTES, PROJECTS_WIRE_MINOR,
+    PageParams, PageResult, PlacementGeneration, ProjectsParams, ProjectsResult, ProviderAuthKind,
+    ReadOnlyReason, RenameParams, RespondResult, RowOrigin, SESSION_WIRE_MINOR, SESSION_WS_PATH,
+    SESSION_WS_SUBPROTOCOL, SecretPutParams, SecretPutResult, SessionRow, SessionSummary,
+    SetProjectParams, StepUpCancelParams, StepUpChallenge, StepUpConfirmParams, SubmitResult,
+    TOOL_GATEWAY_WIRE_MINOR, ToolCallParams, ToolCallResultFrame, ToolListResult, WireSecret,
+    error_codes,
 };
 use harw_protocol::{AgentRole, ClientCaps, Cursor, FrameEnvelope, SessionFrame, ToolApproval};
 use serde::Serialize;
@@ -279,6 +292,33 @@ fn unknown_frame_kind_in_envelope_decodes_to_unknown() -> TestResult {
 }
 
 #[test]
+fn frozen_v5_checkpoint_shapes_are_proof_only() -> TestResult {
+    let issue: ArchiveCheckpointIssueV1 = round_trip("archive_checkpoint_issue_v1")?;
+    let lookup: ArchiveCheckpointDescribeV1 = round_trip("archive_checkpoint_describe_v1")?;
+    let checkpoint: ArchiveCheckpointInfoV1 = round_trip("archive_checkpoint_info_v1")?;
+    assert_eq!(issue.session_id, checkpoint.session_id);
+    assert_eq!(issue.expected, checkpoint.revision);
+    assert_eq!(lookup.checkpoint_id, checkpoint.checkpoint_id);
+    let page: ArchiveCheckpointPageV1 = round_trip("archive_checkpoint_page_v1")?;
+    let rows: ArchiveCheckpointRowsV1 = round_trip("archive_checkpoint_rows_v1")?;
+    let fork: ForkInclusiveV1 = round_trip("fork_inclusive_v1")?;
+    assert_eq!(page.checkpoint_id, fork.checkpoint_id);
+    assert_eq!(rows.rows[0].locator, fork.row);
+    assert_eq!(rows.rows[0].image_count, 2);
+    for field in ["history", "roles", "media", "title", "project"] {
+        let mut params = golden("fork_inclusive_v1")?;
+        params[field] = Value::Null;
+        assert!(serde_json::from_value::<ForkInclusiveV1>(params).is_err());
+    }
+    for field in ["roles", "history", "media", "project"] {
+        let mut params = golden("archive_checkpoint_issue_v1")?;
+        params[field] = Value::Null;
+        assert!(serde_json::from_value::<ArchiveCheckpointIssueV1>(params).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn version_and_subprotocol_constants_match_fixture() -> TestResult {
     let constants = golden("constants")?;
     let text = |key: &str| {
@@ -291,6 +331,18 @@ fn version_and_subprotocol_constants_match_fixture() -> TestResult {
     assert_eq!(text("subprotocol").as_deref(), Some(SESSION_WS_SUBPROTOCOL));
     assert_eq!(text("path").as_deref(), Some(SESSION_WS_PATH));
     assert_eq!(number("wire_minor"), Some(u64::from(SESSION_WIRE_MINOR)));
+    assert_eq!(
+        number("archive_checkpoint_wire_minor"),
+        Some(u64::from(ARCHIVE_CHECKPOINT_WIRE_MINOR))
+    );
+    assert_eq!(
+        number("projects_wire_minor"),
+        Some(u64::from(PROJECTS_WIRE_MINOR))
+    );
+    assert_eq!(
+        number("manage_wire_minor"),
+        Some(u64::from(MANAGE_WIRE_MINOR))
+    );
     assert_eq!(
         number("tool_gateway_wire_minor"),
         Some(u64::from(TOOL_GATEWAY_WIRE_MINOR))
@@ -339,4 +391,428 @@ fn placement_generation_is_a_transparent_integer() -> TestResult {
     assert_eq!(decoded, PlacementGeneration(9));
     assert!(serde_json::from_str::<PlacementGeneration>("-1").is_err());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Wire minor 3 (feature `projects`). All ids are synthetic.
+// ---------------------------------------------------------------------------
+
+fn sorted_keys(value: &Value) -> TestResult<Vec<String>> {
+    let object = value.as_object().ok_or("value is not an object")?;
+    let mut keys: Vec<String> = object.keys().cloned().collect();
+    keys.sort();
+    Ok(keys)
+}
+
+/// The minor-2 hello, its ack and `SessionSummary` keep their exact bytes:
+/// the minor-3 additions never leak into them.
+#[test]
+fn frozen_v2_messages_are_byte_identical_at_minor_3() -> TestResult {
+    let hello: HelloParams = round_trip("hello_params")?;
+    assert_eq!(hello.wire_minor, 2);
+    let ack: HelloAck = round_trip("hello_ack")?;
+    assert_eq!(ack.wire_minor, 2);
+    let hello_text = serde_json::to_string(&hello)?;
+    assert!(!hello_text.contains("projects"), "{hello_text}");
+
+    let summary_json = r#"{"session_id":"sess-a1","title":"t","tenant":null,"state":{"state":"idle"},"attached":0,"updated_at":"2026-01-01T00:00:00Z","model":null}"#;
+    let summary: SessionSummary = serde_json::from_str(summary_json)?;
+    let value = serde_json::to_value(&summary)?;
+    assert_eq!(value, serde_json::from_str::<Value>(summary_json)?);
+    assert_eq!(
+        sorted_keys(&value)?,
+        [
+            "attached",
+            "model",
+            "session_id",
+            "state",
+            "tenant",
+            "title",
+            "updated_at"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn holder_frame_round_trips_and_is_unknown_to_v2_kinds() -> TestResult {
+    let json = r#"{"session_id":"sess-a1","cursor":{"generation":1,"durable":2,"live":0},"frame":{"kind":"holder","data":{"session_id":"sess-a1","holder":{"kind":"tui","since":"2026-01-01T00:00:00Z"}}}}"#;
+    let envelope: FrameEnvelope = serde_json::from_str(json)?;
+    assert!(matches!(
+        envelope.frame,
+        SessionFrame::Holder { holder: Some(ref h), .. } if h.kind == HolderKind::Tui
+    ));
+    assert_eq!(
+        serde_json::to_value(&envelope)?,
+        serde_json::from_str::<Value>(json)?
+    );
+
+    let free = r#"{"kind":"holder","data":{"session_id":"sess-a1","holder":null}}"#;
+    let frame: SessionFrame = serde_json::from_str(free)?;
+    assert!(matches!(frame, SessionFrame::Holder { holder: None, .. }));
+
+    let future = r#"{"session_id":"s","cursor":{"generation":1,"durable":1,"live":0},"frame":{"kind":"holder_v9","data":{"a":1}}}"#;
+    let envelope: FrameEnvelope = serde_json::from_str(future)?;
+    assert!(matches!(envelope.frame, SessionFrame::Unknown));
+    Ok(())
+}
+
+#[test]
+fn holder_info_has_no_pid_field() -> TestResult {
+    let info: HolderInfo =
+        serde_json::from_str(r#"{"kind":"gateway","since":"2026-01-01T00:00:00Z","pid":4242}"#)?;
+    assert_eq!(info.kind, HolderKind::Gateway);
+    let value = serde_json::to_value(&info)?;
+    assert_eq!(sorted_keys(&value)?, ["kind", "since"]);
+    Ok(())
+}
+
+#[test]
+fn minor3_params_reject_unknown_fields() {
+    fn rejects<T: DeserializeOwned>(base: &str) -> bool {
+        let text = format!("{},\"tenant\":\"x\"}}", base.trim_end_matches('}'));
+        serde_json::from_str::<T>(&text).is_err()
+    }
+    assert!(rejects::<ProjectsParams>("{}"));
+    assert!(rejects::<PageParams>("{}"));
+    assert!(rejects::<CreateInParams>(r#"{"project_key":"p"}"#));
+    assert!(rejects::<SetProjectParams>(
+        r#"{"session_id":"sess-a1","project_key":"p"}"#
+    ));
+    assert!(rejects::<RenameParams>(
+        r#"{"session_id":"sess-a1","title":"t"}"#
+    ));
+    assert!(rejects::<ArchiveParams>(
+        r#"{"session_id":"sess-a1","archived":true}"#
+    ));
+}
+
+#[test]
+fn minor3_params_accept_their_plain_shape() -> TestResult {
+    let page: PageParams = serde_json::from_str("{}")?;
+    assert_eq!(page.project_key, None);
+    assert!(!page.include_archived);
+    let none_project: PageParams = serde_json::from_str(r#"{"project_key":""}"#)?;
+    assert_eq!(none_project.project_key.as_deref(), Some(""));
+    let projects: ProjectsParams = serde_json::from_str(r#"{"limit":50}"#)?;
+    assert_eq!(projects.limit, Some(50));
+    Ok(())
+}
+
+#[test]
+fn minor3_results_accept_additional_fields() -> TestResult {
+    let row = r#"{"session_id":"sess-a1","updated_at":"2026-01-01T00:00:00Z","state":{"state":"idle"},"attached":0,"origin":"hosted","continuable":true,"future_field":1}"#;
+    let parsed: SessionRow = serde_json::from_str(row)?;
+    assert!(parsed.continuable);
+    assert_eq!(parsed.origin, RowOrigin::Hosted);
+
+    let page = format!(r#"{{"sessions":[{row}],"extra":true}}"#);
+    let parsed: PageResult = serde_json::from_str(&page)?;
+    assert_eq!(parsed.sessions.len(), 1);
+    assert_eq!(parsed.next_cursor, None);
+
+    let projects = r#"{"projects":[{"project_key":"","label":"x","session_count":1,"last_activity":"2026-01-01T00:00:00Z","active_count":0,"more":1}],"share":{"mode":"off","tier":"observer"},"extra":[]}"#;
+    let parsed: ProjectsResult = serde_json::from_str(projects)?;
+    assert_eq!(parsed.projects.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn row_enums_decode_unknown() -> TestResult {
+    assert_eq!(
+        serde_json::from_str::<RowOrigin>(r#""future""#)?,
+        RowOrigin::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<ReadOnlyReason>(r#""future""#)?,
+        ReadOnlyReason::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<HolderKind>(r#""future""#)?,
+        HolderKind::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<LastOrigin>(r#""future""#)?,
+        LastOrigin::Unknown
+    );
+    Ok(())
+}
+
+#[test]
+fn busy_code_maps_to_port_busy() {
+    assert_eq!(
+        PortError::from_code(error_codes::BUSY, "x".into()),
+        PortError::Busy("x".into())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Wire minor 4 (features `manage`, `stepup`). All ids are synthetic.
+// ---------------------------------------------------------------------------
+
+/// Minor-3 messages keep their exact bytes at minor 4.
+#[test]
+fn frozen_v3_messages_are_byte_identical_at_minor_4() -> TestResult {
+    let row_json = r#"{"session_id":"sess-a1","updated_at":"2026-01-01T00:00:00Z","state":{"state":"idle"},"attached":0,"origin":"hosted","continuable":true}"#;
+    let row: SessionRow = serde_json::from_str(row_json)?;
+    let value = serde_json::to_value(&row)?;
+    assert_eq!(value, serde_json::from_str::<Value>(row_json)?);
+    assert!(!row_json.contains("stepup"));
+
+    let projects_json = r#"{"projects":[{"project_key":"","label":"x","session_count":1,"last_activity":"2026-01-01T00:00:00Z","active_count":0}],"share":{"mode":"off","tier":"observer"}}"#;
+    let projects: ProjectsResult = serde_json::from_str(projects_json)?;
+    assert_eq!(
+        serde_json::to_value(&projects)?,
+        serde_json::from_str::<Value>(projects_json)?
+    );
+
+    let holder_json = r#"{"kind":"tui","since":"2026-01-01T00:00:00Z"}"#;
+    let holder: HolderInfo = serde_json::from_str(holder_json)?;
+    assert_eq!(
+        serde_json::to_value(&holder)?,
+        serde_json::from_str::<Value>(holder_json)?
+    );
+
+    let frame_json = r#"{"session_id":"sess-a1","cursor":{"generation":1,"durable":2,"live":0},"frame":{"kind":"holder","data":{"session_id":"sess-a1","holder":{"kind":"tui","since":"2026-01-01T00:00:00Z"}}}}"#;
+    let envelope: FrameEnvelope = serde_json::from_str(frame_json)?;
+    assert_eq!(
+        serde_json::to_value(&envelope)?,
+        serde_json::from_str::<Value>(frame_json)?
+    );
+    Ok(())
+}
+
+const CHALLENGE_JSON: &str = r#"{"stepup_id":"00000000000000000000000000000001","action":"config.set","target":"effort","text":"Set effort to high","nonce":"0000000000000000000000000000000000000000000000000000000000000002","hash":"0000000000000000000000000000000000000000000000000000000000000003","expires_at":"2026-01-01T00:03:00Z"}"#;
+
+#[test]
+fn stepup_frame_round_trips_and_is_unknown_to_v3_kinds() -> TestResult {
+    let challenge: StepUpChallenge = serde_json::from_str(CHALLENGE_JSON)?;
+    let frame = SessionFrame::StepupRequest(challenge.clone());
+    let value = serde_json::to_value(&frame)?;
+    assert_eq!(value.get("kind"), Some(&Value::from("stepup_request")));
+    assert_eq!(
+        value.get("data"),
+        Some(&serde_json::from_str::<Value>(CHALLENGE_JSON)?)
+    );
+    let back: SessionFrame = serde_json::from_value(value)?;
+    assert!(matches!(back, SessionFrame::StepupRequest(ref c) if *c == challenge));
+
+    let future: SessionFrame = serde_json::from_str(r#"{"kind":"stepup_request_v9","data":{}}"#)?;
+    assert!(matches!(future, SessionFrame::Unknown));
+    Ok(())
+}
+
+/// Merges `"<key>":<value>` into a JSON object text and reports whether decoding fails.
+fn rejects_extra<T: DeserializeOwned>(base: &str, key: &str, value: &str) -> TestResult<bool> {
+    let mut object: Value = serde_json::from_str(base)?;
+    let map = object.as_object_mut().ok_or("base is not an object")?;
+    map.insert(key.to_owned(), serde_json::from_str(value)?);
+    Ok(serde_json::from_value::<T>(object).is_err())
+}
+
+#[test]
+fn minor4_params_reject_unknown_fields() -> TestResult {
+    let tenant = || -> TestResult<[bool; 9]> {
+        Ok([
+            rejects_extra::<CommandsListParams>("{}", "tenant", r#""tenant-test""#)?,
+            rejects_extra::<CommandRunParams>(
+                r#"{"line":"/status","client_msg_id":"m-1"}"#,
+                "tenant",
+                r#""tenant-test""#,
+            )?,
+            rejects_extra::<CatalogGetParams>("{}", "tenant", r#""tenant-test""#)?,
+            rejects_extra::<ConfigGetParams>("{}", "tenant", r#""tenant-test""#)?,
+            rejects_extra::<ConfigSetParams>(
+                r#"{"key":"effort","value":"high","client_msg_id":"m-1"}"#,
+                "tenant",
+                r#""tenant-test""#,
+            )?,
+            rejects_extra::<ConfigResetParams>(
+                r#"{"key":"effort","client_msg_id":"m-1"}"#,
+                "tenant",
+                r#""tenant-test""#,
+            )?,
+            rejects_extra::<SecretPutParams>(
+                r#"{"name":"k","for_provider":"p","value":"fake-SECRET-marker"}"#,
+                "tenant",
+                r#""tenant-test""#,
+            )?,
+            rejects_extra::<StepUpConfirmParams>(
+                r#"{"stepup_id":"a","hash":"b"}"#,
+                "tenant",
+                r#""tenant-test""#,
+            )?,
+            rejects_extra::<StepUpCancelParams>(
+                r#"{"stepup_id":"a"}"#,
+                "tenant",
+                r#""tenant-test""#,
+            )?,
+        ])
+    };
+    assert_eq!(tenant()?, [true; 9]);
+    assert!(rejects_extra::<CommandRunParams>(
+        r#"{"line":"/status","client_msg_id":"m-1"}"#,
+        "tier",
+        r#""owner""#
+    )?);
+    assert!(rejects_extra::<StepUpConfirmParams>(
+        r#"{"stepup_id":"a","hash":"b"}"#,
+        "actor",
+        r#""x""#
+    )?);
+    Ok(())
+}
+
+#[test]
+fn minor4_params_accept_plain_shape() -> TestResult {
+    let list: CommandsListParams = serde_json::from_str("{}")?;
+    assert_eq!(list.session_id, None);
+    let catalog: CatalogGetParams = serde_json::from_str("{}")?;
+    assert_eq!(catalog.session_id, None);
+    let config: ConfigGetParams = serde_json::from_str("{}")?;
+    assert_eq!(config.keys, None);
+    let run: CommandRunParams =
+        serde_json::from_str(r#"{"line":"/status","client_msg_id":"m-1"}"#)?;
+    assert_eq!(run.line, "/status");
+    assert_eq!(run.client_msg_id, "m-1");
+    assert_eq!(run.session_id, None);
+    Ok(())
+}
+
+#[test]
+fn minor4_results_accept_additional_fields() -> TestResult {
+    let entry = r#"{"name":"status","aliases":[],"summary":"s","usage":"/status","domain":"session","permission":"observer","busy":"immediate","origin":"operation","remote":true,"available":true,"subcommands":[],"future":1}"#;
+    let parsed: CommandEntry = serde_json::from_str(entry)?;
+    assert_eq!(parsed.origin, CommandOrigin::Operation);
+    assert_eq!(parsed.reason, None);
+
+    let list = format!(r#"{{"commands":[{entry}],"rev":"0000000000000001","future":1}}"#);
+    let parsed: CommandsListResult = serde_json::from_str(&list)?;
+    assert_eq!(parsed.commands.len(), 1);
+
+    let run = r#"{"ok":true,"text":"done","effect":"applied","future":1}"#;
+    let parsed: CommandRunResult = serde_json::from_str(run)?;
+    assert_eq!(parsed.effect, CommandEffect::Applied);
+    assert_eq!(parsed.stepup, None);
+
+    let provider = r#"{"name":"p","api":"a","base_url":"https://api.example.test/v1","enabled":true,"auth_kind":"env","auth_name":"X","has_secret":false,"models":[],"max_concurrency":null,"future":1}"#;
+    let parsed: CatalogProvider = serde_json::from_str(provider)?;
+    assert_eq!(parsed.auth_kind, ProviderAuthKind::Env);
+
+    let catalog = format!(
+        r#"{{"providers":[{provider}],"models":[],"roles":[],"live":{{}},"note":"n","future":1}}"#
+    );
+    let parsed: CatalogResult = serde_json::from_str(&catalog)?;
+    assert_eq!(parsed.providers.len(), 1);
+
+    let config = r#"{"entries":[{"key":"effort","value":"high","choices":[],"scope":"profile","apply":"now","future":1}],"future":1}"#;
+    let parsed: ConfigGetResult = serde_json::from_str(config)?;
+    assert_eq!(parsed.entries.len(), 1);
+
+    let put = r#"{"handle":"00000000000000000000000000000001","key_name":"k","for_provider":"p","expires_at":"2026-01-01T00:03:00Z","future":1}"#;
+    let parsed: SecretPutResult = serde_json::from_str(put)?;
+    assert_eq!(parsed.key_name, "k");
+
+    let challenge = CHALLENGE_JSON.replace('}', r#","future":1}"#);
+    let parsed: StepUpChallenge = serde_json::from_str(&challenge)?;
+    assert_eq!(parsed.action, "config.set");
+    Ok(())
+}
+
+#[test]
+fn minor4_enums_decode_unknown() -> TestResult {
+    assert_eq!(
+        serde_json::from_str::<CommandOrigin>(r#""future""#)?,
+        CommandOrigin::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<CommandEffect>(r#""future""#)?,
+        CommandEffect::Unknown
+    );
+    assert_eq!(
+        serde_json::from_str::<ProviderAuthKind>(r#""future""#)?,
+        ProviderAuthKind::Unknown
+    );
+    Ok(())
+}
+
+#[test]
+fn command_effect_names_are_stable() -> TestResult {
+    for (effect, name) in [
+        (CommandEffect::Applied, "applied"),
+        (CommandEffect::Staged, "staged"),
+        (CommandEffect::NextSession, "next_session"),
+        (CommandEffect::Refused, "refused"),
+        (CommandEffect::StepupRequired, "stepup_required"),
+    ] {
+        assert_eq!(serde_json::to_value(effect)?, Value::from(name));
+    }
+    Ok(())
+}
+
+#[test]
+fn wire_secret_debug_is_redacted() -> TestResult {
+    let params = SecretPutParams {
+        name: "k".to_owned(),
+        for_provider: "p".to_owned(),
+        value: WireSecret::new("sk-test-FAKE-0000000000000000".to_owned()),
+    };
+    let debug = format!("{params:?}");
+    assert!(!debug.contains("FAKE"), "{debug}");
+    assert!(debug.contains("[redacted]"), "{debug}");
+    // The wire needs the value.
+    assert!(serde_json::to_string(&params)?.contains("sk-test-FAKE-0000000000000000"));
+
+    let result_json = r#"{"handle":"00000000000000000000000000000001","key_name":"k","for_provider":"p","expires_at":"2026-01-01T00:03:00Z"}"#;
+    let result: SecretPutResult = serde_json::from_str(result_json)?;
+    let value = serde_json::to_value(&result)?;
+    assert_eq!(
+        sorted_keys(&value)?,
+        ["expires_at", "for_provider", "handle", "key_name"]
+    );
+    assert!(!serde_json::to_string(&result)?.contains("FAKE"));
+    Ok(())
+}
+
+#[test]
+fn catalog_shapes_have_no_secret_fields() -> TestResult {
+    let provider = CatalogProvider {
+        name: "p".to_owned(),
+        api: "a".to_owned(),
+        base_url: "https://api.example.test/v1".to_owned(),
+        enabled: true,
+        auth_kind: ProviderAuthKind::Secrets,
+        auth_name: Some("k".to_owned()),
+        has_secret: true,
+        models: vec!["m".to_owned()],
+        max_concurrency: Some(2),
+    };
+    let value = serde_json::to_value(&provider)?;
+    let keys = sorted_keys(&value)?;
+    assert_eq!(
+        keys,
+        [
+            "api",
+            "auth_kind",
+            "auth_name",
+            "base_url",
+            "enabled",
+            "has_secret",
+            "max_concurrency",
+            "models",
+            "name"
+        ]
+    );
+    for forbidden in ["api_key", "headers", "auth_header", "auth"] {
+        assert!(!keys.iter().any(|k| k == forbidden), "{forbidden}");
+    }
+    Ok(())
+}
+
+#[test]
+fn client_msg_id_limit_constant() {
+    assert_eq!(MAX_CLIENT_MSG_ID_BYTES, 128);
+    assert_eq!(MAX_COMMAND_LINE_BYTES, 512);
+    assert_eq!(MAX_SECRET_VALUE_BYTES, 8194);
+    assert_eq!(MAX_CONFIG_KEYS, 32);
 }

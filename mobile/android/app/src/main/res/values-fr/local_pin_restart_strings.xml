@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="local_pin_restart">Recommencer la configuration du code PIN</string>
+    <string name="local_pin_restart_confirm_detail">Harw peut vérifier que la configuration interrompue n’a créé aucun coffre récupérable. Choisissez un nouveau code PIN. Les fichiers existants ne sont pas supprimés. Si la vérification échoue, Harw ne redémarre pas la configuration.</string>
+    <string name="local_pin_restart_confirm">Commencer une nouvelle configuration</string>
+    <string name="local_pin_restart_not_confirmed">Harw n’a pas pu confirmer le redémarrage. Aucun coffre existant n’a été supprimé. Rouvrez l’assistant pour vérifier l’état actuel de la configuration.</string>
+    <string name="local_pin_setup_failed">La configuration du code PIN local a échoué. Rien n’a été réinitialisé. Code de diagnostic : %1$s.</string>
+    <string name="local_pin_assistant_handoff_failed">L’étape du code PIN a réussi, mais l’assistant local n’a pas pu ouvrir sa session privée. Rouvrez l’assistant et utilisez votre code PIN existant. Rien n’a été réinitialisé. Code de diagnostic : %1$s.</string>
+    <string name="local_pin_copy_diagnostic">Copier le code de diagnostic</string>
+    <string name="local_pin_copy_diagnostic_failed">Impossible de copier le code. Vous pouvez utiliser le code affiché ci-dessus.</string>
+</resources>

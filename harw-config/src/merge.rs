@@ -1026,6 +1026,24 @@ fn merge_tui(
         "tui.reasoning",
         layer_path,
     );
+    // `[tui] footer_counts` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.footer_counts,
+        incoming.footer_counts,
+        present("footer_counts"),
+        role,
+        "tui.footer_counts",
+        layer_path,
+    );
+    // `[tui] cell_aspect` (rein darstellend, `ProfileReplaces`).
+    profile_replaces(
+        &mut trusted.tui.cell_aspect,
+        incoming.cell_aspect,
+        present("cell_aspect"),
+        role,
+        "tui.cell_aspect",
+        layer_path,
+    );
 }
 
 // `[session]` (Abschnitt 1.4) — `retention_days` ist `MinBound`
@@ -1300,7 +1318,73 @@ fn merge_tools_doc(
     }
 }
 
-// `[session_listener]` — alle sechs Felder `GlobalOnly` und
+// `[admin]` — alle Felder `GlobalOnly` und sicherheitskritisch.
+fn merge_admin(
+    trusted: &mut HarnessConfig,
+    incoming: crate::admin_toml::AdminSection,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+    out: &mut Vec<ScopeDiagnostic>,
+) {
+    let present = |field: &str| field_present(raw, &["admin", field]);
+    global_only(
+        &mut trusted.admin.listen,
+        incoming.listen,
+        present("listen"),
+        role,
+        "admin.listen",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.public_url,
+        incoming.public_url,
+        present("public_url"),
+        role,
+        "admin.public_url",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.public_endpoint,
+        incoming.public_endpoint,
+        present("public_endpoint"),
+        role,
+        "admin.public_endpoint",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.tenant,
+        incoming.tenant,
+        present("tenant"),
+        role,
+        "admin.tenant",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.restart_gateway,
+        incoming.restart_gateway,
+        present("restart_gateway"),
+        role,
+        "admin.restart_gateway",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.admin.gateway_unit,
+        incoming.gateway_unit,
+        present("gateway_unit"),
+        role,
+        "admin.gateway_unit",
+        layer_path,
+        out,
+    );
+}
+
+// `[session_listener]` — alle sechzehn Felder `GlobalOnly` und
 // sicherheitskritisch: nur die Baseline (Home) setzt sie.
 fn merge_session_listener(
     trusted: &mut HarnessConfig,
@@ -1362,6 +1446,96 @@ fn merge_session_listener(
         present("approval_device"),
         role,
         "session_listener.approval_device",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.provider_link_device,
+        incoming.provider_link_device,
+        present("provider_link_device"),
+        role,
+        "session_listener.provider_link_device",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.shared_socket_tenant,
+        incoming.shared_socket_tenant,
+        present("shared_socket_tenant"),
+        role,
+        "session_listener.shared_socket_tenant",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.onion,
+        incoming.onion,
+        present("onion"),
+        role,
+        "session_listener.onion",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.onion_dir,
+        incoming.onion_dir,
+        present("onion_dir"),
+        role,
+        "session_listener.onion_dir",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_profile_sessions,
+        incoming.share_profile_sessions,
+        present("share_profile_sessions"),
+        role,
+        "session_listener.share_profile_sessions",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_tenant,
+        incoming.share_tenant,
+        present("share_tenant"),
+        role,
+        "session_listener.share_tenant",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_legacy_rows,
+        incoming.share_legacy_rows,
+        present("share_legacy_rows"),
+        role,
+        "session_listener.share_legacy_rows",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_since,
+        incoming.share_since,
+        present("share_since"),
+        role,
+        "session_listener.share_since",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_roots,
+        incoming.share_roots,
+        present("share_roots"),
+        role,
+        "session_listener.share_roots",
+        layer_path,
+        out,
+    );
+    global_only(
+        &mut trusted.session_listener.share_new_project_root,
+        incoming.share_new_project_root,
+        present("share_new_project_root"),
+        role,
+        "session_listener.share_new_project_root",
         layer_path,
         out,
     );
@@ -1734,7 +1908,8 @@ fn merge_permissions(
 // unabhaengigen Einzelfeld-Vergleichen, die `FIELD_TABLE` fuer
 // Exhaustivitaets-Zwecke dennoch einzeln auflistet). `execution` (PL-97 E2)
 // ist `ProfileReplaces`: Home und Profil setzen ihn, ein nicht vertrautes
-// Projekt nie.
+// Projekt nie. Ebenso `host_lease_ttl_secs` (PL-100 Phase 4, B22, ADR 0002):
+// ein geklontes Repository kann Host-Arbeitsphasen nicht verlaengern.
 fn merge_sandbox(
     trusted: &mut HarnessConfig,
     incoming: SandboxSection,
@@ -1767,6 +1942,14 @@ fn merge_sandbox(
         field_present(raw, &["sandbox", "execution"]),
         role,
         "sandbox.execution",
+        layer_path,
+    );
+    profile_replaces(
+        &mut trusted.sandbox.host_lease_ttl_secs,
+        incoming.host_lease_ttl_secs,
+        field_present(raw, &["sandbox", "host_lease_ttl_secs"]),
+        role,
+        "sandbox.host_lease_ttl_secs",
         layer_path,
     );
 }
@@ -2483,6 +2666,14 @@ pub(crate) fn merge_layer_into(
         layer_path,
         &mut out,
     );
+    merge_admin(
+        trusted,
+        incoming.admin.clone(),
+        raw,
+        role,
+        layer_path,
+        &mut out,
+    );
     merge_retention(trusted, incoming.retention, raw, role, layer_path, &mut out);
     merge_permissions(
         trusted,
@@ -2898,6 +3089,104 @@ mod tests {
         Ok(())
     }
 
+    // [session_listener] onion/onion_dir: Profil und nicht vertrautes Projekt
+    // können den Onion-Dienst weder aktivieren noch sein Verzeichnis ändern;
+    // jede Abweichung erzeugt eine Diagnose.
+    #[test]
+    fn test_session_listener_onion_fields_reject_non_baseline_override() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert!(!trusted.session_listener.onion);
+        assert_eq!(trusted.session_listener.onion_dir, None);
+        let home = "[session_listener]\nonion_dir = \"/srv/onion\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack = "[session_listener]\nonion = true\nonion_dir = \"/x\"";
+            let diagnostics = merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert!(!trusted.session_listener.onion, "{role:?}");
+            assert_eq!(
+                trusted.session_listener.onion_dir.as_deref(),
+                Some("/srv/onion"),
+                "{role:?}"
+            );
+            for field in ["session_listener.onion", "session_listener.onion_dir"] {
+                assert!(
+                    diagnostics.iter().any(|d| d.field == field),
+                    "{role:?} {field}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // [session_listener] share_*: Profil und nicht vertrautes Projekt können
+    // die Sitzungsfreigabe nicht ändern; jede Abweichung erzeugt eine Diagnose.
+    #[test]
+    fn test_session_listener_share_fields_reject_non_baseline_override() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        let home =
+            "[session_listener]\nshare_profile_sessions = \"read\"\nshare_tenant = \"tenant-test\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.session_listener.share_profile_sessions, "read");
+        let default_rows = trusted.session_listener.share_legacy_rows;
+        for role in [LayerRole::Refinement, LayerRole::UntrustedProject] {
+            let attack = "[session_listener]\nshare_profile_sessions = \"continue\"\nshare_tenant = \"tenant-other\"\nshare_roots = [\"/attack\"]\nshare_legacy_rows = 1\nshare_since = \"2020-01-01\"";
+            let diagnostics = merge_layer_into(
+                &mut trusted,
+                toml::from_str(attack).map_err(ctx("parse attack"))?,
+                &raw_from(attack)?,
+                role,
+                &layer_path(),
+            );
+            assert_eq!(
+                trusted.session_listener.share_profile_sessions, "read",
+                "{role:?}"
+            );
+            assert_eq!(
+                trusted.session_listener.share_tenant.as_deref(),
+                Some("tenant-test"),
+                "{role:?}"
+            );
+            assert_eq!(
+                trusted.session_listener.share_legacy_rows, default_rows,
+                "{role:?}"
+            );
+            assert_eq!(trusted.session_listener.share_since, None, "{role:?}");
+            assert!(trusted.session_listener.share_roots.is_empty(), "{role:?}");
+            for field in [
+                "share_profile_sessions",
+                "share_tenant",
+                "share_legacy_rows",
+                "share_since",
+                "share_roots",
+            ] {
+                let field = format!("session_listener.{field}");
+                assert!(
+                    diagnostics.iter().any(|d| d.field == field),
+                    "{role:?} {field}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     // [tools.doc] remote_ocr: Home/Profil setzen frei, ein nicht vertrautes
     // Projekt verschärft nur (`off` < `ask` < `on`).
     #[test]
@@ -3280,6 +3569,35 @@ mod tests {
         Ok(())
     }
 
+    // [tui] cell_aspect: ProfileReplaces; ein Profil setzt den Wert, eine
+    // Projektschicht ohne das Feld überschreibt ihn nicht.
+    #[test]
+    fn test_tui_cell_aspect_profile_replaces() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.tui.cell_aspect, None);
+
+        let profile = "[tui]\ncell_aspect = 0.48";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.cell_aspect, Some(0.48));
+
+        let project = "default_provider = \"anthropic\"";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(project).map_err(ctx("parse project"))?,
+            &raw_from(project)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.tui.cell_aspect, Some(0.48));
+        Ok(())
+    }
+
     // [tui] status_expiry / goal_mode (h7/h9): ProfileReplaces; vor dieser
     // Verdrahtung wurden Profilwerte beim Zusammenführen still verworfen.
     #[test]
@@ -3635,6 +3953,61 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.sandbox.execution, Some(SandboxExecutionToml::Chain));
+        Ok(())
+    }
+
+    // PL-100 Phase 4 (B22, ADR 0002): `sandbox.host_lease_ttl_secs` ist
+    // `ProfileReplaces` — Home und Profil setzen die Dauer, ein nicht
+    // vertrautes Projekt verlaengert sie nie; ein Layer ohne den Schluessel
+    // erbt den Wert.
+    #[test]
+    fn test_sandbox_host_lease_ttl_trusted_layers_set_it_untrusted_project_cannot() -> TestResult {
+        let mut trusted = HarnessConfig::default();
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, None);
+        assert_eq!(trusted.sandbox.effective_host_lease_ttl_secs(), 28_800);
+
+        let home = "[sandbox]\nhost_lease_ttl_secs = 7200";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(home).map_err(ctx("parse home"))?,
+            &raw_from(home)?,
+            LayerRole::Baseline,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, Some(7_200));
+
+        let profile = "[sandbox]\nhost_lease_ttl_secs = 3600";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(profile).map_err(ctx("parse profile"))?,
+            &raw_from(profile)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, Some(3_600));
+
+        let untrusted = "[sandbox]\nhost_lease_ttl_secs = 604800";
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            toml::from_str(untrusted).map_err(ctx("parse untrusted"))?,
+            &raw_from(untrusted)?,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, Some(3_600));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        // Ein Layer ohne den Schluessel behaelt den Wert.
+        let other = "[jobs]\nmax_running = 8";
+        merge_layer_into(
+            &mut trusted,
+            toml::from_str(other).map_err(ctx("parse other"))?,
+            &raw_from(other)?,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.sandbox.host_lease_ttl_secs, Some(3_600));
+        assert_eq!(trusted.sandbox.effective_host_lease_ttl_secs(), 3_600);
         Ok(())
     }
 

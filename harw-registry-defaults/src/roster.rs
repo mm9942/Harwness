@@ -668,8 +668,10 @@ struct Ceiling<'a> {
 ///
 /// # Beschreibung
 /// `job.start` nur, wenn die (geklemmte) Definition `shell.exec` admittiert;
-/// die lesenden/steuernden Werkzeuge (`job.status/logs/stop/list/wait`)
-/// immer. In jedem Fall nur, was die Basis selbst admittiert.
+/// die lesenden/steuernden Werkzeuge (`job.status/logs/stop/list/suspend/resume`)
+/// immer. Nur `job.start` hängt an `shell.exec`; `job.suspend` und
+/// `job.resume` fragen über `ALWAYS_ASK_TOOLS` nach (PL-100 WP 3.5). In jedem
+/// Fall nur, was die Basis selbst admittiert.
 fn job_companion_tools<'a>(clamped: &AgentIr, ceiling: &'a AgentIr) -> Vec<&'a str> {
     let admits_shell = clamped
         .tools
@@ -876,6 +878,22 @@ max_tokens = 999999
         assert!(explorer.description.is_some());
         assert!(explorer.read_only);
         assert!(!explorer.profile_summary().is_empty());
+        // PL-100 O11: die beiden Envelope-Rollen der Sicherheitsfamilie stehen
+        // read-only, werkzeugarm und kinderlos im Roster.
+        for role in [role_names::INTEL_SCOUT, role_names::CONTEXT_STEWARD] {
+            let entry = roster
+                .entry(role)
+                .ok_or(TestError::Missing("O11-Rolle im Roster"))?;
+            assert_eq!(entry.source, RosterSource::BuiltIn, "{role}");
+            assert_eq!(entry.profile, RegistryProfile::NoTools, "{role}");
+            assert!(entry.read_only, "{role}");
+            assert_eq!(entry.max_depth, Some(0), "{role}");
+            assert_eq!(
+                entry.tools,
+                crate::profile::lockfile_tools_for_role(role),
+                "{role}: admitted"
+            );
+        }
         Ok(())
     }
 
@@ -1192,6 +1210,26 @@ specialization = "web-scout"
         // Über einer eingebauten Rolle gewinnt deren `[tools]`-Abschnitt; die
         // Definition kann ihn nicht verengen — die Kontrollwerkzeuge bleiben.
         assert!(reader.tools.iter().any(|tool| tool == "job.status"));
+        // PL-100 WP 3.5: `job.suspend`/`job.resume` gehören wie `job.stop` zu
+        // den steuernden Werkzeugen, die ein eigener Agent über `executor`
+        // auch ohne `shell.exec` behält (nicht an `shell.exec` gebunden wie
+        // `job.start`); beide fragen trotzdem immer nach.
+        for tool in [
+            harw_tool_job::JOB_STOP_TOOL,
+            harw_tool_job::JOB_SUSPEND_TOOL,
+            harw_tool_job::JOB_RESUME_TOOL,
+        ] {
+            assert!(
+                reader.tools.iter().any(|admitted| admitted == tool),
+                "log-reader: {tool}"
+            );
+        }
+        for tool in [
+            harw_tool_job::JOB_SUSPEND_TOOL,
+            harw_tool_job::JOB_RESUME_TOOL,
+        ] {
+            assert!(crate::ALWAYS_ASK_TOOLS.contains(&tool), "{tool}");
+        }
         Ok(())
     }
 
@@ -1411,8 +1449,8 @@ specialization = "fake-lead"
         use crate::profile::{
             child_message_tools_for_role, child_result_tools_for_role, composition_tools_for_role,
             dod_tools_for_role, job_control_tools_for_role, knowledge_tools_for_role,
-            matrix_tools_for_role, parent_message_tools_for_role, skill_catalog_tools_for_role,
-            sudo_tools_for_role,
+            lockfile_tools_for_role, matrix_tools_for_role, parent_message_tools_for_role,
+            skill_catalog_tools_for_role, sudo_tools_for_role,
         };
         let builtin = builtin()?;
         assert_eq!(builtin.len(), role_names::ALL.len());
@@ -1434,6 +1472,9 @@ specialization = "fake-lead"
                 // PL-97 D4: die lesenden `dod.*` der Triage-Rollen, montiert
                 // vom rollengebundenen Provider in `harw-runtime/src/children.rs`.
                 .chain(dod_tools_for_role(name).iter().copied())
+                // PL-100 O11: `deps.locked` von `intel-scout`, ebenfalls
+                // rollengebunden in `harw-runtime/src/children.rs` montiert.
+                .chain(lockfile_tools_for_role(name).iter().copied())
                 .collect();
             let granted = crate::authority::permissions_of(&surface);
             let manifest = &ir.permissions;

@@ -168,9 +168,18 @@ pub struct AnthropicMessagesProvider {
     budgets: crate::budget::ProviderBudgets,
     /// Exact, identity-bound native assistant rounds; never exposed in logs.
     thinking_replay: crate::anthropic_replay::AnthropicReplayCache,
+    /// Modelle mit `[capabilities] reasoning_replay = "strict"` (siehe
+    /// [`crate::replay_bounds`]); alle übrigen degradieren.
+    strict_replay_models: std::collections::BTreeSet<String>,
 }
 
 impl AnthropicMessagesProvider {
+    pub(crate) fn force_single_dispatch(&mut self) -> crate::HttpProviderResult<()> {
+        self.client = super::one_shot_http_client()?;
+        self.credential_pool = None;
+        Ok(())
+    }
+
     /// Baut einen Provider aus einer bereits zusammengesetzten Endpoint-URL.
     ///
     /// # Arguments
@@ -206,6 +215,7 @@ impl AnthropicMessagesProvider {
             stream_policy: crate::sse::StreamPolicy::default(),
             budgets: crate::budget::ProviderBudgets::default(),
             thinking_replay: crate::anthropic_replay::AnthropicReplayCache::default(),
+            strict_replay_models: std::collections::BTreeSet::new(),
         })
     }
 
@@ -277,6 +287,15 @@ impl AnthropicMessagesProvider {
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
         self.rate_limiter =
             std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(rate_limit));
+    }
+
+    /// Setzt die Modelle, deren Thinking-Replay bei verlorener Kontinuität
+    /// hart abbricht (`[capabilities] reasoning_replay = "strict"`).
+    pub(crate) fn configure_strict_replay_models(
+        &mut self,
+        models: std::collections::BTreeSet<String>,
+    ) {
+        self.strict_replay_models = models;
     }
 
     /// Installiert einen [`crate::DynamicConcurrencyLimiter`] aus
@@ -842,7 +861,19 @@ pub fn extract_anthropic_stop_reason(body: &Value) -> StopReason {
         Some("max_tokens") => StopReason::MaxTokens,
         Some("stop_sequence") => StopReason::StopSequence,
         Some("pause_turn") => StopReason::PauseTurn,
-        Some("refusal") => StopReason::Refusal { detail: None },
+        Some("refusal") => StopReason::Refusal {
+            detail: body
+                .get("stop_details")
+                .and_then(Value::as_object)
+                .filter(|details| {
+                    details
+                        .get("type")
+                        .is_none_or(|kind| kind.as_str() == Some("refusal"))
+                })
+                .and_then(|details| details.get("explanation"))
+                .and_then(Value::as_str)
+                .and_then(crate::error::sanitize_refusal_detail),
+        },
         Some("model_context_window_exceeded") => StopReason::ContextWindowExceeded,
         Some(other) => StopReason::Other(other.to_owned()),
         None => StopReason::EndTurn,
@@ -1113,8 +1144,14 @@ impl AnthropicMessagesProvider {
         let mut wire = build_messages_body(model, self.max_tokens, &request);
         crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
         // Restore after cache decoration so signed native content stays untouched.
-        self.thinking_replay
-            .apply(&self.provider_id, &messages_url, model, &request, &mut wire)?;
+        self.thinking_replay.apply(
+            &self.provider_id,
+            &messages_url,
+            model,
+            &request,
+            &mut wire,
+            crate::replay_bounds::ReplayPolicy::for_model(&self.strict_replay_models, model),
+        )?;
         let stream_sink = request
             .stream
             .as_ref()
@@ -1228,20 +1265,42 @@ impl AnthropicMessagesProvider {
             && let Some(sink) = stream_sink
         {
             let mut accumulator = crate::sse::AnthropicStreamAccumulator::default();
-            crate::sse::read_sse(response, Some(self.stream_idle_timeout), |frame| {
+            let body_read = crate::sse::read_sse(response, Some(self.stream_idle_timeout), |frame| {
                 accumulator.push(&frame, Some(sink))
             })
-            .await?;
-            let value = accumulator.finish()?;
+            .await;
+            let outcome = match body_read {
+                Ok(()) => accumulator.finish()?,
+                // No automatic transport retry after a prefix was displayed.
+                Err(ModelError::Truncated { .. } | ModelError::Timeout { .. })
+                    if accumulator.has_confirmed_end_or_text() =>
+                {
+                    accumulator.finish_after_transport_error()?
+                }
+                Err(error) => return Err(error),
+            };
+            let value = match outcome {
+                crate::sse::NativeStreamOutcome::Completed(body) => body,
+                crate::sse::NativeStreamOutcome::Interrupted(partial) => {
+                    budget_permit.reconcile(&partial.usage);
+                    return Ok(partial); // Never write an unconfirmed turn into replay.
+                }
+            };
             let response = self.interpret_body(&request, model, &value)?;
-            self.thinking_replay.remember(
-                &self.provider_id,
-                &messages_url,
-                model,
-                &request,
-                &response,
-                &value,
-            )?;
+            if !matches!(response.stop, StopReason::Refusal { .. }) {
+                crate::replay_bounds::remember_or_warn(
+                    "anthropic",
+                    model,
+                    self.thinking_replay.remember(
+                        &self.provider_id,
+                        &messages_url,
+                        model,
+                        &request,
+                        &response,
+                        &value,
+                    ),
+                );
+            }
             budget_permit.reconcile(&response.usage);
             return Ok(response);
         }
@@ -1311,14 +1370,20 @@ impl AnthropicMessagesProvider {
 
         let value: Value = serde_json::from_str(&body)?;
         let response = self.interpret_body(&request, model, &value)?;
-        self.thinking_replay.remember(
-            &self.provider_id,
-            &messages_url,
-            model,
-            &request,
-            &response,
-            &value,
-        )?;
+        if !matches!(response.stop, StopReason::Refusal { .. }) {
+            crate::replay_bounds::remember_or_warn(
+                "anthropic",
+                model,
+                self.thinking_replay.remember(
+                    &self.provider_id,
+                    &messages_url,
+                    model,
+                    &request,
+                    &response,
+                    &value,
+                ),
+            );
+        }
         budget_permit.reconcile(&response.usage);
         Ok(response)
     }
@@ -1332,6 +1397,15 @@ impl AnthropicMessagesProvider {
         value: &Value,
     ) -> Result<ModelResponse, ModelError> {
         let text = extract_anthropic_text(value);
+        let stop = extract_anthropic_stop_reason(value);
+        if matches!(stop, StopReason::Refusal { .. }) {
+            return Ok(ModelResponse {
+                message: text,
+                usage: extract_anthropic_usage(value),
+                stop,
+                ..ModelResponse::default()
+            });
+        }
         let names = ToolNameCodec::for_request(request);
         let tool_calls = extract_anthropic_tool_calls(value)
             .map_err(|_| {
@@ -1345,7 +1419,9 @@ impl AnthropicMessagesProvider {
                 ..call
             })
             .collect::<Vec<_>>();
-        if text.is_none() && tool_calls.is_empty() {
+        // An explicit output limit is meaningful even if the entire budget
+        // was consumed by reasoning and no assistant text was emitted.
+        if text.is_none() && tool_calls.is_empty() && stop != StopReason::MaxTokens {
             return Err(ModelError::EmptyResponse);
         }
 
@@ -1353,7 +1429,7 @@ impl AnthropicMessagesProvider {
             message: text,
             tool_calls,
             usage: extract_anthropic_usage(value),
-            stop: extract_anthropic_stop_reason(value),
+            stop,
             reasoning: extract_anthropic_reasoning(value, model),
         })
     }
@@ -2475,6 +2551,50 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_refusal_surfaces_without_text_and_sanitizes_structured_detail() -> TestResult {
+        let body = serde_json::json!({
+            "content": [{"type":"tool_use","id":"partial","name":"lookup","input":"{"}],
+            "stop_reason":"refusal",
+            "stop_details":{
+                "type":"refusal",
+                "explanation":format!("Policy\nreason.\u{202e}{}", "é".repeat(300)),
+                "category":"not needed for the notice",
+            },
+        });
+        let provider = test_provider()?;
+        let response = provider
+            .interpret_body(&request_with_ids(None, None), "fixture", &body)
+            .map_err(ctx("a structured refusal may have no text"))?;
+        let StopReason::Refusal {
+            detail: Some(detail),
+        } = response.stop
+        else {
+            return Err(TestError::Unexpected(
+                "expected a structured refusal".into(),
+            ));
+        };
+        assert!(response.tool_calls.is_empty());
+        assert!(response.message.is_none());
+        assert!(detail.starts_with("Policy reason."));
+        assert!(!detail.contains('\u{202e}'));
+        assert!(detail.chars().count() <= 240);
+
+        let mut ordinary = body;
+        ordinary["stop_reason"] = Value::String("max_tokens".into());
+        assert_eq!(
+            extract_anthropic_stop_reason(&ordinary),
+            StopReason::MaxTokens
+        );
+        ordinary["stop_reason"] = Value::String("refusal".into());
+        ordinary["stop_details"]["type"] = Value::String("not-a-refusal".into());
+        assert_eq!(
+            extract_anthropic_stop_reason(&ordinary),
+            StopReason::Refusal { detail: None },
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_extract_anthropic_stop_reason_maps_context_window_exceeded() {
         let body = serde_json::json!({"stop_reason": "model_context_window_exceeded"});
         assert_eq!(
@@ -3065,6 +3185,78 @@ mod tests {
             peak.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENCY,
             "observed more than {MAX_CONCURRENCY} requests in flight simultaneously"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn respond_preserves_partial_anthropic_stream_without_fabricating_a_limit() -> TestResult {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        for (explicit_limit, transport_error, expected) in [
+            (false, false, StopReason::StreamInterrupted),
+            (false, true, StopReason::StreamTransportInterrupted),
+            (true, false, StopReason::MaxTokens),
+            (true, true, StopReason::MaxTokens),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind SSE fixture"))?;
+            let url = format!(
+                "http://{}/v1/messages",
+                listener.local_addr().map_err(ctx("SSE fixture address"))?
+            );
+            let server = thread::spawn(move || -> TestResult<()> {
+                let (mut stream, _) = listener.accept().map_err(ctx("accept SSE request"))?;
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).map_err(ctx("read SSE request"))?;
+                let start = serde_json::json!({
+                    "type":"message_start", "message":{"stop_reason":null,"usage":{"input_tokens":7}}
+                });
+                let text = serde_json::json!({
+                    "type":"content_block_start", "index":0, "content_block":{"type":"text","text":""}
+                });
+                let delta = serde_json::json!({
+                    "type":"content_block_delta", "index":0, "delta":{"type":"text_delta","text":"visible prefix"}
+                });
+                let mut body = format!("data: {start}\n\ndata: {text}\n\ndata: {delta}\n\n");
+                if explicit_limit {
+                    let stop_block = serde_json::json!({"type":"content_block_stop","index":0});
+                    let stop = serde_json::json!({
+                        "type":"message_delta","delta":{"stop_reason":"max_tokens"},
+                        "usage":{"output_tokens":8}
+                    });
+                    body.push_str(&format!("data: {stop_block}\n\ndata: {stop}\n\n"));
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len() + if transport_error { 1 } else { 0 },
+                )
+                .map_err(ctx("write SSE response"))?;
+                Ok(())
+            });
+            let provider = AnthropicMessagesProvider::new(
+                url,
+                "configured-model",
+                AnthropicCredential::ApiKey(SecretString::new("fixture".into())),
+            )
+            .map_err(ctx("construct SSE fixture provider"))?;
+            let mut request = request_with_ids(None, None);
+            request.stream = Some(harw_core::StreamSink::new(|_| {}));
+            let response = provider
+                .respond(request)
+                .await
+                .map_err(ctx("classify Anthropic SSE finish"))?;
+            server
+                .join()
+                .map_err(|_| TestError::Unexpected("mock server thread panicked".to_owned()))??;
+            assert_eq!(response.stop, expected);
+            assert_eq!(response.message.as_deref(), Some("visible prefix"));
+            assert_eq!(response.usage.input_tokens, 7);
+            assert_eq!(response.usage.output_tokens, if explicit_limit { 8 } else { 0 });
+            assert!(response.tool_calls.is_empty());
+            assert!(response.reasoning.is_none());
+        }
         Ok(())
     }
 

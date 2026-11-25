@@ -27,10 +27,12 @@ packaging_dir=$(CDPATH= cd -- "$(dirname "$0")/../packaging" && pwd)
 # (`harw install --print-systemd`); there is no second copy under harw-dod/.
 deploy_dir=${DEPLOY_DIR:-$(CDPATH= cd -- "$(dirname "$0")/../../deploy" && pwd)}
 
-# DoD units installed from $deploy_dir/systemd. The infrastructure units
-# (harw-infra.target, harw-auth-hub.*, ...) in the same directory are not
-# part of the DoD package.
-dod_units='harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service harw-warden.service harw-warden.socket'
+# DoD units installed from $deploy_dir/systemd (and stopped/disabled on a host
+# uninstall). The infrastructure units (harw-infra.target, harw-auth-hub.*,
+# ...) in the same directory are not part of the DoD package.
+# harw-probe-netlink.service is installed but never enabled or started here and
+# is not pulled in by harw-dod.target (opt-in, PL-100 WP1.8).
+dod_units='harw-dod.target harw-sentinel.service harw-probe-bpf.service harw-probe-fs.service harw-probe-netlink.service harw-warden.service harw-warden.socket'
 # Files of the pre-H10 layout (the old harw-dod/packaging unit, sysusers and tmpfiles trees). Removed on
 # install and uninstall so an upgraded host never keeps two unit sets.
 legacy_files='systemd/harw-dod-sentinel.service systemd/harw-dod-bpf.service systemd/harw-dod-warden.service systemd/harw-dod-warden.socket sysusers/harw-dod.conf tmpfiles/harw-dod.conf'
@@ -58,7 +60,7 @@ ensure_dir() {
 }
 
 check_artifacts() {
-	for binary in harw-sentinel harw-probe-bpf harw-probe-fs harw-warden; do
+	for binary in harw-sentinel harw-probe-bpf harw-probe-fs harw-probe-netlink harw-warden; do
 		[ -f "$binary_dir/$binary" ] || fail "missing $binary_dir/$binary; build release binaries before install (do not build as root)"
 		test -x "$binary_dir/$binary" || fail "binary is not executable: $binary_dir/$binary"
 	done
@@ -129,7 +131,7 @@ install_package() {
 	ensure_dir 0750 "$statedir"
 	ensure_dir 0750 "$logdir"
 
-	for binary in harw-sentinel harw-probe-bpf harw-probe-fs harw-warden; do
+	for binary in harw-sentinel harw-probe-bpf harw-probe-fs harw-probe-netlink harw-warden; do
 		install_file 0755 "$binary_dir/$binary" "$libexecdir/$binary"
 	done
 	for object in exec.bpf.o exit.bpf.o tcp_v4_connect.bpf.o tcp_v6_connect.bpf.o manifest.json; do
@@ -174,6 +176,31 @@ install_package() {
 uninstall_package() {
 	require_root_for_host_install
 	[ -f "$manifest" ] || fail "manifest missing: $manifest"
+
+	# Stop and disable every shipped DoD unit before its unit file goes away:
+	# the operator may have enabled harw-dod.target, the opt-in probes
+	# (harw-probe-fs, harw-probe-netlink) or the Warden, and a removed unit
+	# file would otherwise leave a dangling .wants symlink and a service
+	# running from a deleted binary. Only an explicitly absent, inactive unit
+	# can be skipped, for example when uninstalling an older package.
+	if [ -z "$destdir" ]; then
+		command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required for host uninstallation'
+		for unit in $dod_units; do
+			if ! systemctl disable --now "$unit"; then
+				if [ ! -e "$unitdir/$unit" ] && [ ! -L "$unitdir/$unit" ] &&
+					unit_state=$(systemctl show -p LoadState -p ActiveState "$unit"); then
+					case "$unit_state" in
+						'LoadState=not-found
+ActiveState=inactive'|'ActiveState=inactive
+LoadState=not-found') continue ;;
+						*) fail "could not stop and disable $unit; package files were retained" ;;
+					esac
+				fi
+				fail "could not stop and disable $unit; package files were retained"
+			fi
+		done
+		printf '%s\n' 'Stopped and disabled the installed DoD units; after a reinstall, enable observation, the Warden and opt-in probes again.'
+	fi
 
 	while IFS= read -r entry || [ -n "$entry" ]; do
 		case "$entry" in

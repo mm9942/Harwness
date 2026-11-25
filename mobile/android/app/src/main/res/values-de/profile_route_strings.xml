@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_route_settings_title">Verbindungsweg</string>
+    <string name="harw_route_onion">Nur Onion</string>
+    <string name="harw_route_direct">Nur direkt per IP</string>
+    <string name="harw_route_auto">Erst Tor, dann direkt per IP</string>
+    <string name="harw_route_direct_address">Direkte IP: %1$s</string>
+    <string name="harw_route_onion_address">Onion: %1$s</string>
+    <string name="harw_route_hint_onion_only">Reines Onion-Profil. Es ist keine direkte IP gespeichert. Harw weicht nicht auf eine direkte Verbindung aus.</string>
+    <string name="harw_route_hint_no_onion">In diesem Profil fehlt die Onion-Adresse. Harw verbindet sich erst, wenn du eine Onion-Adresse importierst oder direkte IP für dieses Profil ausdrücklich erlaubst.</string>
+    <string name="harw_route_hint_onion">Nur Onion. Harw verwendet die gespeicherte direkte IP auch dann nicht, wenn Tor keine Verbindung herstellen kann.</string>
+    <string name="harw_route_hint_direct">Nur direkt per IP. Der Verkehr geht ohne Tor an die gespeicherte IP dieses Profils.</string>
+    <string name="harw_route_hint_auto">Harw versucht zuerst Onion und darf bei einem Tor-Fehler die gespeicherte direkte IP verwenden. Das gilt nur für genau dieses Profil.</string>
+    <string name="harw_route_consent_title">Direkte Verbindung erlauben?</string>
+    <string name="harw_route_consent_direct">Ohne Tor direkt zur gespeicherten IP von %1$s verbinden. Der Server und der Netzpfad können deine IP sehen. Die Auswahl wird nur für genau dieses Profil gespeichert.</string>
+    <string name="harw_route_consent_auto">Für %1$s zuerst Onion versuchen. Falls das fehlschlägt, darf Harw sich direkt über die gespeicherte IP verbinden. Dadurch können Server und Netzpfad deine IP sehen. Die Auswahl wird nur für genau dieses Profil gespeichert.</string>
+    <string name="harw_route_consent_confirm">Für dieses Profil erlauben</string>
+    <string name="harw_route_profile_changed">Das gespeicherte Profil hat sich geändert. Prüfe das neue Profil vor der Auswahl.</string>
+    <string name="harw_route_save_failed">Der Verbindungsweg konnte nicht gespeichert werden.</string>
+    <string name="harw_route_unavailable">Der gewählte Verbindungsweg ist in diesem Profil nicht verfügbar. Es wurde kein anderer Weg verwendet.</string>
+</resources>

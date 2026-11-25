@@ -1,0 +1,114 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "harw-mobile-ffi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[lib]
+name = "harw_mobile_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "mobile-bootstrap"
+path = "src/bin/mobile-bootstrap.rs"
+required-features = ["bootstrap"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# Embedded Tor (arti) onion dialer; the Android build uses the default features.
+default = ["onion"]
+onion = ["harw-onion/client"]
+bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+# Explicit Android vault opt-in; not in the APK defaults.
+vault-pin-native = ["dep:argon2", "dep:jni"]
+# Isolated sealed room adapter. Does not enable the UI, PIN, local model, or any bridge.
+vault-uia-native = ["dep:crypt_guard", "dep:harw-fsutil", "blake3/zeroize"]
+# Exact Android PIN-to-room registry, unavailable in default APK builds.
+vault-uia-jni = ["vault-uia-native", "vault-pin-native"]
+vault-uia-chat = ["vault-uia-jni", "local-host"]
+bootstrap = [
+    "dep:clap", "dep:harw-infra-client", "dep:harw-node-listener", "dep:rustix",
+    "dep:harw-tailscale", "dep:tempfile", "tokio/process", "tokio/signal", "tokio/io-util",
+]
+# harw-oauth (Claude/Codex login) is always linked so the UniFFI classes exist in every build.
+# Standalone mode: in-process harw session host, provider-http validation and the
+# model source. Off in the APK build until the phone runtime is enabled.
+local-host = [
+    "dep:harw-local-host", "dep:harw-provider-http", "dep:harw-core", "dep:harw-llama",
+    "dep:harw-extension-api", "dep:harw-media", "dep:harw-model-catalog", "dep:reqwest",
+    "dep:crc32fast", "dep:flate2", "reqwest/multipart",
+]
+# On-device inference: builds llama.cpp (C/C++ via cmake and bindgen/libclang) into the
+# library. Off for host-side checks and tests of `local-host`; the APK build enables it
+# (mobile/scripts/build-native). Without it the "On this device" provider reports
+# "not available in this build" when the host opens.
+local-llama = ["local-host", "harw-llama/engine"]
+
+[dependencies]
+argon2 = { version = "=0.5.3", default-features = false, features = ["zeroize"], optional = true }
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+base64 = "0.23.1"
+blake3 = "1.8.7"
+bytes = "1"
+clap = { version = "4.6", features = ["derive"], optional = true }
+crc32fast = { version = "1.5.5", optional = true }
+flate2 = { version = "1.1.11", optional = true }
+crypt_guard = { version = "=3.1.0", default-features = false, features = ["ml-kem-backend", "ml-dsa-backend"], optional = true }
+harw-config = { path = "../../harw-config" }
+harw-core = { path = "../../harw-core", optional = true }
+harw-extension-api = { path = "../../harw-extension-api", optional = true }
+harw-fsutil = { path = "../../harw-fsutil", optional = true }
+harw-home = { path = "../../harw-home" }
+harw-infra-client = { path = "../../harw-infra-client", optional = true }
+harw-llama = { path = "../../harw-llama", optional = true }
+harw-local-host = { path = "../../harw-local-host", optional = true }
+harw-media = { path = "../../harw-media", optional = true }
+harw-model-catalog = { path = "../../harw-model-catalog", optional = true }
+harw-mobile-core = { path = "../../harw-mobile-core" }
+harw-node-listener = { path = "../../harw-node-listener", optional = true }
+harw-node-transport = { path = "../../harw-node-transport" }
+harw-oauth = { path = "../../harw-oauth" }
+harw-onion = { path = "../../harw-onion" }
+harw-protocol = { path = "../../harw-protocol" }
+harw-provider-http = { path = "../../harw-provider-http", optional = true }
+harw-session-remote = { path = "../../harw-session-remote" }
+harw-tailscale = { path = "../../harw-tailscale", optional = true }
+harw-types = { path = "../../harw-types" }
+hex = "0.4.3"
+http = "1"
+jiff = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+rqrr = { version = "0.11", default-features = false }
+rustix = { version = "1.1.4", features = ["fs", "process"], optional = true }
+secrecy = "0.10.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tempfile = { version = "3.27.0", optional = true }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "1.1.3"
+uniffi = { version = "=0.32.2", default-features = false }
+zeroize = "1.9.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "=0.22.4", default-features = false, optional = true }
+
+[profile.release]
+strip = "debuginfo"
+
+[dev-dependencies]
+harw-node-listener = { path = "../../harw-node-listener" }
+harw-session-host = { path = "../../harw-session-host" }
+harw-session-store = { path = "../../harw-session-store" }
+harw-session-ws = { path = "../../harw-session-ws" }
+tempfile = "3.27.0"
+qrcode = { version = "0.15", default-features = false }

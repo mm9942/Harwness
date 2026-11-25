@@ -17,7 +17,9 @@ transport (§19 / H11 are out of scope here).
 - `AF_UNIX` / `SOCK_STREAM`, Hyper HTTP/1, default path
   `/run/harw/infra/network.sock` (crypto drift report D1).
 - The caller is identified solely by `SO_PEERCRED`. Peers whose uid is not in
-  `allowed_uids` receive `403 peer_not_allowed` on every request.
+  `allowed_uids` receive `403 peer_not_allowed` on ordinary API requests.
+  The optional versioned owner-epoch reads have one separate explicit UID
+  allowlist; granting those reads does not grant ordinary API operations.
 - Request bodies are JSON with `deny_unknown_fields`, bounded by
   `max_body_bytes` (default 64 KiB, hard cap 1 MiB), with header/body read
   timeouts and a concurrent connection limit.
@@ -39,6 +41,28 @@ transport (§19 / H11 are out of scope here).
 | POST | `/v1/nodes/{id}:revoke` | any non-revoked → `revoked` (terminal; prunes routes) |
 | GET | `/v1/zones` | `{"zones":[Zone…]}` |
 | GET | `/v1/routes` | `{"routes":[Route…]}` |
+| GET | `/v1/owner-epochs/{id}` | `{"state":"active","node":"…","epoch":…}` or `{"state":"unavailable","node":"…"}`; separate UID allowlist |
+
+The additive `GET /v2/owner-epochs/{id}` uses the same UID gate, one-node
+selector, lookup budget and negative response, but an active response also
+carries `authority_instance`, an array of 32 bytes derived once from OS
+entropy for the running daemon. It is never persisted, is not a key, and is
+not available through v1, general API routes, or a negative v2 response.
+Failure to obtain a nonzero marker disables only v2. The endpoint accepts
+only an origin-form, no-query, bodyless request and does not permit upgrades.
+No control API version or capability listing changes.
+
+The owner-epoch read accepts no query or body, does not enumerate nodes,
+and samples only the live writer's view. Inactive, absent and unconfirmed
+nodes have the same negative response. The allowlist defaults to empty
+(including for ordinary control UIDs). An opted-in Hub UID needs socket
+access at the OS layer separately; it should not be added to
+`allowed_uids`. The Hub must connect via an operator-owned directory whose
+socket cannot be replaced by the Hub or other untrusted users, and must pin
+the kernel peer UID. Prefer a dedicated daemon UID and a self-bound socket;
+under platform socket activation the listener's kernel peer UID may identify
+the creator of the activated socket instead of the serving daemon. This
+endpoint is internal and not listed as ordinary control capability.
 
 Action bodies are optional: `{}` or `{"reason":"…"}`. The reason and the
 peer uid are recorded in `last_transition`.
@@ -91,6 +115,25 @@ the same mutation is a conflict (`node_exists` / `invalid_transition`), not a
 no-op. A corrupt, oversized, symlinked, unknown-field or inconsistent state
 file stops the daemon at start-up — topology is never silently reset.
 
+State v2 adds a global activation high-water mark and the latest
+activation epoch per node. Strict v1 state is still readable; it acquires
+the v2 format on the next committed mutation, not on open. Only a successful
+Activate or Undrain allocates an epoch, in the same topology transaction and
+under the same writer lock. A legacy Active node is still Active for all
+ordinary NetSec queries and routes, but has no new relay authority.
+
+For future Root-Hub composition, the in-process
+`NetsecStore::active_owner_epoch` reports an epoch only for an Active node
+whose activation was explicitly committed and directory-synced during
+this writer's lifetime. A directory fsync failure withdraws this view.
+Restart retains the durable counter but withdraws old relay observations:
+an operator must explicitly transition an existing Active node through
+Drain and Undrain to establish new relay evidence. Until a more complete
+durability-reconciliation protocol exists, that conservative rule also
+applies to clean restarts. Do not restore an older state snapshot as live
+authority while a Hub retains observations. The explicitly allowlisted local
+read exposes this same view; it does not open traffic or enable a relay.
+
 ## Configuration
 
 `/etc/harw-netsec/config.toml` (no fallback to `$HOME` or the working
@@ -100,6 +143,7 @@ directory):
 # socket = "/run/harw/infra/network.sock"
 # state_dir = "/var/lib/harw-netsec"
 allowed_uids = [0]          # required, non-empty
+# owner_epoch_reader_uids = []  # opt-in, read-only, empty by default
 # max_body_bytes = 65536
 # max_nodes = 4096
 # max_connections = 64

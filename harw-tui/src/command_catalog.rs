@@ -13,11 +13,15 @@
 //! - [`subcommand_hints`]: Unterkommando-Grammatik je Befehl; die Einträge
 //!   folgen den tatsächlichen Parsern in `harw-ops` bzw.
 //!   `crate::tools_command`.
-//! - [`PLANNED_COMMANDS`]: Befehle aus dem Interaktionsvertrag, die weder als
+//! - [`planned_commands`]: Befehle aus dem Interaktionsvertrag, die weder als
 //!   Operation noch lokal existieren — für die Hilfe („geplant").
 //!
+//! Die gemeinsamen Daten liegen in `harw_ops::command_meta`. Dieses Modul
+//! übersetzt sie über `tr` und ergänzt bei Bedarf rein interaktive Hinweise,
+//! die nicht in den Remote-Katalog gehören.
+//!
 //! # Nebenläufigkeit
-//! Nur `const`-Tabellen und reine Funktionen; kein geteilter Zustand.
+//! Nur reine Funktionen über `const`-Daten; kein geteilter Zustand.
 //!
 //! # Fehlertypen
 //! Keine — ungültige Namen in den Tabellen würden beim Bau still entfallen
@@ -29,1180 +33,44 @@ use crate::command::{
 };
 
 use crate::i18n::tr;
+use harw_operations::operation::OperationDomain;
+use harw_ops::command_meta::{self, HintEntry};
+
+// Interactive shortcuts only: do not advertise these in the remote command catalog.
+const TUI_MODELS_SHORTCUTS: &[HintEntry] = &[
+    HintEntry::new(
+        "settings",
+        "",
+        "commands.subcommand.models.settings",
+        "Open the Models tab in Settings",
+    ),
+    HintEntry::new(
+        "session",
+        "",
+        "commands.subcommand.models.session",
+        "Open the active session model picker",
+    ),
+    HintEntry::new(
+        "uia",
+        "",
+        "commands.subcommand.models.uia",
+        "Open the UIA model picker (not the UIA profile)",
+    ),
+];
 
 /// Owned metadata is translated by identity; syntax and supplied metadata are payload.
-struct CatalogHint {
-    name: &'static str,
-    args: &'static str,
-    key: &'static str,
-    english: &'static str,
+fn localized(hint: &HintEntry) -> SubcommandHint {
+    SubcommandHint::new(hint.name, hint.args, tr(hint.key, hint.english))
 }
 
-impl CatalogHint {
-    const fn new(
-        name: &'static str,
-        args: &'static str,
-        key: &'static str,
-        english: &'static str,
-    ) -> Self {
-        Self {
-            name,
-            args,
-            key,
-            english,
-        }
-    }
-
-    fn localized(&self) -> SubcommandHint {
-        SubcommandHint::new(self.name, self.args, tr(self.key, self.english))
+/// Bildet die Operations-Domäne auf die TUI-Domäne ab.
+fn map_domain(domain: OperationDomain) -> CommandDomain {
+    match domain {
+        OperationDomain::Session => CommandDomain::SessionLifecycle,
+        OperationDomain::Execution => CommandDomain::Execution,
+        _ => CommandDomain::Misc,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Unterkommando-Tabellen
-// ---------------------------------------------------------------------------
-
-/// `/model`, Grammatik aus `harw-ops/src/model.rs` (`show|list|switch`).
-const MODEL: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.model.show",
-        "Show the active model",
-    ),
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.model.list",
-        "List catalog models",
-    ),
-    CatalogHint::new(
-        "switch",
-        "<model-id>",
-        "commands.subcommand.model.switch",
-        "Switch provider and model immediately",
-    ),
-];
-
-/// `/uia-model` (`show|list|switch`).
-const UIA_MODEL: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.uia_model.show",
-        "Show the pinned UIA model",
-    ),
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.uia_model.list",
-        "List catalog models",
-    ),
-    CatalogHint::new(
-        "switch",
-        "<model-id>",
-        "commands.subcommand.uia_model.switch",
-        "Switch the UIA model starting next turn",
-    ),
-];
-
-/// `/uia-worker-model` (`show|list|switch`).
-const UIA_WORKER_MODEL: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.uia_worker_model.show",
-        "Show the pinned UIA worker model",
-    ),
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.uia_worker_model.list",
-        "List the UIA provider's models",
-    ),
-    CatalogHint::new(
-        "switch",
-        "<model-id>",
-        "commands.subcommand.uia_worker_model.switch",
-        "Pin the UIA worker model starting next session",
-    ),
-];
-
-/// `/provider` (`show|list|test`); Wechsel läuft über `/model switch`.
-const PROVIDER: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.provider.show",
-        "Show the active provider",
-    ),
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.provider.list",
-        "List configured providers",
-    ),
-    CatalogHint::new(
-        "test",
-        "",
-        "commands.subcommand.provider.test",
-        "Test the active provider's connection",
-    ),
-];
-
-/// `/effort` — das Level ist selbst das Unterkommando.
-const EFFORT: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.effort.show",
-        "Show the current reasoning effort",
-    ),
-    CatalogHint::new(
-        "minimal",
-        "",
-        "commands.subcommand.effort.minimal",
-        "Minimal reasoning effort",
-    ),
-    CatalogHint::new(
-        "low",
-        "",
-        "commands.subcommand.effort.low",
-        "Low reasoning effort",
-    ),
-    CatalogHint::new(
-        "medium",
-        "",
-        "commands.subcommand.effort.medium",
-        "Medium reasoning effort",
-    ),
-    CatalogHint::new(
-        "high",
-        "",
-        "commands.subcommand.effort.high",
-        "High reasoning effort",
-    ),
-    CatalogHint::new(
-        "xhigh",
-        "",
-        "commands.subcommand.effort.xhigh",
-        "Very high reasoning effort",
-    ),
-    CatalogHint::new(
-        "max",
-        "",
-        "commands.subcommand.effort.max",
-        "Maximum reasoning effort",
-    ),
-    CatalogHint::new(
-        "clear",
-        "",
-        "commands.subcommand.effort.clear",
-        "Restore the provider default",
-    ),
-];
-
-/// `/uia-effort` — wie `/effort`, wirkt ab der nächsten Sitzung.
-const UIA_EFFORT: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.uia_effort.show",
-        "Show the pinned UIA reasoning effort",
-    ),
-    CatalogHint::new(
-        "minimal",
-        "",
-        "commands.subcommand.uia_effort.minimal",
-        "Minimal effort starting next session",
-    ),
-    CatalogHint::new(
-        "low",
-        "",
-        "commands.subcommand.uia_effort.low",
-        "Low effort starting next session",
-    ),
-    CatalogHint::new(
-        "medium",
-        "",
-        "commands.subcommand.uia_effort.medium",
-        "Medium effort starting next session",
-    ),
-    CatalogHint::new(
-        "high",
-        "",
-        "commands.subcommand.uia_effort.high",
-        "High effort starting next session",
-    ),
-    CatalogHint::new(
-        "xhigh",
-        "",
-        "commands.subcommand.uia_effort.xhigh",
-        "Very high effort starting next session",
-    ),
-    CatalogHint::new(
-        "max",
-        "",
-        "commands.subcommand.uia_effort.max",
-        "Maximum effort starting next session",
-    ),
-    CatalogHint::new(
-        "clear",
-        "",
-        "commands.subcommand.uia_effort.clear",
-        "Remove the pin and use the role default",
-    ),
-];
-
-/// `/mode` — `show`, ein Modusname oder `default <modus>`.
-const MODE: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.mode.show",
-        "Show the current interaction mode",
-    ),
-    CatalogHint::new(
-        "chat",
-        "",
-        "commands.subcommand.mode.chat",
-        "Chat mode: converse without requiring tools",
-    ),
-    CatalogHint::new(
-        "plan",
-        "",
-        "commands.subcommand.mode.plan",
-        "Plan mode: plan without making changes",
-    ),
-    CatalogHint::new(
-        "explore",
-        "",
-        "commands.subcommand.mode.explore",
-        "Explore mode: investigate with read-only access",
-    ),
-    CatalogHint::new(
-        "work",
-        "",
-        "commands.subcommand.mode.work",
-        "Work mode: implement with tools",
-    ),
-    CatalogHint::new(
-        "shell",
-        "",
-        "commands.subcommand.mode.shell",
-        "Shell mode: execute commands",
-    ),
-    CatalogHint::new(
-        "default",
-        "<mode>",
-        "commands.subcommand.mode.default",
-        "Set the default mode in configuration",
-    ),
-];
-
-/// `/plan` (Runde 5, Teil F): die lokalen Plan-Modus-Befehle vorn, dazu der
-/// Einstieg in die `plan`-Operation (`inspect`). Bare `/plan` schaltet den
-/// Plan-Modus ein.
-const PLAN: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.plan.show",
-        "Show the current or pinned plan",
-    ),
-    CatalogHint::new(
-        "edit",
-        "",
-        "commands.subcommand.plan.edit",
-        "Open the current plan in $EDITOR",
-    ),
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.plan.list",
-        "List project plans (.harw/plans)",
-    ),
-    CatalogHint::new(
-        "open",
-        "<name>",
-        "commands.subcommand.plan.open",
-        "Load an earlier plan to continue planning",
-    ),
-    CatalogHint::new(
-        "inspect",
-        "[id]",
-        "commands.subcommand.plan.inspect",
-        "Show the plan operation's graph",
-    ),
-    // Runde 5, Teil P: Plan-Store (mehrere Pläne, Freigabe, Schritte). `list`
-    // zeigt hier die Plan-Dateien; die Graphen listet `plans`.
-    CatalogHint::new(
-        "plans",
-        "",
-        "commands.subcommand.plan.plans",
-        "List all graphs in the plan store",
-    ),
-    CatalogHint::new(
-        "switch",
-        "<id>",
-        "commands.subcommand.plan.switch",
-        "Activate another plan graph",
-    ),
-    CatalogHint::new(
-        "archive",
-        "<id>",
-        "commands.subcommand.plan.archive",
-        "Hide a plan graph without deleting it",
-    ),
-    CatalogHint::new(
-        "submit",
-        "[id]",
-        "commands.subcommand.plan.submit",
-        "Confirm the proposed plan",
-    ),
-    CatalogHint::new(
-        "step",
-        "<id> <open|running|done|blocked> [evidence]",
-        "commands.subcommand.plan.step",
-        "Report step progress (done requires evidence)",
-    ),
-];
-
-/// `/models` — Modelle je Rolle.
-const MODELS: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.models.show",
-        "Show models for all roles",
-    ),
-    CatalogHint::new(
-        "set",
-        "<role> <target>",
-        "commands.subcommand.models.set",
-        "Set a role's model (child roles apply to new agents immediately)",
-    ),
-    CatalogHint::new(
-        "reset",
-        "<role>",
-        "commands.subcommand.models.reset",
-        "Reset a role to its default",
-    ),
-    CatalogHint::new(
-        "pick",
-        "<role>",
-        "commands.subcommand.models.pick",
-        "Open the model picker for a role",
-    ),
-    // Runde 5, Teil G: eigene Modellwahl je UIA-Worker-Rolle.
-    CatalogHint::new(
-        "worker",
-        "[<role|all> <uia|target>]",
-        "commands.subcommand.models.worker",
-        "Show or set UIA worker models (uia means same as UIA)",
-    ),
-];
-
-/// `/permissions`, Grammatik aus `harw-ops/src/permissions.rs`.
-const PERMISSIONS: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.permissions.show",
-        "Show approval mode, rules and directories",
-    ),
-    CatalogHint::new(
-        "mode",
-        "<ask|auto|full> [--session|--project|--global]",
-        "commands.subcommand.permissions.mode",
-        "Set the approval mode",
-    ),
-    // Runde 5, Teil E: `--user` (= `--global`), `rules`, `rm`, `log`.
-    CatalogHint::new(
-        "allow",
-        "<tool> [pattern] [--session|--project|--user]",
-        "commands.subcommand.permissions.allow",
-        "Add an allow rule",
-    ),
-    CatalogHint::new(
-        "deny",
-        "<tool> [pattern] [--session|--project|--user]",
-        "commands.subcommand.permissions.deny",
-        "Add a deny rule (overrides allow)",
-    ),
-    CatalogHint::new(
-        "rules",
-        "",
-        "commands.subcommand.permissions.rules",
-        "List rules with their origins",
-    ),
-    CatalogHint::new(
-        "remove",
-        "<number>",
-        "commands.subcommand.permissions.remove",
-        "Remove a rule by number",
-    ),
-    CatalogHint::new(
-        "rm",
-        "<number>",
-        "commands.subcommand.permissions.rm",
-        "Remove a rule by number (short form)",
-    ),
-    CatalogHint::new(
-        "log",
-        "[count]",
-        "commands.subcommand.permissions.log",
-        "Show recent auto-mode decisions",
-    ),
-];
-
-/// `/memory`, Grammatik aus `harw-ops/src/memory.rs`.
-const MEMORY: &[CatalogHint] = &[
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.memory.list",
-        "Show hot memories",
-    ),
-    CatalogHint::new(
-        "stats",
-        "",
-        "commands.subcommand.memory.stats",
-        "Show memory statistics",
-    ),
-    CatalogHint::new(
-        "recall",
-        "<keyword…>",
-        "commands.subcommand.memory.recall",
-        "Search facts",
-    ),
-    CatalogHint::new(
-        "record",
-        "<text…> [--project|--global]",
-        "commands.subcommand.memory.record",
-        "Record a fact",
-    ),
-    CatalogHint::new(
-        "forget",
-        "<name>",
-        "commands.subcommand.memory.forget",
-        "Delete a fact",
-    ),
-    CatalogHint::new(
-        "maintain",
-        "",
-        "commands.subcommand.memory.maintain",
-        "Clean up memory",
-    ),
-    CatalogHint::new(
-        "consolidate",
-        "[--project|--global]",
-        "commands.subcommand.memory.consolidate",
-        "Consolidate facts",
-    ),
-    CatalogHint::new(
-        "promote",
-        "<fact-id> [--project|--global] [--slug <slug>]",
-        "commands.subcommand.memory.promote",
-        "Promote a fact to a provisional topic",
-    ),
-    CatalogHint::new(
-        "topics",
-        "",
-        "commands.subcommand.memory.topics",
-        "List provisional topics",
-    ),
-];
-
-/// `/agent`, Grammatik aus `harw-ops/src/agent.rs`.
-const AGENT: &[CatalogHint] = &[
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.agent.list",
-        "List active child agents",
-    ),
-    // Plan R9, Teil C: startbare Agenten (eingebaut und benutzerdefiniert).
-    CatalogHint::new(
-        "defs",
-        "[query]",
-        "commands.subcommand.agent.defs",
-        "List launchable agents with their origins",
-    ),
-    CatalogHint::new(
-        "stop",
-        "<agent-id>",
-        "commands.subcommand.agent.stop",
-        "Cancel child agents",
-    ),
-    CatalogHint::new(
-        "budget",
-        "[agent-id]",
-        "commands.subcommand.agent.budget",
-        "Show budget and lease",
-    ),
-    // Runde 5, Teil I: TUI-lokal abgefangen (vor der Operation `/agent`).
-    CatalogHint::new(
-        "stream",
-        "<orchestrators|all|none>",
-        "commands.subcommand.agent.stream",
-        "Stream child agents live in history (session)",
-    ),
-    // Runde 5, Teil K: TUI-lokal abgefangen (Hintergrund-Agenten).
-    CatalogHint::new(
-        "bg",
-        "",
-        "commands.subcommand.agent.bg",
-        "List background agents with progress",
-    ),
-    CatalogHint::new(
-        "cancel",
-        "<agent-id>",
-        "commands.subcommand.agent.cancel",
-        "Cancel background agents",
-    ),
-];
-
-/// `/export` — Optionen statt Unterkommandos (`harw-ops/src/export.rs`).
-const EXPORT: &[CatalogHint] = &[
-    CatalogHint::new(
-        "--format",
-        "<md|json>",
-        "commands.subcommand.export.format",
-        "Choose the output format",
-    ),
-    CatalogHint::new(
-        "--datei",
-        "<path>",
-        "commands.subcommand.export.datei",
-        "Write to a file",
-    ),
-    CatalogHint::new(
-        "--tools",
-        "",
-        "commands.subcommand.export.tools",
-        "Include tool calls",
-    ),
-    CatalogHint::new(
-        "--no-tools",
-        "",
-        "commands.subcommand.export.no_tools",
-        "Omit tool calls",
-    ),
-    CatalogHint::new(
-        "--reasoning-summary",
-        "",
-        "commands.subcommand.export.reasoning_summary",
-        "Include the reasoning summary",
-    ),
-    CatalogHint::new(
-        "--max-chars",
-        "<n>",
-        "commands.subcommand.export.max_chars",
-        "Limit the length",
-    ),
-];
-
-/// `/sandbox-lease` — auf der Befehlsfläche nur `status`/`revoke`
-/// (`request` braucht einen Grund und läuft über das Modell-Werkzeug).
-const SANDBOX_LEASE: &[CatalogHint] = &[
-    CatalogHint::new(
-        "status",
-        "",
-        "commands.subcommand.sandbox_lease.status",
-        "Show the active host permit",
-    ),
-    CatalogHint::new(
-        "revoke",
-        "",
-        "commands.subcommand.sandbox_lease.revoke",
-        "Revoke the host permit immediately",
-    ),
-];
-
-/// `/workbench`, Grammatik aus `harw-ops/src/workbench.rs`; jeder
-/// Subcommand akzeptiert `--scope=session|project|project:<slug>`.
-const WORKBENCH: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "[--scope=session|project]",
-        "commands.subcommand.workbench.show",
-        "Show the workbench",
-    ),
-    CatalogHint::new(
-        "pin",
-        "<path> [note]",
-        "commands.subcommand.workbench.pin",
-        "Pin a file",
-    ),
-    CatalogHint::new(
-        "unpin",
-        "<path>",
-        "commands.subcommand.workbench.unpin",
-        "Unpin a file",
-    ),
-    CatalogHint::new(
-        "note",
-        "<text>",
-        "commands.subcommand.workbench.note",
-        "Append a note",
-    ),
-    CatalogHint::new(
-        "note",
-        "edit <n> <text> | rm <n>",
-        "commands.subcommand.workbench.note_edit",
-        "Edit or delete a note",
-    ),
-    CatalogHint::new(
-        "hypothesis",
-        "add|confirm|reject <text>",
-        "commands.subcommand.workbench.hypothesis",
-        "Create or decide a hypothesis",
-    ),
-    CatalogHint::new(
-        "retention",
-        "[keep|<days>d] [--scope=project]",
-        "commands.subcommand.workbench.retention",
-        "Show or set retention",
-    ),
-];
-
-/// `/kanban`, Grammatik aus `harw-ops/src/kanban.rs` (`--board=<id>` davor
-/// möglich).
-const KANBAN: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "[card]",
-        "commands.subcommand.kanban.show",
-        "Show the board or a card",
-    ),
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.kanban.list",
-        "List board cards",
-    ),
-    CatalogHint::new(
-        "boards",
-        "",
-        "commands.subcommand.kanban.boards",
-        "List boards",
-    ),
-    CatalogHint::new(
-        "add",
-        "<title>",
-        "commands.subcommand.kanban.add",
-        "Create a card",
-    ),
-    CatalogHint::new(
-        "move",
-        "<card> <todo|ready|running|done|blocked|archived>",
-        "commands.subcommand.kanban.move",
-        "Move a card",
-    ),
-    CatalogHint::new(
-        "todo",
-        "<card>",
-        "commands.subcommand.kanban.todo",
-        "Set a card to todo",
-    ),
-    CatalogHint::new(
-        "ready",
-        "<card>",
-        "commands.subcommand.kanban.ready",
-        "Mark a card ready",
-    ),
-    CatalogHint::new(
-        "claim",
-        "<card>",
-        "commands.subcommand.kanban.claim",
-        "Claim a card",
-    ),
-    CatalogHint::new(
-        "block",
-        "<card> <reason>",
-        "commands.subcommand.kanban.block",
-        "Block a card",
-    ),
-    CatalogHint::new(
-        "unblock",
-        "<card>",
-        "commands.subcommand.kanban.unblock",
-        "Unblock a card",
-    ),
-    CatalogHint::new(
-        "done",
-        "<card>",
-        "commands.subcommand.kanban.done",
-        "Complete a card",
-    ),
-    CatalogHint::new(
-        "archive",
-        "<card>",
-        "commands.subcommand.kanban.archive",
-        "Archive a card",
-    ),
-    CatalogHint::new(
-        "edit",
-        "<card> <text>",
-        "commands.subcommand.kanban.edit",
-        "Replace card text",
-    ),
-    CatalogHint::new(
-        "comment",
-        "<card> <text>",
-        "commands.subcommand.kanban.comment",
-        "Append a comment",
-    ),
-    CatalogHint::new(
-        "evidence",
-        "<card> <path|url>",
-        "commands.subcommand.kanban.evidence",
-        "Link evidence",
-    ),
-    CatalogHint::new(
-        "approve",
-        "<card> [note]",
-        "commands.subcommand.kanban.approve",
-        "Approve a worker card",
-    ),
-    CatalogHint::new(
-        "reject",
-        "<card> [reason]",
-        "commands.subcommand.kanban.reject",
-        "Reject a worker card",
-    ),
-];
-
-/// `/palace`, Grammatik aus `harw-ops/src/palace.rs` plus `list` (Vertrag).
-const PALACE: &[CatalogHint] = &[
-    CatalogHint::new("list", "", "commands.subcommand.palace.list", "List nodes"),
-    CatalogHint::new(
-        "show",
-        "<id>",
-        "commands.subcommand.palace.show",
-        "Show a node",
-    ),
-    CatalogHint::new(
-        "search",
-        "<query> [--max-hops=n] [--max=n]",
-        "commands.subcommand.palace.search",
-        "Search the graph",
-    ),
-    CatalogHint::new(
-        "promote",
-        "<topic>",
-        "commands.subcommand.palace.promote",
-        "Promote a topic to the palace (established)",
-    ),
-    CatalogHint::new(
-        "supersede",
-        "<old> <new> [--confirm]",
-        "commands.subcommand.palace.supersede",
-        "Replace a node with its successor",
-    ),
-    CatalogHint::new(
-        "edit",
-        "<id> <text…> [--confirm]",
-        "commands.subcommand.palace.edit",
-        "Replace node text (new revision)",
-    ),
-    CatalogHint::new(
-        "link",
-        "<a> <b> [--confirm]",
-        "commands.subcommand.palace.link",
-        "Add a link from a to b",
-    ),
-];
-
-/// `/dream`, Grammatik aus `harw-ops/src/dream.rs` (D5).
-const DREAM: &[CatalogHint] = &[
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.dream.list",
-        "List dream reports",
-    ),
-    CatalogHint::new(
-        "show",
-        "<id>",
-        "commands.subcommand.dream.show",
-        "Show a dream report",
-    ),
-    CatalogHint::new(
-        "run",
-        "",
-        "commands.subcommand.dream.run",
-        "Start a dream run",
-    ),
-    CatalogHint::new(
-        "status",
-        "",
-        "commands.subcommand.dream.status",
-        "Show dream run status",
-    ),
-    CatalogHint::new(
-        "review",
-        "[<id>] | <id> accept|reject <p-id> [reason]",
-        "commands.subcommand.dream.review",
-        "Review, accept or reject proposals",
-    ),
-];
-
-/// `/learn`, Grammatik aus `harw-ops/src/learn.rs`: schlägt nur vor, jede
-/// Übernahme braucht ein ausdrückliches `accept`.
-const LEARN: &[CatalogHint] = &[
-    CatalogHint::new(
-        "scan",
-        "",
-        "commands.subcommand.learn.scan",
-        "Scan the session for learning candidates",
-    ),
-    CatalogHint::new(
-        "note",
-        "<text> [--target memory|skill|agent]",
-        "commands.subcommand.learn.note",
-        "Create a proposal from your own text",
-    ),
-    CatalogHint::new(
-        "list",
-        "[--all]",
-        "commands.subcommand.learn.list",
-        "List proposals",
-    ),
-    CatalogHint::new(
-        "show",
-        "<id>",
-        "commands.subcommand.learn.show",
-        "Show a proposal",
-    ),
-    CatalogHint::new(
-        "accept",
-        "<id>",
-        "commands.subcommand.learn.accept",
-        "Accept a proposal",
-    ),
-    CatalogHint::new(
-        "reject",
-        "<id> [reason]",
-        "commands.subcommand.learn.reject",
-        "Reject a proposal",
-    ),
-];
-
-/// `/diary`, Grammatik aus `harw-ops/src/diary.rs` plus `today` (Vertrag).
-const DIARY: &[CatalogHint] = &[
-    CatalogHint::new(
-        "today",
-        "",
-        "commands.subcommand.diary.today",
-        "Show today's entries",
-    ),
-    CatalogHint::new(
-        "show",
-        "[agent] [--date=YYYY-MM-DD | --from=… [--to=…]]",
-        "commands.subcommand.diary.show",
-        "Show entries for a day or date range",
-    ),
-    CatalogHint::new(
-        "search",
-        "<text> [--agent=<id>] [--from=…] [--to=…]",
-        "commands.subcommand.diary.search",
-        "Search diaries",
-    ),
-    CatalogHint::new(
-        "agents",
-        "",
-        "commands.subcommand.diary.agents",
-        "List agents with diaries",
-    ),
-    CatalogHint::new(
-        "note",
-        "<text>",
-        "commands.subcommand.diary.note",
-        "Write a diary note",
-    ),
-];
-
-/// `/matrix`, Grammatik der Matrix-Game-Operation (`harw-ops/src/matrix`).
-/// Runde 7, Teil M: nur noch Ansicht — Start und Steuerung übernimmt der
-/// Game Master (`matrix-game-master`), den die UIA im Hintergrund startet.
-const MATRIX: &[CatalogHint] = &[
-    CatalogHint::new(
-        "show",
-        "",
-        "commands.subcommand.matrix.show",
-        "Show the running game (panel: F9)",
-    ),
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.matrix.list",
-        "List scenarios, drafts and runs",
-    ),
-    CatalogHint::new(
-        "replay",
-        "",
-        "commands.subcommand.matrix.replay",
-        "Verify the journal deterministically",
-    ),
-    CatalogHint::new(
-        "compare",
-        "<run> <run> …",
-        "commands.subcommand.matrix.compare",
-        "Compare runs for design lessons",
-    ),
-];
-
-/// `/jobs`, Grammatik aus `harw-ops/src/jobs.rs` (Plan R9, Teil F).
-const JOBS: &[CatalogHint] = &[
-    CatalogHint::new(
-        "list",
-        "",
-        "commands.subcommand.jobs.list",
-        "List this session's background jobs",
-    ),
-    CatalogHint::new(
-        "show",
-        "<id>",
-        "commands.subcommand.jobs.show",
-        "Show status, command and recent lines",
-    ),
-    CatalogHint::new(
-        "stop",
-        "<id> [TERM|INT|HUP|KILL]",
-        "commands.subcommand.jobs.stop",
-        "Stop a job and its process group",
-    ),
-    CatalogHint::new(
-        "logs",
-        "<id> [n]",
-        "commands.subcommand.jobs.logs",
-        "Show recent log lines (stdout/stderr)",
-    ),
-];
-
-/// `/tools`, Grammatik aus `crate::tools_command`.
-const TOOLS: &[CatalogHint] = &[
-    CatalogHint::new(
-        "on",
-        "<name>",
-        "commands.subcommand.tools.on",
-        "Enable a tool",
-    ),
-    CatalogHint::new(
-        "off",
-        "<name>",
-        "commands.subcommand.tools.off",
-        "Disable a tool",
-    ),
-    CatalogHint::new(
-        "reset",
-        "[name]",
-        "commands.subcommand.tools.reset",
-        "Reset overrides",
-    ),
-    CatalogHint::new(
-        "profile",
-        "<minimal|coding|full>",
-        "commands.subcommand.tools.profile",
-        "Choose a tool profile",
-    ),
-];
-
-/// Befehl → (Nutzungszeile, Unterkommandos). Einzige Quelle für
-/// [`subcommand_hints`] und die Nutzungszeilen in [`enrich`].
-const HINT_TABLE: &[(&str, &str, &[CatalogHint])] = &[
-    (
-        "settings",
-        "/settings [show|set <key> <value>|reset <key>]",
-        &[],
-    ),
-    ("model", "/model [show|list|switch <model-id>]", MODEL),
-    (
-        "uia-model",
-        "/uia-model [show|list|switch <model-id>]",
-        UIA_MODEL,
-    ),
-    (
-        "uia-worker-model",
-        "/uia-worker-model [show|list|switch <model-id>]",
-        UIA_WORKER_MODEL,
-    ),
-    ("provider", "/provider [show|list|test]", PROVIDER),
-    (
-        "effort",
-        "/effort [show|minimal|low|medium|high|xhigh|max|clear]",
-        EFFORT,
-    ),
-    (
-        "uia-effort",
-        "/uia-effort [show|minimal|low|medium|high|xhigh|max|clear]",
-        UIA_EFFORT,
-    ),
-    ("mode", "/mode [show|<mode>|default <mode>]", MODE),
-    // Runde 5, Teil F.
-    (
-        "plan",
-        "/plan [show|edit|list|open <name>|inspect|plans|switch|submit|step …]",
-        PLAN,
-    ),
-    (
-        "models",
-        "/models [show|set <role> <target>|reset <role>|pick <role>|worker [<role|all> <uia|target>]]",
-        MODELS,
-    ),
-    (
-        "permissions",
-        "/permissions [show|mode <mode>|allow <tool>|deny <tool>|rules|rm <number>|log]",
-        PERMISSIONS,
-    ),
-    (
-        "memory",
-        "/memory [list|stats|recall|record|forget|promote|topics|maintain|consolidate] …",
-        MEMORY,
-    ),
-    (
-        "agent",
-        "/agent [list|defs [query]|stop <agent-id>|budget [agent-id]|stream <orchestrators|all|none>|bg|cancel <agent-id>]",
-        AGENT,
-    ),
-    (
-        "export",
-        "/export [--format <md|json>] [--datei <path>] [--no-tools] …",
-        EXPORT,
-    ),
-    (
-        "sandbox-lease",
-        "/sandbox-lease [status|revoke]",
-        SANDBOX_LEASE,
-    ),
-    (
-        "workbench",
-        "/workbench [show|pin|unpin|note [edit|rm]|hypothesis|retention] [--scope=…] …",
-        WORKBENCH,
-    ),
-    (
-        "kanban",
-        "/kanban [--board=<id>] [show|list|boards|add|move|block|done|…] …",
-        KANBAN,
-    ),
-    (
-        "palace",
-        "/palace [list|show <id>|search <query>|promote <topic>|supersede|edit|link] …",
-        PALACE,
-    ),
-    (
-        "dream",
-        "/dream [list|show <id>|run|status|review [<id>] [accept|reject <p-id>]]",
-        DREAM,
-    ),
-    (
-        "learn",
-        "/learn [scan|note <text>|list [--all]|show <id>|accept <id>|reject <id>]",
-        LEARN,
-    ),
-    (
-        "diary",
-        "/diary [today|show [agent] [--date|--from/--to]|search <text>|agents|note <text>]",
-        DIARY,
-    ),
-    (
-        "matrix",
-        "/matrix [show|list|replay|compare <run> <run>] — Start via the UIA (Game Master)",
-        MATRIX,
-    ),
-    (
-        "jobs",
-        "/jobs [list|show <id>|stop <id> [signal]|logs <id> [n]]",
-        JOBS,
-    ),
-    (
-        "tools",
-        "/tools [on <name>|off <name>|reset [name]|profile <p>]",
-        TOOLS,
-    ),
-];
-
-/// Kurzbeschreibungen, die zu lange oder veraltete Operations-Texte ersetzen.
-const SUMMARY_OVERRIDES: &[(&str, &str, &str)] = &[
-    (
-        "sandbox-lease",
-        "commands.summary.sandbox_lease",
-        "Show or revoke the host permit for shell.exec",
-    ),
-    (
-        "mode",
-        "commands.summary.mode",
-        "Show or change the interaction mode",
-    ),
-    (
-        "memory",
-        "commands.summary.memory",
-        "Long-term memory: list, search, record, forget",
-    ),
-    (
-        "agent",
-        "commands.summary.agent",
-        "Child agents: tree, list, stop, budget, stream",
-    ),
-];
-
-/// Befehle aus dem Interaktionsvertrag, die (noch) weder als Operation noch
-/// TUI-lokal existieren: `(name, message key, English summary)`.
-const PLANNED_COMMANDS: &[(&str, &str, &str)] = &[
-    (
-        "rewind",
-        "commands.planned.rewind",
-        "Restore the session to an earlier state",
-    ),
-    (
-        "fork",
-        "commands.planned.fork",
-        "Branch the session from here",
-    ),
-    ("archive", "commands.planned.archive", "Archive the session"),
-    (
-        "spawn",
-        "commands.planned.spawn",
-        "Launch specific child agents",
-    ),
-    (
-        "mention",
-        "commands.planned.mention",
-        "Mention an agent or file",
-    ),
-    (
-        "kill",
-        "commands.planned.kill",
-        "Terminate child agents immediately",
-    ),
-    ("logs", "commands.planned.logs", "Show logs"),
-    (
-        "doctor",
-        "commands.planned.doctor",
-        "Check installation and configuration",
-    ),
-    (
-        "config",
-        "commands.planned.config",
-        "Show and change configuration",
-    ),
-    ("mcp", "commands.planned.mcp", "Manage MCP servers"),
-    ("channels", "commands.planned.channels", "Manage channels"),
-    ("lease", "commands.planned.lease", "Show and manage leases"),
-    (
-        "priority",
-        "commands.planned.priority",
-        "Set a task's priority",
-    ),
-    (
-        "depends",
-        "commands.planned.depends",
-        "Set dependencies between tasks",
-    ),
-    ("theme", "commands.planned.theme", "Change the color scheme"),
-];
 
 // ---------------------------------------------------------------------------
 // Öffentliche Funktionen
@@ -1213,17 +81,21 @@ const PLANNED_COMMANDS: &[(&str, &str, &str)] = &[
 /// # Rückgabe
 /// Die lokalisierte Hinweisliste oder eine leere Liste für unbekannte Befehle.
 pub(crate) fn subcommand_hints(name: &str) -> Vec<SubcommandHint> {
-    for (command, _, hints) in HINT_TABLE {
-        if *command == name {
-            return hints.iter().map(CatalogHint::localized).collect();
-        }
+    let hints = command_meta::help_for(name).map_or(&[][..], |help| help.hints);
+    if name == "models" {
+        hints
+            .iter()
+            .chain(TUI_MODELS_SHORTCUTS)
+            .map(localized)
+            .collect()
+    } else {
+        hints.iter().map(localized).collect()
     }
-    Vec::new()
 }
 
 /// Localized planned summaries, keyed by owned command identity.
 pub(crate) fn planned_commands() -> Vec<(&'static str, &'static str)> {
-    PLANNED_COMMANDS
+    command_meta::PLANNED_COMMANDS
         .iter()
         .map(|(name, key, english)| (*name, tr(key, english)))
         .collect()
@@ -1231,16 +103,13 @@ pub(crate) fn planned_commands() -> Vec<(&'static str, &'static str)> {
 
 /// Nutzungszeile aus der Katalogtabelle, falls vorhanden.
 fn usage_for(name: &str) -> Option<&'static str> {
-    HINT_TABLE
-        .iter()
-        .find(|(command, _, _)| *command == name)
-        .map(|(_, usage, _)| {
-            if name == "matrix" {
-                tr("commands.usage.matrix", "/matrix [show|list|replay|compare <run> <run>] — Start via the UIA (Game Master)")
-            } else {
-                *usage
-            }
-        })
+    if name == "models" {
+        return Some(
+            "/models [settings|session|uia|show|image [show|reset|target]|set <role> <target> [effort]|reset <role>|pick <role>|worker [<role|all> <uia|target>]]",
+        );
+    }
+    command_meta::help_for(name)
+        .map(|help| help.usage_key.map_or(help.usage, |key| tr(key, help.usage)))
 }
 
 /// Ergänzt eine Spezifikation um Katalogwissen.
@@ -1258,24 +127,13 @@ fn usage_for(name: &str) -> Option<&'static str> {
 /// Idempotent: ein zweiter Aufruf ändert nichts mehr.
 pub(crate) fn enrich(spec: &mut CommandSpec) {
     let name = spec.name.as_str().to_owned();
-    if let Some((_, key, english)) = SUMMARY_OVERRIDES.iter().find(|(n, _, _)| *n == name) {
+    if let Some((key, english)) = command_meta::summary_override(&name) {
         spec.summary = tr(key, english).to_owned();
     }
     if name == "settings" {
-        spec.summary = crate::i18n::tr("settings.title", "Settings").to_owned();
-        spec.subcommands = vec![
-            SubcommandHint::new("show", "", crate::i18n::tr("settings.title", "Settings")),
-            SubcommandHint::new(
-                "set",
-                "<key> <value>",
-                crate::i18n::tr("settings.scope", "Active profile · applies immediately"),
-            ),
-            SubcommandHint::new(
-                "reset",
-                "<key>",
-                crate::i18n::tr("settings.scope", "Active profile · applies immediately"),
-            ),
-        ];
+        let (key, english) = command_meta::SETTINGS_SUMMARY;
+        spec.summary = tr(key, english).to_owned();
+        spec.subcommands = command_meta::SETTINGS_HINTS.iter().map(localized).collect();
     }
     if spec.subcommands.is_empty() {
         spec.subcommands = subcommand_hints(&name);
@@ -1323,139 +181,21 @@ pub(crate) const FALLBACK_COMMANDS: &[&str] = &["mode", "matrix", "plan"];
 /// [`CommandScope::TuiOnly`]. Beim Einmischen via
 /// `CommandRegistry::with_local_specs` gewinnt bei Namens-/Alias-Kollision
 /// die Operation — Ersatz-Spezifikationen verschwinden also automatisch,
-/// sobald die Operation registriert ist.
+/// sobald die Operation registriert ist. Daten: `command_meta::LOCAL_COMMANDS`.
 pub(crate) fn local_command_specs() -> Vec<CommandSpec> {
-    use BusyAvailability::{DeferredUntilTurnEnd as Deferred, Immediate, Staged};
-    use CommandDomain::{Execution, Misc, SessionLifecycle};
-    use PermissionTier::{Observer, Operator};
-
-    [
-        // ── Echte lokale Befehle ──────────────────────────────────────────
-        local_spec(
-            "tools",
-            Execution,
-            Operator,
-            Deferred,
-            tr("commands.local.tools", "Show tools, enable or disable them, choose a profile"),
-            "",
-        ),
-        local_spec(
-            "resume",
-            SessionLifecycle,
-            Operator,
-            Deferred,
-            tr("commands.local.resume", "Resume an earlier session (without an ID: choose one)"),
-            "/resume [session-id]",
-        ),
-        local_spec(
-            "sessions",
-            SessionLifecycle,
-            Observer,
-            Deferred,
-            tr("commands.local.sessions", "Open the session picker"),
-            "/sessions",
-        ),
-        local_spec(
-            "exit",
-            SessionLifecycle,
-            Observer,
-            Deferred,
-            tr("commands.local.exit", "Exit the TUI (same as /quit)"),
-            "/exit",
-        ),
-        local_spec(
-            "clear",
-            SessionLifecycle,
-            Observer,
-            Deferred,
-            tr("commands.local.clear", "Clear the display (keep the session)"),
-            "/clear",
-        ),
-        local_spec(
-            "verbose",
-            Misc,
-            Observer,
-            Immediate,
-            tr("commands.local.verbose", "Toggle detailed tool display"),
-            "/verbose",
-        ),
-        local_spec(
-            "keys",
-            Misc,
-            Observer,
-            Immediate,
-            tr("commands.local.keys", "Show key bindings"),
-            "/keys",
-        ),
-        local_spec(
-            "whoami",
-            Misc,
-            Observer,
-            Immediate,
-            tr("commands.local.whoami", "Show session, permission and active model"),
-            "/whoami",
-        ),
-        local_spec(
-            "rename",
-            SessionLifecycle,
-            Operator,
-            Immediate,
-            tr("commands.local.rename", "Rename the session"),
-            "/rename <title>",
-        ),
-        // Runde 5, Teil I: `/agents` entfällt (nur noch `/agent`); die
-        // Eingabe `/agents` zeigt einen Hinweis (`local_commands`).
-        // Runde 5, Teil L: flüchtige Nebenfrage, jederzeit (auch im Turn).
-        local_spec(
-            "btw",
-            Misc,
-            Operator,
-            Immediate,
-            tr("commands.local.btw", "Ask a side question without interrupting the agent (not in history)"),
-            "/btw <question>",
-        ),
-        // Bilder: der Agent sieht sie mit der nächsten Nachricht.
-        local_spec(
-            "image",
-            Misc,
-            Operator,
-            Immediate,
-            tr("commands.local.image", "Attach an image to the next message (PNG, JPEG, GIF, WebP)"),
-            "/image <path>",
-        ),
-        // ── Ersatz, solange die Operation fehlt ───────────────────────────
-        local_spec(
-            "mode",
-            SessionLifecycle,
-            Operator,
-            Staged,
-            tr("commands.summary.mode", "Show or change the interaction mode"),
-            "",
-        ),
-        local_spec(
-            "matrix",
-            Misc,
-            Operator,
-            Deferred,
-            tr("commands.local.matrix", "View the Matrix game (UIA/Game Master starts and controls it; bare command opens panel)"),
-            "",
-        ),
-        // Runde 5, Teil F: `/plan` (Plan-Modus an) und `/plan
-        // show|edit|list|open` sind immer lokal; die `plan`-Operation (nur
-        // mit Plan-Diensten) gewinnt als Spezifikation, sobald sie
-        // registriert ist.
-        local_spec(
-            "plan",
-            SessionLifecycle,
-            Operator,
-            Immediate,
-            tr("commands.local.plan", "Enable plan mode; show, edit or open plans"),
-            "",
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    command_meta::LOCAL_COMMANDS
+        .iter()
+        .filter_map(|meta| {
+            local_spec(
+                meta.name,
+                map_domain(meta.domain),
+                meta.permission,
+                meta.busy,
+                tr(meta.key, meta.english),
+                meta.usage,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1507,7 +247,8 @@ mod tests {
 
     #[test]
     fn hint_table_names_and_enriched_hints_are_valid_unique_and_non_empty() -> TestResult {
-        for (index, (name, usage, hints)) in HINT_TABLE.iter().enumerate() {
+        for (index, help) in command_meta::HINT_TABLE.iter().enumerate() {
+            let (name, usage, hints) = (&help.name, &help.usage, help.hints);
             CommandName::parse(*name).map_err(ctx("hinted name must be valid"))?;
             let mut spec = CommandSpec::new(
                 *name,
@@ -1542,7 +283,12 @@ mod tests {
                 assert_eq!(spec.subcommands[2].summary, spec.subcommands[1].summary);
             } else {
                 assert!(!hints.is_empty(), "{name} has an empty static hint list");
-                assert_eq!(spec.subcommands.len(), hints.len());
+                let local_count = if *name == "models" {
+                    TUI_MODELS_SHORTCUTS.len()
+                } else {
+                    0
+                };
+                assert_eq!(spec.subcommands.len(), hints.len() + local_count);
             }
             assert!(
                 !spec.subcommands.is_empty(),
@@ -1551,7 +297,9 @@ mod tests {
             assert!(usage.starts_with(&format!("/{name}")), "{name} usage");
             assert_eq!(Some(spec.usage.as_str()), usage_for(name));
             assert!(
-                HINT_TABLE[index + 1..].iter().all(|(n, _, _)| n != name),
+                command_meta::HINT_TABLE[index + 1..]
+                    .iter()
+                    .all(|h| h.name != *name),
                 "{name} appears twice in HINT_TABLE"
             );
             for hint in &spec.subcommands {
@@ -1567,7 +315,8 @@ mod tests {
     #[test]
     fn every_hinted_command_exists_as_operation_or_local() -> TestResult {
         let built_in = CommandRegistry::built_in().map_err(ctx("built_in"))?;
-        for (name, _, _) in HINT_TABLE {
+        for help in command_meta::HINT_TABLE {
+            let name = &help.name;
             let exists = built_in.find(name).is_some()
                 || REAL_LOCAL.contains(name)
                 || ALLOWED_MISSING.contains(name);
@@ -1590,11 +339,11 @@ mod tests {
             assert!(!summary.is_empty());
             assert!(
                 built_in.find(name).is_none(),
-                "'/{name}' is implemented as an operation; remove it from PLANNED_COMMANDS"
+                "'/{name}' is implemented as an operation; remove it from command_meta::PLANNED_COMMANDS"
             );
             assert!(
                 locals.iter().all(|s| s.name.as_str() != name),
-                "'/{name}' is implemented locally; remove it from PLANNED_COMMANDS"
+                "'/{name}' is implemented locally; remove it from command_meta::PLANNED_COMMANDS"
             );
         }
         Ok(())
@@ -1606,7 +355,10 @@ mod tests {
             |cmd: &str| -> Vec<&str> { subcommand_hints(cmd).iter().map(|h| h.name).collect() };
         assert_eq!(names("model"), ["show", "list", "switch"]);
         assert_eq!(names("provider"), ["show", "list", "test"]);
-        assert_eq!(names("models"), ["show", "set", "reset", "pick", "worker"]);
+        assert_eq!(
+            names("models"),
+            ["show", "set", "reset", "pick", "worker", "settings", "session", "uia"]
+        );
         assert_eq!(names("sandbox-lease"), ["status", "revoke"]);
         assert!(names("mode").contains(&"default"));
         assert!(names("tools").contains(&"profile"));
@@ -1688,16 +440,22 @@ mod tests {
         use harw_config::UiLanguage;
         let mut keys = std::collections::BTreeSet::new();
         let mut count = 0;
-        for (name, _, hints) in HINT_TABLE {
-            for hint in *hints {
+        for help in command_meta::HINT_TABLE {
+            let (name, hints) = (&help.name, help.hints);
+            for hint in hints {
                 count += 1;
                 assert!(keys.insert(hint.key), "duplicate key: {}", hint.key);
             }
             for language in UiLanguage::ALL {
                 with_language(language, || {
                     let localized = subcommand_hints(name);
-                    assert_eq!(localized.len(), hints.len());
-                    for (actual, owned) in localized.iter().zip(*hints) {
+                    let local_count = if *name == "models" {
+                        TUI_MODELS_SHORTCUTS.len()
+                    } else {
+                        0
+                    };
+                    assert_eq!(localized.len(), hints.len() + local_count);
+                    for (actual, owned) in localized.iter().zip(hints) {
                         assert_eq!((actual.name, actual.args), (owned.name, owned.args));
                         assert_eq!(actual.summary, tr_for(language, owned.key, owned.english));
                         if language == UiLanguage::English {
@@ -1766,7 +524,7 @@ mod tests {
                         assert_ne!(summary, english);
                     }
                 }
-                for (name, key, fallback) in SUMMARY_OVERRIDES {
+                for (name, key, fallback) in command_meta::SUMMARY_OVERRIDES {
                     let mut spec = CommandSpec::new(
                         *name,
                         Vec::<String>::new(),
@@ -1846,6 +604,76 @@ mod tests {
                 assert_eq!(spec.summary, supplied);
             });
         }
+        Ok(())
+    }
+
+    /// Kanonischer Abzug des Katalogs in Englisch (ausserhalb `with_language`).
+    fn popup_dump() -> String {
+        use std::fmt::Write as _;
+        fn subs(out: &mut String, spec: &CommandSpec) {
+            for hint in &spec.subcommands {
+                let _ = write!(out, "\tS\t{}\t{}\t{}", hint.name, hint.args, hint.summary);
+            }
+            out.push('\n');
+        }
+        let mut out = String::new();
+        for spec in local_command_specs() {
+            let _ = write!(
+                out,
+                "L\t{}\t{}\t{}\t{:?}\t{:?}\t{:?}",
+                spec.name, spec.summary, spec.usage, spec.busy, spec.permission, spec.domain
+            );
+            subs(&mut out, &spec);
+        }
+        let names = command_meta::HINT_TABLE
+            .iter()
+            .map(|help| help.name)
+            .chain(std::iter::once("settings"));
+        for name in names {
+            let Ok(mut spec) = CommandSpec::new(
+                name,
+                Vec::<String>::new(),
+                CommandScope::TuiOnly,
+                PermissionTier::Operator,
+                OutputSurface::Inline,
+                CommandDomain::Misc,
+            ) else {
+                continue;
+            };
+            enrich(&mut spec);
+            let _ = write!(out, "H\t{}\t{}\t{}", spec.name, spec.summary, spec.usage);
+            subs(&mut out, &spec);
+        }
+        for (name, summary) in planned_commands() {
+            let _ = writeln!(out, "P\t{name}\t{summary}");
+        }
+        out
+    }
+
+    /// Abnahme "TUI-Popup unveraendert": Abzug gegen die vor dem Rueckbau
+    /// erzeugte Datei. `HARW_BLESS_POPUP=1` schreibt sie neu.
+    #[test]
+    fn popup_catalog_snapshot_is_unchanged() -> TestResult {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/command_popup_en.snap"
+        );
+        let dump = popup_dump();
+        if std::env::var_os("HARW_BLESS_POPUP").is_some() {
+            let dir = std::path::Path::new(path)
+                .parent()
+                .ok_or(crate::test_support::TestError::Missing("snapshot dir"))?;
+            std::fs::create_dir_all(dir).map_err(ctx("create tests/data"))?;
+            std::fs::write(path, &dump).map_err(ctx("write snapshot"))?;
+            return Ok(());
+        }
+        let expected = std::fs::read_to_string(path).map_err(ctx(
+            "snapshot missing: run once with HARW_BLESS_POPUP=1 on the base",
+        ))?;
+        assert_eq!(
+            dump, expected,
+            "popup catalog changed; bless only if intended"
+        );
         Ok(())
     }
 }

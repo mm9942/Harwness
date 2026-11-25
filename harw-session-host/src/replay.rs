@@ -47,6 +47,31 @@ pub trait TranscriptSource: Send + Sync {
         limit: usize,
     ) -> Result<Vec<TranscriptRecord>, HostError>;
 
+    /// An authoritative read of the visible user/assistant prefix, stopping
+    /// before an exact canonical user item. Unsupported stores fail closed.
+    fn fork_prefix(
+        &self,
+        _session: &SessionId,
+        _before: &str,
+        _committed_head: u64,
+    ) -> Result<Vec<TurnItem>, HostError> {
+        Err(HostError::NotImplemented("durable session fork"))
+    }
+
+    /// Exactly the ordered displayed User/Assistant rows under the attached canonical cursor.
+    fn displayed_fork_prefix(
+        &self,
+        _session: &SessionId,
+        _selection: &harw_protocol::session_wire::DisplayedForkV1,
+        _thread: &harw_types::ThreadRef,
+    ) -> Result<Vec<TurnItem>, HostError> {
+        Err(HostError::NotImplemented("displayed session fork"))
+    }
+
+    /// The first sequence belonging to the current canonical transcript.
+    /// Archives keep the preceding records but chat replay must never mix them in.
+    fn canonical_floor(&self, _session: &SessionId, _head: u64) -> Result<u64, HostError> { Ok(0) }
+
     /// Sequence the next appended record will get (0 for no transcript).
     fn head(&self, session: &SessionId) -> Result<u64, HostError>;
 }
@@ -79,6 +104,55 @@ impl StoreTranscripts {
 }
 
 impl TranscriptSource for StoreTranscripts {
+    fn fork_prefix(
+        &self,
+        session: &SessionId,
+        before: &str,
+        committed_head: u64,
+    ) -> Result<Vec<TurnItem>, HostError> {
+        let mut reader = self
+            .store
+            .snapshot_reader(session, FORK_SCAN_MAX_BYTES)
+            .map_err(|error| match error {
+                SessionStoreError::CorruptRecord { .. } => HostError::Denied(
+                    "fork source journal is incomplete or exceeds its byte limit".into(),
+                ),
+                other => HostError::from(other),
+            })?;
+        let items = canonical_fork_prefix(
+            reader.by_ref().map(|record| {
+                record.map_err(|_| HostError::Denied("fork source journal is incomplete".into()))
+            }),
+            session,
+            before,
+            committed_head,
+        )?;
+        if !self.store.snapshot_is_current(session, &reader)? {
+            return Err(HostError::Busy(
+                "fork source journal has changed; try again".into(),
+            ));
+        }
+        Ok(items)
+    }
+
+    fn displayed_fork_prefix(
+        &self, session: &SessionId, selection: &harw_protocol::session_wire::DisplayedForkV1,
+        thread: &harw_types::ThreadRef,
+    ) -> Result<Vec<TurnItem>, HostError> {
+        let mut reader = self.store.snapshot_reader(session, FORK_SCAN_MAX_BYTES)
+            .map_err(|_| HostError::Denied("Displayed fork source unavailable or above the safe size limit".into()))?;
+        let items = canonical_fork_items(
+            reader.by_ref().map(|record| {
+                record.map_err(|_| HostError::Denied("Displayed fork source is incomplete".into()))
+            }), session, selection.head.durable, Some(thread),
+        )?;
+        let result = verified_displayed_fork(items, selection)?;
+        if !self.store.snapshot_is_current(session, &reader)? {
+            return Err(HostError::Busy("Displayed chat changed; refresh it and try Fork again".into()));
+        }
+        Ok(result)
+    }
+
     fn read_from(
         &self,
         session: &SessionId,
@@ -106,6 +180,11 @@ impl TranscriptSource for StoreTranscripts {
         Ok(records)
     }
 
+    fn canonical_floor(&self, session: &SessionId, head: u64) -> Result<u64, HostError> {
+        let Some(reader) = self.reader(session)? else { return Ok(0); };
+        canonical_floor(reader.map(|record| record.map_err(HostError::from)), head)
+    }
+
     fn head(&self, session: &SessionId) -> Result<u64, HostError> {
         let Some(reader) = self.reader(session)? else {
             return Ok(0);
@@ -122,6 +201,243 @@ impl TranscriptSource for StoreTranscripts {
         Ok(next)
     }
 }
+
+const FORK_SCAN_MAX_RECORDS: usize = 32_768;
+const FORK_SCAN_MAX_BYTES: u64 = 24 * 1024 * 1024;
+const FORK_MAX_ITEMS: usize = 512;
+const FORK_PREFIX_MAX_BYTES: usize = 2 * 1024 * 1024;
+const HISTORY_REPLACE_STARTED: &str = "history_replace_started";
+
+fn canonical_floor(
+    records: impl Iterator<Item = Result<TranscriptRecord, HostError>>,
+    head: u64,
+) -> Result<u64, HostError> {
+    let mut floor = 0;
+    let mut pending = None::<(u64, u64)>;
+    for record in records {
+        let record = record?;
+        if record.sequence >= head { break; }
+        if record.kind != RecordKind::Lifecycle { continue; }
+        let marker = record.payload.get("marker").and_then(serde_json::Value::as_str);
+        let count = record.payload.get("item_count").and_then(serde_json::Value::as_u64);
+        match (marker, count) {
+            (Some(HISTORY_REPLACE_STARTED), Some(count)) if pending.is_none() => {
+                pending = Some((record.sequence, count));
+            }
+            (Some(HISTORY_REPLACED_MARKER), Some(count)) => {
+                let first = record.sequence.checked_sub(count).ok_or_else(|| HostError::Storage("invalid replacement extent".into()))?;
+                if let Some((start, claimed_count)) = pending.take()
+                    && (claimed_count != count || Some(first) != start.checked_add(1))
+                {
+                    return Err(HostError::Storage("incomplete history replacement".into()));
+                }
+                floor = first;
+            }
+            (Some(HISTORY_REPLACE_STARTED | HISTORY_REPLACED_MARKER), _) =>
+                return Err(HostError::Storage("invalid history replacement".into())),
+            _ => {}
+        }
+    }
+    if pending.is_some() {
+        return Err(HostError::Storage("uncommitted history replacement".into()));
+    }
+    Ok(floor)
+}
+
+fn canonical_fork_items(
+    records: impl Iterator<Item = Result<TranscriptRecord, HostError>>,
+    session: &SessionId,
+    committed_head: u64,
+    expected_thread: Option<&harw_types::ThreadRef>,
+) -> Result<Vec<TurnItem>, HostError> {
+    let ambiguous = || HostError::Denied("fork source snapshot is incomplete or ambiguous".into());
+    let large = || HostError::Denied("fork source exceeds the snapshot limit".into());
+    let mut items = Vec::<TurnItem>::new();
+    let mut thread = None;
+    let mut pending = None;
+    let mut previous_committed = 0usize;
+    let mut scanned = 0u64;
+
+    for (index, record) in records.enumerate() {
+        if index >= FORK_SCAN_MAX_RECORDS {
+            return Err(large());
+        }
+        let record = record?;
+        if index as u64 >= committed_head {
+            return Err(HostError::Busy(
+                "fork source journal has changed; try again".into(),
+            ));
+        }
+        scanned += 1;
+        if record.session_id != *session || record.sequence != index as u64
+            || expected_thread.is_some_and(|thread| *thread != record.thread)
+        {
+            return Err(ambiguous());
+        }
+        let marker = record
+            .payload
+            .get("marker")
+            .and_then(serde_json::Value::as_str);
+        if record.kind != RecordKind::Item
+            && !(record.kind == RecordKind::Lifecycle
+                && matches!(
+                    marker,
+                    Some(HISTORY_REPLACE_STARTED | HISTORY_REPLACED_MARKER)
+                ))
+        {
+            continue;
+        }
+        let seen = thread.get_or_insert_with(|| record.thread.clone());
+        if seen.as_str() != record.thread.as_str() {
+            return Err(ambiguous());
+        }
+        if record.kind == RecordKind::Item {
+            items.push(serde_json::from_value(record.payload).map_err(|_| ambiguous())?);
+            continue;
+        }
+        let count = record
+            .payload
+            .get("item_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(ambiguous)?;
+        if marker == Some(HISTORY_REPLACE_STARTED) {
+            if pending.replace((items.len(), count)).is_some() || count > FORK_SCAN_MAX_RECORDS {
+                return Err(ambiguous());
+            }
+        } else if marker == Some(HISTORY_REPLACED_MARKER) {
+            if let Some((start, expected)) = pending.take() {
+                if expected != count || items.len().saturating_sub(start) != count {
+                    return Err(ambiguous());
+                }
+            } else if items.len().saturating_sub(previous_committed) < count {
+                return Err(ambiguous());
+            }
+            items.drain(..items.len() - count);
+            previous_committed = items.len();
+        }
+    }
+    if pending.is_some() || scanned != committed_head {
+        return Err(ambiguous());
+    }
+    Ok(items)
+}
+
+fn canonical_fork_prefix(
+    records: impl Iterator<Item = Result<TranscriptRecord, HostError>>,
+    session: &SessionId, before: &str, committed_head: u64,
+) -> Result<Vec<TurnItem>, HostError> {
+    use harw_protocol::items::ContentPart;
+    let ambiguous = || HostError::Denied("fork source snapshot is incomplete or ambiguous".into());
+    let large = || HostError::Denied("fork source exceeds the snapshot limit".into());
+    let items = canonical_fork_items(records, session, committed_head, None)?;
+    let mut unique = std::collections::HashSet::with_capacity(items.len());
+    let mut target = None;
+    for (offset, item) in items.iter().enumerate() {
+        let id = match item {
+            TurnItem::UserMessage(m) => m.id.as_str(),
+            TurnItem::AssistantMessage(m) => m.id.as_str(),
+            TurnItem::Reasoning(m) => m.id.as_str(),
+            TurnItem::ToolCall(m) => m.id.as_str(),
+            TurnItem::ToolResult(m) => m.id.as_str(),
+            TurnItem::Error(m) => m.id.as_str(),
+        };
+        if !unique.insert(id) {
+            return Err(ambiguous());
+        }
+        if id == before && matches!(item, TurnItem::UserMessage(_)) {
+            target = Some(offset);
+        }
+    }
+    let target = target.ok_or_else(|| {
+        HostError::Denied(
+            "fork target is not an exact canonical user message; archived suffixes are unsupported"
+                .into(),
+        )
+    })?;
+    let mut prefix = Vec::new();
+    let mut prefix_bytes = 0usize;
+    for item in items.into_iter().take(target) {
+        let item = match item {
+            TurnItem::UserMessage(mut m) => {
+                m.content.retain(|part| {
+                    matches!(part, ContentPart::Text { .. } | ContentPart::Media { .. })
+                });
+                TurnItem::UserMessage(m)
+            }
+            TurnItem::AssistantMessage(mut m) => {
+                m.content
+                    .retain(|part| matches!(part, ContentPart::Text { .. }));
+                TurnItem::AssistantMessage(m)
+            }
+            _ => continue,
+        };
+        prefix_bytes =
+            prefix_bytes.saturating_add(serde_json::to_vec(&item).map_err(|_| ambiguous())?.len());
+        if prefix.len() >= FORK_MAX_ITEMS || prefix_bytes > FORK_PREFIX_MAX_BYTES {
+            return Err(large());
+        }
+        prefix.push(item);
+    }
+    Ok(prefix)
+}
+
+fn verified_displayed_fork(
+    items: Vec<TurnItem>,
+    selection: &harw_protocol::session_wire::DisplayedForkV1,
+) -> Result<Vec<TurnItem>, HostError> {
+    use harw_protocol::items::ContentPart;
+    use harw_protocol::session_wire::{DISPLAYED_FORK_MAX_ROWS, DisplayedForkRoleV1, displayed_fork_body_v1};
+    let changed = || HostError::Denied("Displayed chat changed; refresh it and try Fork again".into());
+    let large = || HostError::Denied("The displayed prefix exceeds the safe fork limit; nothing was copied".into());
+    if !(1..=DISPLAYED_FORK_MAX_ROWS).contains(&selection.rows.len()) { return Err(large()); }
+    let mut actual = std::collections::HashMap::new();
+    for (position, row) in items.into_iter().enumerate() {
+        let id = match &row {
+            TurnItem::UserMessage(m) => m.id.as_str(),
+            TurnItem::AssistantMessage(m) => m.id.as_str(),
+            _ => continue,
+        };
+        if actual.insert(id.to_owned(), (position, row)).is_some() { return Err(changed()); }
+    }
+    let mut previous = None;
+    let mut prefix = Vec::with_capacity(selection.rows.len());
+    let mut total_bytes = 0usize;
+    for wanted in &selection.rows {
+        let (position, row) = actual.remove(&wanted.item_id).ok_or_else(changed)?;
+        if previous.is_some_and(|p| p >= position) { return Err(changed()); }
+        previous = Some(position);
+        let (role, content) = match &row {
+            TurnItem::UserMessage(m) => (DisplayedForkRoleV1::User, &m.content),
+            TurnItem::AssistantMessage(m) => (DisplayedForkRoleV1::Assistant, &m.content),
+            _ => return Err(changed()),
+        };
+        if role != wanted.role { return Err(changed()); }
+        let mut media = Vec::new();
+        let mut parts = Vec::with_capacity(content.len());
+        for part in content {
+            match part {
+                ContentPart::Text { text } => parts.push(text.as_str()),
+                ContentPart::Media { media: reference, .. } if role == DisplayedForkRoleV1::User => {
+                    media.push(reference.clone());
+                    parts.push("[image]");
+                }
+                _ => return Err(HostError::Denied("An attachment in the displayed chat is not available for a verified fork".into())),
+            }
+        }
+        // Must be the very row the UI drew, not an older/newer row that reused an ID.
+        let body = displayed_fork_body_v1(&parts.join("
+"), &media).map_err(|_| changed())?;
+        if blake3::hash(&body).as_bytes() != &wanted.body_digest { return Err(changed()); }
+        total_bytes = total_bytes.saturating_add(body.len());
+        if total_bytes > FORK_PREFIX_MAX_BYTES { return Err(large()); }
+        prefix.push(row);
+    }
+    Ok(prefix)
+}
+
+#[cfg(test)]
+mod fork_tests;
 
 /// In-memory [`TranscriptSource`] for host tests and fakes.
 #[derive(Debug, Default)]
@@ -267,16 +583,38 @@ pub fn replay(
     from: u64,
     limit: usize,
 ) -> Result<Vec<FrameEnvelope>, HostError> {
+    Ok(replay_page(source, session, generation, from, limit)?.frames)
+}
+
+pub(crate) struct ReplayPage {
+    pub frames: Vec<FrameEnvelope>,
+    /// Next record after the last **scanned** record, independent of filtering.
+    pub next_sequence: u64,
+}
+
+/// Same bounded replay scan as [`replay`], with the underlying transcript progress.
+pub(crate) fn replay_page(
+    source: &dyn TranscriptSource,
+    session: &SessionId,
+    generation: u32,
+    from: u64,
+    limit: usize,
+) -> Result<ReplayPage, HostError> {
     let limit = limit.min(MAX_PAGE);
+    let mut page = ReplayPage {
+        frames: Vec::new(),
+        next_sequence: from,
+    };
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(page);
     }
-    Ok(source
-        .read_from(session, from, limit)?
-        .iter()
-        .take(limit)
-        .filter_map(|record| envelope(record, session, generation))
-        .collect())
+    for record in source.read_from(session, from, limit)?.iter().take(limit) {
+        page.next_sequence = page.next_sequence.max(record.sequence.saturating_add(1));
+        if let Some(frame) = envelope(record, session, generation) {
+            page.frames.push(frame);
+        }
+    }
+    Ok(page)
 }
 
 /// First sequence to send for an attach without cursor: head.saturating_sub(tail_items).
@@ -305,9 +643,11 @@ pub fn history_before(
     // Collected newest window first; each window is ascending.
     let mut windows: Vec<Vec<FrameEnvelope>> = Vec::new();
     let mut found = 0_usize;
-    let mut high = before;
-    while high > 0 && found < limit {
-        let low = high.saturating_sub(window);
+    let head = source.head(session)?;
+    let floor = source.canonical_floor(session, head)?;
+    let mut high = before.min(head);
+    while high > floor && found < limit {
+        let low = high.saturating_sub(window).max(floor);
         let span = usize::try_from(high - low).unwrap_or(MAX_PAGE);
         let frames: Vec<FrameEnvelope> = source
             .read_from(session, low, span)?
@@ -528,6 +868,23 @@ mod tests {
         assert_eq!(tail_start(10, 3), 7);
         assert_eq!(tail_start(2, 5), 0);
         assert_eq!(tail_start(0, 0), 0);
+    }
+
+    #[test]
+    fn canonical_history_does_not_page_back_into_a_retained_pre_edit_suffix() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let store = TranscriptStore::new(temp.path());
+        store.append(&item_record(0, "old prefix")?)?;
+        store.append(&item_record(1, "old suffix")?)?;
+        store.append(&item_record(2, "replacement prefix")?)?;
+        store.append(&item_record(3, "replacement prompt")?)?;
+        store.append(&history_replaced_record(4, 2))?;
+        store.append(&item_record(5, "current answer")?)?;
+        let source = StoreTranscripts::new(store);
+        assert_eq!(source.canonical_floor(&session(), 6)?, 2);
+        assert!(history_before(&source, &session(), 0, 2, 100)?.is_empty());
+        assert_eq!(durables(&history_before(&source, &session(), 0, 6, 100)?), [3, 4, 5, 6]);
+        Ok(())
     }
 
     #[test]

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Verify the exact exported Android JNI surface before enabling the local UI.
+set -euo pipefail
+library=${1:?usage: verify-local-uia-bridge /path/to/libharw_mobile_ffi.so [readelf]}
+reader=${2:-readelf}
+symbols=$("$reader" --dyn-syms --wide "$library" |
+    awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" { print $NF }')
+required_symbols=(
+    LocalUiaDevCapability_activeProfileNative
+    AndroidVaultPinKdf_deriveInPlace
+    AndroidUiaRoomPinNative_provisionNewNative
+    AndroidUiaRoomPinNative_resumeEnrollmentNative
+    AndroidUiaRoomPinNative_canRestartUncommittedNative
+    AndroidUiaRoomPinNative_retireUncommittedNative
+    AndroidUiaRoomPinNative_openExistingNative
+    AndroidUiaRoomPinNative_openExistingBiometricNative
+    AndroidUiaRoomPinNative_revokeNative
+    AndroidUiaRoomPinNative_cloudWorkNative
+    AndroidUiaRoomPinNative_memoryNative
+    AndroidUiaRoomPinNative_readRoomNative
+    AndroidUiaRoomPinNative_reserveRoomNative
+    AndroidUiaRoomPinNative_cancelRoomNative
+    AndroidUiaRoomPinNative_parkRoomVersionNative
+    AndroidUiaRoomPinNative_hasPendingParkedResponseNative
+    AndroidUiaRoomPinNative_parkRoomNative
+    AndroidUiaRoomPinNative_cancelParkedRoomNative
+    AndroidUiaRoomPinNative_runRoomNative
+    AndroidUiaRoomPinNative_libraryNative
+)
+for symbol in "${required_symbols[@]}"; do
+    if ! grep -Fxq "Java_dev_harw_mobile_$symbol" <<<"$symbols"; then
+        echo "Local UIA native bridge is missing $symbol." >&2
+        exit 1
+    fi
+done

@@ -272,6 +272,47 @@ impl SecretStoreWriter {
             .map_err(store_error_message)?;
         Ok(SecretRef::Secrets(id.to_string()))
     }
+
+    /// Write-only-Senke fuer `secret.put` und Rollback (Welle 3 S3). Keine Lese-Methode.
+    pub(crate) fn sink(&mut self) -> &mut dyn harw_secrets::write_only::WriteOnlySecretSink {
+        &mut self.store
+    }
+}
+
+/// Resolves one sealed `secrets:<uuid>` reference for a harw-internal consumer
+/// (the admin service's TOTP seed). Unlike
+/// [`open_configured_secret_resolver`] this does not depend on a provider
+/// using sealed secrets; the sealing (AuthHub or local KEK) is chosen the same
+/// way as for writing.
+///
+/// # Errors
+/// A message without secret content.
+pub(crate) fn resolve_sealed(
+    home: &Path,
+    config: &ResolvedConfig,
+    reference: &str,
+) -> Result<SecretString, String> {
+    let store = match select_secret_sealing(config)? {
+        SecretSealing::LocalV2 => {
+            let kek = ensure_local_kek(home, config)?;
+            open_store_with_kek(home, &kek)?
+        }
+        SecretSealing::AuthHubV3 => open_hub_reader_store(home, config)?,
+    };
+    ConfiguredSecretResolver::new(store).resolve(reference)
+}
+
+/// Best-effort removal of a sealed secret that is no longer referenced.
+pub(crate) fn discard_sealed(home: &Path, config: &ResolvedConfig, reference: &str) {
+    let Some(raw) = reference.strip_prefix("secrets:") else {
+        return;
+    };
+    let Ok(id) = harw_secrets::SecretId::parse(raw) else {
+        return;
+    };
+    if let Ok(mut writer) = open_secret_store_for_writing(home, config) {
+        let _ = harw_secrets::write_only::WriteOnlySecretSink::discard(writer.sink(), &id);
+    }
 }
 
 /// Opens the store for writing and seals `value` once, see

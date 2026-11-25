@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_vision_settings_default_title">Default for new image descriptions</string>
+    <string name="harw_vision_settings_mode_local">Local</string>
+    <string name="harw_vision_settings_mode_api">API</string>
+    <string name="harw_vision_settings_default_explanation">This chooses which dialog opens in chat. Images are processed or sent only after you confirm.</string>
+    <string name="harw_vision_settings_hide_api_settings">Hide API settings</string>
+    <string name="harw_vision_settings_show_api_settings">Configure optional API routes</string>
+    <string name="harw_vision_settings_api_routes_failed">Could not read the API image routes.</string>
+    <string name="harw_vision_settings_api_routes_empty">No supported route is configured with an API key and a model that supports images.</string>
+    <string name="harw_vision_settings_choose_api_route">Choose API provider or route</string>
+    <string name="harw_vision_settings_choose_api_model">Choose API model</string>
+    <string name="harw_vision_settings_api_preselection">Preselected: %1$s · %2$s\n%3$s</string>
+    <string name="harw_vision_settings_no_preselection">Without a verified default, choose a route and model in the dialog.</string>
+    <string name="harw_vision_settings_local_api_alternative_title">Optional API alternative after local analysis</string>
+    <string name="harw_vision_settings_api_failure_alternative_title">Optional alternative after an API failure</string>
+    <string name="harw_vision_settings_confirm_new_selection">Nothing is sent until you select images again and confirm.</string>
+    <string name="harw_vision_settings_choose_alternative_route">Choose an alternative route</string>
+    <string name="harw_vision_settings_choose_alternative_model">Choose an alternative model</string>
+    <string name="harw_vision_settings_remove_api_alternative">Remove API alternative</string>
+    <string name="harw_vision_settings_manage_device_providers">Manage providers on this device</string>
+    <string name="harw_vision_settings_api_parallelism">Concurrent API requests: %1$d</string>
+    <string name="harw_vision_settings_api_parallelism_detail">Applies only to new API image analysis. Provider limits can reduce the actual number of concurrent requests.</string>
+    <string name="harw_vision_settings_local_preferred_model">Preferred local vision model</string>
+    <string name="harw_vision_settings_local_model_loaded">%1$s · loaded</string>
+    <string name="harw_vision_settings_local_model_installed">%1$s · installed</string>
+    <string name="harw_vision_settings_local_model_unavailable">Currently unavailable: %1$s</string>
+    <string name="harw_vision_settings_local_no_preference">No local model preference</string>
+    <string name="harw_vision_settings_local_models_unreadable">Could not read the installed models.</string>
+    <string name="harw_vision_settings_local_no_compatible_projector">No fully installed vision model with a compatible projector was found.</string>
+    <string name="harw_vision_settings_local_offer_loaded_alternative">Offer another compatible model that is already loaded as a local alternative</string>
+    <string name="harw_vision_settings_local_current_effective">Loaded: %1$s · up to %2$d at a time</string>
+    <string name="harw_vision_settings_local_alternative_effective">Local alternative: %1$s · up to %2$d at a time</string>
+    <string name="harw_vision_settings_local_effective_unavailable">This choice does not change the chat model or load a model. The actual limit appears when a model is loaded.</string>
+    <string name="harw_vision_settings_api_alternative_checking">Checking the API alternative …</string>
+    <string name="harw_vision_settings_api_alternative_saved">Saved API alternative: %1$s · %2$s</string>
+    <string name="harw_vision_settings_api_alternative_new_selection">Select images again with this API alternative</string>
+    <string name="harw_vision_settings_api_choose_manually">Choose an API route manually</string>
+    <string name="harw_vision_settings_api_alternative_privacy">Local images are not carried over. Select images again and confirm sending separately.</string>
+    <string name="harw_vision_settings_observed_parallelism">%1$s · %2$s: %3$d parallel requests observed in three complete batches without throttling. This is not a capacity guarantee.</string>
+    <string name="harw_vision_settings_apply_observed_parallelism">Use %1$d as the API default</string>
+</resources>

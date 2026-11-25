@@ -1705,7 +1705,10 @@ async fn run_summary(
         StopReason::MaxTokens => true,
         StopReason::Refusal { .. }
         | StopReason::ContentFilter
-        | StopReason::ContextWindowExceeded => {
+        | StopReason::ContextWindowExceeded
+        | StopReason::StreamInterrupted
+        | StopReason::StreamTransportInterrupted
+        | StopReason::IncompleteUnknown => {
             tracing::warn!(
                 stop = ?response.stop,
                 "compaction summary call stopped without usable summary; keeping deterministic result"

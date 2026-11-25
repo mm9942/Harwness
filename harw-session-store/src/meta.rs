@@ -50,9 +50,18 @@
 //! # Nebenläufigkeit
 //! Alle Funktionen sind zustandslos (`Send + Sync`). Lesen erfolgt
 //! symlinkfest über [`harw_fsutil::open_nofollow`], Schreiben atomar über
-//! [`harw_fsutil::write_atomic`] mit Rechten `0600`; es gibt keinen
-//! Datei-Lock, weil `save` den Sidecar immer vollständig ersetzt (kein
-//! Read-Modify-Write mehrerer Schreiber auf dieselbe Datei ist vorgesehen).
+//! [`harw_fsutil::write_atomic`] mit Rechten `0600`.
+//!
+//! ## Meta-Sperre
+//! Jede schreibende Funktion (`save`, [`update`], [`load_or_derive`],
+//! `touch_opened`, `set_*`, `add_*`) hält für die Dauer von
+//! Lesen-Ändern-Schreiben eine blockierende Advisory-Sperre auf
+//! `<id>.meta.lock` (siehe [`meta_lock_path`]); parallele Schreiber (TUI,
+//! Gateway, Hintergrundjobs) verlieren so keine Änderungen. Die Sperre ist
+//! **nicht reentrant**: innerhalb einer gesperrten Funktion dürfen nur die
+//! internen `*_unlocked`-Varianten laufen, nie eine öffentliche
+//! Schreibfunktion (Code-Review-Regel). [`load`] und [`peek`] sperren nicht;
+//! sie sehen dank atomarem Ersetzen immer einen vollständigen Stand.
 //!
 //! # Beispiel
 //! ```rust,no_run
@@ -69,9 +78,11 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use fs4::FileExt;
 use harw_fsutil::{AtomicWriteOptions, OpenMode, is_symlink_loop, open_nofollow, write_atomic};
 use harw_types::SessionId;
 use jiff::Timestamp;
@@ -86,6 +97,9 @@ pub const SESSION_META_VERSION: u32 = 1;
 
 /// Dateiendung des Sidecars: `<session-id>.meta.json`.
 const META_EXTENSION: &str = "meta.json";
+
+/// Endung der Meta-Sperrdatei (`<id>.meta.lock`).
+const META_LOCK_EXTENSION: &str = "meta.lock";
 
 /// Obergrenze für `first_user_message` (zeichensicher gekürzt).
 const MAX_FIRST_USER_MESSAGE_CHARS: usize = 200;
@@ -164,6 +178,28 @@ pub struct SessionMeta {
     /// wird die Art hier als `String` geführt statt als `DriftKind`.
     #[serde(default)]
     pub drift_events: BTreeMap<String, u64>,
+    /// Plan §3.4: archivierte Sessions blendet die Liste aus.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    /// Wer zuletzt einen Turn geschrieben hat (`harw -r`: "zuletzt: Handy").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_origin: Option<LastOrigin>,
+    /// Ende des letzten Turns (Server-Uhr). Geht in `updated_at` der Liste ein.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<Timestamp>,
+}
+
+/// Woher der letzte Turn kam. Datei: `"tui" | "gateway"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LastOrigin {
+    /// Terminal-Oberfläche (`harw`).
+    Tui,
+    /// Gateway (Handy, Web über den Session-Host).
+    Gateway,
+    /// Unbekannter Wert einer neueren Fassung (sonst würde der ganze Sidecar verworfen).
+    #[serde(other)]
+    Unknown,
 }
 
 impl SessionMeta {
@@ -187,6 +223,9 @@ impl SessionMeta {
             usage_rounds: 0,
             total_usage: harw_types::TokenUsage::default(),
             drift_events: BTreeMap::new(),
+            archived: false,
+            last_origin: None,
+            last_activity_at: None,
         }
     }
 
@@ -220,6 +259,47 @@ impl SessionMeta {
 #[must_use]
 pub fn meta_path(root: &Path, id: &SessionId) -> PathBuf {
     root.join(format!("{}.{META_EXTENSION}", id.as_str()))
+}
+
+/// Leitet den Pfad der Meta-Sperrdatei `<root>/<id>.meta.lock` her.
+///
+/// Rein syntaktisch (keine I/O), wie [`meta_path`].
+#[must_use]
+pub fn meta_lock_path(root: &Path, id: &SessionId) -> PathBuf {
+    root.join(format!("{}.{META_LOCK_EXTENSION}", id.as_str()))
+}
+
+/// Gehaltene Meta-Sperre; gibt beim Drop frei (Absturz: das Betriebssystem).
+struct MetaLock {
+    file: File,
+}
+
+impl MetaLock {
+    /// Nimmt die blockierende Sperre auf `<id>.meta.lock`.
+    ///
+    /// Öffnet symlinkfest (`write+create`, `0600`); ein Symlink als
+    /// Sperrdatei ergibt einen `Io`-Fehler.
+    fn acquire(root: &Path, id: &SessionId) -> SessionStoreResult<Self> {
+        ensure_addressable(root, id)?;
+        std::fs::create_dir_all(root).map_err(SessionStoreError::Io)?;
+        let path = meta_lock_path(root, id);
+        let mode = OpenMode {
+            write: true,
+            create: true,
+            ..OpenMode::read_only()
+        };
+        let file = open_nofollow(&path, mode).map_err(SessionStoreError::Io)?;
+        FileExt::lock(&file).map_err(SessionStoreError::Io)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for MetaLock {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            tracing::warn!(error = %error, "failed to release session meta lock");
+        }
+    }
 }
 
 /// Prüft, dass `id` als Transcript-Pfad unterhalb von `root` adressierbar
@@ -287,10 +367,16 @@ pub fn load(root: &Path, id: &SessionId) -> SessionStoreResult<Option<SessionMet
 /// # Errors
 /// - [`SessionStoreError::UnsafeTranscriptPath`]: `meta.session_id` ist
 ///   keine gültige Transcript-Session-ID.
-/// - [`SessionStoreError::Io`]: Anlegen des Verzeichnisses oder atomares
-///   Schreiben ist gescheitert.
+/// - [`SessionStoreError::Io`]: Meta-Sperre, Anlegen des Verzeichnisses oder
+///   atomares Schreiben ist gescheitert.
 /// - [`SessionStoreError::Serde`]: `meta` ließ sich nicht kodieren.
 pub fn save(root: &Path, meta: &SessionMeta) -> SessionStoreResult<()> {
+    let _lock = MetaLock::acquire(root, &meta.session_id)?;
+    save_unlocked(root, meta)
+}
+
+// Wie `save`, aber ohne Meta-Sperre; der Aufrufer hält sie bereits.
+fn save_unlocked(root: &Path, meta: &SessionMeta) -> SessionStoreResult<()> {
     ensure_addressable(root, &meta.session_id)?;
     let path = meta_path(root, &meta.session_id);
     let parent = path.parent().ok_or_else(|| {
@@ -332,12 +418,18 @@ pub fn save(root: &Path, meta: &SessionMeta) -> SessionStoreResult<()> {
 /// - [`SessionStoreError::CorruptRecord`], [`SessionStoreError::Io`]: das
 ///   Transcript selbst ist nicht lesbar (defekter Datensatz, Symlink, …).
 pub fn load_or_derive(root: &Path, id: &SessionId) -> SessionStoreResult<SessionMeta> {
+    let _lock = MetaLock::acquire(root, id)?;
+    load_or_derive_unlocked(root, id)
+}
+
+// Wie `load_or_derive`, aber ohne Meta-Sperre; der Aufrufer hält sie bereits.
+fn load_or_derive_unlocked(root: &Path, id: &SessionId) -> SessionStoreResult<SessionMeta> {
     if let Some(mut meta) = load(root, id)? {
         if meta.first_user_message.is_none()
             && let Some(text) = first_user_message_from_transcript(root, id)?
         {
             meta.first_user_message = Some(text);
-            if let Err(error) = save(root, &meta) {
+            if let Err(error) = save_unlocked(root, &meta) {
                 tracing::warn!(
                     session = %id,
                     error = %error,
@@ -348,7 +440,7 @@ pub fn load_or_derive(root: &Path, id: &SessionId) -> SessionStoreResult<Session
         return Ok(meta);
     }
     let derived = derive_from_transcript(root, id)?;
-    if let Err(error) = save(root, &derived) {
+    if let Err(error) = save_unlocked(root, &derived) {
         tracing::warn!(
             session = %id,
             error = %error,
@@ -438,6 +530,9 @@ fn derive_from_transcript(root: &Path, id: &SessionId) -> SessionStoreResult<Ses
         usage_rounds: 0,
         total_usage: harw_types::TokenUsage::default(),
         drift_events: BTreeMap::new(),
+        archived: false,
+        last_origin: None,
+        last_activity_at: None,
     })
 }
 
@@ -531,9 +626,10 @@ pub fn touch_opened(
     id: &SessionId,
     now: Timestamp,
 ) -> SessionStoreResult<SessionMeta> {
-    let mut meta = load_or_derive(root, id)?;
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = load_or_derive_unlocked(root, id)?;
     meta.last_opened_at = now;
-    save(root, &meta)?;
+    save_unlocked(root, &meta)?;
     Ok(meta)
 }
 
@@ -553,14 +649,82 @@ pub fn set_title(
     title: &str,
     source: TitleSource,
 ) -> SessionStoreResult<SessionMeta> {
-    let mut meta = load_or_derive(root, id)?;
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = load_or_derive_unlocked(root, id)?;
+    apply_title(&mut meta, title, source);
+    save_unlocked(root, &meta)?;
+    Ok(meta)
+}
+
+/// Speichert ein Ergebnis der automatischen Titelvergabe nur, solange der
+/// Titel noch nicht manuell gesetzt oder bereits vom Modell bestimmt wurde.
+/// Prüfung und Schreiben teilen dieselbe Sperre wie eine manuelle Umbenennung.
+///
+/// # Errors
+/// Wie [`load_or_derive`] und [`save`].
+pub fn set_automatic_title_if_unresolved(
+    root: &Path,
+    id: &SessionId,
+    title: &str,
+    model_generated: bool,
+) -> SessionStoreResult<SessionMeta> {
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = load_or_derive_unlocked(root, id)?;
+    if matches!(meta.title_source, TitleSource::Manual | TitleSource::Model) {
+        return Ok(meta);
+    }
+    let source = if model_generated {
+        TitleSource::Model
+    } else {
+        TitleSource::Fallback
+    };
+    apply_title(&mut meta, title, source);
+    save_unlocked(root, &meta)?;
+    Ok(meta)
+}
+
+/// Strict compare-and-set for a model result from an interactive client.
+/// Never writes over any stored title, even a fallback or a blank manual title.
+/// Uses the same sidecar lock as ordinary rename and TUI title changes.
+///
+/// # Errors
+/// Storage/lock errors and invalid title content are returned to the caller.
+pub fn set_model_title_if_untitled(
+    root: &Path,
+    id: &SessionId,
+    title: &str,
+) -> SessionStoreResult<Option<SessionMeta>> {
+    let title = normalize_whitespace(title);
+    if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS || title.chars().any(char::is_control) {
+        return Err(SessionStoreError::CorruptRecord { detail: "invalid generated session title".into() });
+    }
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = match load(root, id)? {
+        Some(meta) => meta,
+        None => match std::fs::symlink_metadata(meta_path(root, id)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                SessionMeta::fresh(id.clone(), Timestamp::now())
+            }
+            Err(error) => return Err(SessionStoreError::Io(error)),
+            Ok(_) => return Err(SessionStoreError::CorruptRecord {
+                detail: "Cannot prove untitled session metadata".to_owned(),
+            }),
+        },
+    };
+    if meta.title.is_some() || meta.title_source != TitleSource::None {
+        return Ok(None);
+    }
+    apply_title(&mut meta, &title, TitleSource::Model);
+    save_unlocked(root, &meta)?;
+    Ok(Some(meta))
+}
+
+fn apply_title(meta: &mut SessionMeta, title: &str, source: TitleSource) {
     meta.title = Some(truncate_chars(
         &normalize_whitespace(title),
         MAX_TITLE_CHARS,
     ));
     meta.title_source = source;
-    save(root, &meta)?;
-    Ok(meta)
 }
 
 /// Setzt die Projekt-Zuordnung einer Session (`cwd`, `project_root`,
@@ -575,11 +739,12 @@ pub fn set_project(
     project_root: Option<&Path>,
     project_key: Option<&str>,
 ) -> SessionStoreResult<SessionMeta> {
-    let mut meta = load_or_derive(root, id)?;
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = load_or_derive_unlocked(root, id)?;
     meta.cwd = cwd.map(Path::to_path_buf);
     meta.project_root = project_root.map(Path::to_path_buf);
     meta.project_key = project_key.map(str::to_owned);
-    save(root, &meta)?;
+    save_unlocked(root, &meta)?;
     Ok(meta)
 }
 
@@ -604,11 +769,12 @@ pub fn add_usage_round(
     id: &SessionId,
     usage: &harw_types::TokenUsage,
 ) -> SessionStoreResult<SessionMeta> {
-    let mut meta = load_or_derive(root, id)?;
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = load_or_derive_unlocked(root, id)?;
     meta.usage_rounds += 1;
     meta.turns += 1;
     meta.total_usage.add(usage);
-    save(root, &meta)?;
+    save_unlocked(root, &meta)?;
     Ok(meta)
 }
 
@@ -631,10 +797,62 @@ pub fn add_usage_round(
 /// # Errors
 /// Wie [`load_or_derive`] und [`save`].
 pub fn add_drift_event(root: &Path, id: &SessionId, kind: &str) -> SessionStoreResult<SessionMeta> {
-    let mut meta = load_or_derive(root, id)?;
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = load_or_derive_unlocked(root, id)?;
     *meta.drift_events.entry(kind.to_owned()).or_insert(0) += 1;
-    save(root, &meta)?;
+    save_unlocked(root, &meta)?;
     Ok(meta)
+}
+
+/// Lesen-Ändern-Schreiben unter der Meta-Sperre.
+///
+/// # Description
+/// Lädt über die ungesperrte Variante von [`load_or_derive`], wendet `change`
+/// an, speichert ungesperrt und gibt das Ergebnis zurück. `change` darf keine
+/// öffentliche Schreibfunktion dieses Moduls aufrufen (Sperre nicht
+/// reentrant, sonst Selbst-Deadlock).
+///
+/// # Errors
+/// Wie [`load_or_derive`] und [`save`].
+pub fn update(
+    root: &Path,
+    id: &SessionId,
+    change: impl FnOnce(&mut SessionMeta),
+) -> SessionStoreResult<SessionMeta> {
+    let _lock = MetaLock::acquire(root, id)?;
+    let mut meta = load_or_derive_unlocked(root, id)?;
+    change(&mut meta);
+    save_unlocked(root, &meta)?;
+    Ok(meta)
+}
+
+/// Setzt `last_origin = origin` und `last_activity_at = Some(at)` unter der
+/// Meta-Sperre.
+///
+/// # Errors
+/// Wie [`update`].
+pub fn set_last_origin(
+    root: &Path,
+    id: &SessionId,
+    origin: LastOrigin,
+    at: Timestamp,
+) -> SessionStoreResult<SessionMeta> {
+    update(root, id, |meta| {
+        meta.last_origin = Some(origin);
+        meta.last_activity_at = Some(at);
+    })
+}
+
+/// Setzt `archived` unter der Meta-Sperre.
+///
+/// # Errors
+/// Wie [`update`].
+pub fn set_archived(
+    root: &Path,
+    id: &SessionId,
+    archived: bool,
+) -> SessionStoreResult<SessionMeta> {
+    update(root, id, |meta| meta.archived = archived)
 }
 
 /// Leitet einen Fallback-Titel aus der ersten Nutzernachricht ab.
@@ -718,6 +936,9 @@ mod tests {
                 cache_write_tokens: Some(5),
             },
             drift_events: BTreeMap::from([("repeated_failing_call".to_owned(), 2)]),
+            archived: false,
+            last_origin: None,
+            last_activity_at: None,
         };
 
         save(temp.path(), &meta)?;
@@ -1018,6 +1239,35 @@ mod tests {
     }
 
     #[test]
+    fn automatic_title_does_not_overwrite_manual_or_model_title() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let manual = SessionId::from_str("manual-title-race");
+        let model = SessionId::from_str("two-automatic-title-jobs");
+
+        set_title(temp.path(), &manual, "My title", TitleSource::Manual)?;
+        let manual_meta =
+            set_automatic_title_if_unresolved(temp.path(), &manual, "Late model result", true)?;
+        assert_eq!(manual_meta.title.as_deref(), Some("My title"));
+        assert_eq!(manual_meta.title_source, TitleSource::Manual);
+
+        set_title(
+            temp.path(),
+            &model,
+            "Readable fallback",
+            TitleSource::Fallback,
+        )?;
+        let improved =
+            set_automatic_title_if_unresolved(temp.path(), &model, "First model result", true)?;
+        assert_eq!(improved.title.as_deref(), Some("First model result"));
+        assert_eq!(improved.title_source, TitleSource::Model);
+        let retained =
+            set_automatic_title_if_unresolved(temp.path(), &model, "Late fallback", false)?;
+        assert_eq!(retained.title.as_deref(), Some("First model result"));
+        assert_eq!(retained.title_source, TitleSource::Model);
+        Ok(())
+    }
+
+    #[test]
     fn set_project_updates_and_clears_fields() -> TestResult {
         let temp = tempfile::tempdir()?;
         let session = SessionId::from_str("session-a");
@@ -1169,6 +1419,127 @@ mod tests {
             save(temp.path(), &meta),
             Err(SessionStoreError::UnsafeTranscriptPath(value)) if value == "../escape"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn old_meta_without_new_fields_loads() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-old");
+        let json = serde_json::json!({
+            "version": 1,
+            "session_id": "session-old",
+            "title": null,
+            "title_source": "none",
+            "created_at": "2025-01-01T00:00:00Z",
+            "last_opened_at": "2025-01-01T00:00:00Z",
+            "cwd": null,
+            "project_root": null,
+            "project_key": null,
+            "first_user_message": "Hallo",
+            "turns": 1
+        });
+        std::fs::write(meta_path(temp.path(), &session), serde_json::to_vec(&json)?)?;
+        let loaded = load(temp.path(), &session)?.ok_or(TestError::Missing("sidecar"))?;
+        assert!(!loaded.archived);
+        assert_eq!(loaded.last_origin, None);
+        assert_eq!(loaded.last_activity_at, None);
+        Ok(())
+    }
+
+    #[test]
+    fn meta_without_new_values_serializes_byte_identical() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-a");
+        save(
+            temp.path(),
+            &SessionMeta::fresh(session.clone(), Timestamp::now()),
+        )?;
+        let text = std::fs::read_to_string(meta_path(temp.path(), &session))?;
+        for key in ["archived", "last_origin", "last_activity_at"] {
+            assert!(!text.contains(key), "unexpected key {key}: {text}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_last_origin_decodes_to_unknown() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-new");
+        let json = serde_json::json!({
+            "version": 1,
+            "session_id": "session-new",
+            "title": null,
+            "title_source": "none",
+            "created_at": "2025-01-01T00:00:00Z",
+            "last_opened_at": "2025-01-01T00:00:00Z",
+            "cwd": null,
+            "project_root": null,
+            "project_key": null,
+            "first_user_message": "Hallo",
+            "turns": 1,
+            "last_origin": "watch"
+        });
+        std::fs::write(meta_path(temp.path(), &session), serde_json::to_vec(&json)?)?;
+        let loaded = load(temp.path(), &session)?.ok_or(TestError::Missing("sidecar"))?;
+        assert_eq!(loaded.last_origin, Some(LastOrigin::Unknown));
+        Ok(())
+    }
+
+    #[test]
+    fn set_last_origin_sets_origin_and_activity() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-a");
+        let at: Timestamp = "2026-01-02T03:04:05Z"
+            .parse()
+            .map_err(ctx("parse timestamp"))?;
+        let meta = set_last_origin(temp.path(), &session, LastOrigin::Gateway, at)?;
+        assert_eq!(meta.last_origin, Some(LastOrigin::Gateway));
+        assert_eq!(meta.last_activity_at, Some(at));
+        assert_eq!(load(temp.path(), &session)?, Some(meta));
+        Ok(())
+    }
+
+    #[test]
+    fn set_archived_round_trip() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-a");
+        assert!(set_archived(temp.path(), &session, true)?.archived);
+        assert_eq!(load(temp.path(), &session)?.map(|m| m.archived), Some(true));
+        assert!(!set_archived(temp.path(), &session, false)?.archived);
+        assert_eq!(
+            load(temp.path(), &session)?.map(|m| m.archived),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_updates_lose_nothing() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let session = SessionId::from_str("session-a");
+        save(
+            temp.path(),
+            &SessionMeta::fresh(session.clone(), Timestamp::now()),
+        )?;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let root = temp.path().to_path_buf();
+                let id = session.clone();
+                std::thread::spawn(move || -> SessionStoreResult<()> {
+                    for _ in 0..50 {
+                        update(&root, &id, |meta| meta.turns += 1)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| TestError::Unexpected("updater thread panicked".to_owned()))??;
+        }
+        assert_eq!(load(temp.path(), &session)?.map(|m| m.turns), Some(100));
         Ok(())
     }
 }

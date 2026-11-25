@@ -21,14 +21,20 @@ harw-provider = { path = "../harw-provider" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 secrecy = "0.10.3"
 # Images go out as base64 (`images.rs`); already a dev-dependency here.
 base64 = "0.23.1"
 serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["time", "sync"] }
+# url_guard: tokio::net::lookup_host (SystemResolver).
+tokio = { version = "1.52.3", features = ["time", "sync", "net"] }
 tracing = "0.1.44"
+
+# The OS keyring has no Android backend; `keyring:` references fail closed
+# there (src/lib.rs `read_keyring_secret`). Phones resolve `secrets:` refs
+# through an injected SecretResolver (Android Keystore).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 harw-test-support = { path = "../harw-test-support" }

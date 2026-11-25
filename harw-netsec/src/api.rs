@@ -6,6 +6,8 @@
 //! | GET    | `/v1/health`                           | `{"status":"ok"}`           |
 //! | GET    | `/v1/version`                          | service, version, protocol  |
 //! | GET    | `/v1/capabilities`                     | service, protocol, ops      |
+//! | GET    | `/v1/owner-epochs/{id}`                | pinned readers, one epoch   |
+//! | GET    | `/v2/owner-epochs/{id}`                | same readers, one activation and daemon incarnation |
 //! | GET    | `/v1/nodes`                            | `{"nodes":[NodeRecord…]}`   |
 //! | POST   | `/v1/nodes`                            | 201 + pending `NodeRecord`  |
 //! | GET    | `/v1/nodes/{id}`                       | `NodeRecord`                |
@@ -19,6 +21,8 @@
 //!
 //! Errors are `{"error":{"code":"…","message":"…"}}`. Capabilities are
 //! descriptive, never authority (masterplan §38).
+
+use std::num::NonZeroU64;
 
 use hyper::Method;
 use serde::{Deserialize, Serialize};
@@ -45,6 +49,8 @@ pub const OPERATIONS: &[&str] = &[
 ];
 
 const NODES_PREFIX: &str = "/v1/nodes/";
+const OWNER_EPOCH_PREFIX: &str = "/v1/owner-epochs/";
+const OWNER_AUTHORITY_PREFIX: &str = "/v2/owner-epochs/";
 
 /// A resolved endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +67,10 @@ pub enum Endpoint {
     RegisterNode,
     /// `GET /v1/nodes/{id}` (raw, not yet validated id).
     GetNode(String),
+    /// `GET /v1/owner-epochs/{id}` (separate read-only UID allowlist).
+    GetOwnerEpoch(String),
+    /// `GET /v2/owner-epochs/{id}` (same opt-in read-only UID allowlist).
+    GetOwnerAuthority(String),
     /// `POST /v1/nodes/{id}:{action}`.
     NodeAction(String, NodeEvent),
     /// `GET /v1/zones`.
@@ -107,6 +117,18 @@ pub fn resolve(method: &Method, path: &str) -> Result<Endpoint, ResolveError> {
         }
         _ => {}
     }
+    if let Some(id) = path.strip_prefix(OWNER_EPOCH_PREFIX) {
+        if id.is_empty() || id.contains('/') {
+            return Err(ResolveError::NotFound);
+        }
+        return only(Method::GET, Endpoint::GetOwnerEpoch(id.to_owned()));
+    }
+    if let Some(id) = path.strip_prefix(OWNER_AUTHORITY_PREFIX) {
+        if id.is_empty() || id.contains('/') {
+            return Err(ResolveError::NotFound);
+        }
+        return only(Method::GET, Endpoint::GetOwnerAuthority(id.to_owned()));
+    }
     let Some(rest) = path.strip_prefix(NODES_PREFIX) else {
         return Err(ResolveError::NotFound);
     };
@@ -125,6 +147,26 @@ pub fn resolve(method: &Method, path: &str) -> Result<Endpoint, ResolveError> {
             only(Method::POST, Endpoint::NodeAction(id.to_owned(), event))
         }
     }
+}
+
+/// Exactly one result for a selected node, never an enumeration.
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum OwnerEpochResponse<'a> {
+    Active { node: &'a str, epoch: NonZeroU64 },
+    Unavailable { node: &'a str },
+}
+
+/// Exact current activation and the ephemeral daemon that observed it.
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum OwnerAuthorityResponse<'a> {
+    Active {
+        node: &'a str,
+        epoch: NonZeroU64,
+        authority_instance: [u8; 32],
+    },
+    Unavailable { node: &'a str },
 }
 
 /// Optional body of `POST /v1/nodes/{id}:{action}`. An empty body is the

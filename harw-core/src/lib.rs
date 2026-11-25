@@ -35,6 +35,8 @@ pub mod child_lease_heartbeat;
 pub mod compaction;
 pub mod context_budget;
 pub mod delegation_visibility;
+// PL-100 Phase 4 (B22, O1): DoD-Taint je Turn.
+pub mod dod_taint;
 pub mod durable_job_runner;
 pub mod envelope;
 pub mod error;
@@ -124,9 +126,10 @@ pub use history_tail::{
 };
 pub use media::{ModelImage, install_media_source, resolve_media, resolve_media_with};
 pub use mode::InteractionMode;
+pub use model::current_session_id;
 pub use model::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,
-    RequestIdentity,
+    REPLAY_UNAVAILABLE_CODE, RequestIdentity,
 };
 pub use one_shot::{OneShotError, complete_text};
 pub use pinned_model::PinnedModelProvider;

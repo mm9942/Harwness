@@ -1,0 +1,45 @@
+[package]
+publish.workspace = true
+name = "harw-llama"
+description = "On-device GGUF inference for the phone: a harw_core::ModelProvider over llama.cpp (llama-cpp-2) with the model's own chat template"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Real inference through llama.cpp. llama-cpp-sys-2 builds llama.cpp with cmake
+# (C/C++), so the feature is off by default: the plain workspace build and the
+# desktop gates stay free of a C toolchain. The phone app enables it through its
+# `local-host` feature; without it `LocalGgufProvider::open` reports "unavailable".
+engine = ["dep:llama-cpp-2"]
+
+[dependencies]
+harw-core = { path = "../harw-core" }
+harw-protocol = { path = "../harw-protocol" }
+harw-tools = { path = "../harw-tools" }
+harw-types = { path = "../harw-types" }
+jiff = { workspace = true }
+# Pure-Rust Jinja engine: renders the chat template stored in the GGUF
+# (llama.cpp's built-in matcher does not know qwen35 and cannot pass tools).
+# Pinned exactly; 3.x changed the value API.
+minijinja = { version = "=2.24.0", features = ["json", "loop_controls"] }
+minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
+serde_json = { workspace = true }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
+tracing = { workspace = true }
+
+# llama.cpp binding, pinned exactly. 0.1.161 bundles a llama.cpp with the
+# `qwen35` architecture and the GATED_DELTA_NET op (checked in the crate source).
+# No default features: `openmp` is a no-op on Android and `common` is not needed.
+llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["mtmd"], optional = true }
+
+# Android: link libc++ statically so the APK needs no libc++_shared.so.
+[target.'cfg(target_os = "android")'.dependencies]
+llama-cpp-2 = { version = "=0.1.161", default-features = false, features = ["android-static-stdcxx", "mtmd"], optional = true }
+
+[lints]
+workspace = true

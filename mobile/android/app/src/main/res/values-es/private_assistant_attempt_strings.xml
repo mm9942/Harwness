@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="private_assistant_attempt_channel">Asistente privado</string>
+    <string name="private_assistant_attempt_running">Solicitud del asistente local en curso</string>
+    <string name="private_assistant_attempt_stop">Detener</string>
+    <string name="private_assistant_attempt_not_sent">Android no pudo mantener esta solicitud en primer plano. No se envió nada.</string>
+    <string name="private_assistant_parked_pending">Hay una solicitud del asistente local en curso. El asistente seguirá bloqueado hasta que termine.</string>
+    <string name="private_assistant_parked_check_unavailable">Harw no pudo comprobar si hay una solicitud local en curso. No se ha consumido ningún intento de PIN.</string>
+    <string name="private_assistant_parked_check_again">Volver a comprobar</string>
+</resources>

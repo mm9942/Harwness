@@ -1,5 +1,6 @@
-//! systemd-Unit-Beschreibung der vier DoD-Binaries (Knoten **AW7-03**,
-//! abgeglichen in **H10** des Crypto-Masterplans v2).
+//! systemd-Unit-Beschreibung der DoD-Binaries (Knoten **AW7-03**,
+//! abgeglichen in **H10** des Crypto-Masterplans v2; `harw-probe-netlink`
+//! seit PL-100 WP1.8).
 //!
 //! Die Unit-Texte selbst liegen ausschließlich unter `deploy/systemd/` und
 //! werden über [`crate::deployment::DEPLOYMENT_ASSETS`] im Produktionscode
@@ -10,13 +11,14 @@
 //! `deploy/` installiert. Die frühere zweite Quelle
 //! `harw-dod/packaging/systemd/*` ist mit H10 entfallen.
 //!
-//! # Die vier Klassen
+//! # Die fünf Klassen
 //! | Binary | Klasse | Fähigkeiten dieser Unit |
 //! |---|---|---|
 //! | `harw-sentinel` | unprivilegiert | keine (`CapabilityBoundingSet=` leer) |
 //! | `harw-probe-fs` | fanotify | genau `CAP_SYS_ADMIN` |
 //! | `harw-probe-bpf` | eBPF | genau `CAP_BPF CAP_PERFMON` |
-//! | `harw-warden` | systemd-Socket, kein IP | genau `CAP_DAC_OVERRIDE CAP_NET_ADMIN` |
+//! | `harw-probe-netlink` | Audit-Netlink (lesend) | genau `CAP_AUDIT_READ` |
+//! | `harw-warden` | systemd-Socket, kein IP | genau `CAP_DAC_OVERRIDE` (`CAP_NET_ADMIN` nur per Isolations-Drop-in) |
 //!
 //! **H10-Entscheidungen** (jeweils die strengere Variante der beiden
 //! früheren Quellen, am Code begründet):
@@ -30,15 +32,29 @@
 //!   für die Netzisolation `/usr/sbin/nft` als Kindprozess auf
 //!   (`harw-warden/src/isolation.rs` → `CAP_NET_ADMIN`, über die
 //!   Ambient-Menge vererbt). Die frühere Annahme `CAP_SYS_ADMIN` entfällt.
+//! - `harw-warden` seit PL-100 WP3.1: Die Vorgabe-`warden.toml` erlaubt nur
+//!   Freeze/Thaw, deshalb trägt die ausgelieferte Unit **nur**
+//!   `CAP_DAC_OVERRIDE` (geringste Rechte). `CAP_NET_ADMIN` kommt allein über
+//!   das Drop-in `harw-warden.service.d/isolation.conf`, wenn die Policy
+//!   `isolate-network`/`lift-isolation` erlaubt; fehlt es dann, startet der
+//!   Warden nicht (`WardenBinError::NetAdminMissing`, fail closed). Die
+//!   Basis-Unit darf `CAP_NET_ADMIN` daher nicht selbst gewähren.
+//!
+//! **PL-100 WP1.8** (Entscheidung O11): `harw-probe-netlink` tritt nur der
+//! lesenden Audit-Multicast-Gruppe bei (`AUDIT_NLGRP_READLOG`) und braucht
+//! dafür genau `CAP_AUDIT_READ` — weder `CAP_AUDIT_CONTROL` (Regeln,
+//! Audit-Daemon) noch `CAP_AUDIT_WRITE`. Wie die anderen Sonden ordnet die
+//! Unit nach `harw-sentinel.service` ohne `Requires=`.
 //!
 //! # Die Landlock-Asymmetrie (Entscheidung Nr. 4)
 //! `harw-sentinel` **degradiert** bei fehlender Landlock-Unterstützung
 //! (`SensorDegraded`-Ereignis, `harw-sentinel/src/sandbox.rs`) und läuft
-//! ohne die zusätzliche Schranke weiter. Die drei privilegierten Binaries
-//! (`harw-probe-fs`, `harw-probe-bpf`, `harw-warden`) brechen dagegen
-//! **hart** ab, sobald `landlock::RulesetStatus::FullyEnforced` nicht
-//! erreicht wird. Die Units erzwingen diese Vorbedingung nicht noch einmal;
-//! das Binary selbst ist der harte Torwächter.
+//! ohne die zusätzliche Schranke weiter. Die privilegierten Binaries
+//! (`harw-probe-fs`, `harw-probe-bpf`, `harw-probe-netlink`, `harw-warden`)
+//! brechen dagegen **hart** ab, sobald
+//! `landlock::RulesetStatus::FullyEnforced` nicht erreicht wird. Die Units
+//! erzwingen diese Vorbedingung nicht noch einmal; das Binary selbst ist der
+//! harte Torwächter.
 //!
 //! # Wohin die Units gehören
 //! Ausschließlich Systemunits (`/etc/systemd/system/` bzw.
@@ -69,12 +85,12 @@
 
 use std::collections::BTreeSet;
 
-/// Beschreibt eine der vier Berechtigungsklassen dieses Knotens.
+/// Beschreibt eine der Berechtigungsklassen dieses Knotens.
 ///
 /// # Description
 /// Ein reiner, `'static` Werttyp — die Zuordnung Binary → Unit-Dateiname →
-/// erwartete Fähigkeitsmenge, wie sie [`UNIT_CLASSES`] für jedes der vier
-/// Binaries hält. `expected_capabilities` ist die Menge, die sowohl
+/// erwartete Fähigkeitsmenge, wie sie [`UNIT_CLASSES`] für jedes der
+/// DoD-Binaries hält. `expected_capabilities` ist die Menge, die sowohl
 /// `CapabilityBoundingSet=` als auch `AmbientCapabilities=` der
 /// zugehörigen Unit **exakt** tragen müssen (siehe Moduldoku, Rule 1).
 #[derive(Debug, Clone, Copy)]
@@ -89,11 +105,13 @@ pub struct UnitClass {
     pub expected_capabilities: &'static [&'static str],
 }
 
-/// Die vier Klassen dieses Knotens, in der Reihenfolge der Auftragstabelle.
+/// Die Klassen dieses Knotens, in der Reihenfolge der Tabelle in der
+/// Moduldoku.
 ///
 /// # Description
 /// Die Fähigkeitsmengen von `harw-probe-bpf` und `harw-warden` sind die
-/// H10-Entscheidungen (siehe Moduldoku, Abschnitt „Die vier Klassen").
+/// H10-Entscheidungen, die von `harw-probe-netlink` die aus PL-100 WP1.8
+/// (siehe Moduldoku, Abschnitt „Die fünf Klassen").
 pub const UNIT_CLASSES: &[UnitClass] = &[
     UnitClass {
         binary: "harw-sentinel",
@@ -111,9 +129,15 @@ pub const UNIT_CLASSES: &[UnitClass] = &[
         expected_capabilities: &["CAP_BPF", "CAP_PERFMON"],
     },
     UnitClass {
+        binary: "harw-probe-netlink",
+        service_file: "harw-probe-netlink.service",
+        expected_capabilities: &["CAP_AUDIT_READ"],
+    },
+    UnitClass {
         binary: "harw-warden",
         service_file: "harw-warden.service",
-        expected_capabilities: &["CAP_DAC_OVERRIDE", "CAP_NET_ADMIN"],
+        // `CAP_NET_ADMIN` nur über das Isolations-Drop-in (PL-100 WP3.1).
+        expected_capabilities: &["CAP_DAC_OVERRIDE"],
     },
 ];
 
@@ -201,7 +225,7 @@ impl ParsedUnit {
 /// Knoten selbst schreibt: `[Abschnitt]`-Kopfzeilen, `Schlüssel=Wert`-
 /// Zeilen, `#`- und `;`-Kommentarzeilen (systemd erlaubt beide
 /// Kommentarzeichen), Leerzeilen. Keine Zeilenfortsetzung (`\`), kein
-/// `%`-Specifier-Ersatz — für die vier statischen Units dieses Knotens
+/// `%`-Specifier-Ersatz — für die statischen Units dieses Knotens
 /// nicht benötigt.
 ///
 /// # Arguments
@@ -415,7 +439,11 @@ mod tests {
 
     #[test]
     fn test_probes_order_after_the_sentinel_without_a_hard_requires() -> TestResult {
-        for service_file in ["harw-probe-fs.service", "harw-probe-bpf.service"] {
+        for service_file in [
+            "harw-probe-fs.service",
+            "harw-probe-bpf.service",
+            "harw-probe-netlink.service",
+        ] {
             let parsed = parse_unit(service_text(service_file)?);
             assert!(
                 parsed
@@ -430,6 +458,58 @@ mod tests {
                  (ein Sentinel-Neustart soll die Sonde nicht mit stoppen — siehe Moduldoku)"
             );
         }
+        Ok(())
+    }
+
+    /// PL-100 WP1.8: die Audit-Netlink-Sonde hat eine eigene Klasse mit
+    /// genau `CAP_AUDIT_READ`, und ihre Unit gewährt genau das — keine
+    /// Steuer- oder Schreibfähigkeit des Audit-Subsystems.
+    #[test]
+    fn test_netlink_probe_unit_grants_exactly_cap_audit_read() -> TestResult {
+        let class = UNIT_CLASSES
+            .iter()
+            .find(|class| class.binary == "harw-probe-netlink")
+            .ok_or(TestError::Missing("UnitClass für harw-probe-netlink"))?;
+        assert_eq!(class.service_file, "harw-probe-netlink.service");
+        assert_eq!(class.expected_capabilities, ["CAP_AUDIT_READ"].as_slice());
+
+        let parsed = parse_unit(service_text(class.service_file)?);
+        let expected = capability_set("CAP_AUDIT_READ");
+        for key in ["CapabilityBoundingSet", "AmbientCapabilities"] {
+            let granted = parsed
+                .last_value("Service", key)
+                .map(capability_set)
+                .ok_or(TestError::Missing("Capability-Zeile der Netlink-Sonde"))?;
+            assert_eq!(granted, expected, "harw-probe-netlink.service: {key}");
+            for forbidden in ["CAP_AUDIT_CONTROL", "CAP_AUDIT_WRITE", "CAP_SYS_ADMIN"] {
+                assert!(
+                    !granted.contains(forbidden),
+                    "harw-probe-netlink.service: {key} gewährt {forbidden}"
+                );
+            }
+        }
+        assert_eq!(
+            parsed.last_value("Service", "User"),
+            Some("harw-probe-netlink"),
+            "die Sonde läuft unter ihrem eigenen Systemnutzer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_netlink_probe_restricts_address_families_to_unix_and_netlink() -> TestResult {
+        let parsed = parse_unit(service_text("harw-probe-netlink.service")?);
+        let value = parsed
+            .last_value("Service", "RestrictAddressFamilies")
+            .ok_or(TestError::Missing(
+                "harw-probe-netlink.service muss RestrictAddressFamilies= setzen",
+            ))?;
+        assert_eq!(
+            capability_set(value),
+            capability_set("AF_UNIX AF_NETLINK"),
+            "harw-probe-netlink.service: nur AF_NETLINK (Audit-Lesesocket) und AF_UNIX \
+             (push-only zum Sentinel) sind begründet"
+        );
         Ok(())
     }
 

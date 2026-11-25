@@ -30,5 +30,5 @@ pub use error::MediaError;
 pub use inspect::{Inspected, inspect, sniff};
 pub use limits::MediaLimits;
 pub use memory::MemorySource;
-pub use sanitize::sanitize;
+pub use sanitize::{sanitize, sanitize_jpeg_into};
 pub use store::{MediaSource, MediaStore};

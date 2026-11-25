@@ -194,12 +194,9 @@ impl Direction {
 ///
 /// # Description
 /// Trägt ausschließlich Metadaten — siehe Moduldoku, Abschnitt „Keine
-/// Nutzdaten". `pid` bleibt erhalten, obwohl
-/// [`crate::report::to_security_event`] es aktuell nicht in die erzeugte
-/// `harw_dod_signals::SecurityEvent` übernimmt (weder `EventKind::EgressFlow`
-/// noch `Actor` haben ein `pid`-Feld): ein künftiger Konsument, der den
-/// vollständigen geparsten Datensatz statt der bereits reduzierten
-/// `SecurityEvent`-Form braucht, findet ihn hier vollständig vor.
+/// Nutzdaten". `pid` übernimmt [`crate::report::to_security_event`] seit
+/// PL-100 WP0.15 als `harw_dod_signals::Actor::process`
+/// (`ProcessContext::from_pid`, eine `0` bleibt „unbekannt").
 ///
 /// # Errors
 /// Keine eigenen Fehler — entsteht ausschließlich über

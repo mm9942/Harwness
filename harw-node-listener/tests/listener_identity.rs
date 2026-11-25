@@ -1,17 +1,22 @@
 //! Identity mapping and upgrade ordering (S08, W00 D4, ID-01..ID-05).
-//! Driven over in-memory duplex streams; no TCP, no node transport.
+//! Identity mapping uses in-memory streams; transport admission also covers TCP.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_lc_rs::signature::{KeyPair, ML_DSA_65_SIGNING, PqdsaKeyPair};
 use futures_util::{SinkExt, StreamExt};
 use harw_node_listener::{
-    DeviceRecord, DeviceRegistry, IdentityMapper, ListenerError, RegistryIdentityMapper,
-    UpgradeHandler,
+    DeviceRecord, DeviceRegistry, IdentityMapper, ListenerError, NodeListener,
+    RegistryIdentityMapper, RevocationSink, UpgradeHandler,
 };
-use harw_node_transport::{AuthenticatedPeer, UpgradeError};
+use harw_node_transport::{
+    AuthenticatedPeer, ClientOptions, LocalNode, ML_DSA_65_SIGNATURE_LEN, NodeIdentity, NodeSigner,
+    NodeTransportClient, NodeTransportServer, PinnedPeers, ServerOptions, SignFuture, SignerError,
+    UpgradeError, UpgradedIo, empty_body,
+};
 use harw_protocol::methods::METHOD_SESSION_HELLO;
-use harw_protocol::session_wire::HelloAck;
+use harw_protocol::session_wire::{GatewayListenerInfo, HelloAck, ListenerKind};
 use harw_protocol::{ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireMessage};
 use harw_session_host::approvals::MemoryApprovals;
 use harw_session_host::driver::{
@@ -25,6 +30,8 @@ use http_body_util::Empty;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Role;
@@ -334,5 +341,318 @@ fn opt_in_marker_round_trips_and_other_seventh_fields_fail_closed() -> TestResul
     ] {
         assert!(DeviceRecord::parse(bad).is_none(), "{bad}");
     }
+    Ok(())
+}
+
+// --- stream intake (onion) next to a running NodeListener::serve ---------
+
+/// Test-only deterministic ML-DSA-65 node signer.
+struct TestSigner {
+    key: PqdsaKeyPair,
+}
+
+impl NodeSigner for TestSigner {
+    fn sign<'a>(&'a self, transcript: &'a [u8]) -> SignFuture<'a> {
+        let mut signature = vec![0u8; ML_DSA_65_SIGNATURE_LEN];
+        let result = self
+            .key
+            .sign(transcript, &mut signature)
+            .map(|written| {
+                signature.truncate(written);
+                signature
+            })
+            .map_err(|_| SignerError::new("test signer failed"));
+        Box::pin(std::future::ready(result))
+    }
+}
+
+struct TestNode {
+    id: NodeId,
+    identity: NodeIdentity,
+    local: LocalNode,
+}
+
+fn test_node(name: &str, seed: u8) -> TestResult<TestNode> {
+    let id = NodeId::try_from_str(name)?;
+    let key = PqdsaKeyPair::from_seed(&ML_DSA_65_SIGNING, &[seed; 32])
+        .map_err(|_| "ML-DSA-65 key from seed")?;
+    let identity = NodeIdentity {
+        node_id: id.clone(),
+        public_key: key.public_key().as_ref().to_vec(),
+        key_ref: format!("test-only/{name}"),
+    };
+    let local = LocalNode::new(identity.clone(), Arc::new(TestSigner { key }));
+    Ok(TestNode {
+        id,
+        identity,
+        local,
+    })
+}
+
+type IntakeWs = WebSocketStream<UpgradedIo>;
+
+/// A listener whose transport pins an enrolled device (`node-a`, `dev-1`)
+/// and a transport-valid device that is not in the registry (`node-x`).
+struct Rig {
+    _dir: tempfile::TempDir,
+    listener: Arc<NodeListener>,
+    host: Arc<SessionHost>,
+    gateway: TestNode,
+    enrolled: TestNode,
+    unknown: TestNode,
+    client_verifier: PinnedPeers,
+}
+
+impl Rig {
+    fn new() -> TestResult<Self> {
+        let dir = tempfile::tempdir()?;
+        DeviceRegistry::new(dir.path()).enroll(&record(
+            "node-a",
+            "dev-1",
+            PermissionTier::Operator,
+        ))?;
+        let gateway = test_node("gateway", 1)?;
+        let enrolled = test_node("node-a", 2)?;
+        let unknown = test_node("node-x", 3)?;
+        let mut server_peers = PinnedPeers::new();
+        server_peers.pin_identity(&enrolled.identity)?;
+        server_peers.pin_identity(&unknown.identity)?;
+        let mut client_verifier = PinnedPeers::new();
+        client_verifier.pin_identity(&gateway.identity)?;
+        let server = NodeTransportServer::new(
+            gateway.local.clone(),
+            Arc::new(server_peers),
+            ServerOptions::default(),
+        )?;
+        let mapper: Arc<dyn IdentityMapper> = Arc::new(RegistryIdentityMapper::new(dir.path()));
+        let host = open_host(dir.path())?;
+        let listener = Arc::new(NodeListener::new(
+            server,
+            Arc::clone(&host),
+            mapper,
+            WsLimits::default(),
+        ));
+        Ok(Self {
+            _dir: dir,
+            listener,
+            host,
+            gateway,
+            enrolled,
+            unknown,
+            client_verifier,
+        })
+    }
+
+    /// Run `NodeListener::serve` (which registers the `node` listener) until
+    /// the returned sender fires or is dropped.
+    async fn start_serve(
+        &self,
+    ) -> TestResult<(
+        tokio::sync::oneshot::Sender<()>,
+        JoinHandle<Result<(), ListenerError>>,
+    )> {
+        self.start_serve_on(TcpListener::bind("127.0.0.1:0").await?)
+            .await
+    }
+
+    async fn start_serve_on(
+        &self,
+        tcp: TcpListener,
+    ) -> TestResult<(
+        tokio::sync::oneshot::Sender<()>,
+        JoinHandle<Result<(), ListenerError>>,
+    )> {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let listener = Arc::clone(&self.listener);
+        let task = tokio::spawn(async move {
+            listener
+                .serve(tcp, async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.host.listener_enabled("node") != Some(true) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok((stop, task))
+    }
+
+    fn set_ingress_enabled(&self, address: std::net::SocketAddr, enabled: bool) {
+        self.host.register_listener(GatewayListenerInfo {
+            name: "node".into(),
+            kind: ListenerKind::Node,
+            address: address.to_string(),
+            enabled,
+        });
+    }
+
+    /// Dial the intake over a duplex stream as `client`: `Ok(Ok(ws))` when
+    /// upgraded, `Ok(Err(status))` when refused with that HTTP status.
+    async fn dial(&self, client: &TestNode) -> TestResult<Result<IntakeWs, u16>> {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let intake = self.listener.intake();
+        tokio::spawn(async move {
+            let _ = intake.serve(server_io, Duration::from_secs(5)).await;
+        });
+        let transport = NodeTransportClient::connect_over(
+            client_io,
+            &client.local,
+            &self.gateway.id,
+            &self.client_verifier,
+            &ClientOptions::default(),
+        )
+        .await?;
+        let (request, _key) = upgrade::client_request("localhost")?;
+        match transport.upgrade(request.map(|_| empty_body())).await {
+            Ok(upgraded) => Ok(Ok(WebSocketStream::from_raw_socket(
+                upgraded.io,
+                Role::Client,
+                None,
+            )
+            .await)),
+            Err(UpgradeError::NotSwitched(status)) => Ok(Err(status)),
+            Err(other) => Err(other.into()),
+        }
+    }
+}
+
+async fn session_hello(ws: &mut IntakeWs) -> TestResult {
+    let envelope = RequestEnvelope {
+        jsonrpc: "2.0".into(),
+        id: "h".into(),
+        method: METHOD_SESSION_HELLO.into(),
+        params: serde_json::json!({"client_label": "t", "wire_minor": 1}),
+        protocol: ProtocolVersion::default(),
+    };
+    ws.send(Message::text(serde_json::to_string(&envelope)?))
+        .await?;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await?
+            .ok_or("closed")??;
+        if let Message::Text(text) = message
+            && let WireMessage::Response(response) = serde_json::from_str(text.as_str())?
+            && response.id == "h"
+        {
+            assert!(response.error.is_none(), "{response:?}");
+            return Ok(());
+        }
+    }
+}
+
+/// Read until the socket ends (close frame, error or EOF).
+async fn ends(ws: &mut IntakeWs) -> TestResult {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next()).await? {
+            None | Some(Err(_) | Ok(Message::Close(_))) => return Ok(()),
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn intake_upgrades_an_enrolled_device_into_the_live_table() -> TestResult {
+    let rig = Rig::new()?;
+    let (_stop, _task) = rig.start_serve().await?;
+
+    let mut ws = rig
+        .dial(&rig.enrolled)
+        .await?
+        .map_err(|status| format!("upgrade refused with {status}"))?;
+    session_hello(&mut ws).await?;
+
+    let live = rig.listener.handler().live();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live.count_for(&DeviceId::from_str("dev-1")), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoking_the_device_closes_its_intake_websocket() -> TestResult {
+    let rig = Rig::new()?;
+    let (_stop, _task) = rig.start_serve().await?;
+    let mut ws = rig
+        .dial(&rig.enrolled)
+        .await?
+        .map_err(|status| format!("upgrade refused with {status}"))?;
+    session_hello(&mut ws).await?;
+
+    let report = rig
+        .listener
+        .revoker()
+        .revoke_device(&DeviceId::from_str("dev-1"))?;
+    assert_eq!(report.connections_closed, 1);
+
+    ends(&mut ws).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn serve_shutdown_closes_the_intake_websocket() -> TestResult {
+    let rig = Rig::new()?;
+    let (stop, task) = rig.start_serve().await?;
+    let mut ws = rig
+        .dial(&rig.enrolled)
+        .await?
+        .map_err(|status| format!("upgrade refused with {status}"))?;
+    session_hello(&mut ws).await?;
+
+    stop.send(()).map_err(|()| "serve already ended")?;
+    ends(&mut ws).await?;
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unregistered_intake_closes_without_a_node_handshake() -> TestResult {
+    let rig = Rig::new()?;
+    assert!(rig.dial(&rig.enrolled).await.is_err());
+    assert!(rig.listener.handler().live().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_ingress_refuses_tcp_and_intake_before_authentication() -> TestResult {
+    let rig = Rig::new()?;
+    let tcp = TcpListener::bind("127.0.0.1:0").await?;
+    let address = tcp.local_addr()?;
+    let (_stop, _task) = rig.start_serve_on(tcp).await?;
+    rig.set_ingress_enabled(address, false);
+
+    // Connect without sending an HTTP request: a late 503 is not sufficient.
+    let connect_tcp = || {
+        NodeTransportClient::connect(
+            address,
+            &rig.enrolled.local,
+            &rig.gateway.id,
+            &rig.client_verifier,
+        )
+    };
+    let disabled_tcp = tokio::time::timeout(Duration::from_secs(5), connect_tcp()).await?;
+    assert!(disabled_tcp.is_err());
+    assert!(rig.dial(&rig.enrolled).await.is_err());
+    assert!(rig.listener.handler().live().is_empty());
+
+    rig.set_ingress_enabled(address, true);
+    let transport = tokio::time::timeout(Duration::from_secs(5), connect_tcp()).await??;
+    drop(transport);
+    let mut ws = rig
+        .dial(&rig.enrolled)
+        .await?
+        .map_err(|status| format!("upgrade refused with {status}"))?;
+    session_hello(&mut ws).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn intake_refuses_a_device_missing_from_the_registry_with_403() -> TestResult {
+    let rig = Rig::new()?;
+    let (_stop, _task) = rig.start_serve().await?;
+    let refused = rig.dial(&rig.unknown).await?;
+    assert_eq!(refused.err(), Some(403));
+    assert!(rig.listener.handler().live().is_empty());
     Ok(())
 }

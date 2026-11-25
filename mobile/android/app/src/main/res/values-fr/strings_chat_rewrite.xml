@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_rewrite_resolve">Vérifier ou réessayer la modification précédente</string>
+    <string name="chat_rewrite_resolve_unavailable">Impossible de vérifier la demande précédente pour le moment.</string>
+    <string name="chat_rewrite_reload">Recharger la conversation</string>
+    <string name="chat_rewrite_forget">Ne plus suivre cette modification</string>
+    <string name="chat_rewrite_forget_explanation">Seul le suivi sur ce téléphone s’arrête. Une modification sur le serveur reste en place et la version précédente peut ne pas apparaître ici. La conversation sera rechargée avant toute nouvelle modification.</string>
+    <string name="chat_rewrite_forget_confirm">Ne plus suivre</string>
+    <string name="chat_rewrite_journal_unavailable">Le téléphone n’a pas pu enregistrer ou effacer la modification précédente. Aucune nouvelle modification n’a été envoyée.</string>
+    <string name="chat_rewrite_archive_only">La version précédente était trop volumineuse pour le cache du téléphone. Consulte l’historique conservé sur le serveur.</string>
+    <string name="chat_reply_interrupted">La réponse a été interrompue.</string>
+    <string name="chat_reply_reload">Recharger la réponse</string>
+    <string name="chat_reply_retry">Réessayer</string>
+    <string name="chat_reply_stop">Arrêter la réponse</string>
+    <string name="chat_reply_waiting_stop">Impossible d’arrêter la réponse pour le moment</string>
+</resources>

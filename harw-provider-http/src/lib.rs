@@ -81,6 +81,11 @@
 pub mod anthropic;
 mod anthropic_caps;
 mod anthropic_replay;
+mod azure_foundry;
+pub use azure_foundry::{
+    AzureFoundryChatTokenLimits, azure_foundry_chat_token_limits, azure_foundry_vision_deployments,
+    is_azure_foundry_chat,
+};
 pub mod budget;
 pub mod cache_strategy;
 mod chat_reasoning;
@@ -88,6 +93,7 @@ pub mod discovery;
 mod error;
 mod images;
 pub mod rate_limiter;
+mod replay_bounds;
 mod responses_reasoning;
 pub mod retry;
 pub mod routing;
@@ -96,6 +102,7 @@ mod text_tool_calls;
 mod thinking_profiles;
 mod tool_call_ids;
 mod tool_names;
+pub mod url_guard;
 
 use error::{model_error_for_status, model_error_for_transport, retry_after_hint};
 use harw_core::envelope::render_tool_result;
@@ -121,6 +128,7 @@ pub use anthropic::{
     DEFAULT_ANTHROPIC_BASE_URL, anthropic_messages_url, build_messages_body,
     extract_anthropic_text,
 };
+pub use chatgpt_plan::{API as CHATGPT_PLAN_API, BASE_URL as CHATGPT_PLAN_BASE_URL};
 pub use codex::{is_codex_base_url, is_codex_login_reference};
 pub use error::{HttpProviderError, HttpProviderResult};
 pub use retry::{
@@ -130,6 +138,7 @@ pub use retry::{
 };
 pub use routing::{RoutingBackends, RoutingModelProvider};
 
+mod chatgpt_plan;
 mod codex;
 mod credential_pool;
 
@@ -148,8 +157,12 @@ pub trait SecretResolver {
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const SECRET_RESOLVER_FAILURE_REASON: &str = "secret resolver failed";
 const EMPTY_CREDENTIAL_REASON: &str = "credential is empty";
+#[cfg(target_os = "android")]
+const KEYRING_UNSUPPORTED_REASON: &str =
+    "keyring credentials are not available on Android; use a secrets: reference";
 const INVALID_KEYRING_REFERENCE_REASON: &str =
     "invalid keyring reference (expected keyring:<service>/<account>)";
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const KEYRING_FAILURE_REASON: &str =
     "keyring credential unavailable (no entry for service/account or system keyring not reachable)";
 // Gründe für `file:`/`file-json:`-Fehler: bewusst ohne Pfad und ohne Inhalt,
@@ -185,7 +198,6 @@ const UNKNOWN_TOOL_NAME: &str = "unknown";
 /// `include`-Wert der Responses-API für zustandslos wiederverwendbares Reasoning.
 const INCLUDE_ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 /// Höchstzahl gemerkter Reasoning-Runden je Provider (FIFO).
-const MAX_REASONING_REPLAY_ENTRIES: usize = 64;
 /// Obergrenze für provider-gelieferte Grund-Strings in `StopReason::Other`.
 const MAX_STOP_REASON_CHARS: usize = 64;
 
@@ -484,7 +496,52 @@ pub fn build_named_backend(
         model,
         sources,
         &budget::ProviderBudgetRegistry::global(),
+        BackendDispatch::Conversation,
     )
+}
+
+/// Visible effective base for the isolated one-shot route. Legacy Codex login
+/// has no stable account-consent proof in this path; the distinct ChatGPT
+/// Account API is instead supported with its registration scope.
+pub fn one_shot_effective_endpoint(provider: &harw_config::ProviderToml) -> HttpProviderResult<String> {
+    validate_endpoint_with(&provider.base_url, provider.allow_insecure_lan)?;
+    if codex::CodexRoute::from_provider(provider)?.is_some() {
+        return Err(HttpProviderError::Decode("legacy Codex login cannot authorize this one-shot task".into()));
+    }
+    Ok(provider.base_url.trim_end_matches('/').to_owned())
+}
+
+/// Builds the exact configured backend for a bounded one-shot auxiliary task.
+/// No alternate provider, account pool, or application-level resubmission.
+pub fn build_exact_one_shot_backend(
+    config: &harw_config::ResolvedConfig,
+    provider_name: &str,
+    home: &Path,
+    resolver: &dyn SecretResolver,
+    account_scope: Option<&str>,
+) -> HttpProviderResult<Box<dyn ModelProvider>> {
+    let model = config.harness.default_model.as_deref().ok_or_else(|| {
+        HttpProviderError::MissingDefault { what: "default_model".to_owned() }
+    })?;
+    let provider = config.providers.get(provider_name).filter(|provider| provider.enabled)
+        .ok_or_else(|| HttpProviderError::DefaultProviderNotFound { name: provider_name.to_owned() })?;
+    one_shot_effective_endpoint(provider)?;
+    if (provider.api == CHATGPT_PLAN_API) != account_scope.is_some() {
+        return Err(HttpProviderError::Decode("one-shot ChatGPT account scope does not match the selected route".into()));
+    }
+    let mut scoped = config.clone();
+    scoped.auth.credential_pool.clear();
+    let sources = SecretSources { env_layer: &scoped.env_layer, resolver: Some(resolver), home: Some(home), endpoint: None };
+    let (backend, _) = build_named_provider(
+        provider_name,
+        provider,
+        &scoped,
+        model,
+        sources,
+        &budget::ProviderBudgetRegistry::global(),
+        BackendDispatch::OneShot { account_scope },
+    )?;
+    Ok(backend)
 }
 
 fn build_routing_provider_with_optional_resolver(
@@ -519,7 +576,7 @@ fn build_routing_provider_with_optional_resolver(
         .filter(|(_, provider)| provider.enabled)
         .collect::<BTreeMap<_, _>>()
     {
-        match build_named_provider(name, provider, config, model, sources, budgets) {
+        match build_named_provider(name, provider, config, model, sources, budgets, BackendDispatch::Conversation) {
             Ok((backend, load_control)) => {
                 if let Some(load_control) = load_control {
                     load_controls.insert(name.to_owned(), load_control);
@@ -619,6 +676,12 @@ type NamedProviderBuild = (
     Option<std::sync::Arc<dyn ProviderLoadControl>>,
 );
 
+#[derive(Clone, Copy)]
+enum BackendDispatch<'a> {
+    Conversation,
+    OneShot { account_scope: Option<&'a str> },
+}
+
 /// Builds one named provider backend, plus its [`ProviderLoadControl`] handle
 /// when the backend supports it.
 ///
@@ -638,6 +701,7 @@ fn build_named_provider(
     default_model: &str,
     sources: SecretSources<'_>,
     budgets: &budget::ProviderBudgetRegistry,
+    dispatch: BackendDispatch<'_>,
 ) -> HttpProviderResult<NamedProviderBuild> {
     validate_endpoint_with(&provider.base_url, provider.allow_insecure_lan)?;
     let sources = SecretSources {
@@ -763,6 +827,7 @@ fn build_named_provider(
         ));
         backend.configure_credential_pool(pool);
         backend.configure_concurrency(provider.max_concurrency);
+        backend.configure_strict_replay_models(strict_replay_models(provider_name, config));
         // Runde 7, Teil L4: Request- und Streaming-Leerlauf-Zeitlimit.
         backend.configure_timeouts(
             Duration::from_secs(provider.effective_request_timeout_secs()),
@@ -779,6 +844,10 @@ fn build_named_provider(
                 rate_limiter: backend.rate_limiter_handle(),
                 budgets: anthropic_budgets,
             });
+        if matches!(dispatch, BackendDispatch::OneShot { .. }) {
+            backend.force_single_dispatch()?;
+            return Ok((Box::new(backend), Some(load_control)));
+        }
         return Ok((
             Box::new(RetryingProvider::new(
                 backend,
@@ -788,7 +857,7 @@ fn build_named_provider(
         ));
     }
 
-    let http_provider = OpenAiResponsesProvider::from_named_config_with_budgets(
+    let mut http_provider = OpenAiResponsesProvider::from_named_config_with_budgets(
         provider_name,
         provider,
         config,
@@ -805,6 +874,14 @@ fn build_named_provider(
             rate_limiter: http_provider.rate_limiter_handle(),
             budgets: http_provider.budgets(),
         });
+    if let BackendDispatch::OneShot { account_scope } = dispatch {
+        http_provider.exact_once = true;
+        http_provider.one_shot_account_scope = account_scope.map(str::to_owned);
+        // Same validated configured origin; never forward the transcript via
+        // a redirect or environment proxy.
+        http_provider.client = one_shot_http_client()?;
+        return Ok((Box::new(http_provider), Some(load_control)));
+    }
     Ok((
         Box::new(RetryingProvider::new(
             http_provider,
@@ -1055,6 +1132,16 @@ pub(crate) fn http_client() -> HttpProviderResult<reqwest::Client> {
         .build()
         .map_err(HttpProviderError::ClientBuild)
 }
+
+fn one_shot_http_client() -> HttpProviderResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(HttpProviderError::ClientBuild)
+}
+
 
 /// Runde 7, Teil L8: Baut den HTTP-Client für einen konkreten Endpunkt.
 ///
@@ -1637,6 +1724,9 @@ pub struct OpenAiResponsesProvider {
     model: String,
     api_key: SecretString,
     codex_route: Option<codex::CodexRoute>,
+    chatgpt_plan: Option<harw_oauth::chatgpt_plan::ChatGptPlanStore>,
+    exact_once: bool,
+    one_shot_account_scope: Option<String>,
     auth_header: String,
     headers: reqwest::header::HeaderMap,
     transport: Transport,
@@ -1644,6 +1734,10 @@ pub struct OpenAiResponsesProvider {
     reasoning_replay: ReasoningReplay,
     chat_reasoning_cache: chat_reasoning::ChatReasoningCache,
     chat_reasoning_overrides: std::collections::HashMap<String, harw_config::ChatReasoningReplay>,
+    /// Modelle (IDs und Aliase) mit `[capabilities] reasoning_replay =
+    /// "strict"`; alle übrigen degradieren bei verlorener Kontinuität
+    /// (siehe [`replay_bounds`]).
+    strict_replay_models: BTreeSet<String>,
     /// Modell-ID → Prompt-Caching-Override (`ModelToml::prompt_caching`),
     /// befüllt aus `config.models` beim Bau über [`Self::from_named_config`].
     /// Leer, wenn der Provider über [`Self::new`]/[`Self::with_transport`]
@@ -1773,12 +1867,16 @@ impl OpenAiResponsesProvider {
             model: model.into(),
             api_key,
             codex_route: None,
+            chatgpt_plan: None,
+            exact_once: false,
+            one_shot_account_scope: None,
             auth_header: "bearer".into(),
             headers: reqwest::header::HeaderMap::new(),
             transport,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reasoning_replay: ReasoningReplay::default(),
             chat_reasoning_cache: chat_reasoning::ChatReasoningCache::default(),
+            strict_replay_models: BTreeSet::new(),
             chat_reasoning_overrides: std::collections::HashMap::new(),
             cache_overrides: std::collections::HashMap::new(),
             stream_policy: sse::StreamPolicy::default(),
@@ -1896,6 +1994,7 @@ impl OpenAiResponsesProvider {
         sources: SecretSources<'_>,
         budgets: &budget::ProviderBudgetRegistry,
     ) -> HttpProviderResult<Self> {
+        let plan = chatgpt_plan::route(provider, sources.home)?;
         let codex_route = codex::CodexRoute::from_provider(provider)?;
         let base_url = if codex_route.is_some() {
             codex::BASE_URL
@@ -1926,31 +2025,34 @@ impl OpenAiResponsesProvider {
         // Credential, übernimmt stattdessen der erste Pool-Eintrag diese
         // Rolle. Codex-Routen haben ihre eigene OAuth-Auflösung
         // (`route.headers()`) und nehmen nie am Pool teil.
-        let primary: Option<SecretString> = if let Some(reference) = &provider.auth {
+        let primary: Option<SecretString> = if plan.is_some() {
+            Some(SecretString::new(String::new().into()))
+        } else if let Some(reference) = &provider.auth {
             Some(resolve_secret(reference, sources)?)
         } else if auth_header == "none" {
             Some(SecretString::new(String::new().into()))
         } else {
             None
         };
-        let pool: Option<credential_pool::CredentialPool<SecretString>> = if codex_route.is_none() {
-            let pool = credential_pool::CredentialPool::from_auth_config(
-                &config.auth,
-                provider_name,
-                sources,
-                Ok,
-            )?;
-            if let Some(pool) = &pool {
-                for index in 0..pool.len() {
-                    if let Some(url) = &pool.entry(index).base_url {
-                        validate_endpoint_with(url, provider.allow_insecure_lan)?;
+        let pool: Option<credential_pool::CredentialPool<SecretString>> =
+            if codex_route.is_none() && plan.is_none() {
+                let pool = credential_pool::CredentialPool::from_auth_config(
+                    &config.auth,
+                    provider_name,
+                    sources,
+                    Ok,
+                )?;
+                if let Some(pool) = &pool {
+                    for index in 0..pool.len() {
+                        if let Some(url) = &pool.entry(index).base_url {
+                            validate_endpoint_with(url, provider.allow_insecure_lan)?;
+                        }
                     }
                 }
-            }
-            pool
-        } else {
-            None
-        };
+                pool
+            } else {
+                None
+            };
         let (api_key, pool) = match (pool, primary) {
             (Some(pool), Some(primary_value)) => {
                 let pool = pool.prepend_primary(primary_value, format!("{provider_name}#primary"));
@@ -1987,10 +2089,11 @@ impl OpenAiResponsesProvider {
         )?;
         http_provider.auth_header = auth_header.to_owned();
         http_provider.codex_route = codex_route;
+        http_provider.chatgpt_plan = plan;
         http_provider.credential_pool = pool.map(std::sync::Arc::new);
         if !matches!(
             provider.api.as_str(),
-            "openai-chat" | "openai-responses" | "ollama"
+            "openai-chat" | "openai-responses" | "ollama" | chatgpt_plan::API
         ) {
             return Err(HttpProviderError::Decode(format!(
                 "unsupported provider API '{}'",
@@ -2060,6 +2163,7 @@ impl OpenAiResponsesProvider {
             }
         }
         http_provider.toolless_models = toolless_models(provider_name, config);
+        http_provider.strict_replay_models = strict_replay_models(provider_name, config);
         http_provider.imageless_models = imageless_models(provider_name, config);
         Ok(http_provider)
     }
@@ -2139,6 +2243,18 @@ impl OpenAiResponsesProvider {
     /// eine eigene [`budget::ProviderBudgetRegistry`] injizieren).
     pub fn set_budgets(&mut self, budgets: budget::ProviderBudgets) {
         self.budgets = budgets;
+    }
+
+    /// Limits the requested output after resolving the actual deployment, before
+    /// serializing the body or accounting for its output in quota admission.
+    fn apply_chat_output_limit(&self, request: &mut ModelRequest, base_url: &str, model: &str) {
+        if self.transport == Transport::Chat
+            && let Some(requested) = request.max_output_tokens
+            && let Some(limits) =
+                azure_foundry_chat_token_limits(&self.provider_id, base_url, model)
+        {
+            request.max_output_tokens = Some(requested.min(limits.max_output_tokens));
+        }
     }
 
     /// Resolves the model for one request after checking its provider affinity.
@@ -2335,7 +2451,7 @@ pub(crate) fn parse_retry_after(
 /// (z. B. `"openai-chat"`) ergibt [`Transport::Chat`].
 fn transport_from_api(api: &str) -> Transport {
     match api {
-        "openai-responses" => Transport::Responses,
+        "openai-responses" | chatgpt_plan::API => Transport::Responses,
         _ => Transport::Chat,
     }
 }
@@ -2358,6 +2474,7 @@ fn transport_from_api(api: &str) -> Transport {
 /// mit [`HttpProviderError::UnsupportedCredentialReference`] fehl; Aufrufer
 /// müssen dann einen Resolver über die `*_with_resolver`-Konstruktoren
 /// injizieren oder auf `env:`/`file:`/`keyring:` ausweichen.
+/// Auf Android schlagen `keyring:`-Referenzen fail-closed fehl (nur `secrets:` ist dort nutzbar).
 /// Resolver- und Keyring-Fehler werden auf feste Gründe abgebildet, damit weder
 /// Secret-Werte noch Resolver-Diagnosen in Fehlertexte gelangen.
 /// `file:`/`file-json:` lesen nur unterhalb von `<home>/secrets/` (siehe
@@ -2457,22 +2574,42 @@ fn resolve_secret(
                     reason: INVALID_KEYRING_REFERENCE_REASON.to_owned(),
                 }
             })?;
-            let entry = keyring::Entry::new(service, account).map_err(|_| {
-                HttpProviderError::UnresolvedCredential {
-                    reference: reference.clone(),
-                    reason: KEYRING_FAILURE_REASON.to_owned(),
-                }
-            })?;
-            let password =
-                entry
-                    .get_password()
-                    .map_err(|_| HttpProviderError::UnresolvedCredential {
-                        reference: reference.clone(),
-                        reason: KEYRING_FAILURE_REASON.to_owned(),
-                    })?;
-            validate_resolved_secret(reference, SecretString::new(password.into()))
+            read_keyring_secret(&reference, service, account)
         }
     }
+}
+
+#[cfg(not(target_os = "android"))]
+fn read_keyring_secret(
+    reference: &str,
+    service: &str,
+    account: &str,
+) -> HttpProviderResult<SecretString> {
+    let entry = keyring::Entry::new(service, account).map_err(|_| {
+        HttpProviderError::UnresolvedCredential {
+            reference: reference.to_owned(),
+            reason: KEYRING_FAILURE_REASON.to_owned(),
+        }
+    })?;
+    let password = entry
+        .get_password()
+        .map_err(|_| HttpProviderError::UnresolvedCredential {
+            reference: reference.to_owned(),
+            reason: KEYRING_FAILURE_REASON.to_owned(),
+        })?;
+    validate_resolved_secret(reference.to_owned(), SecretString::new(password.into()))
+}
+
+#[cfg(target_os = "android")]
+fn read_keyring_secret(
+    reference: &str,
+    _service: &str,
+    _account: &str,
+) -> HttpProviderResult<SecretString> {
+    Err(HttpProviderError::UnresolvedCredential {
+        reference: reference.to_owned(),
+        reason: KEYRING_UNSUPPORTED_REASON.to_owned(),
+    })
 }
 
 /// Löst das Credential eines konfigurierten Providers auf (Design
@@ -2997,15 +3134,13 @@ fn build_responses_body(
     Ok(body)
 }
 
-/// Kürzt einen provider-gelieferten Grund auf ein unkritisches Token.
-fn bounded_reason(reason: &str) -> String {
-    reason
-        .chars()
-        .filter(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        })
-        .take(MAX_STOP_REASON_CHARS)
-        .collect()
+/// Keep only short machine-readable codes. Never reformat arbitrary
+/// provider prose (which can include prompt content) into a plausible code.
+fn bounded_reason(reason: &str) -> Option<&str> {
+    let reason = reason.trim();
+    (!reason.is_empty() && reason.len() <= MAX_STOP_REASON_CHARS
+        && reason.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+        .then_some(reason)
 }
 
 /// Sammelt `refusal`-Parts der `message`-Items einer Responses-Antwort.
@@ -3025,11 +3160,12 @@ fn extract_responses_refusal(body: &Value) -> Option<String> {
 /// Projiziert eine nicht-gestreamte Responses-Antwort auf den W3-Vertrag.
 ///
 /// # Description
-/// - `status` fehlt → wie `completed`; `failed`/`cancelled` → `RequestFailed`.
+/// - An absent status means completed for older adapters. Other non-success
+///   statuses preserve available text, suppress tools, and keep a safe code.
 /// - `incomplete`: `incomplete_details.reason` `max_output_tokens` →
 ///   [`StopReason::MaxTokens`], `content_filter` → [`StopReason::ContentFilter`],
-///   sonst `Other`. Teiltext bleibt erhalten; `function_call`-Items werden
-///   verworfen (Argumente können abgeschnitten sein — nie ausführen).
+///   otherwise a safe explicit code or `IncompleteUnknown`. Partial text is kept; `function_call` items are
+///   dropped because their arguments may be incomplete.
 /// - sonst: Tool-Calls → `ToolUse`; nur Refusal-Parts → `Refusal`; Text → `EndTurn`;
 ///   gar nichts → `EmptyResponse`.
 /// - `reasoning`-Items → `OpaqueReasoning{provider, model, blocks}` (verbatim);
@@ -3038,7 +3174,7 @@ fn extract_responses_refusal(body: &Value) -> Option<String> {
 ///   dass der Provider in dieser Runde kein Reasoning geliefert hat.
 ///
 /// # Errors
-/// `RequestFailed` bei `failed`/`cancelled` oder defekten Tool-Calls;
+/// `RequestFailed` for malformed tool calls in a completed response;
 /// `EmptyResponse` bei leerer, vollständiger Antwort.
 fn interpret_responses(
     body: &Value,
@@ -3049,16 +3185,15 @@ fn interpret_responses(
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("completed");
-    if matches!(status, "failed" | "cancelled") {
-        return Err(ModelError::RequestFailed(format!(
-            "provider reported response status '{status}'"
-        )));
-    }
-    let incomplete = (status == "incomplete").then(|| {
-        body.pointer("/incomplete_details/reason")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    });
+    let non_success = status != "completed";
+    let stop_code = match status {
+        "completed" => None,
+        "incomplete" => body.pointer("/incomplete_details/reason")
+            .and_then(Value::as_str).and_then(bounded_reason),
+        "failed" | "cancelled" => body.pointer("/error/code")
+            .and_then(Value::as_str).and_then(bounded_reason).or(Some(status)),
+        _ => bounded_reason(status),
+    };
     let output = body
         .get("output")
         .and_then(Value::as_array)
@@ -3066,7 +3201,7 @@ fn interpret_responses(
         .unwrap_or_default();
     let text = extract_assistant_text(body);
     let refusal = extract_responses_refusal(body);
-    let tool_calls = if incomplete.is_some() {
+    let tool_calls = if non_success {
         let dropped = output
             .iter()
             .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
@@ -3079,17 +3214,19 @@ fn interpret_responses(
         extract_openai_tool_calls(body, Transport::Responses)
             .map_err(|error| ModelError::RequestFailed(error.to_string()))?
     };
-    let stop = match incomplete {
+    let stop = match stop_code {
         Some("max_output_tokens") => StopReason::MaxTokens,
         Some("content_filter") => StopReason::ContentFilter,
-        Some(other) => StopReason::Other(bounded_reason(other)),
+        Some("context_length_exceeded") => StopReason::ContextWindowExceeded,
+        Some("unknown") | None if non_success => StopReason::IncompleteUnknown,
+        Some(code) => StopReason::Other(code.to_owned()),
         None if !tool_calls.is_empty() => StopReason::ToolUse,
         None if text.is_none() && refusal.is_some() => StopReason::Refusal {
             detail: refusal.clone(),
         },
         None => StopReason::EndTurn,
     };
-    if incomplete.is_none() && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
+    if !non_success && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
         return Err(ModelError::EmptyResponse);
     }
 
@@ -3120,11 +3257,12 @@ fn interpret_responses(
                 blocks: replayable,
             }
         });
-    let reasoning = (!blocks.is_empty()).then(|| OpaqueReasoning {
-        provider: provider.to_owned(),
-        model: model.to_owned(),
-        blocks,
-    });
+    let reasoning =
+        (!blocks.is_empty() && !non_success).then(|| OpaqueReasoning {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            blocks,
+        });
 
     Ok((
         ModelResponse {
@@ -3144,7 +3282,8 @@ fn interpret_responses(
 /// `choices[0].finish_reason`: `length` → `MaxTokens`, `content_filter` →
 /// `ContentFilter` (beide: Tool-Calls verworfen, Teiltext bleibt);
 /// vorhandene Tool-Calls → `ToolUse` (auch bei `stop`, manche Gateways);
-/// nur `message.refusal` → `Refusal`; `stop`/`tool_calls`/fehlend → `EndTurn`;
+/// `message.refusal` (auch nach Teiltext) → `Refusal` ohne Tool-Calls;
+/// `stop`/`tool_calls`/fehlend → `EndTurn`;
 /// unbekannt → `Other`.
 ///
 /// `choices[0].message.reasoning_content` (DeepSeek/Kimi/GLM-Konvention):
@@ -3192,10 +3331,15 @@ fn interpret_chat(
     let refusal = choice
         .and_then(|choice| choice.pointer("/message/refusal"))
         .and_then(Value::as_str)
-        .filter(|refusal| !refusal.is_empty())
-        .map(str::to_owned);
-    let truncated = matches!(finish, Some("length" | "content_filter"));
-    let mut tool_calls = if truncated {
+        .filter(|refusal| !refusal.trim().is_empty());
+    let nonstandard_stop = finish.is_some_and(|reason| {
+        !matches!(reason, "stop" | "length" | "tool_calls" | "function_call" | "content_filter")
+    });
+    let suppress_tools = refusal.is_some()
+        || nonstandard_stop
+        || matches!(finish, Some("length" | "content_filter"))
+        || body["_harw_no_explicit_finish"].as_bool() == Some(true);
+    let mut tool_calls = if suppress_tools {
         let dropped = choice
             .and_then(|choice| choice.pointer("/message/tool_calls"))
             .and_then(Value::as_array)
@@ -3203,7 +3347,7 @@ fn interpret_chat(
         if dropped > 0 {
             tracing::warn!(
                 dropped,
-                "dropping tool calls of a truncated chat completion"
+                "dropping tool calls of an incomplete or refused chat completion"
             );
         }
         Vec::new()
@@ -3233,7 +3377,7 @@ fn interpret_chat(
     // strukturierte Tool-Calls fehlen, der Request tatsächlich Tools
     // angeboten hat, und der (bereits think-bereinigte) Text einen
     // `<tool_call>`-Marker enthält — sonst bleibt die Antwort unverändert.
-    if !truncated
+    if !suppress_tools
         && tool_calls.is_empty()
         && !offered_tools.is_empty()
         && let Some(candidate) = text.as_deref()
@@ -3262,7 +3406,7 @@ fn interpret_chat(
     // `[TOOL_CALLS]`, Llama `<|python_tag|>` und eine Antwort, die nur aus
     // einem (ggf. umzäunten) JSON-Aufruf eines angebotenen Werkzeugs
     // besteht. Gleiche Fail-closed-Regeln wie oben.
-    if !truncated
+    if !suppress_tools
         && tool_calls.is_empty()
         && !offered_tools.is_empty()
         && let Some(candidate) = text.as_deref()
@@ -3292,15 +3436,25 @@ fn interpret_chat(
     let stop = match finish {
         Some("length") => StopReason::MaxTokens,
         Some("content_filter") => StopReason::ContentFilter,
-        _ if !tool_calls.is_empty() => StopReason::ToolUse,
-        _ if text.is_none() && refusal.is_some() => StopReason::Refusal {
-            detail: refusal.clone(),
+        _ if refusal.is_some() => StopReason::Refusal {
+            detail: refusal.and_then(error::sanitize_refusal_detail),
         },
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
         None | Some("stop" | "tool_calls" | "function_call") => StopReason::EndTurn,
-        Some(other) => StopReason::Other(bounded_reason(other)),
+        Some(other) => bounded_reason(other).map_or(StopReason::IncompleteUnknown, |code| {
+            StopReason::Other(code.to_owned())
+        }),
     };
-    if !truncated && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
+    if !suppress_tools && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
         return Err(ModelError::EmptyResponse);
+    }
+    if matches!(stop, StopReason::Refusal { .. }) {
+        return Ok(ModelResponse {
+            message: text,
+            usage: extract_openai_usage(body, Transport::Chat),
+            stop,
+            ..ModelResponse::default()
+        });
     }
     // Runde 7, Teil L7: vLLM/LM Studio liefern Denktext je nach Version in
     // `reasoning_content` oder `reasoning` — beide werden gelesen.
@@ -3473,6 +3627,27 @@ fn toolless_models(provider_name: &str, config: &harw_config::ResolvedConfig) ->
         .values()
         .filter(|model| model.provider == provider_name)
         .filter(|model| model.capabilities.tool_calling == Some(false))
+    {
+        models.insert(model.id.clone());
+        models.extend(model.aliases.iter().cloned());
+    }
+    models
+}
+
+/// Modell-IDs und Aliase von `provider_name`, deren Modelldatei
+/// `[capabilities] reasoning_replay = "strict"` sagt.
+pub(crate) fn strict_replay_models(
+    provider_name: &str,
+    config: &harw_config::ResolvedConfig,
+) -> BTreeSet<String> {
+    let mut models = BTreeSet::new();
+    for model in config
+        .models
+        .values()
+        .filter(|model| model.provider == provider_name)
+        .filter(|model| {
+            model.capabilities.reasoning_replay == Some(harw_config::ReasoningReplayPolicy::Strict)
+        })
     {
         models.insert(model.id.clone());
         models.extend(model.aliases.iter().cloned());
@@ -3702,6 +3877,26 @@ fn build_chat_body_with(request: &ModelRequest, model: &str, compat: ChatCompat)
         }
     }
     body
+}
+
+/// Removes only optional compatibility fields for the one HTTP 400 retry.
+fn remove_optional_chat_fields(body: &mut Value) -> bool {
+    let Some(map) = body.as_object_mut() else {
+        return false;
+    };
+    let mut removed = false;
+    for key in [
+        "reasoning_effort",
+        "stream_options",
+        "parallel_tool_calls",
+        "temperature",
+        "top_p",
+        "thinking",
+        "reasoning",
+    ] {
+        removed |= map.remove(key).is_some();
+    }
+    removed
 }
 
 /// Hängt einen `tool_calls`-Eintrag an die laufende Assistant-Nachricht an oder
@@ -4074,6 +4269,13 @@ impl OpenAiResponsesProvider {
         if let Some(route) = &self.codex_route {
             return Ok(builder.headers(route.headers(&self.client).await?));
         }
+        if let Some(store) = &self.chatgpt_plan {
+            let token = match self.one_shot_account_scope.as_deref() {
+                Some(scope) => store.access_token_for_registration(scope).await,
+                None => store.access_token().await,
+            }.map_err(chatgpt_plan::model_auth_error)?;
+            return Ok(builder.bearer_auth(token.expose_secret()));
+        }
         let mut builder = match self.auth_header.as_str() {
             "none" => builder,
             "api-key" | "x-api-key" => builder.header(
@@ -4135,6 +4337,7 @@ impl OpenAiResponsesProvider {
         let mut request = request;
         let model = self.selected_model(&request)?.to_owned();
         let model = model.as_str();
+        self.apply_chat_output_limit(&mut request, base_url, model);
         // Runde 7, Teil L7: Modelle ohne Werkzeugaufrufe bekommen keine
         // Werkzeuge angeboten (plus Hinweis in den Instruktionen).
         strip_tools_for_toolless_model(&mut request, model, &self.toolless_models);
@@ -4150,6 +4353,8 @@ impl OpenAiResponsesProvider {
             model,
             self.chat_reasoning_overrides.get(model).copied(),
         );
+        let replay_policy =
+            replay_bounds::ReplayPolicy::for_model(&self.strict_replay_models, model);
         let (url, mut wire) = match self.transport {
             Transport::Responses => {
                 let replay = self.reasoning_replay.for_request(
@@ -4157,6 +4362,7 @@ impl OpenAiResponsesProvider {
                     model,
                     base_url,
                     &request,
+                    replay_policy,
                 )?;
                 tracing::debug!(
                     model,
@@ -4181,6 +4387,7 @@ impl OpenAiResponsesProvider {
                         model,
                         &request,
                         &mut body,
+                        replay_policy,
                     )?;
                 }
                 cache_strategy::apply_chat_cache_control(&mut body, strategy);
@@ -4191,6 +4398,12 @@ impl OpenAiResponsesProvider {
 
         if self.codex_route.is_some() {
             codex::prepare_body(&mut wire);
+        }
+        if self.chatgpt_plan.is_some() {
+            chatgpt_plan::prepare_body(&mut wire);
+        }
+        if self.exact_once && self.transport == Transport::Responses {
+            wire["store"] = Value::Bool(false);
         }
         // Natives SSE-Streaming (Codex streamt ohnehin, siehe oben).
         let stream_sink = request
@@ -4267,6 +4480,7 @@ impl OpenAiResponsesProvider {
         // kein zweiter Refresh-Versuch nach erneutem 401 (siehe
         // `codex::CodexRoute::refresh`).
         let mut codex_refreshed_after_401 = false;
+        let mut degraded_after_400 = false;
         let response = loop {
             let builder = self.authorized_request(&url, api_key, identity).await?;
             // Runde 7, Teil L4: gestreamt begrenzt `request_timeout` nur die
@@ -4274,12 +4488,30 @@ impl OpenAiResponsesProvider {
             let response = send_with_timeout(
                 builder.json(&wire),
                 self.request_timeout,
-                stream_sink.is_some(),
+                stream_sink.is_some() || self.chatgpt_plan.is_some(),
             )
             .await?;
 
+            // Selbstheilung bei HTTP 400 (z. B. Azure/xAI-Gateways lehnen optionale Felder wie
+            // `reasoning_effort` oder `stream_options` ab): einmal ohne diese Zusatzfelder wiederholen.
+            if response.status() == reqwest::StatusCode::BAD_REQUEST
+                && self.transport == Transport::Chat
+                && !degraded_after_400
+                && !self.exact_once
+                && self.codex_route.is_none()
+                && self.chatgpt_plan.is_none()
+                && remove_optional_chat_fields(&mut wire)
+            {
+                degraded_after_400 = true;
+                tracing::warn!(
+                    model,
+                    "provider returned HTTP 400; retrying once without optional request fields"
+                );
+                continue;
+            }
             if response.status() == reqwest::StatusCode::UNAUTHORIZED
                 && !codex_refreshed_after_401
+                && !self.exact_once
                 && let Some(route) = &self.codex_route
             {
                 codex_refreshed_after_401 = true;
@@ -4296,11 +4528,37 @@ impl OpenAiResponsesProvider {
         let retry_after_ms = header_string(response.headers(), "retry-after-ms");
         let request_id = provider_request_id(response.headers());
         let value: Value = if status.is_success() && self.codex_route.is_some() {
-            codex::read_response(response, request.stream.as_ref()).await?
+            match codex::read_response(response, request.stream.as_ref()).await? {
+                sse::NativeStreamOutcome::Completed(body) => body,
+                sse::NativeStreamOutcome::Interrupted(partial) => {
+                    budget_permit.reconcile(&partial.usage);
+                    return Ok(partial);
+                }
+            }
+        } else if status.is_success() && self.chatgpt_plan.is_some() {
+            match chatgpt_plan::read_response(response, stream_sink, self.stream_idle_timeout)
+                .await?
+            {
+                sse::NativeStreamOutcome::Completed(body) => body,
+                sse::NativeStreamOutcome::Interrupted(partial) => {
+                    budget_permit.reconcile(&partial.usage);
+                    return Ok(partial);
+                }
+            }
         } else if status.is_success()
             && let Some(sink) = stream_sink
         {
-            read_native_stream(response, self.transport, sink, self.stream_idle_timeout).await?
+            match read_native_stream(response, self.transport, sink, self.stream_idle_timeout)
+                .await?
+            {
+                sse::NativeStreamOutcome::Completed(body) => body,
+                sse::NativeStreamOutcome::Interrupted(partial) => {
+                    budget_permit.reconcile(&partial.usage);
+                    // This is a partial answer, not an error eligible for
+                    // transport retry and not a complete round for replay.
+                    return Ok(partial);
+                }
+            }
         } else {
             let body = response
                 .text()
@@ -4308,6 +4566,12 @@ impl OpenAiResponsesProvider {
                 .map_err(|error| model_error_for_transport(error, true))?;
 
             if !status.is_success() {
+                if self.chatgpt_plan.is_some()
+                    && let Ok(value) = serde_json::from_str(&body)
+                    && let Some(error) = chatgpt_plan::response_error(&value)
+                {
+                    return Err(error);
+                }
                 if status.as_u16() == 429 {
                     // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
                     // dieses Providers, unabhängig davon, ob sie unten als
@@ -4330,8 +4594,17 @@ impl OpenAiResponsesProvider {
                             .note_rate_limit_cooldown(Duration::from_secs(secs));
                     }
                 }
-                let error =
-                    model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
+                let diagnostic_body = if self.chatgpt_plan.is_some() {
+                    ""
+                } else {
+                    &body
+                };
+                let error = model_error_for_status(
+                    status.as_u16(),
+                    request_id.as_deref(),
+                    hint,
+                    diagnostic_body,
+                );
                 tracing::debug!(
                     status = status.as_u16(),
                     retryable = error.is_retryable(),
@@ -4373,8 +4646,12 @@ impl OpenAiResponsesProvider {
         }
         budget_permit.reconcile(&response.usage);
         if let Some(replay) = response_replay {
-            self.reasoning_replay
-                .remember(replay, base_url, &request, &response)?;
+            replay_bounds::remember_or_warn(
+                "responses",
+                model,
+                self.reasoning_replay
+                    .remember(replay, base_url, &request, &response),
+            );
         }
         if self.transport == Transport::Chat
             && chat_reasoning_mode == harw_config::ChatReasoningReplay::ReasoningContent
@@ -4383,15 +4660,20 @@ impl OpenAiResponsesProvider {
                 StopReason::MaxTokens
                     | StopReason::ContentFilter
                     | StopReason::ContextWindowExceeded
+                    | StopReason::Refusal { .. }
             )
         {
-            self.chat_reasoning_cache.remember(
-                &chat_replay_namespace,
+            replay_bounds::remember_or_warn(
+                "chat",
                 model,
-                &request,
-                &response,
-                &value,
-            )?;
+                self.chat_reasoning_cache.remember(
+                    &chat_replay_namespace,
+                    model,
+                    &request,
+                    &response,
+                    &value,
+                ),
+            );
         }
         Ok(response)
     }
@@ -4441,30 +4723,52 @@ async fn read_native_stream(
     transport: Transport,
     sink: &harw_core::StreamSink,
     idle_timeout: Duration,
-) -> Result<Value, ModelError> {
+) -> Result<sse::NativeStreamOutcome, ModelError> {
     match transport {
         Transport::Chat => {
             let mut accumulator = sse::ChatStreamAccumulator::default();
-            sse::read_sse(response, Some(idle_timeout), |frame| {
+            match sse::read_sse(response, Some(idle_timeout), |frame| {
                 accumulator.push(&frame, Some(sink))
             })
-            .await?;
-            accumulator.finish()
+            .await
+            {
+                Ok(()) => Ok(accumulator.finish()),
+                Err(error @ (ModelError::Truncated { .. } | ModelError::Timeout { .. })) => {
+                    accumulator.finish_after_transport_error().ok_or(error)
+                }
+                Err(error) => Err(error),
+            }
         }
         Transport::Responses => {
             let mut terminal = None;
-            sse::read_sse(response, Some(idle_timeout), |frame| {
+            let mut partial = sse::ResponsesPartialText::default();
+            let body_read = sse::read_sse(response, Some(idle_timeout), |frame| {
                 if frame.data.trim().is_empty() || frame.data.trim() == "[DONE]" {
                     return Ok(false);
                 }
                 let event: Value = serde_json::from_str(&frame.data)?;
-                terminal = sse::responses_event(&event, Some(sink))?;
+                partial.observe(&event);
+                terminal = match partial.terminal_error(&event) {
+                    Some(failure) => Some(failure),
+                    None => sse::responses_event(&event, Some(sink))?,
+                };
                 Ok(terminal.is_some())
             })
-            .await?;
-            terminal.ok_or_else(|| ModelError::Truncated {
-                message: "response stream ended before its terminal event".into(),
-            })
+            .await;
+            match body_read {
+                Ok(()) => Ok(match terminal {
+                    Some(body) => {
+                        sse::NativeStreamOutcome::Completed(partial.retain_visible_text(body))
+                    }
+                    None => partial.into_interrupted(false),
+                }),
+                // Do not retry a response already visible to the user. Decoder
+                // errors and explicit provider failure keep their own category.
+                Err(ModelError::Truncated { .. } | ModelError::Timeout { .. }) if partial.has_text() => {
+                    Ok(partial.into_interrupted(true))
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 }
@@ -4689,9 +4993,70 @@ mod tests {
         Ok((base_url, handle))
     }
 
+    /// Returns a clean HTTP response whose SSE conversation has no terminal
+    /// event. This is different from the transport itself failing.
+    fn mock_interrupted_chat_sse() -> TestResult<(String, thread::JoinHandle<TestResult<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").map_err(ctx("bind SSE fixture"))?;
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().map_err(ctx("SSE fixture address"))?
+        );
+        let content = serde_json::json!({
+            "id":"fixture",
+            "choices":[{"delta":{
+                "content":"visible prefix<tool_call>lookup",
+                "reasoning_content":"partial reasoning",
+                "tool_calls":[{"index":0,"id":"call-1","function":{"name":"lookup","arguments":"{"}}]
+            }}],
+        });
+        let usage = serde_json::json!({
+            "id":"fixture",
+            "choices":[],
+            "usage":{"prompt_tokens":10,"completion_tokens":4},
+        });
+        let body = format!("data: {content}\n\ndata: {usage}\n\n");
+        let thread = thread::spawn(move || -> TestResult<()> {
+            let (mut stream, _) = listener.accept().map_err(ctx("accept SSE request"))?;
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer).map_err(ctx("read SSE request"))?;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .map_err(ctx("write SSE response"))?;
+            Ok(())
+        });
+        Ok((base_url, thread))
+    }
+
     #[tokio::test]
-    async fn identityless_responses_tool_results_require_identity_only_for_reasoning() -> TestResult
-    {
+    async fn chat_bare_eof_is_not_a_provider_token_limit() -> TestResult {
+        let (base_url, server) = mock_interrupted_chat_sse()?;
+        let provider = OpenAiResponsesProvider::with_transport(
+            base_url,
+            "gpt-test",
+            SecretString::new("fixture".into()),
+            Transport::Chat,
+        )
+        .map_err(ctx("construct SSE fixture provider"))?;
+        let mut request = request_with_ids(None, None);
+        request.stream = Some(harw_core::StreamSink::new(|_| {}));
+        let response = provider
+            .respond(request)
+            .await
+            .map_err(ctx("partial response"))?;
+        server.join().map_err(join_thread_error)??;
+        assert_eq!(response.stop, StopReason::StreamInterrupted);
+        assert_eq!(response.message.as_deref(), Some("visible prefix"));
+        assert!(response.tool_calls.is_empty());
+        assert!(response.reasoning.is_none());
+        assert_eq!(response.usage.output_tokens, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identityless_responses_tool_results_keep_the_paid_response() -> TestResult {
         for (case, effort, encrypted, identity, succeeds) in [
             ("ordinary tool round", None, false, None, true),
             (
@@ -4699,15 +5064,18 @@ mod tests {
                 Some(harw_types::ReasoningEffort::High),
                 false,
                 None,
-                false,
+                true,
             ),
-            ("encrypted reasoning", None, true, None, false),
+            // Eine nicht merkbare Runde verwirft die bezahlte Antwort nicht
+            // mehr (HARW-REPLAY-003); erst eine `strict`-Folgeanfrage würde
+            // an der fehlenden Kontinuität scheitern.
+            ("encrypted reasoning", None, true, None, true),
             (
                 "invalid provided identity",
                 None,
                 false,
                 Some(test_identity("", "", "reader")),
-                false,
+                true,
             ),
         ] {
             let mut output = Vec::new();
@@ -4750,10 +5118,10 @@ mod tests {
                 assert_eq!(response.tool_calls[0].id.as_str(), "a");
                 assert_eq!(response.tool_calls[0].name.as_str(), "lookup");
                 assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
-                assert!(response.reasoning.is_none());
+                assert_eq!(response.reasoning.is_some(), encrypted, "{case}");
             } else {
                 assert!(
-                    matches!(result, Err(ModelError::RequestFailed(ref detail)) if detail.contains("request identity is missing")),
+                    matches!(result, Err(ModelError::ReplayUnavailable { ref detail, .. }) if detail.contains("request identity is missing")),
                     "{case} must retain its identity requirement: {result:?}"
                 );
             }
@@ -6358,6 +6726,28 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_plan_provider_can_start_before_account_linking() -> TestResult {
+        let home = tempfile::tempdir().map_err(ctx("create Harw home"))?;
+        let mut config = harw_config::ResolvedConfig::default();
+        let mut provider = configured_provider(
+            "chatgpt-plan",
+            "https://api.openai.com/v1".to_owned(),
+            vec!["gpt-test"],
+            "UNUSED",
+        );
+        provider.api = "openai-chatgpt-plan".to_owned();
+        provider.auth = None;
+        provider.headers.clear();
+        config.harness.default_provider = Some(provider.name.clone());
+        config.harness.default_model = Some("gpt-test".to_owned());
+        config.providers.insert(provider.name.clone(), provider);
+
+        build_provider_with_home(&config, home.path(), None)
+            .map_err(ctx("an unlinked ChatGPT plan provider must still start"))?;
+        Ok(())
+    }
+
+    #[test]
     fn test_build_provider_broken_primary_reference_is_hard_error() {
         let config = config_with_stale_codex_failover("HARW_TEST_MISSING_PRIMARY_KEY");
         assert!(build_provider(&config).is_err());
@@ -6486,6 +6876,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn test_resolve_secret_missing_keyring_entry_is_redacted_and_skips_resolver() -> TestResult {
         // Mock-Backend statt echtem System-Keyring: jede neue `Entry` ist leer,
@@ -6616,6 +7007,73 @@ mod tests {
                 .map_err(ctx("selected_model succeeds"))?,
             "requested-model"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn foundry_default_model_preserves_the_output_cap_on_the_chat_retry() -> TestResult {
+        let provider_id = "azure-foundry-chat";
+        let base_url = "https://fixture.services.ai.azure.com/openai/v1";
+        let mut provider = OpenAiResponsesProvider::with_transport(
+            base_url,
+            "mistral-large-4-latest",
+            SecretString::new("fixture".into()),
+            Transport::Chat,
+        )
+        .map_err(ctx("configure fixture"))?;
+        provider.provider_id = provider_id.to_owned();
+
+        // The phone's SwitchingModel deliberately clears both request IDs.
+        let mut request = request_with_ids(None, None);
+        request.max_output_tokens = Some(20_000);
+        request.reasoning_effort = Some(harw_types::ReasoningEffort::High);
+        let model = provider
+            .selected_model(&request)
+            .map_err(ctx("select model"))?
+            .to_owned();
+        provider.apply_chat_output_limit(&mut request, base_url, &model);
+
+        assert_eq!(request.max_output_tokens, Some(4_096)); // Also used for quota admission.
+        let mut wire = build_chat_body(&request, &model);
+        assert_eq!(wire["max_completion_tokens"], 4_096);
+        assert_eq!(wire["reasoning_effort"], "high");
+        assert!(remove_optional_chat_fields(&mut wire));
+        assert_eq!(wire["max_completion_tokens"], 4_096);
+        assert!(wire.get("reasoning_effort").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn foundry_chat_budget_does_not_raise_small_budgets_or_cap_other_routes() -> TestResult {
+        let foundry_url = "https://fixture.services.ai.azure.com/openai/v1";
+        let mut provider = OpenAiResponsesProvider::with_transport(
+            foundry_url,
+            "grok-4.3",
+            SecretString::new("fixture".into()),
+            Transport::Chat,
+        )
+        .map_err(ctx("configure fixture"))?;
+        provider.provider_id = "azure-foundry-chat".to_owned();
+
+        let mut request = request_with_ids(None, None);
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3");
+        assert_eq!(request.max_output_tokens, None);
+        request.max_output_tokens = Some(2_000);
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3");
+        assert_eq!(request.max_output_tokens, Some(2_000));
+
+        request.max_output_tokens = Some(20_000);
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3-custom");
+        assert_eq!(request.max_output_tokens, Some(20_000));
+        provider.apply_chat_output_limit(&mut request, "https://api.x.ai/v1", "grok-4.3");
+        assert_eq!(request.max_output_tokens, Some(20_000));
+        provider.transport = Transport::Responses;
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3");
+        assert_eq!(request.max_output_tokens, Some(20_000));
+        provider.transport = Transport::Chat;
+        provider.provider_id = "azure-openai-chat".to_owned();
+        provider.apply_chat_output_limit(&mut request, foundry_url, "grok-4.3");
+        assert_eq!(request.max_output_tokens, Some(20_000));
         Ok(())
     }
 

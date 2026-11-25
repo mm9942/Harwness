@@ -21,11 +21,12 @@ use crate::cli::CompletionsCommand;
 const BIN_NAME: &str = "harw";
 
 /// Weitere harw-Programme, an die `--all-binaries` Installation bzw. Entfernung weiterreicht.
-pub const DOD_BINARIES: [&str; 4] = [
+pub const DOD_BINARIES: [&str; 5] = [
     "harw-sentinel",
-    "harw-warden",
-    "harw-probe-fs",
     "harw-probe-bpf",
+    "harw-probe-fs",
+    "harw-probe-netlink",
+    "harw-warden",
 ];
 
 /// Führt `harw completions` aus.
@@ -141,5 +142,25 @@ fn is_executable_file(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DOD_BINARIES;
+    use crate::test_support::TestResult;
+
+    /// `--all-binaries` reicht an genau die Programme weiter, die das
+    /// DoD-Paket installiert, in Manifest-Reihenfolge (PL-100 WP1.8:
+    /// inklusive `harw-probe-netlink`). Die einzige Quelle ist
+    /// `harw_install::DOD_PACKAGE_BINARIES`.
+    #[test]
+    fn test_dod_binaries_are_the_dod_package_binaries() -> TestResult {
+        assert_eq!(
+            DOD_BINARIES.as_slice(),
+            harw_install::DOD_PACKAGE_BINARIES,
+            "DOD_BINARIES weicht von harw_install::DOD_PACKAGE_BINARIES ab"
+        );
+        Ok(())
     }
 }

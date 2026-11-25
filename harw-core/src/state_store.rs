@@ -48,12 +48,14 @@ use crate::mode::InteractionMode;
 use harw_extension_api::ExtFuture;
 use harw_protocol::AgentOrchestrationEvent;
 use harw_protocol::items::{ResultTrust, ToolCallResult, ToolResultItem, TurnItem};
-use harw_session_store::{RecordKind, TranscriptStore};
+use harw_session_store::title_seed::{self, TitleSeedLocation};
+use harw_session_store::{RecordKind, SessionPurpose, TranscriptStore};
 use harw_tools::ToolName;
-use harw_types::{ItemId, SessionId, ThreadRef, TokenUsage, ToolCallId};
+use harw_types::{ItemId, SessionId, ThreadRef, TokenUsage, ToolCallId, TurnId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Errors returned by a [`StateStore`] operation.
@@ -560,6 +562,53 @@ pub trait StateStore: Send + Sync {
         item: &'a TurnItem,
     ) -> ExtFuture<'a, StateStoreResult<()>>;
 
+    /// Host-only evidence admission; ordinary StateStore implementations do not track title inputs.
+    fn begin_title_seed<'a>(
+        &'a self, _sid: &'a SessionId, _turn: &'a TurnId, _human: bool, _preceding_users: usize,
+    ) -> ExtFuture<'a, StateStoreResult<bool>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    /// Existing journal item write, with exact byte location returned by its durable writer.
+    fn save_title_seed_item<'a>(
+        &'a self, sid: &'a SessionId, item: &'a TurnItem,
+    ) -> ExtFuture<'a, StateStoreResult<Option<TitleSeedLocation>>> {
+        Box::pin(async move {
+            self.save_turn(sid, item).await?;
+            Ok(None)
+        })
+    }
+
+    /// Bind the actual durable user item, or retire the index when its ID is unprovable.
+    fn attach_title_seed_user<'a>(
+        &'a self, _sid: &'a SessionId, _turn: &'a TurnId, _user: Option<TitleSeedLocation>,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// A terminal outcome comes from the runtime, not a streaming projection.
+    fn finish_title_seed<'a>(
+        &'a self, _sid: &'a SessionId, _turn: &'a TurnId,
+        _completed: bool, _assistant: Option<TitleSeedLocation>,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Next sequence published by this process only after a completed sync.
+    /// An unsupported or not-yet-observed journal has no trusted cursor.
+    fn committed_fork_head(&self, _sid: &SessionId) -> StateStoreResult<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Actual configured archive journal location and thread mapping.
+    /// No core state, provider, or model is opened by this query.
+    fn archive_journal_binding(
+        &self,
+        _sid: &SessionId,
+    ) -> Option<(std::path::PathBuf, ThreadRef)> {
+        None
+    }
+
     /// Lädt den vollständigen Verlauf einer Session.
     ///
     /// Impls sollen offene Tool-Calls über [`repair_open_tool_calls`]
@@ -590,6 +639,18 @@ pub trait StateStore: Send + Sync {
             }
             Ok(())
         })
+    }
+
+    /// Persists a rewrite after the runtime resolved its exact user-message
+    /// rewind boundary. Durable stores can tag the existing transaction;
+    /// other implementations retain their normal history-save semantics.
+    fn save_history_with_rewind_boundary<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        history: &'a ConversationHistory,
+        _target: Option<&'a str>,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        self.save_history(sid, history)
     }
 
     /// Persistiert den Sitzungszustand (Modus, Nutzung, Aktivierung).
@@ -727,7 +788,18 @@ pub type SessionThreadMapper = fn(&SessionId) -> ThreadRef;
 // wiederhergestellt.
 #[derive(Debug, Default)]
 struct SequenceSlot {
-    next: Option<u64>,
+    next: Mutex<Option<u64>>,
+    // Zero denotes unknown. A successful append always advances past zero.
+    committed_next: AtomicU64,
+    // Zero is unknown; otherwise one plus the capped count of observed user
+    // records. This count never shrinks when the active model context compacts.
+    title_users_plus_one: AtomicU64,
+}
+
+const TITLE_USER_OBSERVATION_CAP: u64 = 4;
+
+fn is_title_user_record(kind: RecordKind, payload: &serde_json::Value) -> bool {
+    kind == RecordKind::Item && payload.get("type").and_then(serde_json::Value::as_str) == Some("user_message")
 }
 
 // Runs blocking file I/O off the async executor when a Tokio runtime is
@@ -744,6 +816,18 @@ where
             .map_err(|_| StateStoreError::PoisonedMutex { operation })?,
         Err(_) => work(),
     }
+}
+
+fn recover_writer_sequence(
+    store: &TranscriptStore,
+    sid: &SessionId,
+    thread: &ThreadRef,
+    purpose: Option<SessionPurpose>,
+) -> StateStoreResult<u64> {
+    if let Some(purpose) = purpose {
+        store.ensure_session_purpose(sid, thread, purpose)?;
+    }
+    recovered_next_sequence(store, sid)
 }
 
 fn recovered_next_sequence(store: &TranscriptStore, sid: &SessionId) -> StateStoreResult<u64> {
@@ -778,7 +862,8 @@ fn recovered_next_sequence(store: &TranscriptStore, sid: &SessionId) -> StateSto
 pub struct TranscriptStateStore {
     transcript_store: Arc<TranscriptStore>,
     thread_for_session: SessionThreadMapper,
-    sessions: Mutex<HashMap<String, Arc<Mutex<SequenceSlot>>>>,
+    creation_purpose: Option<SessionPurpose>,
+    sessions: Mutex<HashMap<String, Arc<SequenceSlot>>>,
 }
 
 impl TranscriptStateStore {
@@ -791,13 +876,21 @@ impl TranscriptStateStore {
         Self {
             transcript_store: Arc::new(transcript_store),
             thread_for_session,
+            creation_purpose: None,
             sessions: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Use only for stores mounted by a trusted runtime producer, never for user content.
+    #[must_use]
+    pub fn with_creation_purpose(mut self, purpose: SessionPurpose) -> Self {
+        self.creation_purpose = Some(purpose);
+        self
+    }
+
     // Holt (oder legt an) das Sequenz-Schloss einer Session. Die globale Map
     // ist nur für diesen Nachschlag gesperrt, nie über I/O.
-    fn session_slot(&self, sid: &SessionId) -> StateStoreResult<Arc<Mutex<SequenceSlot>>> {
+    fn session_slot(&self, sid: &SessionId) -> StateStoreResult<Arc<SequenceSlot>> {
         let mut sessions = lock_state(&self.sessions, "transcript_save_turn")?;
         Ok(Arc::clone(
             sessions.entry(sid.as_str().to_owned()).or_default(),
@@ -810,15 +903,22 @@ impl TranscriptStateStore {
         kind: RecordKind,
         payload: serde_json::Value,
     ) -> StateStoreResult<()> {
+        self.append_record_inner(sid, kind, payload, false).await.map(|_| ())
+    }
+
+    async fn append_record_inner(
+        &self, sid: &SessionId, kind: RecordKind, payload: serde_json::Value, capture: bool,
+    ) -> StateStoreResult<Option<TitleSeedLocation>> {
         let slot = self.session_slot(sid)?;
         let store = Arc::clone(&self.transcript_store);
         let thread = (self.thread_for_session)(sid);
+        let purpose = self.creation_purpose;
         let sid = sid.clone();
         run_blocking("transcript_save_turn", move || {
-            let mut slot = lock_state(slot.as_ref(), "transcript_save_turn")?;
-            let sequence = match slot.next {
+            let mut writer_next = lock_state(&slot.next, "transcript_save_turn")?;
+            let sequence = match *writer_next {
                 Some(sequence) => sequence,
-                None => recovered_next_sequence(&store, &sid)?,
+                None => recover_writer_sequence(&store, &sid, &thread, purpose)?,
             };
             let next =
                 sequence
@@ -834,15 +934,108 @@ impl TranscriptStateStore {
                 kind,
                 payload,
             );
-            store.append(&record)?;
-            slot.next = Some(next);
-            Ok(())
+            let is_user = is_title_user_record(record.kind, &record.payload);
+            let location = match if capture { store.append_title_item(&record) }
+                else { store.append(&record).map(|()| None) }
+            {
+                Ok(location) => location,
+                Err(error) => {
+                    slot.committed_next.store(0, Ordering::Release);
+                    // An append can fail after reaching disk. Rehydrate before certifying any count.
+                    slot.title_users_plus_one.store(0, Ordering::Release);
+                    return Err(error.into());
+                }
+            };
+            if is_user {
+                let count = slot.title_users_plus_one.load(Ordering::Relaxed);
+                if count != 0 {
+                    slot.title_users_plus_one.store((count + 1).min(TITLE_USER_OBSERVATION_CAP + 1), Ordering::Release);
+                }
+            }
+            *writer_next = Some(next);
+            slot.committed_next.store(next, Ordering::Release);
+            Ok(location)
         })
         .await
     }
 }
 
 impl StateStore for TranscriptStateStore {
+    fn begin_title_seed<'a>(
+        &'a self, sid: &'a SessionId, turn: &'a TurnId, human: bool, preceding_users: usize,
+    ) -> ExtFuture<'a, StateStoreResult<bool>> {
+        let store = Arc::clone(&self.transcript_store);
+        let thread = (self.thread_for_session)(sid);
+        Box::pin(async move {
+            let slot = self.session_slot(sid)?;
+            let (sid, turn) = (sid.clone(), turn.clone());
+            run_blocking("title_seed_begin", move || {
+                if human {
+                    let _writer = lock_state(&slot.next, "title_seed_begin")?;
+                    let durable_users = slot.title_users_plus_one.load(Ordering::Acquire)
+                        .checked_sub(1).and_then(|count| usize::try_from(count).ok());
+                    Ok(title_seed::begin_title_seed(
+                        store.root(), &sid, &thread, &turn, preceding_users, durable_users,
+                    )?)
+                } else {
+                    title_seed::invalidate_title_seed(store.root(), &sid)?;
+                    Ok(false)
+                }
+            }).await
+        })
+    }
+
+    fn save_title_seed_item<'a>(
+        &'a self, sid: &'a SessionId, item: &'a TurnItem,
+    ) -> ExtFuture<'a, StateStoreResult<Option<TitleSeedLocation>>> {
+        Box::pin(async move {
+            let payload = serde_json::to_value(item).map_err(harw_session_store::SessionStoreError::from)?;
+            self.append_record_inner(sid, RecordKind::Item, payload, true).await
+        })
+    }
+
+    fn attach_title_seed_user<'a>(
+        &'a self, sid: &'a SessionId, turn: &'a TurnId, user: Option<TitleSeedLocation>,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        let store = Arc::clone(&self.transcript_store);
+        let (sid, turn) = (sid.clone(), turn.clone());
+        Box::pin(async move {
+            run_blocking("title_seed_user", move || {
+                Ok(title_seed::attach_title_user(store.root(), &sid, &turn, user)?)
+            }).await
+        })
+    }
+
+    fn finish_title_seed<'a>(
+        &'a self, sid: &'a SessionId, turn: &'a TurnId,
+        completed: bool, assistant: Option<TitleSeedLocation>,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        let store = Arc::clone(&self.transcript_store);
+        let (sid, turn) = (sid.clone(), turn.clone());
+        Box::pin(async move {
+            run_blocking("title_seed_finish", move || {
+                Ok(title_seed::finish_title_seed(store.root(), &sid, &turn, completed, assistant)?)
+            }).await
+        })
+    }
+
+    fn archive_journal_binding(
+        &self,
+        sid: &SessionId,
+    ) -> Option<(std::path::PathBuf, ThreadRef)> {
+        Some((
+            self.transcript_store.root().to_path_buf(),
+            (self.thread_for_session)(sid),
+        ))
+    }
+
+    fn committed_fork_head(&self, sid: &SessionId) -> StateStoreResult<Option<u64>> {
+        let head = lock_state(&self.sessions, "transcript_fork_cursor")?
+            .get(sid.as_str())
+            .map(|slot| slot.committed_next.load(Ordering::Acquire));
+        Ok(head.filter(|head| *head != 0))
+    }
+
     fn record_skill_injection<'a>(
         &'a self,
         sid: &'a SessionId,
@@ -1008,29 +1201,84 @@ impl StateStore for TranscriptStateStore {
         })
     }
 
-    /// Ersetzt den Verlauf append-only: hängt jedes Item aus `history` als
-    /// `RecordKind::Item` an (wie `save_turn`) und schreibt danach EINEN
-    /// `RecordKind::Lifecycle`-Datensatz mit Payload
-    /// `{"marker": "history_replaced", "item_count": N}`
-    /// (`N = history.items().len()`). `load_history` behält beim Auftreten
-    /// dieses Markers rückwirkend nur die letzten `N` bis dahin gesammelten
-    /// Items; danach neu angehängte Items zählen normal weiter dazu.
-    ///
-    /// Stürzt der Prozess vor dem Marker ab, bleibt der alte Zustand
-    /// (Duplikate, aber kein Datenverlust) — ein späterer `save_history`-Aufruf
-    /// schreibt den Marker nach.
     fn save_history<'a>(
         &'a self,
         sid: &'a SessionId,
         history: &'a ConversationHistory,
     ) -> ExtFuture<'a, StateStoreResult<()>> {
+        self.save_history_with_rewind_boundary(sid, history, None)
+    }
+
+    /// Appends a framed replacement under one journal writer fence. Old
+    /// readers ignore the begin marker and retain the existing commit rule.
+    fn save_history_with_rewind_boundary<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        history: &'a ConversationHistory,
+        target: Option<&'a str>,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
         Box::pin(async move {
-            for item in history.items() {
-                self.save_turn(sid, item).await?;
+            let slot = self.session_slot(sid)?;
+            let store = Arc::clone(&self.transcript_store);
+            let thread = (self.thread_for_session)(sid);
+            let purpose = self.creation_purpose;
+            let sid = sid.clone();
+            let item_count = history.items().len();
+            let mut payloads = Vec::with_capacity(item_count.saturating_add(2));
+            let mut start = serde_json::json!({
+                "marker": "history_replace_started",
+                "item_count": item_count,
+            });
+            if let Some(target) = target {
+                start["rewind_target_item_id"] = serde_json::json!(target);
             }
-            let payload = history_replaced_payload(history.items().len())?;
-            self.append_record(sid, RecordKind::Lifecycle, payload)
-                .await
+            payloads.push((RecordKind::Lifecycle, start));
+            for item in history.items() {
+                let payload = serde_json::to_value(item)
+                    .map_err(harw_session_store::SessionStoreError::from)?;
+                payloads.push((RecordKind::Item, payload));
+            }
+            payloads.push((RecordKind::Lifecycle, history_replaced_payload(item_count)?));
+            let is_rewind = target.is_some();
+            run_blocking("transcript_save_history", move || {
+                if is_rewind {
+                    // A user-requested rewind is not an ordinary send: if the old source
+                    // cannot be revoked, abort the rewrite rather than leave valid-looking
+                    // old byte offsets available for publication after the edit.
+                    title_seed::invalidate_title_seed(store.root(), &sid)?;
+                }
+                let mut writer_next = lock_state(&slot.next, "transcript_save_history")?;
+                let mut sequence = match *writer_next {
+                    Some(sequence) => sequence,
+                    None => recover_writer_sequence(&store, &sid, &thread, purpose)?,
+                };
+                let mut records = Vec::with_capacity(payloads.len());
+                for (kind, payload) in payloads {
+                    records.push(harw_session_store::TranscriptRecord::new(
+                        sid.clone(),
+                        thread.clone(),
+                        sequence,
+                        jiff::Timestamp::now(),
+                        kind,
+                        payload,
+                    ));
+                    sequence = sequence.checked_add(1).ok_or_else(|| {
+                        StateStoreError::SequenceExhausted {
+                            session: sid.clone(),
+                        }
+                    })?;
+                }
+                if let Err(error) = store.append_group(&records) {
+                    // A failed write can leave a durable start marker.
+                    *writer_next = None;
+                    slot.committed_next.store(0, Ordering::Release);
+                    return Err(error.into());
+                }
+                *writer_next = Some(sequence);
+                slot.committed_next.store(sequence, Ordering::Release);
+                Ok(())
+            })
+            .await
         })
     }
 
@@ -1041,22 +1289,36 @@ impl StateStore for TranscriptStateStore {
         Box::pin(async move {
             let store = Arc::clone(&self.transcript_store);
             let thread = (self.thread_for_session)(sid);
+            let slot = self.session_slot(sid).ok();
             let sid = sid.clone();
             let mut history = run_blocking("transcript_load_history", move || {
+                // Reuse this canonical hydration pass; the title API itself never scans a journal.
+                // If the optional observation cannot be safely published, do not make history
+                // loading wait or fail because of its index.
+                let writer = slot.as_ref().and_then(|slot| slot.next.try_lock().ok());
                 let reader = match store.reader(&sid) {
                     Ok(reader) => reader,
                     Err(harw_session_store::SessionStoreError::NotFound { .. }) => {
+                        if let Some(slot) = slot.as_ref().filter(|_| writer.is_some()) {
+                            slot.title_users_plus_one.store(1, Ordering::Release);
+                        }
                         return Ok(ConversationHistory::new());
                     }
                     Err(error) => return Err(error.into()),
                 };
                 let mut items = Vec::new();
+                let mut title_users = 0;
                 for record in reader {
                     let record = record?;
                     if record.thread != thread {
                         continue;
                     }
                     if record.kind == RecordKind::Item {
+                        // A rewrite can copy old rows; on an ambiguous restart this may
+                        // over-count and safely disable titles, but never overlook a gap.
+                        if title_users < TITLE_USER_OBSERVATION_CAP && is_title_user_record(record.kind, &record.payload) {
+                            title_users += 1;
+                        }
                         items.push(
                             serde_json::from_value(record.payload)
                                 .map_err(harw_session_store::SessionStoreError::from)?,
@@ -1067,6 +1329,9 @@ impl StateStore for TranscriptStateStore {
                         let keep_from = items.len().saturating_sub(item_count);
                         items.drain(..keep_from);
                     }
+                }
+                if let Some(slot) = slot.as_ref().filter(|_| writer.is_some()) {
+                    slot.title_users_plus_one.store(title_users + 1, Ordering::Release);
                 }
                 Ok(ConversationHistory::from_items(items))
             })
@@ -1599,6 +1864,35 @@ mod tests {
             loaded_state,
             Some(snapshot(InteractionMode::Plan, 2)),
             "the history_replaced marker must never be mistaken for a session-state snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_cursor_is_published_only_by_successful_process_local_writes() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let sid = session();
+        let writer =
+            TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
+        assert_eq!(writer.committed_fork_head(&sid)?, None);
+        writer.save_turn(&sid, &error_item("one")).await?;
+        assert_eq!(writer.committed_fork_head(&sid)?, Some(1));
+
+        let reopened =
+            TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
+        assert_eq!(reopened.load_history(&sid).await?.items().len(), 1);
+        assert_eq!(
+            reopened.committed_fork_head(&sid)?,
+            None,
+            "raw replay proves no writer horizon"
+        );
+
+        let updated = ConversationHistory::from_items(vec![error_item("replacement")]);
+        writer.save_history(&sid, &updated).await?;
+        assert_eq!(
+            writer.committed_fork_head(&sid)?,
+            Some(4),
+            "start/item/commit all fsynced"
         );
         Ok(())
     }

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="private_library_assistant_text_only">Las imágenes se quedan en la biblioteca privada. Puedes añadir una descripción guardada como texto al borrador del asistente privado.</string>
+    <string name="private_library_assistant_picture_description">Usar la descripción en el asistente privado</string>
+    <string name="private_library_assistant_description_consent">¿Añadir la descripción guardada de «%1$s» al borrador de este asistente privado? La imagen se queda en la biblioteca. El texto no se procesa hasta que pulses Enviar.</string>
+    <string name="private_library_assistant_stage_description">Añadir texto al borrador</string>
+    <string name="private_library_assistant_description_missing">El elemento ya no tiene una descripción guardada. No se ha añadido nada.</string>
+    <string name="private_library_assistant_draft_unavailable">El borrador del asistente no está disponible o es demasiado largo. No se ha añadido nada.</string>
+    <string name="private_library_assistant_draft_heading">Descripción de mi biblioteca privada (solo texto, sin imagen):</string>
+    <string name="private_library_assistant_photo_intro">Puedes adjuntar una foto al asistente privado de este dispositivo o añadir una descripción guardada como texto.</string>
+    <string name="private_library_assistant_attach_photo">Adjuntar foto al asistente privado</string>
+    <string name="private_library_assistant_photo_consent">¿Adjuntar «%1$s» a este borrador? Al pulsar Enviar, solo tu modelo de visión local verá la foto. No se subirá nada.</string>
+    <string name="private_library_assistant_stage_photo">Adjuntar al borrador</string>
+    <string name="private_library_assistant_photo_draft">Foto adjunta: %1$s</string>
+    <string name="private_library_assistant_remove_photo">Quitar foto</string>
+    <string name="private_library_assistant_photo_in_turn">Foto de la biblioteca privada · procesada en el dispositivo</string>
+    <string name="private_library_assistant_photo_changed">La foto o la biblioteca cambió. Quita el adjunto y selecciona la foto de nuevo. No se envió nada.</string>
+    <string name="private_library_assistant_photo_model_required">La foto requiere un modelo de visión local compatible y su proyector. No se envió nada.</string>
+    <string name="private_library_assistant_photo_invalid">El modelo local no puede leer esta foto. No se envió nada.</string>
+    <string name="private_library_assistant_open_photo">Ver foto privada</string>
+    <string name="private_library_assistant_photo_unavailable">No se pudo abrir la foto original de este mensaje. Si se eliminó o cambió, no se mostrará otra.</string>
+    <string name="private_library_assistant_close_photo">Cerrar</string>
+    <string name="private_library_assistant_turn_interrupted">Una respuesta anterior se interrumpió. No se guardaron la pregunta ni la respuesta parcial. Vuelve a escribir tu pregunta para intentarlo de nuevo.</string>
+    <string name="private_library_assistant_turn_attempt_unknown">No se pudo verificar el intento anterior. Revisa la conversación guardada antes de volver a enviar.</string>
+</resources>

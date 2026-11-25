@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "uniffi.harw_mobile_ffi"
+cdylib_name = "harw_mobile_ffi"
+android = true

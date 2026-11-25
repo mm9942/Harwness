@@ -331,31 +331,42 @@ pub(crate) fn prepare_body(body: &mut Value) {
     }
 }
 
-/// Read SSE incrementally and retain only one bounded event. Never execute
-/// partial tool calls: the terminal response is the sole source of results.
+/// Read SSE incrementally. The terminal response is the sole source of
+/// executable tool calls; interrupted streams keep only visible answer text.
 pub(crate) async fn read_response(
     mut response: reqwest::Response,
     sink: Option<&harw_core::StreamSink>,
-) -> Result<Value, ModelError> {
+) -> Result<crate::sse::NativeStreamOutcome, ModelError> {
+    use crate::sse::NativeStreamOutcome;
     let mut decoder = ResponseDecoder::default();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| crate::error::model_error_for_transport(error, true))?
-    {
-        if let Some(value) = decoder.push(&chunk, sink)? {
-            return Ok(value);
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if let Some(value) = decoder.push(&chunk, sink)? {
+                    return Ok(NativeStreamOutcome::Completed(value));
+                }
+            }
+            Ok(None) if decoder.partial.has_text() => {
+                return Ok(decoder.partial.into_interrupted(false));
+            }
+            Ok(None) => {
+                return Err(ModelError::Truncated {
+                    message: "Codex response stream ended before its terminal event".into(),
+                });
+            }
+            Err(_) if decoder.partial.has_text() => {
+                return Ok(decoder.partial.into_interrupted(true));
+            }
+            Err(error) => return Err(crate::error::model_error_for_transport(error, true)),
         }
     }
-    Err(ModelError::Truncated {
-        message: "Codex response stream ended before its terminal event".into(),
-    })
 }
 
 #[derive(Default)]
 struct ResponseDecoder {
     line: Vec<u8>,
     data: Vec<u8>,
+    partial: crate::sse::ResponsesPartialText,
 }
 
 impl ResponseDecoder {
@@ -384,30 +395,13 @@ impl ResponseDecoder {
                 }
                 let event: Value = serde_json::from_slice(&data)
                     .map_err(|_| ModelError::RequestFailed("Invalid Codex SSE event".into()))?;
-                match event.get("type").and_then(Value::as_str) {
-                    Some("response.completed" | "response.incomplete") => {
-                        let mut response = event
-                            .get("response")
-                            .filter(|value| value.is_object())
-                            .cloned()
-                            .ok_or_else(|| {
-                                ModelError::RequestFailed("Missing Codex terminal response".into())
-                            })?;
-                        if event["type"] == "response.incomplete" {
-                            response["status"] = Value::String("incomplete".into());
-                        }
-                        return Ok(Some(response));
-                    }
-                    Some("error" | "response.failed" | "response.cancelled") => {
-                        return Err(ModelError::RequestFailed(
-                            "Codex response stream reported a failure".into(),
-                        ));
-                    }
-                    // Live-Deltas (Text/Reasoning/Tool-Argumente) weiterreichen;
-                    // ausgeführt wird weiterhin nur die Terminal-Antwort.
-                    _ => {
-                        crate::sse::responses_event(&event, sink)?;
-                    }
+                self.partial.observe(&event);
+                let terminal = match self.partial.terminal_error(&event) {
+                    Some(failure) => Some(failure),
+                    None => crate::sse::responses_event(&event, sink)?,
+                };
+                if let Some(body) = terminal {
+                    return Ok(Some(std::mem::take(&mut self.partial).retain_visible_text(body)));
                 }
             } else if let Some(data) = self.line.strip_prefix(b"data:") {
                 let data = data.strip_prefix(b" ").unwrap_or(data);

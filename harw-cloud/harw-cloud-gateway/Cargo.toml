@@ -3,7 +3,7 @@ name = "harw-cloud-gateway"
 version.workspace = true
 edition = "2024"
 rust-version.workspace = true
-description = "Harwness cloud gateway configuration and status probing"
+description = "Harwness cloud gateway configuration, status and ownership prerequisites"
 publish = false
 license.workspace = true
 
@@ -15,10 +15,40 @@ tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
 tracing = "0.1"
 pingora = { version = "0.9", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
+harw-fsutil = { path = "../../harw-fsutil" }
+harw-node-transport = { path = "../../harw-node-transport", optional = true }
+harw-onion = { path = "../../harw-onion", optional = true }
+harw-protocol = { path = "../../harw-protocol", optional = true }
+harw-session-host = { path = "../../harw-session-host", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+tower-service = { version = "0.3", optional = true }
+serde_json = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+harw-infra-client = { path = "../../harw-infra-client", optional = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util"] }
 
 [features]
+hub-owner-liveness = [
+    "dep:harw-node-transport",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:serde_json",
+    "tokio/sync",
+]
+hub-owner-netsec = ["hub-owner-liveness", "dep:harw-infra-client"]
+hub-owner-local-host = ["hub-owner-liveness", "dep:harw-session-host"]
+hub-owner-process-proof = ["hub-owner-liveness", "dep:aws-lc-rs", "dep:harw-protocol"]
+hub-owner-process-custody = ["hub-owner-process-proof", "hub-owner-local-host"]
+hub-owner-create-receipt = ["dep:aws-lc-rs", "dep:harw-session-host", "dep:serde_json"]
+hub-owner-readiness = ["hub-owner-create-receipt", "hub-owner-netsec", "dep:tower-service"]
+hub-owner-placement-listener = ["hub-owner-process-proof", "dep:tower-service"]
+hub-owner-onion = ["hub-owner-placement-listener", "dep:harw-onion", "harw-onion/service"]
 proxy = ["dep:pingora", "pingora/proxy"]
 
 [lints]

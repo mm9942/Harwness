@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_ui_appearance_title">Apparence</string>
+    <string name="harw_ui_language">Langue de l’application</string>
+    <string name="harw_ui_language_summary">Cela change uniquement l’interface. La langue du téléphone et le contenu des conversations restent inchangés.</string>
+    <string name="harw_ui_language_apply">Appliquer</string>
+    <string name="harw_ui_language_cancel">Annuler</string>
+    <string name="harw_ui_language_follow_device">Suivre la langue de l’appareil</string>
+</resources>

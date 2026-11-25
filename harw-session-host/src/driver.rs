@@ -39,8 +39,18 @@ pub enum DriverEvent {
         role: String,
         event: TurnEvent,
     },
+    /// State change of an agent job (a background child agent) of this
+    /// session. Live-only: never written to the transcript.
+    Job {
+        work_id: String,
+        kind: String,
+        state: String,
+        summary: Option<String>,
+    },
     /// The turn parked on an approval.
     ApprovalRequested(ApprovalRequest),
+    /// The selected prompt and its replacement committed atomically.
+    HistoryReplaced,
     /// The durable transcript advanced; the host re-reads the head.
     DurableAdvanced,
 }
@@ -56,13 +66,22 @@ pub trait EventSink: Send + Sync {
 pub struct TurnInput {
     pub session_id: SessionId,
     pub text: String,
+    /// Images attached to the prompt (base64, size-checked by the host; the
+    /// driver decodes and stores them).
+    pub images: Vec<harw_protocol::session_wire::SubmitImage>,
     pub client_msg_id: String,
     /// Presence label of the submitting client (audit/log only).
     pub submitted_by: String,
+    /// Host-owned origin; never deserialize this from a client.
+    pub title_seed_human: bool,
     /// Host-derived actor of the submitting client.
     pub actor: ApprovalActor,
     /// Connection that submitted it (revocation drops its queued inputs).
     pub origin: ConnectionId,
+    /// Item id of an earlier user message: history is cut before it and replaced before the turn runs.
+    pub rewind_before: Option<String>,
+    /// Host-derived canonical replacement ID; this is not sent by the client.
+    pub rewrite_replacement_id: Option<harw_types::ItemId>,
 }
 
 /// How a turn ended.
@@ -230,8 +249,38 @@ impl ExecutionAdmission {
     }
 }
 
+/// Configured physical journal used by this exact driver's state store.
+#[derive(Clone, Debug)]
+pub struct ArchiveJournalBinding {
+    pub root: std::path::PathBuf,
+    pub thread: harw_types::ThreadRef,
+}
+
 /// The runtime behind the host.
 pub trait TurnDriver: Send + Sync + 'static {
+    /// Whether the configured writer can issue real durable checkpoints.
+    fn supports_archive_checkpoints(&self) -> bool {
+        false
+    }
+
+    /// Whether the driver commits an exact edit and signals the hosted replay boundary.
+    fn supports_exact_rewind(&self) -> bool { false }
+
+    /// Actual processed-writer post-sync cursor, not a replay or file head.
+    fn archive_published_head(&self, _session: &SessionId) -> Result<Option<std::num::NonZeroU64>, HostError> {
+        Ok(None)
+    }
+
+    /// The authoritative destination/source mapping, without opening a core or model.
+    fn archive_journal_binding(&self, _session: &SessionId) -> Result<ArchiveJournalBinding, HostError> {
+        Err(HostError::NotImplemented("archive journal binding"))
+    }
+
+    /// The exact content-addressed prompt media store used by this driver.
+    fn archive_media_store(&self) -> Option<&harw_media::MediaStore> {
+        None
+    }
+
     /// Install freshly revalidated creator authority before building or running
     /// a core session. Drivers that execute effects must enforce this ceiling.
     fn prepare_execution(
@@ -250,6 +299,33 @@ pub trait TurnDriver: Send + Sync + 'static {
     /// This never deletes an established session's transcript.
     fn discard_unpublished_session(&self, _session_id: &SessionId) -> Result<(), HostError> {
         Ok(())
+    }
+
+    /// Drop cached core state of an established session so the next turn
+    /// hydrates from the transcript again (head check, plan §3.5). Never
+    /// deletes the transcript and leaves no admission tombstone.
+    fn forget_session(&self, _session_id: &SessionId) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    /// Read the actual process-local writer cursor without locking the source
+    /// model. `new` is the fresh session built by the same host factory.
+    fn committed_fork_head(
+        &self,
+        _new: &SessionId,
+        _source: &SessionId,
+    ) -> DriverFuture<'_, Option<u64>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Install only the host-authorized, visible prefix in a new session.
+    /// Return the new transcript's post-sync sequence.
+    fn seed_fork_history(
+        &self,
+        _new: &SessionId,
+        _items: Vec<harw_protocol::items::TurnItem>,
+    ) -> DriverFuture<'_, u64> {
+        Box::pin(async { Err(HostError::NotImplemented("durable session fork")) })
     }
 
     /// Prepare durable state for a new session (transcript, meta).
@@ -277,4 +353,44 @@ pub trait TurnDriver: Send + Sync + 'static {
 
     /// Model name for summaries, when known.
     fn model_name(&self, session_id: &SessionId) -> Option<String>;
+
+    /// Child agents that are currently admitted below any hosted session
+    /// (global `agents.list`). Default: none known.
+    fn live_agents(&self) -> Vec<LiveAgent> {
+        Vec::new()
+    }
+
+    /// Requests cancellation of one child agent of `session_id`. `Ok(true)`
+    /// when a running agent was signalled, `Ok(false)` when no such agent
+    /// exists. Default: not supported.
+    fn stop_agent(&self, _session_id: &SessionId, _agent_id: &str) -> DriverFuture<'_, bool> {
+        Box::pin(async {
+            Err(HostError::Denied(
+                "driver does not support stopping agents".into(),
+            ))
+        })
+    }
+}
+
+/// One admitted child agent as the driver reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveAgent {
+    /// Id of the child agent (its session id).
+    pub agent_id: String,
+    /// Hosted session whose subtree the agent belongs to.
+    pub session_id: SessionId,
+    /// Direct parent, when known.
+    pub parent: Option<String>,
+    /// Role label.
+    pub role: String,
+    /// Model route, when pinned.
+    pub model: Option<String>,
+    /// `running|waiting|done|failed`.
+    pub state: String,
+    /// Name of the tool in flight, when known.
+    pub current_tool: Option<String>,
+    /// Admission time in Unix milliseconds.
+    pub started_ms: u64,
+    /// Tool calls made so far.
+    pub tool_calls: u32,
 }

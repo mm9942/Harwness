@@ -110,7 +110,7 @@ use harw_observe::TelemetrySink;
 use harw_types::SensorId;
 use jiff::Timestamp;
 
-use crate::buffer::EvidenceBuffer;
+use crate::buffer::{BufferMark, EvidenceBuffer, EvidenceDelta};
 use crate::error::SentinelResult;
 use crate::health::{RetryPolicy, SensorHealth};
 use crate::metrics::{self, BufferKind};
@@ -569,6 +569,45 @@ impl Sentinel {
     pub fn freeze(&self, now: Timestamp) -> SentinelResult<SecurityEvidence> {
         self.buffer.freeze(now)
     }
+
+    /// Friert nur das seit `since` angekommene Delta des Puffers ein.
+    ///
+    /// # Description
+    /// Bequemlichkeitsmethode, die an [`EvidenceBuffer::freeze_since`] auf
+    /// [`Self::buffer`] delegiert (PL-100 WP0.1: Regeln laufen je Zyklus nur
+    /// über neu angekommene Einträge, der Ring bleibt Kontextspeicher).
+    /// [`Self::freeze`] bleibt für den vollen Ringinhalt unverändert.
+    ///
+    /// # Arguments
+    /// - `since` (`BufferMark`): die Folgemarke des vorigen Zyklus
+    ///   ([`EvidenceDelta::until`]) oder [`BufferMark::START`].
+    /// - `now` (`jiff::Timestamp`): injizierter Einfrierzeitpunkt.
+    ///
+    /// # Returns
+    /// Ein [`EvidenceDelta`].
+    ///
+    /// # Errors
+    /// - [`crate::error::SentinelError::Evidence`] — siehe
+    ///   [`EvidenceBuffer::freeze_since`].
+    ///
+    /// # Concurrency
+    /// Reine Lesefunktion über [`Self::buffer`].
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_sentinel::{BufferMark, Sentinel, SentinelConfig};
+    /// use harw_observe::NullSink;
+    /// use std::sync::Arc;
+    ///
+    /// let sentinel = Sentinel::new(vec![], Arc::new(NullSink), SentinelConfig::default());
+    /// let delta = sentinel.freeze_since(BufferMark::START, jiff::Timestamp::UNIX_EPOCH)?;
+    /// assert!(delta.evidence.events.is_empty());
+    /// assert_eq!(delta.until, BufferMark::START);
+    /// # Ok::<(), harw_dod_sentinel::SentinelError>(())
+    /// ```
+    pub fn freeze_since(&self, since: BufferMark, now: Timestamp) -> SentinelResult<EvidenceDelta> {
+        self.buffer.freeze_since(since, now)
+    }
 }
 
 #[cfg(test)]
@@ -947,6 +986,28 @@ mod tests {
             )));
         };
         assert_eq!(sensor.as_str(), "probe-fs-0");
+        Ok(())
+    }
+
+    #[test]
+    fn test_freeze_since_reports_an_external_event_only_in_the_cycle_it_arrived() -> TestResult {
+        let mut sentinel = Sentinel::new(vec![], Arc::new(NullSink), SentinelConfig::default());
+        sentinel.record_external_event(external_event("probe-fs-0"));
+
+        let first = sentinel
+            .freeze_since(crate::buffer::BufferMark::START, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("well-formed buffer content always encodes"))?;
+        assert_eq!(first.evidence.events.len(), 1);
+
+        let second = sentinel
+            .freeze_since(first.until, Timestamp::UNIX_EPOCH)
+            .map_err(ctx("well-formed buffer content always encodes"))?;
+        assert!(second.evidence.events.is_empty());
+        assert_eq!(
+            sentinel.buffer().event_len(),
+            1,
+            "the full ring stays available to freeze()"
+        );
         Ok(())
     }
 

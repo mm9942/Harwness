@@ -30,8 +30,8 @@ CARGO ?= $(if $(wildcard $(HOME)/.cargo/bin/cargo),$(HOME)/.cargo/bin/cargo,carg
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 
-.PHONY: help clippy-tests clippy tests fmt check build install uninstall service gates \
-	dod-build dod-install dod-enable dod-uninstall release release-publish
+.PHONY: release-apk help clippy-tests clippy tests fmt check build install uninstall service gates \
+	dod-build dod-install dod-enable dod-uninstall release release-publish site site-check
 
 .DEFAULT_GOAL := help
 
@@ -40,7 +40,7 @@ help:
 	@echo "HARW — available targets:"
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
-	@echo "Variables: CARGO, PREFIX, BINDIR (default $(HOME)/.local/bin)"
+	@echo "Variables: CARGO, PREFIX, BINDIR (default $(HOME)/.local/bin), HARW_FEATURES (default: onion)"
 
 clippy-tests: ## Canonical verification: clippy (incl. tests, -D warnings) + test suite + gates
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
@@ -72,8 +72,15 @@ HOST_BINS = --bin harw $(if $(HOST_IS_ANDROID),,--bin killer --bin harw-job-exec
 # A literal comma inside $(if ...) arguments.
 comma := ,
 
-build: ## Release-build harw, killer and harw-job-exec (both not on Android) and the agent runner
-	$(CARGO) build --release $(HOST_BINS)
+# Optional harw-cli cargo features of the gateway. `onion` (embedded arti) lets the
+# gateway publish a Tor onion service for the phone's "Tor (.onion)" route; it is on
+# by default off Android. `make install HARW_FEATURES=` builds without it.
+HARW_FEATURES ?= $(if $(HOST_IS_ANDROID),,onion)
+HARW_FEATURE_FLAGS = $(if $(strip $(HARW_FEATURES)),--features $(subst $(space),$(comma),$(foreach f,$(strip $(HARW_FEATURES)),harw-cli/$(f))))
+space := $() $()
+
+build: ## Release-build harw (HARW_FEATURES, default onion), killer, harw-job-exec and the agent runner
+	$(CARGO) build --release $(HOST_BINS) $(HARW_FEATURE_FLAGS)
 	$(CARGO) build --profile release-runner --bin harw-agent-runner
 
 # HARW_HOME follows the same default the Rust side uses (harw-home::paths,
@@ -93,6 +100,9 @@ HARW_HOST_TARGET = $(shell rustc -vV | sed -n 's/^host: //p')
 # `HARW_VERSION` embeds via `CARGO_PKG_VERSION`), so Make needs no cargo
 # subprocess to know it.
 HARW_VERSION = $(shell awk -F'"' '/^version = /{print $$2; exit}' Cargo.toml)
+
+release-apk: ## Build the Android app, bump the version (VERSION=x.y.z to pin) and push a changed APK to the update channel
+	mobile/scripts/release-apk $(if $(VERSION),--version $(VERSION)) $(if $(NOTES),--notes "$(NOTES)") $(RELEASE_ARGS)
 
 install: build ## Install harw, killer, harw-job-exec and the agent runner into BINDIR (default ~/.local/bin)
 	install -Dm755 target/release/harw $(BINDIR)/harw
@@ -150,5 +160,11 @@ dod-install: ## DoD: install the system package onto the host (root; see docs/se
 dod-enable: ## DoD: explicitly validate config and enable observation
 	$(MAKE) -C harw-dod enable
 
-dod-uninstall: ## DoD: remove only manifest-owned files (config/state/logs are preserved)
+dod-uninstall: ## DoD: stop/disable all DoD units, remove manifest-owned files (config/state/logs preserved; re-enable opt-ins after reinstall)
 	$(MAKE) -C harw-dod uninstall
+
+site: ## Website: build site/dist from site/src
+	python3 -I site/build_content.py
+
+site-check: site ## Website: build and validate site/dist
+	python3 -I site/validate_site.py

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_title_heading">Titres automatiques des discussions</string>
+    <string name="chat_title_purpose">Pour les discussions locales et Cloud ouvertes dans cette application. Le modèle reçoit les trois premiers échanges complets, sans images ni reste de la conversation. Les titres saisis manuellement sont conservés.</string>
+    <string name="chat_title_load_failed">Impossible de charger la liste des modèles.</string>
+    <string name="chat_title_loading">Chargement des modèles…</string>
+    <string name="chat_title_on">Activé</string>
+    <string name="chat_title_off">Désactivé</string>
+    <string name="chat_title_pick_provider">Choisir un fournisseur ou le mode local</string>
+    <string name="chat_title_pick_model">Choisir un modèle pour les titres</string>
+    <string name="chat_title_selected_missing">Le modèle enregistré est indisponible. Harw ne changera pas de modèle automatiquement.</string>
+    <string name="chat_title_allow_loaded">Utiliser le modèle local chargé comme alternative</string>
+    <string name="chat_title_preferred_unloaded">Le modèle préféré n’est pas chargé. Harw ne changera pas le modèle de cette discussion.</string>
+    <string name="chat_title_empty_catalog">Chargez un modèle local ou configurez un fournisseur de texte.</string>
+    <string name="chat_title_refresh">Actualiser la liste des modèles</string>
+    <string name="chat_title_fallback_heading">API de secours pour les titres locaux</string>
+    <string name="chat_title_pick_fallback">Choisir une API de secours</string>
+    <string name="chat_title_no_fallback">Aucune API de secours</string>
+    <string name="chat_title_fallback_missing">L’API de secours enregistrée est indisponible.</string>
+    <string name="chat_title_fallback_consent">Ce fournisseur est contacté seulement après votre confirmation dans la discussion concernée.</string>
+    <string name="chat_title_provider_consent">L’activation autorise l’envoi de ces extraits à %1$s. Harw ne changera pas de fournisseur automatiquement.</string>
+    <string name="chat_title_can_use_loaded">Harw peut utiliser %1$s sans changer le modèle de cette discussion.</string>
+    <string name="chat_title_provider_local">Local sur cet appareil</string>
+    <string name="chat_title_provider_linked">Compte ChatGPT · %1$s</string>
+</resources>

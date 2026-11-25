@@ -9,9 +9,9 @@
 # Spawn-Tiefe, Budget, Rückgabevertrag und Kontextprogramm besitzt die Basis;
 # eigene Tabellen gleichen Namens würden beim Auflösen verworfen.
 #
-# Netz: egress-gebunden an `[network]` — im Modus `allowlist` nur die
-# gelisteten Hosts (leer = kein Netz), mit `[network].research_web = "open"`
-# jeder öffentliche Host, nur lesend; die erste Anfrage je Domain fragt unter
+# Netz: egress-gebunden an `[network]` — im Default (`research_web = "open"`)
+# jeder öffentliche Host, nur lesend; mit `"allowlist"` nur die gelisteten
+# Hosts (leer = kein Netz); die erste Anfrage je Domain fragt unter
 # `ask`/`auto` die Nutzerin. Private, Loopback- und Link-Local-Ziele nie.
 #
 # Die Arbeitsanweisung steht in `system.md` (`instructions_file`); fest

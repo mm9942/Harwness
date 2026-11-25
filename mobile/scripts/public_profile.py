@@ -1,0 +1,149 @@
+import base64
+import binascii
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import stat
+import sys
+import unicodedata
+
+
+def unique_fields(pairs):
+    fields = {}
+    for key, value in pairs:
+        if key in fields:
+            raise ValueError("duplicate field")
+        fields[key] = value
+    return fields
+
+
+def valid_endpoint(endpoint):
+    host, _, port = endpoint.rpartition(":")
+    if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+        return False
+    if host.startswith("[") and host.endswith("]"):
+        literal, percent, scope = host[1:-1].partition("%")
+        if percent and (
+            not re.fullmatch(r"[0-9]{1,10}", scope) or int(scope) > 0xFFFFFFFF
+        ):
+            return False
+        address = ipaddress.IPv6Address(literal)
+    else:
+        address = ipaddress.IPv4Address(host)
+    return not address.is_unspecified and not address.is_multicast
+
+
+def valid_onion(onion):
+    match = re.fullmatch(r"([a-z2-7]{56})\.onion:([1-9][0-9]{0,4})", onion)
+    if not match or int(match.group(2)) > 65535 or len(onion) > 68:
+        return False
+    try:
+        raw = base64.b32decode(match.group(1).upper())
+    except (binascii.Error, ValueError):
+        return False
+    if len(raw) != 35 or raw[34] != 3:
+        return False
+    checksum = hashlib.sha3_256(b".onion checksum" + raw[:32] + b"\x03").digest()[:2]
+    return checksum == raw[32:34]
+
+
+def profile_component(name):
+    # Never pass an absolute path, separator, or parent reference to openat.
+    if not re.fullmatch(r"(?!(?:\.|\.\.)\Z)[^/\x00-\x1f\x7f]+", name):
+        raise ValueError("invalid profile path component")
+    return name
+
+
+def check_profile_directory(fd, owners):
+    metadata = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid not in owners
+        or (metadata.st_mode & 0o022 and not metadata.st_mode & stat.S_ISVTX)
+    ):
+        raise ValueError("unsafe profile directory")
+
+
+def open_profile(path):
+    directory, filename = os.path.split(os.fsdecode(path))
+    filename = profile_component(filename)
+    components = [
+        profile_component(part) for part in directory.split("/") if part not in ("", ".")
+    ]
+    owners = (os.geteuid(), 0)
+    directory_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent = os.open("/" if directory.startswith("/") else ".", directory_flags)
+    try:
+        for component in components:
+            # Check each directory before looking up its child. A trusted sticky
+            # directory such as /tmp cannot replace another user's owned entries.
+            check_profile_directory(parent, owners)
+            previous = parent
+            parent = os.open(component, directory_flags, dir_fd=previous)
+            os.close(previous)
+        check_profile_directory(parent, owners)
+        return os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def read_profile(path):
+    try:
+        with os.fdopen(open_profile(path), "rb") as source:
+            metadata = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid not in (os.geteuid(), 0)
+                or metadata.st_mode & 0o022
+            ):
+                raise ValueError("unsafe file")
+            maximum = 16 * 1024
+            contents = source.read(maximum + 1)
+            if len(contents) > maximum:
+                raise ValueError("file too large")
+        return parse_profile(contents)
+    except (OSError, ValueError, RecursionError):
+        # Do not expose a rejected file's path or partially parsed fields.
+        raise ValueError(
+            "expected a valid version 1 public server profile in a trusted regular file"
+        ) from None
+
+
+def parse_profile(contents):
+    fields = {"version", "label", "endpoint", "server_node_id", "server_public_key_hex"}
+    allowed = fields | {"onion"}
+    profile = json.loads(contents.decode("utf-8"), object_pairs_hook=unique_fields)
+    if (
+        not isinstance(profile, dict)
+        or not fields <= profile.keys() <= allowed
+        or type(profile["version"]) is not int
+        or profile["version"] != 1
+        or any(
+            not isinstance(profile[field], str)
+            for field in profile.keys() - {"version"}
+        )
+    ):
+        raise ValueError("invalid public profile schema")
+    label = profile["label"]
+    if (
+        not label.strip()
+        or len(label.encode("utf-8")) > 128
+        or any(unicodedata.category(char) == "Cc" for char in label)
+        or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", profile["server_node_id"])
+        or not re.fullmatch(r"[A-Fa-f0-9]{3904}", profile["server_public_key_hex"])
+        or not valid_endpoint(profile["endpoint"])
+        or ("onion" in profile and not valid_onion(profile["onion"]))
+    ):
+        raise ValueError("invalid public profile fields")
+    return profile
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit("usage: public_profile.py PATH")
+    try:
+        print(json.dumps(read_profile(sys.argv[1]), ensure_ascii=False))
+    except ValueError as error:
+        sys.exit(str(error))

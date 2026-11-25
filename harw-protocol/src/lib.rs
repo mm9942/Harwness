@@ -7,11 +7,13 @@
 
 pub mod agent_tree;
 pub mod approvals;
+pub mod cloud_library;
 pub mod events;
 pub mod items;
 pub mod media;
 pub mod methods;
 pub mod orchestration;
+pub mod owner_placement;
 pub mod session_port;
 pub mod session_wire;
 pub mod wire;

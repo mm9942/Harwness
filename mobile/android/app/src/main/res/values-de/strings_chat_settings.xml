@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_history_archive">Verlaufsarchiv</string>
+    <string name="chat_history_variant_temporary">Diese Fassung bleibt nur bis zum Schließen der App verfügbar. Sie konnte nicht sicher gespeichert werden.</string>
+    <string name="chat_history_show_retained_in_chat">Ältere Fassung im Chat ansehen</string>
+    <string name="chat_history_retained_readonly">Bestätigte ältere Fassung, nur lesen</string>
+    <string name="chat_history_return_current">Zum aktuellen Chat zurück</string>
+    <string name="chat_history_retained_unavailable">Keine vollständige ältere Fassung bestätigt. Der aktuelle Chat blieb unverändert.</string>
+    <string name="chat_history_retained_fork_unconfirmed">Fork nicht bestätigt. Tippe dieselbe Zeile erneut, um nur diesen Vorgang zu prüfen.</string>
+    <string name="chat_quick_picker_model">Modell</string>
+    <string name="chat_quick_picker_uia_unavailable">Keine weitere UIA für diesen Chat verfügbar.</string>
+    <string name="chat_quick_picker_uia_local_only">UIA-Auswahl ist nur in lokalen Chats verfügbar.</string>
+    <string name="chat_quick_picker_model_unavailable">Modellauswahl für diesen Chat nicht verfügbar.</string>
+    <string name="chat_history_partial_readonly">Nur der neueste Teil dieser Fassung wird angezeigt. Ein Fork aus dieser Teilansicht ist nicht möglich.</string>
+    <string name="chat_history_open_paged_archive">Seitenweise im Archiv öffnen</string>
+    <string name="chat_owner_status_action">Host-Status verifizieren</string>
+    <string name="chat_owner_status_unavailable">Der Status des zuständigen Hosts konnte nicht verifiziert werden.</string>
+    <string name="chat_owner_status_idle">Verifizierter Host-Status: inaktiv</string>
+    <string name="chat_owner_status_active">Verifizierter Host-Status: aktiv</string>
+    <string name="chat_owner_status_interrupted">Verifizierter Host-Status: unterbrochen</string>
+    <string name="chat_owner_status_failed">Verifizierter Host-Status: fehlgeschlagen</string>
+    <string name="chat_owner_status_import_required">Importiere das vertrauenswürdige Profildokument separat, um den Host-Status zu konfigurieren.</string>
+</resources>

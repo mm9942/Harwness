@@ -15,6 +15,9 @@ pub enum ModelsAction {
     /// Standardmodell) und die internen Modellstellen samt Auflösung.
     List,
     /// Fragt die verfügbaren Modelle der konfigurierten Anbieter ab.
+    ///
+    /// Remote-Aufrufe prüfen die Adresse mit dem URL-Guard (https, keine
+    /// privaten Adressen, keine Weiterleitungen).
     Scan {
         /// Nur diesen Provider abfragen; ohne Angabe alle aktivierten
         /// Provider.
@@ -58,6 +61,16 @@ pub enum ModelsAction {
         #[command(subcommand)]
         action: Option<InternalAction>,
     },
+    /// Dieselbe Rollenauflösung und Modellwahl wie der Chat-Befehl /models.
+    Roles {
+        #[command(subcommand)]
+        action: Option<RoleModelAction>,
+    },
+    /// Bildverständnis-Modell dieses Profils anzeigen oder bewusst auswählen.
+    Image {
+        #[command(subcommand)]
+        action: Option<ImageModelAction>,
+    },
     /// Setzt das globale Standardmodell.
     Default {
         /// Modell-ID, wie in `models/<id>.toml` deklariert.
@@ -70,6 +83,42 @@ pub enum ModelsAction {
         #[arg(long)]
         refresh: bool,
     },
+}
+
+/// Feste Argumentstruktur für die profilweite Rollenwahl.
+#[derive(Debug, Subcommand)]
+pub enum RoleModelAction {
+    /// Zeigt Rollen, Quellen und Reasoning-Gewicht ohne laufende Chat-Sitzung.
+    Show,
+    /// Setzt ein Modell für eine bestimmte Rolle in diesem Profil.
+    Set {
+        #[arg(value_name = "ROLE")]
+        role: String,
+        #[arg(value_name = "MODEL")]
+        target: String,
+        /// Optionales Gewicht für eine Rolle mit eigener Reasoning-Konfiguration.
+        #[arg(long, value_name = "LEVEL")]
+        effort: Option<String>,
+    },
+    /// Entfernt die explizite Modellwahl dieser Rolle.
+    Reset {
+        #[arg(value_name = "ROLE")]
+        role: String,
+    },
+}
+
+/// Bildverständnis ist nicht allgemeine Textmodellwahl oder Bildgenerierung.
+#[derive(Debug, Subcommand)]
+pub enum ImageModelAction {
+    /// Zeigt die gespeicherte Wahl bzw. den aufgelösten Standard.
+    Show,
+    /// Wählt ein Modell mit bestätigtem Bild-Input.
+    Set {
+        #[arg(value_name = "MODEL")]
+        target: String,
+    },
+    /// Entfernt die explizite Wahl ohne einen Anbieter einzusetzen.
+    Reset,
 }
 
 /// Aktionen des `harw model internal`-Subcommands.
@@ -110,4 +159,69 @@ pub enum InternalAction {
         #[arg(value_enum)]
         state: OnOff,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::ModelsAction;
+    use crate::cli::{Cli, Command};
+    use crate::test_support::{TestError, TestResult, ctx};
+
+    fn action(args: &[&str]) -> TestResult<Option<ModelsAction>> {
+        let cli = Cli::try_parse_from(args).map_err(ctx("models-Aufruf sollte parsen"))?;
+        match cli.command {
+            Some(Command::Model { action }) => Ok(action),
+            other => Err(TestError::Unexpected(format!(
+                "erwartete Model, bekam {other:?}"
+            ))),
+        }
+    }
+
+    #[test]
+    fn scan_parses_provider_and_flags() -> TestResult {
+        let parsed = action(&[
+            "harw",
+            "models",
+            "scan",
+            "openrouter",
+            "--free-only",
+            "--prune",
+        ])?;
+        let Some(ModelsAction::Scan {
+            provider,
+            free_only,
+            prune,
+            add,
+        }) = parsed
+        else {
+            return Err(TestError::Unexpected("erwartete Scan".into()));
+        };
+        assert_eq!(provider.as_deref(), Some("openrouter"));
+        assert!(free_only);
+        assert!(prune);
+        assert!(!add);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_alias_delete_parses() -> TestResult {
+        let parsed = action(&["harw", "models", "delete", "openrouter/some-model"])?;
+        let Some(ModelsAction::Remove { target }) = parsed else {
+            return Err(TestError::Unexpected("erwartete Remove".into()));
+        };
+        assert_eq!(target, "openrouter/some-model");
+        Ok(())
+    }
+
+    #[test]
+    fn add_without_target_parses() -> TestResult {
+        let parsed = action(&["harw", "models", "add"])?;
+        let Some(ModelsAction::Add { target }) = parsed else {
+            return Err(TestError::Unexpected("erwartete Add".into()));
+        };
+        assert_eq!(target, None);
+        Ok(())
+    }
 }

@@ -72,7 +72,7 @@ help:
 		'  restart      validate config and restart observation' \
 		'  status/logs   inspect observation services' \
 		'  smoke        explicit live smoke check (SMOKE_CONFIRM=1)' \
-		'  uninstall    remove only manifest-owned files; preserve data/config' \
+		'  uninstall    stop/disable all DoD units, remove manifest-owned files; preserve data/config' \
 		'  stage-test   static packaging/placeholder checks (no Cargo invocation)' \
 		'  clean-ephemeral  list (default) or delete (APPLY=1) rotated telemetry older than' \
 		'               RETENTION_DAYS (default 7); never touches spool, findings or audit data' \
@@ -148,7 +148,7 @@ build:
 	@set -eu; test "$$(id -u)" -ne 0 || { echo 'build must run unprivileged; do not invoke Cargo as root' >&2; exit 2; }; \
 	command -v cargo >/dev/null 2>&1 || { echo 'cargo is required; run make doctor first' >&2; exit 2; }; \
 	cargo build --manifest-path '$(ROOT_MANIFEST)' --locked --release --target-dir '$(TARGET_DIR)' \
-		-p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-warden; \
+		-p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-probe-netlink -p harw-warden; \
 	$(MAKE) build-bpf
 
 check:

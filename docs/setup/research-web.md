@@ -34,9 +34,11 @@ Three layers decide whether a request goes out; the effective reach is the
 
 **Defaults.** `[research].network_allow_hosts` lists four Rust documentation
 hosts, so by default research-capable agents started from the TUI or a
-one-shot run can reach those, plus the host of the search backend. An empty
-union of all lists means no network at all (fail-closed); the search host
-alone never opens network. There is no role-specific network list today:
+one-shot run can reach those, plus the host of the search backend. With the default
+`research_web = "open"` the research roles may additionally read any public
+web host (GET only, domain approval under `ask`/`auto`, see below). With the
+opt-in `research_web = "allowlist"`, an empty union of all lists means no
+network at all (fail-closed); the search host alone never opens network. There is no role-specific network list today:
 `researcher-web` gets the same scope as any other role that holds web tools
 (its parent's scope). What sets the role apart is its tool surface (no
 workspace access) and the open-web approval rule below; see "Known gaps".
@@ -48,7 +50,7 @@ workspace access) and the open-web approval rule below; see "Known gaps".
 allow_hosts = []                 # general harness egress allowlist
 allow_private = false            # loopback, RFC 1918, CGNAT, unique-local
 researcher_web_hosts = ["docs.rs", "crates.io", "doc.rust-lang.org"]
-research_web = "allowlist"       # or "open"
+research_web = "open"            # default; or "allowlist" (opt-in, fail-closed)
 ```
 
 | Key | Default | Meaning |
@@ -56,7 +58,7 @@ research_web = "allowlist"       # or "open"
 | `allow_hosts` | `[]` | Plain host names (no scheme, no path) the harness may reach in general. |
 | `allow_private` | `false` | Allow loopback, private (RFC 1918), CGNAT and unique-local destinations. It applies to the shared process policy and therefore to every role: an allowlisted host name that resolves to such an address becomes reachable. Link-local, cloud-metadata and multicast ranges stay refused regardless. |
 | `researcher_web_hosts` | `[]` | Extra hosts. Meant for `researcher-web` only, but today merged into the same shared lists as `allow_hosts` (see below), so it widens the network of every role that has web tools. |
-| `research_web` | `"allowlist"` | `"allowlist"`: only the configured hosts. `"open"`: see below. |
+| `research_web` | `"open"` | `"open"` (default): public web, see below. `"allowlist"` (opt-in): only the configured hosts; empty lists mean no network. |
 
 Entries are host names, not URLs; an entry with a scheme prefix or an empty
 entry is a configuration error. An entry matches the host and its

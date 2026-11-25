@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_diagnostics_title_local">Journal de débogage · Local</string>
+    <string name="harw_diagnostics_title_cloud">Journal de débogage · Cloud</string>
+    <string name="harw_diagnostics_clipboard_label">Journal de débogage Harw</string>
+    <string name="harw_diagnostics_privacy">Conservé uniquement pendant l’exécution de l’application. Aucun message, aucune image, aucun identifiant ni adresse de serveur. Rien n’est partagé automatiquement.</string>
+    <string name="harw_diagnostics_unavailable">Le journal de débogage de cette connexion est indisponible.</string>
+    <string name="harw_diagnostics_failed">Impossible de lire ou de modifier le journal de débogage.</string>
+    <string name="harw_diagnostics_domain_chat">Chat</string>
+    <string name="harw_diagnostics_domain_stream">Diffusion</string>
+    <string name="harw_diagnostics_domain_onion">Onion</string>
+    <string name="harw_diagnostics_level_off">Désactivé</string>
+    <string name="harw_diagnostics_level_error">Erreur</string>
+    <string name="harw_diagnostics_level_warn">Avertissement</string>
+    <string name="harw_diagnostics_level_info">Info</string>
+    <string name="harw_diagnostics_level_debug">Débogage</string>
+    <string name="harw_diagnostics_trace_enable">Activer la trace pendant 10 minutes</string>
+    <string name="harw_diagnostics_trace_extend">Prolonger la trace · active à la dernière actualisation</string>
+    <string name="harw_diagnostics_refreshing">Actualisation…</string>
+    <string name="harw_diagnostics_counts">Entrées : %1$s · écartées : %2$s</string>
+    <string name="harw_diagnostics_empty">Pas encore d’entrées pour les niveaux sélectionnés.</string>
+    <string name="harw_diagnostics_refresh">Actualiser</string>
+    <string name="harw_diagnostics_clear">Effacer</string>
+    <string name="harw_diagnostics_copy">Copier</string>
+    <string name="harw_diagnostics_copy_failed">Impossible de copier le journal de débogage.</string>
+    <string name="harw_diagnostics_close">Fermer</string>
+</resources>

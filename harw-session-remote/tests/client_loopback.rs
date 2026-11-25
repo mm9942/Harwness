@@ -189,6 +189,8 @@ fn titled(title: &str) -> CreateParams {
     CreateParams {
         workspace: None,
         title: Some(title.to_owned()),
+    fork_from: None,
+        fork_from: None,
     }
 }
 
@@ -331,6 +333,8 @@ async fn attach_submit_receives_turn_events_then_detach_ends_the_stream() -> Tes
             expect_head: ack.head,
             client_msg_id: "m1".into(),
             force: false,
+            images: Vec::new(),
+            rewind_before: None,
         })
         .await?;
     assert!(
@@ -368,6 +372,8 @@ async fn many_sessions_share_one_connection() -> TestResult {
                 expect_head: *head,
                 client_msg_id: format!("m-{name}"),
                 force: false,
+                images: Vec::new(),
+                rewind_before: None,
             })
             .await?;
         assert!(
@@ -402,6 +408,8 @@ async fn responses_correlate_under_interleaving() -> TestResult {
         expect_head: ack.head,
         client_msg_id: "flood".into(),
         force: false,
+        images: Vec::new(),
+        rewind_before: None,
     })
     .await?;
 

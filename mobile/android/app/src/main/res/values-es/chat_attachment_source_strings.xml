@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_attachment_source_title">Adjuntar imagen</string>
+    <string name="chat_attachment_source_disclosure">Elige la fuente. No se transmite ninguna imagen hasta que envíes el mensaje.</string>
+    <string name="chat_attachment_gallery">Galería del dispositivo</string>
+    <string name="chat_attachment_gallery_releases_library">Al abrir la galería se descarta la selección pendiente de la biblioteca Cloud.</string>
+    <string name="chat_attachment_gallery_decode_failed">No se pudo leer o reducir una imagen.</string>
+    <string name="chat_attachment_gallery_open_failed">No se pudo abrir la galería del dispositivo.</string>
+    <string name="chat_attachment_library">Biblioteca Cloud</string>
+    <string name="chat_attachment_library_disclosure">Seleccionar una imagen no envía nada. Harw carga esa imagen al enviar el mensaje a este chat de Cloud.</string>
+    <string name="chat_attachment_library_search">Buscar por nombre o descripción</string>
+    <string name="chat_attachment_library_no_match">No hay imágenes que coincidan.</string>
+    <string name="chat_attachment_library_unavailable">La biblioteca Cloud no está disponible en este chat ahora mismo.</string>
+    <string name="chat_attachment_library_empty">No hay imágenes en esta biblioteca Cloud.</string>
+    <string name="chat_attachment_library_selected">Biblioteca Cloud: %1$s seleccionada</string>
+    <string name="chat_attachment_library_loading">Cargando %1$s para este mensaje…</string>
+    <string name="chat_attachment_remove">Quitar</string>
+    <string name="chat_media_close_picker">Cerrar</string>
+</resources>

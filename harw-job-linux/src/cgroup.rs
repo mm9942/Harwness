@@ -38,6 +38,19 @@ use crate::resources::{CgroupController, JobResources};
 /// `CGROUP2_SUPER_MAGIC` from `linux/magic.h`.
 const CGROUP2_SUPER_MAGIC: i128 = 0x6367_7270;
 
+/// The kernel interface behind [`CgroupBackend::is_frozen`]: the `frozen`
+/// key of `cgroup.events` (Linux 5.2+).
+const FROZEN_EVENT: &str = "cgroup.events frozen";
+
+/// The kernel interface behind [`CgroupBackend::freeze`],
+/// [`CgroupBackend::thaw`] and [`CgroupBackend::freeze_requested`]
+/// (Linux 5.2+).
+const FREEZE_FILE: &str = "cgroup.freeze";
+
+/// The kernel interface behind [`CgroupBackend::kernel_id`]: on cgroup v2
+/// the id of a cgroup is the inode number of its directory.
+const CGROUP_ID: &str = "cgroup id (directory inode)";
+
 /// What to create for one job attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CgroupSpec {
@@ -147,6 +160,71 @@ pub trait CgroupBackend: Send + Sync {
     /// [`CgroupError::Unsupported`] before Linux 5.2.
     fn thaw(&self, group: &CgroupHandle) -> Result<(), CgroupError>;
 
+    /// Whether the kernel reports the cgroup as frozen (`cgroup.events`
+    /// key `frozen`).
+    ///
+    /// # Description
+    /// Freezing is asynchronous: after [`CgroupBackend::freeze`] this turns
+    /// `true` once every member has stopped; after [`CgroupBackend::thaw`]
+    /// it turns `false`. The provided implementation reports
+    /// [`CgroupError::Unsupported`], so existing backends (and test fakes)
+    /// need not implement it; [`CgroupV2Fs`] reads the kernel state.
+    ///
+    /// # Errors
+    /// [`CgroupError::Unsupported`] for backends without this probe and for
+    /// kernels before 5.2 (no `frozen` key), [`CgroupError::NotFound`] if
+    /// the cgroup is gone.
+    fn is_frozen(&self, _group: &CgroupHandle) -> Result<bool, CgroupError> {
+        Err(CgroupError::Unsupported {
+            feature: FROZEN_EVENT,
+        })
+    }
+
+    /// Whether a freeze of this cgroup itself is requested (`cgroup.freeze`
+    /// reads `1`), whoever wrote it.
+    ///
+    /// # Description
+    /// Unlike [`CgroupBackend::is_frozen`] this is the requested state of
+    /// this cgroup alone: it turns `true` with the write, before every
+    /// member has stopped, and it does not show a freeze inherited from an
+    /// ancestor. Callers that must not take over or lift a freeze someone
+    /// else set check both. The provided implementation reports
+    /// [`CgroupError::Unsupported`], so existing backends (and test fakes)
+    /// need not implement it; [`CgroupV2Fs`] reads the file.
+    ///
+    /// # Errors
+    /// [`CgroupError::Unsupported`] for backends without this probe and for
+    /// kernels before 5.2 (no `cgroup.freeze`), [`CgroupError::NotFound`]
+    /// if the cgroup is gone, [`CgroupError::Parse`] for content other than
+    /// `0` or `1`.
+    fn freeze_requested(&self, _group: &CgroupHandle) -> Result<bool, CgroupError> {
+        Err(CgroupError::Unsupported {
+            feature: FREEZE_FILE,
+        })
+    }
+
+    /// The kernel id of the cgroup: on cgroup v2 the inode number of its
+    /// directory, the id `bpf_get_current_cgroup_id()`, the DoD probes and
+    /// the sentinel use. The Warden addresses cgroups by path; for a
+    /// containment marker keyed by this id it derives it the same way
+    /// (`st_ino` of `<cgroup root>/<cgroup>`).
+    ///
+    /// # Description
+    /// Callers that coordinate with another owner of the same cgroup (e.g.
+    /// a containment index keyed by kernel id) name the cgroup by this id,
+    /// not by a path. The provided implementation reports
+    /// [`CgroupError::Unsupported`], so existing backends (and test fakes)
+    /// need not implement it, and callers that need the id fail closed;
+    /// [`CgroupV2Fs`] reads it from the opened directory (`fstat`).
+    ///
+    /// # Errors
+    /// [`CgroupError::Unsupported`] for backends without this probe,
+    /// [`CgroupError::NotFound`] if the cgroup is gone,
+    /// [`CgroupError::InvalidName`] for an unsafe name.
+    fn kernel_id(&self, _group: &CgroupHandle) -> Result<u64, CgroupError> {
+        Err(CgroupError::Unsupported { feature: CGROUP_ID })
+    }
+
     /// SIGKILLs every member, descendants included (`cgroup.kill`, with a
     /// freeze + kill + thaw fallback before Linux 5.14).
     ///
@@ -193,6 +271,34 @@ pub(crate) fn parse_keyed(content: &str, key: &str) -> Option<u64> {
             .flatten()
             .and_then(|value| value.parse().ok())
     })
+}
+
+/// Reads the `frozen` key of a `cgroup.events` file.
+///
+/// # Errors
+/// [`CgroupError::Unsupported`] when the key is missing (kernels before 5.2
+/// have no cgroup v2 freezer).
+pub(crate) fn parse_frozen(events: &str) -> Result<bool, CgroupError> {
+    parse_keyed(events, "frozen")
+        .map(|value| value != 0)
+        .ok_or(CgroupError::Unsupported {
+            feature: FROZEN_EVENT,
+        })
+}
+
+/// Reads the content of a `cgroup.freeze` file (`0` or `1`).
+///
+/// # Errors
+/// [`CgroupError::Parse`] for any other content.
+pub(crate) fn parse_freeze_requested(content: &str) -> Result<bool, CgroupError> {
+    match content.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        other => Err(CgroupError::Parse {
+            file: FREEZE_FILE,
+            content: other.chars().take(120).collect(),
+        }),
+    }
 }
 
 /// Parses a space-separated controller list (`cgroup.controllers`,
@@ -400,6 +506,20 @@ impl CgroupV2Fs {
         &self.root_display
     }
 
+    /// The root as it appears in `/proc/<pid>/cgroup` (`0::<path>`):
+    /// hierarchy-relative, not under the mount point (e.g. `/harw.slice`).
+    ///
+    /// # Description
+    /// Every job cgroup this backend creates is a direct child of this path
+    /// ([`CgroupHandle::proc_path`]). Callers that hold a hierarchy-relative
+    /// cgroup path of a job (e.g. a persisted recovery identity) compare its
+    /// parent with this value before acting on the leaf name; the value
+    /// itself grants no authority.
+    #[must_use]
+    pub fn root_proc_path(&self) -> &str {
+        &self.root_proc_path
+    }
+
     fn enable_controllers(&mut self) {
         let available = self
             .root
@@ -594,11 +714,45 @@ impl CgroupBackend for CgroupV2Fs {
     }
 
     fn freeze(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
-        self.write(group, "cgroup.freeze", "1")
+        self.write(group, FREEZE_FILE, "1")
     }
 
     fn thaw(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
-        self.write(group, "cgroup.freeze", "0")
+        self.write(group, FREEZE_FILE, "0")
+    }
+
+    fn freeze_requested(&self, group: &CgroupHandle) -> Result<bool, CgroupError> {
+        let dir = self.child(group.name())?;
+        let content = dir.read_to_string(FREEZE_FILE).map_err(|error| {
+            // Like `write`: a missing file in an existing cgroup is a kernel
+            // without the cgroup v2 freezer.
+            if error.kind() == io::ErrorKind::NotFound && dir_exists(&self.root, group.name()) {
+                CgroupError::Unsupported {
+                    feature: FREEZE_FILE,
+                }
+            } else {
+                CgroupError::from_io("read", &format!("{}/{FREEZE_FILE}", group.name()), error)
+            }
+        })?;
+        parse_freeze_requested(&content)
+    }
+
+    fn is_frozen(&self, group: &CgroupHandle) -> Result<bool, CgroupError> {
+        let dir = self.child(group.name())?;
+        let events = dir
+            .read_to_string("cgroup.events")
+            .map_err(|error| CgroupError::from_io("read", group.name(), error))?;
+        parse_frozen(&events)
+    }
+
+    fn kernel_id(&self, group: &CgroupHandle) -> Result<u64, CgroupError> {
+        // `child` validates the name and opens exactly that directory
+        // beneath the delegated root; its inode is the cgroup id.
+        let dir = self.child(group.name())?;
+        let meta = dir
+            .dir_metadata()
+            .map_err(|error| CgroupError::from_io("stat", group.name(), error))?;
+        Ok(cap_std::fs::MetadataExt::ino(&meta))
     }
 
     fn kill(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
@@ -690,6 +844,149 @@ mod tests {
         assert_eq!(controllers.len(), 4);
         assert!(controllers.contains(&CgroupController::Memory));
         assert!(parse_controllers("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_frozen_reads_the_events_key() -> TestResult {
+        assert!(!parse_frozen("populated 1\nfrozen 0\n").map_err(ctx("thawed"))?);
+        assert!(parse_frozen("populated 1\nfrozen 1\n").map_err(ctx("frozen"))?);
+        // Kernels before 5.2 have no freezer key: typed, not a parse guess.
+        match parse_frozen("populated 1\n") {
+            Err(CgroupError::Unsupported { feature }) => assert_eq!(feature, FROZEN_EVENT),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_freeze_requested_reads_zero_or_one() -> TestResult {
+        assert!(!parse_freeze_requested("0\n").map_err(ctx("thawed"))?);
+        assert!(parse_freeze_requested("1\n").map_err(ctx("frozen"))?);
+        for bad in ["", "2", "frozen 1", "01x"] {
+            match parse_freeze_requested(bad) {
+                Err(CgroupError::Parse { file, .. }) => assert_eq!(file, FREEZE_FILE),
+                other => return Err(TestError::Unexpected(format!("{bad:?}: {other:?}"))),
+            }
+        }
+        Ok(())
+    }
+
+    /// A backend that implements only the required methods (like the
+    /// runtime's test fakes) inherits an `is_frozen` that reports
+    /// `Unsupported` instead of guessing.
+    struct RequiredOnly;
+
+    impl CgroupBackend for RequiredOnly {
+        fn create(&self, spec: &CgroupSpec) -> Result<CgroupHandle, CgroupError> {
+            Err(CgroupError::NotFound {
+                path: spec.name.clone(),
+            })
+        }
+
+        fn reopen(&self, name: &str) -> Result<CgroupHandle, CgroupError> {
+            Ok(CgroupHandle::new(
+                name.to_owned(),
+                format!("/r/{name}"),
+                None,
+            ))
+        }
+
+        fn attach(&self, group: &CgroupHandle, _process: &LinuxProcess) -> Result<(), CgroupError> {
+            Err(CgroupError::NotFound {
+                path: group.name().to_owned(),
+            })
+        }
+
+        fn attach_self(&self, group: &CgroupHandle) -> Result<(), CgroupError> {
+            Err(CgroupError::NotFound {
+                path: group.name().to_owned(),
+            })
+        }
+
+        fn freeze(&self, _group: &CgroupHandle) -> Result<(), CgroupError> {
+            Ok(())
+        }
+
+        fn thaw(&self, _group: &CgroupHandle) -> Result<(), CgroupError> {
+            Ok(())
+        }
+
+        fn kill(&self, _group: &CgroupHandle) -> Result<(), CgroupError> {
+            Ok(())
+        }
+
+        fn stats(&self, _group: &CgroupHandle) -> Result<CgroupStats, CgroupError> {
+            Ok(CgroupStats::default())
+        }
+
+        fn remove(&self, _group: CgroupHandle) -> Result<(), CgroupError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_is_frozen_defaults_to_unsupported() -> TestResult {
+        let backend = RequiredOnly;
+        let group = backend.reopen("harw-job-a").map_err(ctx("reopen"))?;
+        match backend.is_frozen(&group) {
+            Err(CgroupError::Unsupported { feature }) => assert_eq!(feature, FROZEN_EVENT),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        match backend.freeze_requested(&group) {
+            Err(CgroupError::Unsupported { feature }) => assert_eq!(feature, FREEZE_FILE),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        // No kernel id either: callers that need it fail closed instead of
+        // guessing one.
+        match backend.kernel_id(&group) {
+            Err(CgroupError::Unsupported { feature }) => assert_eq!(feature, CGROUP_ID),
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        Ok(())
+    }
+
+    /// `CgroupV2Fs::kernel_id` is the inode of the child directory beneath
+    /// the root, and it validates the name before touching the tree (no
+    /// path outside the delegated root is ever stat'ed). The backend is
+    /// built over a plain directory: `kernel_id` needs no cgroupfs.
+    #[test]
+    fn test_kernel_id_is_the_child_directory_inode() -> TestResult {
+        let temp = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        std::fs::create_dir(temp.path().join("harw-job-a")).map_err(ctx("mkdir"))?;
+        let backend = CgroupV2Fs {
+            root: Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority())
+                .map_err(ctx("open root"))?,
+            root_proc_path: "/harw.slice".to_owned(),
+            enabled: BTreeSet::new(),
+            root_display: temp.path().to_path_buf(),
+        };
+        let group = CgroupHandle::new(
+            "harw-job-a".to_owned(),
+            "/harw.slice/harw-job-a".to_owned(),
+            None,
+        );
+        let inode = std::os::unix::fs::MetadataExt::ino(
+            &std::fs::symlink_metadata(temp.path().join("harw-job-a"))
+                .map_err(ctx("stat child"))?,
+        );
+        assert_eq!(backend.kernel_id(&group).map_err(ctx("kernel id"))?, inode);
+        let gone = CgroupHandle::new(
+            "harw-job-b".to_owned(),
+            "/harw.slice/harw-job-b".to_owned(),
+            None,
+        );
+        match backend.kernel_id(&gone) {
+            Err(CgroupError::NotFound { .. }) => {}
+            other => return Err(TestError::Unexpected(format!("{other:?}"))),
+        }
+        for bad in ["..", "a/b", ".hidden"] {
+            let group = CgroupHandle::new(bad.to_owned(), format!("/harw.slice/{bad}"), None);
+            match backend.kernel_id(&group) {
+                Err(CgroupError::InvalidName { .. }) => {}
+                other => return Err(TestError::Unexpected(format!("{bad:?}: {other:?}"))),
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -806,8 +1103,60 @@ mod tests {
         assert_eq!(identity.cgroup_v2_path.as_deref(), Some(handle.proc_path()));
         let stats = backend.stats(&handle).map_err(ctx("stats"))?;
         assert_eq!(stats.populated, Some(true));
+        // The kernel id is the inode of the cgroup directory (the id the
+        // BPF probes report; the Warden derives it for its markers).
+        let inode = std::os::unix::fs::MetadataExt::ino(
+            &std::fs::symlink_metadata(backend.root_path().join(handle.name()))
+                .map_err(ctx("stat cgroup dir"))?,
+        );
+        assert_eq!(backend.kernel_id(&handle).map_err(ctx("kernel id"))?, inode);
+        assert!(
+            !backend
+                .freeze_requested(&handle)
+                .map_err(ctx("freeze requested before"))?
+        );
         backend.freeze(&handle).map_err(ctx("freeze"))?;
+        // The request shows at once; the kernel view follows.
+        assert!(
+            backend
+                .freeze_requested(&handle)
+                .map_err(ctx("freeze requested"))?
+        );
+        // Freezing is asynchronous: poll the kernel view until it settles.
+        let frozen_deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or(TestError::Missing("freeze deadline"))?;
+        while !backend.is_frozen(&handle).map_err(ctx("is_frozen"))? {
+            if Instant::now() >= frozen_deadline {
+                return Err(TestError::Unexpected("cgroup did not freeze".to_owned()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            backend.root_proc_path().trim_end_matches('/'),
+            handle
+                .proc_path()
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent)
+        );
         backend.thaw(&handle).map_err(ctx("thaw"))?;
+        assert!(
+            !backend
+                .freeze_requested(&handle)
+                .map_err(ctx("freeze requested after thaw"))?
+        );
+        let thawed_deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .ok_or(TestError::Missing("thaw deadline"))?;
+        while backend
+            .is_frozen(&handle)
+            .map_err(ctx("is_frozen after thaw"))?
+        {
+            if Instant::now() >= thawed_deadline {
+                return Err(TestError::Unexpected("cgroup did not thaw".to_owned()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         backend.kill(&handle).map_err(ctx("kill"))?;
         let outcome = process.wait().map_err(ctx("wait"))?;
         assert!(matches!(

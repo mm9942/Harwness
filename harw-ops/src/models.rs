@@ -14,6 +14,9 @@
 //! | `/models image [show\|reset]` | Zeigt die Bildmodellwahl oder entfernt sie; ohne Wahl nur bildfähiges Hauptmodell, kein externer Standard |
 //! | `/models worker` | Wahl je UIA-Worker-Rolle („wie UIA“ oder Provider/Modell), Runde 5 Teil G |
 //! | `/models worker <rolle\|all> <uia\|ziel>` | Setzt die Wahl einer bzw. aller UIA-Worker-Rollen |
+//! | `/models add <provider>/<modell>` | Nimmt das Katalogmodell in `models` der Provider-Datei des Profils auf (sortiert, ohne Duplikate) |
+//! | `/models remove <provider>/<modell>` | Entfernt es wieder und löscht die zugehörige Modelldatei (nur reguläre Datei, kein Symlink) |
+//! | `/models scan [provider]` | Delegiert an den URL-Guard; bis dahin `NotAvailable` |
 //!
 //! `<ziel>` ist entweder eine bekannte Modell-ID (Schlüssel, `id` oder Alias
 //! aus `config.models`; der Provider wird aus dem Katalog übernommen) oder
@@ -63,9 +66,34 @@
 
 use harw_config::{ModelRole, ResolvedConfig, RoleModelRow};
 use harw_macros::operation;
-use harw_operations::{OpContext, OpError, OpOutput, SharedSessionController};
+use harw_operations::operation::{RemoteEffect, RemotePolicy, RemoteVerb};
+use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput, SharedSessionController};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+
+/// Remote-Allowlist von `/models` (Plan 4.2). Lese-Formen zuerst; der erste
+/// Treffer gilt. `pick` (interaktiver Picker) und `--allow-insecure-lan`
+/// sind an keiner Position remote erlaubt.
+pub const REMOTE: RemotePolicy = RemotePolicy {
+    path: "/models",
+    verbs: &[
+        RemoteVerb::read(&["-"]),
+        RemoteVerb::read(&["show", "-"]),
+        RemoteVerb::read(&["list", "-"]),
+        RemoteVerb::read(&["image", "-"]),
+        RemoteVerb::read(&["image", "show", "-"]),
+        RemoteVerb::read(&["image", "list", "-"]),
+        RemoteVerb::read(&["worker", "-"]),
+        RemoteVerb::global(&["set", "*"], RemoteEffect::NextSession),
+        RemoteVerb::global(&["reset", "*"], RemoteEffect::NextSession),
+        RemoteVerb::global(&["image", "*"], RemoteEffect::NextSession),
+        RemoteVerb::global(&["worker", "*"], RemoteEffect::NextSession),
+        RemoteVerb::global(&["add", "*"], RemoteEffect::NextSession),
+        RemoteVerb::global(&["remove", "*"], RemoteEffect::NextSession),
+        RemoteVerb::global(&["scan", "*"], RemoteEffect::NextSession),
+    ],
+    denied_tokens: &["--allow-insecure-lan", "pick"],
+};
 
 /// Hinweis, der jeder Anzeige und jeder Änderung beigefügt wird.
 pub(crate) const EFFECTIVE_NEXT_SESSION: &str =
@@ -453,15 +481,12 @@ fn render_show(
             .to_owned()
     };
 
-    let mut lines = vec![
-        format!(
-            "Live (diese Sitzung): {} / {}",
-            cell(live_provider),
-            cell(live_model)
-        ),
-        String::new(),
-        format_line(headers),
-    ];
+    let heading = if live_provider.is_some() || live_model.is_some() {
+        format!("Live (diese Sitzung): {} / {}", cell(live_provider), cell(live_model))
+    } else {
+        "Konfigurierte Modellwahl".to_owned()
+    };
+    let mut lines = vec![heading, String::new(), format_line(headers)];
     for line in &table {
         lines.push(format_line([
             line[0].as_str(),
@@ -743,12 +768,14 @@ async fn models(ctx: &OpContext, args: ModelsArgs) -> Result<OpOutput, OpError> 
                 }
             }
         }
-        "show" | "list" => {
+        "show" | "list" | "profile" => {
             let config = crate::provider::resolved_config(ctx)?;
             let rows = harw_config::resolve_role_models(&config);
-            let snapshot = ctx
-                .service::<SharedSessionController>()
-                .map(|controller| controller.snapshot());
+            // The local shell has no real chat controller. The remote allowlist
+            // does not expose this profile-only presentation verb.
+            let snapshot = if action == "profile" { None } else {
+                ctx.service::<SharedSessionController>().map(|controller| controller.snapshot())
+            };
             let live_provider = snapshot
                 .as_ref()
                 .and_then(|snap| snap.active_provider.as_deref());
@@ -789,12 +816,683 @@ async fn models(ctx: &OpContext, args: ModelsArgs) -> Result<OpOutput, OpError> 
                 args.target.as_deref(),
             )
         }
+        "add" => {
+            let config = crate::provider::resolved_config(ctx)?;
+            handle_add(ctx, &config, args.role.as_deref())
+        }
+        "remove" => {
+            let config = crate::provider::resolved_config(ctx)?;
+            handle_remove(ctx, &config, args.role.as_deref())
+        }
+        // Delegiert an den URL-Guard von manage-guard (Vertrag O-1); bis dahin
+        // nicht verfügbar.
+        "scan" => Err(OpError::NotAvailable(
+            "scan folgt mit dem URL-Guard".to_owned(),
+        )),
         other => Err(OpError::InvalidArguments(format!(
             "Unbekanntes /models-Sub-Kommando: '{other}'. Gültig: show, image [show|reset|modell|provider/modell], \
              set <rolle> <modell|provider/modell>, reset <rolle>, \
              worker [<rolle|all> <uia|modell|provider/modell>]."
         ))),
     }
+}
+
+// ── Katalog-Sicht für `catalog.get` (Scheibe 1) ──────────────────────────────
+
+/// Geschwärzte Sicht auf Provider, Modelle, Rollen und Live-Modell.
+///
+/// Enthält nie: `api_key`, `headers` (Namen und Werte), `auth_header`,
+/// Secret-Werte, Dateipfade von `SecretRef::File`/`FileJson`, Userinfo, Query
+/// oder Fragment der Basis-URL.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CatalogView {
+    /// Provider, sortiert nach Name.
+    pub providers: Vec<ProviderView>,
+    /// Modelle, sortiert nach (Provider, Id).
+    pub models: Vec<ModelView>,
+    /// Rollen in der Reihenfolge von [`harw_config::resolve_role_models`].
+    pub roles: Vec<RoleView>,
+    /// Live-Modell der Sitzung.
+    pub live: LiveView,
+    /// Hinweis [`EFFECTIVE_NEXT_SESSION`].
+    pub note: &'static str,
+}
+
+/// Ein Provider ohne Geheimnisse.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ProviderView {
+    /// Provider-Name.
+    pub name: String,
+    /// API-Familie.
+    pub api: String,
+    /// `scheme://host[:port]/path`; nicht parsebar: leer.
+    pub base_url: String,
+    /// Aktiviert?
+    pub enabled: bool,
+    /// Art der Anmeldung (ohne Wert).
+    pub auth_kind: AuthKind,
+    /// Nur bei `Env`, `Keyring`, `Secrets`: Name, Eintrag bzw. Id.
+    pub auth_name: Option<String>,
+    /// `auth.is_some() || api_key.is_some()`.
+    pub has_secret: bool,
+    /// Ausgewählte Modell-Ids.
+    pub models: Vec<String>,
+    /// Obergrenze gleichzeitiger Requests.
+    pub max_concurrency: Option<usize>,
+}
+
+/// Art der Anmeldung eines Providers; nie der Wert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthKind {
+    /// Keine Anmeldung.
+    None,
+    /// `env:`-Referenz.
+    Env,
+    /// `file:`-Referenz (Pfad wird nie gezeigt).
+    File,
+    /// `keyring:`-Referenz.
+    Keyring,
+    /// `secrets:`-Referenz.
+    Secrets,
+    /// `file-json:`-Referenz (Pfad wird nie gezeigt).
+    FileJson,
+    /// Veralteter Klartext-`api_key`.
+    InlineKey,
+}
+
+/// Ein Katalogmodell.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ModelView {
+    /// Schlüssel in `ResolvedConfig::models`.
+    pub key: String,
+    /// Modell-Id beim Provider.
+    pub id: String,
+    /// Anzeigename.
+    pub name: Option<String>,
+    /// Kanonischer Provider-Name.
+    pub provider: String,
+    /// Aliase.
+    pub aliases: Vec<String>,
+    /// Kontextfenster.
+    pub context_window: Option<u64>,
+    /// Maximale Ausgabe-Tokens.
+    pub max_tokens: Option<u64>,
+    /// Reasoning-fähig?
+    pub reasoning: bool,
+    /// Eingabearten.
+    pub input_types: Vec<String>,
+    /// `"active" | "deprecated" | "retirement_window" | "retired" | "unknown"`.
+    pub lifecycle: &'static str,
+}
+
+/// Eine Rolle mit aufgelöstem Modell.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RoleView {
+    /// Rollenschlüssel.
+    pub role: &'static str,
+    /// Anzeigename der Rolle.
+    pub label: &'static str,
+    /// Provider.
+    pub provider: Option<String>,
+    /// Modell.
+    pub model: Option<String>,
+    /// Herkunft der Wahl.
+    pub source: &'static str,
+    /// Reasoning-Gewicht.
+    pub effort: Option<String>,
+}
+
+/// Live-Modell der Sitzung.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LiveView {
+    /// Aktiver Provider.
+    pub provider: Option<String>,
+    /// Aktives Modell.
+    pub model: Option<String>,
+}
+
+/// Schwärzt eine Basis-URL auf `scheme://host[:port]/path`.
+///
+/// Ohne neue Abhängigkeit von Hand: Schema bis `://`, Autorität bis zum
+/// ersten `/`, `?` oder `#`; Userinfo (bis zum letzten `@`) entfällt; der Pfad
+/// endet vor `?`/`#`. Fehlt `://` oder der Host, ist das Ergebnis leer.
+fn redact_base_url(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.trim().split_once("://") else {
+        return String::new();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if scheme.is_empty() || host.is_empty() {
+        return String::new();
+    }
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    format!("{scheme}://{host}{}", &tail[..path_end])
+}
+
+fn auth_view(provider: &harw_config::ProviderToml) -> (AuthKind, Option<String>) {
+    use harw_config::SecretRef;
+    match (&provider.auth, &provider.api_key) {
+        (Some(SecretRef::Env(name)), _) => (AuthKind::Env, Some(name.clone())),
+        (Some(SecretRef::Keyring(name)), _) => (AuthKind::Keyring, Some(name.clone())),
+        (Some(SecretRef::Secrets(id)), _) => (AuthKind::Secrets, Some(id.clone())),
+        (Some(SecretRef::File(_)), _) => (AuthKind::File, None),
+        (Some(SecretRef::FileJson { .. }), _) => (AuthKind::FileJson, None),
+        (None, Some(_)) => (AuthKind::InlineKey, None),
+        (None, None) => (AuthKind::None, None),
+    }
+}
+
+fn lifecycle_label(
+    entries: &[harw_model_catalog::lifecycle::LifecycleEntry],
+    provider: &str,
+    model: &str,
+    now: harw_model_catalog::lifecycle::OffsetDateTime,
+) -> &'static str {
+    use harw_model_catalog::lifecycle::{LifecycleStatus, lookup};
+    match lookup(entries, provider, model).map(|entry| entry.lifecycle.status(now)) {
+        Some(LifecycleStatus::Active) => "active",
+        Some(LifecycleStatus::Deprecated) => "deprecated",
+        Some(LifecycleStatus::RetirementWindow) => "retirement_window",
+        Some(LifecycleStatus::Retired) => "retired",
+        None => "unknown",
+    }
+}
+
+/// Baut die geschwärzte Katalogsicht. Rein; `now` bestimmt den Lebenszyklus,
+/// die Live-Werte liefert der Aufrufer (Controller-Snapshot).
+#[must_use]
+pub fn catalog_view(
+    config: &ResolvedConfig,
+    live_provider: Option<&str>,
+    live_model: Option<&str>,
+    now: harw_model_catalog::lifecycle::OffsetDateTime,
+) -> CatalogView {
+    let mut providers: Vec<ProviderView> = config
+        .providers
+        .values()
+        .map(|provider| {
+            let (auth_kind, auth_name) = auth_view(provider);
+            ProviderView {
+                name: provider.name.clone(),
+                api: provider.api.clone(),
+                base_url: redact_base_url(&provider.base_url),
+                enabled: provider.enabled,
+                auth_kind,
+                auth_name,
+                has_secret: provider.auth.is_some() || provider.api_key.is_some(),
+                models: provider.models.clone(),
+                max_concurrency: provider.max_concurrency,
+            }
+        })
+        .collect();
+    providers.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let entries = harw_model_catalog::lifecycle::bundled_lifecycles();
+    let mut models: Vec<ModelView> = config
+        .models
+        .iter()
+        .map(|(key, entry)| {
+            let provider = canonical_provider_name(config, &entry.provider);
+            let lifecycle = lifecycle_label(&entries, &provider, &entry.id, now);
+            ModelView {
+                key: key.clone(),
+                id: entry.id.clone(),
+                name: entry.name.clone(),
+                provider,
+                aliases: entry.aliases.clone(),
+                context_window: entry.context_window,
+                max_tokens: entry.max_tokens,
+                reasoning: entry.reasoning,
+                input_types: entry.input_types.clone(),
+                lifecycle,
+            }
+        })
+        .collect();
+    models.sort_by(|a, b| (&a.provider, &a.id, &a.key).cmp(&(&b.provider, &b.id, &b.key)));
+
+    let roles = harw_config::resolve_role_models(config)
+        .into_iter()
+        .map(|row| RoleView {
+            role: row.role.key(),
+            label: row.role.label(),
+            provider: row.provider,
+            model: row.model,
+            source: row.source.label(),
+            effort: row.reasoning_effort,
+        })
+        .collect();
+
+    CatalogView {
+        providers,
+        models,
+        roles,
+        live: LiveView {
+            provider: live_provider.map(str::to_owned),
+            model: live_model.map(str::to_owned),
+        },
+        note: EFFECTIVE_NEXT_SESSION,
+    }
+}
+
+/// Bequemer Einstieg: aufgelöste Config, Controller-Snapshot und aktuelle Zeit.
+///
+/// # Fehler
+/// Wie [`crate::provider::resolved_config`].
+pub fn catalog_view_for(ctx: &OpContext) -> Result<CatalogView, OpError> {
+    let config = crate::provider::resolved_config(ctx)?;
+    let snapshot = ctx
+        .service::<SharedSessionController>()
+        .map(|controller| controller.snapshot());
+    Ok(catalog_view(
+        &config,
+        snapshot
+            .as_ref()
+            .and_then(|snap| snap.active_provider.as_deref()),
+        snapshot
+            .as_ref()
+            .and_then(|snap| snap.active_model.as_deref()),
+        harw_model_catalog::lifecycle::OffsetDateTime::now_utc(),
+    ))
+}
+
+// ── Scheibe 3: add / remove ──────────────────────────────────────────────────
+
+/// Kanonischer Step-up-Text einer Änderung, Grundlage für Hash/Nonce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelsChange {
+    /// `"set" | "reset" | "image" | "worker" | "add" | "remove"`.
+    pub action: &'static str,
+    /// `"models.{action} {ziel}: {alt} -> {neu}"`.
+    pub canonical: String,
+}
+
+fn change(action: &'static str, target: &str, old: &str, new: &str) -> ModelsChange {
+    ModelsChange {
+        action,
+        canonical: format!("models.{action} {target}: {old} -> {new}"),
+    }
+}
+
+fn role_value(config: &ResolvedConfig, role: ModelRole) -> String {
+    let row = harw_config::resolve_role_model(config, role);
+    match (row.provider, row.model) {
+        (Some(provider), Some(model)) => format!("{provider}/{model}"),
+        _ => "-".to_owned(),
+    }
+}
+
+/// Prüft `set`/`image` wie die Ausführung (Ziel, Bildfähigkeit, Lebenszyklus),
+/// ohne zu schreiben; liefert `(provider, modell)`.
+fn check_set_target(
+    config: &ResolvedConfig,
+    role: ModelRole,
+    target: &str,
+) -> Result<(String, String), OpError> {
+    let (provider, model) = resolve_target(config, target)?;
+    if role == ModelRole::ImageUnderstanding {
+        validate_image_target(config, &provider, &model)?;
+    }
+    crate::live_model::enforce_lifecycle(&provider, &model)?;
+    Ok((provider, model))
+}
+
+/// Plant eine Änderung rein, ohne Schreiben.
+///
+/// Prüft wie `handle_set`/`resolve_target`/`enforce_lifecycle` und liefert den
+/// kanonischen Text, z. B. `"models.set uia: prov-a/m1 -> prov-b/m2"`,
+/// `"models.add prov-a/m3: absent -> present"`. Fehlender Altwert: `-`. Bei
+/// `reset` ist der Neuwert `default`; bei `worker` ist der Altwert `-` und der
+/// Neuwert das rohe Ziel.
+///
+/// # Fehler
+/// [`OpError::InvalidArguments`] für Nicht-Änderungen (`show`, unbekannte
+/// Sub-Kommandos) und alles, was die Ausführung ablehnen würde.
+pub fn plan_models_change(ctx: &OpContext, args: &[String]) -> Result<ModelsChange, OpError> {
+    let parsed = ModelsArgs::from_raw_args(args)?;
+    let action = parsed
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|action| !action.is_empty())
+        .unwrap_or("show");
+    let config = crate::provider::resolved_config(ctx)?;
+    match action {
+        "set" => {
+            let usage = "/models set <rolle> <modell|provider/modell> [effort]";
+            let role = parse_role(parsed.role.as_deref(), usage)?;
+            let target = parsed
+                .target
+                .as_deref()
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+                .ok_or_else(|| {
+                    OpError::InvalidArguments(format!("Ziel fehlt. Aufruf: {usage}."))
+                })?;
+            parse_role_effort(parsed.effort.as_deref(), role.key())?;
+            let (provider, model) = check_set_target(&config, role, target)?;
+            Ok(change(
+                "set",
+                role.key(),
+                &role_value(&config, role),
+                &format!("{provider}/{model}"),
+            ))
+        }
+        "reset" | "clear" => {
+            let role = parse_role(parsed.role.as_deref(), "/models reset <rolle>")?;
+            Ok(change(
+                "reset",
+                role.key(),
+                &role_value(&config, role),
+                "default",
+            ))
+        }
+        "image" => {
+            let role = ModelRole::ImageUnderstanding;
+            match parsed
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some("reset" | "clear") => Ok(change(
+                    "image",
+                    role.key(),
+                    &role_value(&config, role),
+                    "default",
+                )),
+                None | Some("show" | "list") => Err(OpError::InvalidArguments(
+                    "/models image show ändert nichts".to_owned(),
+                )),
+                Some(target) => {
+                    let (provider, model) = check_set_target(&config, role, target)?;
+                    Ok(change(
+                        "image",
+                        role.key(),
+                        &role_value(&config, role),
+                        &format!("{provider}/{model}"),
+                    ))
+                }
+            }
+        }
+        "worker" | "workers" => {
+            let role = parsed
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    OpError::InvalidArguments(
+                        "Aufruf: /models worker <rolle|all> <uia|modell|provider/modell>"
+                            .to_owned(),
+                    )
+                })?;
+            let target = parsed
+                .target
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    OpError::InvalidArguments(
+                        "Aufruf: /models worker <rolle|all> <uia|modell|provider/modell>"
+                            .to_owned(),
+                    )
+                })?;
+            Ok(change("worker", role, "-", target))
+        }
+        "add" => {
+            let edit = prepare_list_edit(ctx, &config, parsed.role.as_deref(), true)?;
+            let old = if edit.current.contains(&edit.model) {
+                "present"
+            } else {
+                "absent"
+            };
+            Ok(change(
+                "add",
+                &format!("{}/{}", edit.provider, edit.model),
+                old,
+                "present",
+            ))
+        }
+        "remove" => {
+            let edit = prepare_list_edit(ctx, &config, parsed.role.as_deref(), false)?;
+            let old = if edit.current.contains(&edit.model) {
+                "present"
+            } else {
+                "absent"
+            };
+            Ok(change(
+                "remove",
+                &format!("{}/{}", edit.provider, edit.model),
+                old,
+                "absent",
+            ))
+        }
+        other => Err(OpError::InvalidArguments(format!(
+            "Keine Änderung: '{other}'."
+        ))),
+    }
+}
+
+/// Vorbereitete Änderung der Modellliste einer Provider-Datei.
+struct ListEdit {
+    /// Kanonischer Provider-Name.
+    provider: String,
+    /// Modell-Id.
+    model: String,
+    /// `<profil>/providers/<schlüssel>.toml`.
+    path: std::path::PathBuf,
+    /// Aktuelle Liste (Datei, sonst Config).
+    current: BTreeSet<String>,
+    /// Profilverzeichnis.
+    profile_dir: std::path::PathBuf,
+}
+
+fn io_error(context: &str, error: impl std::fmt::Display) -> OpError {
+    OpError::Execution(format!("{context}: {error}"))
+}
+
+/// Zerlegt `provider/modell` am ersten `/`.
+fn parse_list_target(target: Option<&str>) -> Result<(&str, &str), OpError> {
+    let usage = "Aufruf: /models add|remove <provider>/<modell>";
+    let target = target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| OpError::InvalidArguments(format!("Ziel fehlt. {usage}")))?;
+    match target.split_once('/') {
+        Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+            Ok((provider, model))
+        }
+        _ => Err(OpError::InvalidArguments(format!(
+            "Ungültiges Ziel '{target}'. {usage}"
+        ))),
+    }
+}
+
+/// Provider-Schlüssel als sicherer Dateiname (kein Pfadtrenner, kein führender Punkt).
+fn is_safe_file_stem(stem: &str) -> bool {
+    !stem.is_empty()
+        && !stem.starts_with('.')
+        && stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Liest die aktuelle `models`-Liste der Provider-Datei; fehlt der Schlüssel,
+/// gilt die aufgelöste Config (`fallback`).
+fn read_current_models(
+    path: &std::path::Path,
+    fallback: &[String],
+) -> Result<BTreeSet<String>, OpError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(OpError::InvalidArguments(
+                "Der Provider hat keine eigene Datei im Profil (providers/<name>.toml).".to_owned(),
+            ));
+        }
+        Err(error) => return Err(io_error("Provider-Datei lesen", error)),
+    };
+    let document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| io_error("Provider-Datei lesen", error))?;
+    Ok(
+        match document.get("models").and_then(|item| item.as_array()) {
+            Some(array) => array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect(),
+            None => fallback.iter().cloned().collect(),
+        },
+    )
+}
+
+/// Schreibt die sortierte Liste; andere Schlüssel der Datei bleiben erhalten.
+fn write_model_list(path: &std::path::Path, ids: &BTreeSet<String>) -> Result<(), OpError> {
+    let mut writer = harw_config::ConfigWriter::open_locked(path)
+        .map_err(|error| io_error("Provider-Datei öffnen", error))?;
+    let mut array = toml_edit::Array::new();
+    for id in ids {
+        array.push(id.as_str());
+    }
+    writer
+        .set_value("models", toml_edit::value(array))
+        .map_err(|error| io_error("Provider-Datei ändern", error))?;
+    writer
+        .save()
+        .map_err(|error| io_error("Provider-Datei speichern", error))
+}
+
+/// Prüft Ziel, Provider und (beim Hinzufügen) Katalog; ohne Schreiben.
+fn prepare_list_edit(
+    ctx: &OpContext,
+    config: &ResolvedConfig,
+    target: Option<&str>,
+    adding: bool,
+) -> Result<ListEdit, OpError> {
+    let (provider_name, model_id) = parse_list_target(target)?;
+    let (key, provider) = config
+        .providers
+        .iter()
+        .find(|(key, provider)| key.as_str() == provider_name || provider.name == provider_name)
+        .ok_or_else(|| {
+            OpError::InvalidArguments(format!(
+                "Provider '{provider_name}' ist nicht konfiguriert."
+            ))
+        })?;
+    if adding && !provider.enabled {
+        return Err(OpError::InvalidArguments(format!(
+            "Provider '{provider_name}' ist deaktiviert."
+        )));
+    }
+    let canonical = provider.name.clone();
+    if adding
+        && !config
+            .models
+            .values()
+            .any(|entry| entry.id == model_id && model_belongs_to(config, entry, &canonical))
+    {
+        return Err(OpError::InvalidArguments(format!(
+            "Modell '{model_id}' steht nicht im Katalog von '{provider_name}'."
+        )));
+    }
+    if !is_safe_file_stem(key) {
+        return Err(OpError::InvalidArguments(format!(
+            "Provider-Schlüssel '{key}' ist als Dateiname ungeeignet."
+        )));
+    }
+    let profile_dir = crate::config_util::bound_home(ctx)?.profile_dir.clone();
+    let path = profile_dir.join("providers").join(format!("{key}.toml"));
+    let current = read_current_models(&path, &provider.models)?;
+    Ok(ListEdit {
+        provider: canonical,
+        model: model_id.to_owned(),
+        path,
+        current,
+        profile_dir,
+    })
+}
+
+/// Dateiname einer Modelldatei: Bytes außerhalb `[A-Za-z0-9._-]` als `%XX`,
+/// Endung `.toml` (wie `harw models`).
+fn model_filename(id: &str) -> String {
+    use std::fmt::Write as _;
+    let mut name = String::new();
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            name.push(char::from(byte));
+        } else {
+            let _ = write!(name, "%{byte:02X}");
+        }
+    }
+    name.push_str(".toml");
+    name
+}
+
+/// Führt `add <provider>/<modell>` aus.
+fn handle_add(
+    ctx: &OpContext,
+    config: &ResolvedConfig,
+    target: Option<&str>,
+) -> Result<OpOutput, OpError> {
+    let edit = prepare_list_edit(ctx, config, target, true)?;
+    let mut next = edit.current.clone();
+    next.insert(edit.model.clone());
+    write_model_list(&edit.path, &next)?;
+    Ok(OpOutput {
+        text: format!(
+            "{}/{} hinzugefügt. {EFFECTIVE_NEXT_SESSION}",
+            edit.provider, edit.model
+        ),
+        data: Some(json!({
+            "action": "add",
+            "provider": edit.provider,
+            "model": edit.model,
+            "persisted": true,
+            "note": EFFECTIVE_NEXT_SESSION,
+        })),
+    })
+}
+
+/// Führt `remove <provider>/<modell>` aus; löscht die Modelldatei nur, wenn
+/// sie eine reguläre Datei und kein Symlink ist.
+fn handle_remove(
+    ctx: &OpContext,
+    config: &ResolvedConfig,
+    target: Option<&str>,
+) -> Result<OpOutput, OpError> {
+    let edit = prepare_list_edit(ctx, config, target, false)?;
+    let mut next = edit.current.clone();
+    next.remove(&edit.model);
+    write_model_list(&edit.path, &next)?;
+    let model_path = edit
+        .profile_dir
+        .join("models")
+        .join(model_filename(&edit.model));
+    let mut file_removed = false;
+    if let Ok(metadata) = std::fs::symlink_metadata(&model_path)
+        && metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+    {
+        std::fs::remove_file(&model_path)
+            .map_err(|error| io_error("Modelldatei löschen", error))?;
+        file_removed = true;
+    }
+    Ok(OpOutput {
+        text: format!(
+            "{}/{} entfernt. {EFFECTIVE_NEXT_SESSION}",
+            edit.provider, edit.model
+        ),
+        data: Some(json!({
+            "action": "remove",
+            "provider": edit.provider,
+            "model": edit.model,
+            "persisted": true,
+            "model_file_removed": file_removed,
+            "note": EFFECTIVE_NEXT_SESSION,
+        })),
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -2059,6 +2757,366 @@ mod tests {
             }
         }
         assert!(fixture.recorder.calls().is_empty());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::{
+        AuthKind, REMOTE, ResolvedConfig, catalog_view, handle_add, handle_remove, model_filename,
+        plan_models_change, redact_base_url, render_show,
+    };
+    use crate::test_support::{TestError, TestResult, ctx};
+    use crate::testutil::toks;
+    use harw_operations::context::ServiceMap;
+    use harw_operations::operation::{RemoteCap, RemoteEffect, RemoteSlice};
+    use harw_operations::{OpContext, OpError};
+    use serde_json::json;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn provider(value: serde_json::Value) -> TestResult<harw_config::ProviderToml> {
+        serde_json::from_value(value).map_err(ctx("ProviderToml bauen"))
+    }
+
+    fn model(id: &str, provider_name: &str) -> TestResult<harw_config::ModelToml> {
+        serde_json::from_value(json!({"id": id, "provider": provider_name}))
+            .map_err(ctx("ModelToml bauen"))
+    }
+
+    fn now() -> harw_model_catalog::lifecycle::OffsetDateTime {
+        harw_model_catalog::lifecycle::OffsetDateTime::now_utc()
+    }
+
+    fn secret_config() -> TestResult<ResolvedConfig> {
+        let mut config = ResolvedConfig::default();
+        config.providers.insert(
+            "p1".to_owned(),
+            provider(json!({
+                "name": "p1",
+                "api": "openai-chat",
+                "base_url": "https://user:pw-fake@api.example.test/v1?key=q-fake-SECRET-marker#frag",
+                "api_key": "sk-fake-SECRET-marker",
+                "auth_header": "X-Auth-fake",
+                "headers": {"X-Fake": "hdr-fake-SECRET-marker"},
+            }))?,
+        );
+        config.providers.insert(
+            "p2".to_owned(),
+            provider(json!({
+                "name": "p2",
+                "api": "openai-chat",
+                "base_url": "https://api.example.test/p2",
+                "auth": "secrets:fake-id",
+            }))?,
+        );
+        config.providers.insert(
+            "p3".to_owned(),
+            provider(json!({
+                "name": "p3",
+                "api": "openai-chat",
+                "base_url": "https://api.example.test/p3",
+                "auth": "file:/x/fake-path",
+            }))?,
+        );
+        config.models.insert("m1".to_owned(), model("m1", "p1")?);
+        Ok(config)
+    }
+
+    #[test]
+    fn catalog_view_never_leaks_secrets() -> TestResult {
+        let view = catalog_view(&secret_config()?, None, None, now());
+        let json = serde_json::to_string(&view).map_err(ctx("serialisieren"))?;
+        for forbidden in [
+            "SECRET",
+            "pw-fake",
+            "X-Fake",
+            "X-Auth-fake",
+            "?key",
+            "#frag",
+        ] {
+            assert!(!json.contains(forbidden), "{forbidden} im JSON: {json}");
+        }
+        let p1 = view
+            .providers
+            .iter()
+            .find(|p| p.name == "p1")
+            .ok_or(TestError::Missing("p1"))?;
+        assert_eq!(p1.base_url, "https://api.example.test/v1");
+        assert_eq!(p1.auth_kind, AuthKind::InlineKey);
+        assert!(p1.has_secret);
+        let p2 = view
+            .providers
+            .iter()
+            .find(|p| p.name == "p2")
+            .ok_or(TestError::Missing("p2"))?;
+        assert_eq!(p2.auth_kind, AuthKind::Secrets);
+        assert_eq!(p2.auth_name.as_deref(), Some("fake-id"));
+        assert!(p2.has_secret);
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_view_file_secret_has_no_path() -> TestResult {
+        let view = catalog_view(&secret_config()?, None, None, now());
+        let p3 = view
+            .providers
+            .iter()
+            .find(|p| p.name == "p3")
+            .ok_or(TestError::Missing("p3"))?;
+        assert_eq!(p3.auth_kind, AuthKind::File);
+        assert_eq!(p3.auth_name, None);
+        let json = serde_json::to_string(&view).map_err(ctx("serialisieren"))?;
+        assert!(!json.contains("fake-path"));
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_view_is_sorted_and_carries_live_model() -> TestResult {
+        let view = catalog_view(&secret_config()?, Some("p1"), Some("m1"), now());
+        let names: Vec<&str> = view.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["p1", "p2", "p3"]);
+        assert_eq!(view.live.provider.as_deref(), Some("p1"));
+        assert_eq!(view.live.model.as_deref(), Some("m1"));
+        assert_eq!(view.models.len(), 1);
+        assert_eq!(view.models[0].lifecycle, "unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn redact_base_url_keeps_only_scheme_host_path() {
+        assert_eq!(
+            redact_base_url("http://h.example.test:8080/a/b?x=1#f"),
+            "http://h.example.test:8080/a/b"
+        );
+        assert_eq!(
+            redact_base_url("https://u:p@h.example.test"),
+            "https://h.example.test"
+        );
+        assert_eq!(redact_base_url("no-scheme"), "");
+        assert_eq!(redact_base_url("https://"), "");
+    }
+
+    #[test]
+    fn catalog_view_lists_roles_like_show() -> TestResult {
+        let config = secret_config()?;
+        let view = catalog_view(&config, None, None, now());
+        let rows = harw_config::resolve_role_models(&config);
+        let shown = render_show(&rows, None, None);
+        let data = shown.data.ok_or(TestError::Missing("data"))?;
+        let shown_roles: Vec<String> = data["roles"]
+            .as_array()
+            .ok_or(TestError::Missing("roles"))?
+            .iter()
+            .filter_map(|row| row["role"].as_str().map(str::to_owned))
+            .collect();
+        let view_roles: Vec<String> = view.roles.iter().map(|r| r.role.to_owned()).collect();
+        assert!(!view_roles.is_empty());
+        assert_eq!(view_roles, shown_roles);
+        Ok(())
+    }
+
+    #[test]
+    fn models_remote_policy_shape() {
+        let show = REMOTE.find_verb(&toks(&["show"]));
+        assert!(show.is_some_and(|v| v.cap == RemoteCap::Observe && !v.stepup));
+        assert!(
+            REMOTE
+                .find_verb(&toks(&[]))
+                .is_some_and(|v| v.slice == RemoteSlice::Read)
+        );
+        let set = REMOTE.find_verb(&toks(&["set", "uia", "x/y"]));
+        assert!(set.is_some_and(|v| v.stepup
+            && v.cap == RemoteCap::Control
+            && v.slice == RemoteSlice::Global
+            && v.effect == RemoteEffect::NextSession));
+        assert!(REMOTE.find_verb(&toks(&["pick", "uia"])).is_none());
+        assert!(REMOTE.denied_tokens.contains(&"pick"));
+        assert!(REMOTE.denied_tokens.contains(&"--allow-insecure-lan"));
+        // Lese-Formen von image/worker bleiben Observe, Schreib-Formen nicht.
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["image", "show"]))
+                .is_some_and(|v| !v.stepup)
+        );
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["image", "x/y"]))
+                .is_some_and(|v| v.stepup)
+        );
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["worker"]))
+                .is_some_and(|v| !v.stepup)
+        );
+        assert!(
+            REMOTE
+                .find_verb(&toks(&["add", "p/m"]))
+                .is_some_and(|v| v.stepup)
+        );
+    }
+
+    struct ListFixture {
+        ctx: OpContext,
+        config: Arc<ResolvedConfig>,
+        profile: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn list_fixture() -> TestResult<ListFixture> {
+        let dir = tempfile::tempdir().map_err(ctx("tempdir"))?;
+        let home = crate::config_util::test_home_context(dir.path())?;
+        let profile = home.profile_dir.clone();
+        std::fs::create_dir_all(profile.join("providers")).map_err(ctx("providers"))?;
+        let mut config = ResolvedConfig::default();
+        for (name, enabled) in [("p1", true), ("off", false)] {
+            let mut entry = provider(json!({
+                "name": name,
+                "api": "x",
+                "base_url": "https://api.example.test/v1",
+                "models": ["m1"],
+                "enabled": enabled,
+            }))?;
+            entry.models = vec!["m1".to_owned()];
+            config.providers.insert(name.to_owned(), entry);
+            std::fs::write(
+                profile.join("providers").join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\napi = \"x\"\nbase_url = \"https://api.example.test/v1\"\nenabled = {enabled}\nmodels = [\"m1\"]\n"
+                ),
+            )
+            .map_err(ctx("Provider-Datei"))?;
+        }
+        config.models.insert("m1".to_owned(), model("m1", "p1")?);
+        config.models.insert("m2".to_owned(), model("m2", "p1")?);
+        config.models.insert("m9".to_owned(), model("m9", "off")?);
+        let config = Arc::new(config);
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&home));
+        services.insert(Arc::clone(&config));
+        let ctx = crate::knowledge_test_support::op_context(services)?;
+        Ok(ListFixture {
+            ctx,
+            config,
+            profile,
+            _dir: dir,
+        })
+    }
+
+    fn file_models(path: &Path) -> TestResult<Vec<String>> {
+        let text = std::fs::read_to_string(path).map_err(ctx("lesen"))?;
+        let doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(ctx("parsen"))?;
+        Ok(doc["models"]
+            .as_array()
+            .ok_or(TestError::Missing("models"))?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect())
+    }
+
+    #[test]
+    fn add_then_remove_roundtrip() -> TestResult {
+        let fx = list_fixture()?;
+        let path = fx.profile.join("providers/p1.toml");
+        handle_add(&fx.ctx, &fx.config, Some("p1/m2")).map_err(ctx("add"))?;
+        assert_eq!(file_models(&path)?, ["m1", "m2"]);
+        // Fremdschlüssel bleiben erhalten.
+        let text = std::fs::read_to_string(&path).map_err(ctx("lesen"))?;
+        assert!(text.contains("api = \"x\""), "{text}");
+        assert!(text.contains("name = \"p1\""), "{text}");
+        // Doppeltes Hinzufügen erzeugt kein Duplikat.
+        handle_add(&fx.ctx, &fx.config, Some("p1/m2")).map_err(ctx("add 2"))?;
+        assert_eq!(file_models(&path)?, ["m1", "m2"]);
+
+        std::fs::create_dir_all(fx.profile.join("models")).map_err(ctx("models dir"))?;
+        let model_file = fx.profile.join("models").join(model_filename("m2"));
+        std::fs::write(&model_file, "id = \"m2\"\n").map_err(ctx("Modelldatei"))?;
+        handle_remove(&fx.ctx, &fx.config, Some("p1/m2")).map_err(ctx("remove"))?;
+        assert_eq!(file_models(&path)?, ["m1"]);
+        assert!(!model_file.exists());
+        let text = std::fs::read_to_string(&path).map_err(ctx("lesen"))?;
+        assert!(text.contains("api = \"x\""), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn add_rejects_disabled_provider() -> TestResult {
+        let fx = list_fixture()?;
+        let error = handle_add(&fx.ctx, &fx.config, Some("off/m9"));
+        assert!(matches!(error, Err(OpError::InvalidArguments(_))));
+        assert_eq!(file_models(&fx.profile.join("providers/off.toml"))?, ["m1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn add_rejects_unknown_model_and_bad_target() -> TestResult {
+        let fx = list_fixture()?;
+        for target in ["p1/unknown", "p1", "p1/", "/m1", "nope/m1"] {
+            assert!(
+                matches!(
+                    handle_add(&fx.ctx, &fx.config, Some(target)),
+                    Err(OpError::InvalidArguments(_))
+                ),
+                "{target}"
+            );
+        }
+        assert_eq!(file_models(&fx.profile.join("providers/p1.toml"))?, ["m1"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_keeps_symlinked_model_file() -> TestResult {
+        let fx = list_fixture()?;
+        std::fs::create_dir_all(fx.profile.join("models")).map_err(ctx("models dir"))?;
+        let real = fx.profile.join("real-model.toml");
+        std::fs::write(&real, "id = \"m1\"\n").map_err(ctx("real"))?;
+        let link = fx.profile.join("models").join(model_filename("m1"));
+        std::os::unix::fs::symlink(&real, &link).map_err(ctx("symlink"))?;
+        handle_remove(&fx.ctx, &fx.config, Some("p1/m1")).map_err(ctx("remove"))?;
+        assert!(link.symlink_metadata().is_ok());
+        assert!(real.exists());
+        assert!(file_models(&fx.profile.join("providers/p1.toml"))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_models_change_text_is_canonical() -> TestResult {
+        let fx = list_fixture()?;
+        let add = plan_models_change(&fx.ctx, &toks(&["add", "p1/m2"])).map_err(ctx("add"))?;
+        assert_eq!(add.action, "add");
+        assert_eq!(add.canonical, "models.add p1/m2: absent -> present");
+        let remove =
+            plan_models_change(&fx.ctx, &toks(&["remove", "p1/m1"])).map_err(ctx("remove"))?;
+        assert_eq!(remove.canonical, "models.remove p1/m1: present -> absent");
+        let set =
+            plan_models_change(&fx.ctx, &toks(&["set", "uia", "p1/m1"])).map_err(ctx("set"))?;
+        assert_eq!(set.action, "set");
+        assert!(
+            set.canonical.starts_with("models.set uia: "),
+            "{}",
+            set.canonical
+        );
+        assert!(set.canonical.ends_with(" -> p1/m1"), "{}", set.canonical);
+        // Planen schreibt nichts.
+        assert_eq!(file_models(&fx.profile.join("providers/p1.toml"))?, ["m1"]);
+        // Lesende Formen sind keine Änderung.
+        assert!(plan_models_change(&fx.ctx, &toks(&["show"])).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_is_not_available_until_guard_lands() -> TestResult {
+        let fx = list_fixture()?;
+        let args = <super::ModelsArgs as harw_operations::FromRawArgs>::from_raw_args(&toks(&[
+            "scan", "p1",
+        ]))
+        .map_err(ctx("args"))?;
+        let result = super::models(&fx.ctx, args).await;
+        assert!(matches!(result, Err(OpError::NotAvailable(_))));
         Ok(())
     }
 }

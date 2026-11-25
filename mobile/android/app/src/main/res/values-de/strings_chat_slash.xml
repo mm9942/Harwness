@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_slash_title">Chat-Befehle</string>
+    <string name="chat_slash_ok">OK</string>
+    <string name="chat_slash_help">Mit /export oder /transcript speicherst du die Nachrichten aus diesem Chat. Der Button Befehle zeigt Aktionen, die der Host anbietet.</string>
+    <string name="chat_slash_unknown">Unbekannter Befehl. /help zeigt unterstützte Chat-Befehle. Beginne mit einem Satz, wenn du dem Agenten schreiben möchtest. Es wurde nichts gesendet.</string>
+    <string name="chat_slash_export_needs_chat">Öffne einen bestehenden Chat, bevor du /export verwendest. Es wurde nichts gesendet.</string>
+    <string name="chat_slash_export_wait">Warte, bis der Chat vollständig geladen ist und die Antwort beendet ist.</string>
+    <string name="chat_slash_export_current_version">Wechsle vor dem Export zur aktuellen Fassung dieses Chats.</string>
+    <string name="chat_slash_export_changed">Der aktive Chat oder die Verbindung hat sich geändert. Es wurde kein Verlauf geschrieben.</string>
+    <string name="chat_slash_export_saved">Verlauf gespeichert.</string>
+    <string name="chat_slash_export_failed">Der Verlauf konnte nicht gespeichert werden. Wähle einen anderen Speicherort.</string>
+    <string name="chat_slash_export_user">Nutzer</string>
+    <string name="chat_slash_export_agent">Agent</string>
+    <string name="chat_slash_export_images">[%1$d Bilder nicht exportiert]</string>
+    <string name="chat_slash_export_empty">Es werden keine Nachrichten zum Export angezeigt.</string>
+    <string name="chat_slash_export_too_large">Der angezeigte Verlauf ist zu groß für einen einzelnen Export.</string>
+    <string name="chat_slash_host_loading">Befehle für diesen Chat werden geladen…</string>
+    <string name="chat_slash_host_unavailable">Dieser Befehl ist für diesen Chat oder diese Verbindung nicht verfügbar. Es wurde keine Nachricht gesendet.</string>
+    <string name="chat_slash_host_run">Befehl ausführen</string>
+    <string name="chat_slash_host_discover">Verfügbare Lesebefehle durchsuchen. Die Auswahl führt noch keinen Befehl aus.</string>
+    <string name="chat_slash_host_filter">Befehle filtern</string>
+    <string name="chat_slash_host_no_match">Kein unterstützter Lesebefehl passt. Es wurde keine Nachricht gesendet.</string>
+    <string name="chat_slash_host_all">Alle Befehle anzeigen</string>
+</resources>

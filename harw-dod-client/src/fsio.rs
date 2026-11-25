@@ -78,27 +78,31 @@ pub(crate) fn open_regular_nofollow(path: &Path) -> Result<Option<OpenedFile>, D
 }
 
 /// `true` for characters that must not reach a terminal or a model prompt
-/// verbatim: Unicode controls and characters that reorder or hide text
-/// (bidi overrides/isolates, zero-width characters, BOM, line/paragraph
-/// separators). Mirrors the sentinel's export sanitizer.
+/// verbatim.
+///
+/// Delegates to [`harw_untrusted_text::needs_escape`], the one shared
+/// classification (PL-100 WP0.8) the sentinel export and the `dod`
+/// operations use as well: controls (`Cc`, including the ESC/BEL of
+/// ANSI/OSC sequences), format characters (`Cf`: bidi overrides/isolates,
+/// zero-width characters, BOM, soft hyphen), line/paragraph separators,
+/// private use, the tag block, variation selectors and an approximation of
+/// unassigned code points. A superset of the former local list.
 pub(crate) fn is_unsafe_char(ch: char) -> bool {
-    ch.is_control()
-        || matches!(
-            ch,
-            '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2069}'
-                | '\u{FEFF}'
-        )
+    harw_untrusted_text::needs_escape(ch)
 }
 
-/// Replaces unsafe characters by `replacement` and truncates to at most
-/// `max_bytes` bytes on a character boundary.
+/// Replaces unsafe characters ([`is_unsafe_char`]) by `replacement` and
+/// truncates to at most `max_bytes` bytes on a character boundary.
+///
+/// The readers keep a one-character replacement instead of the visible
+/// `\u{…}` escape of [`harw_untrusted_text::escape`]: every caller bounds
+/// its field in bytes, and one replacement per unsafe character keeps those
+/// byte caps exact.
 pub(crate) fn sanitize(raw: &str, max_bytes: usize, replacement: char) -> String {
     let mut out = String::with_capacity(raw.len().min(max_bytes));
     for ch in raw.chars() {
         let ch = if is_unsafe_char(ch) { replacement } else { ch };
-        if out.len() + ch.len_utf8() > max_bytes {
+        if out.len().saturating_add(ch.len_utf8()) > max_bytes {
             break;
         }
         out.push(ch);
@@ -107,9 +111,9 @@ pub(crate) fn sanitize(raw: &str, max_bytes: usize, replacement: char) -> String
 }
 
 /// `true` when `value` is non-empty, at most `max_bytes` long and free of
-/// unsafe characters.
+/// unsafe characters ([`harw_untrusted_text::is_clean`]).
 pub(crate) fn is_clean(value: &str, max_bytes: usize) -> bool {
-    !value.trim().is_empty() && value.len() <= max_bytes && !value.chars().any(is_unsafe_char)
+    !value.trim().is_empty() && value.len() <= max_bytes && harw_untrusted_text::is_clean(value)
 }
 
 #[cfg(test)]
@@ -129,6 +133,30 @@ mod tests {
         assert!(!is_clean("host\u{7}", 16));
         assert!(!is_clean("   ", 16));
         assert!(!is_clean("abcdef", 3));
+    }
+
+    #[test]
+    fn sanitize_and_is_clean_follow_the_shared_escaper_classification() -> TestResult {
+        // Tag block, variation selector, private use, soft hyphen and an
+        // ANSI escape byte: replaced like any other unsafe character.
+        assert_eq!(
+            sanitize("a\u{E0041}b\u{FE0F}c\u{E000}d\u{AD}e\u{1B}[0m", 64, '?'),
+            "a?b?c?d?e?[0m"
+        );
+        assert!(!is_clean("host\u{E0041}", 16));
+        assert!(!is_clean("id\u{200B}x", 16));
+        assert!(!is_clean("id\u{FE0F}", 16));
+        assert!(is_clean("Übersicht", 16));
+        // Quotes and backslashes are visible and stay.
+        assert_eq!(sanitize(r#"say "hi" \o/"#, 64, ' '), r#"say "hi" \o/"#);
+        // The byte cap still holds after the replacement, on a char boundary.
+        assert_eq!(sanitize("\u{E0041}äb", 3, '?'), "?ä");
+        // Every character the shared escaper rewrites is unsafe here too.
+        for ch in ['\u{202E}', '\u{2066}', '\u{2028}', '\u{E0100}', '\u{FFFE}'] {
+            assert_eq!(is_unsafe_char(ch), harw_untrusted_text::needs_escape(ch));
+            assert!(is_unsafe_char(ch), "{ch:?}");
+        }
+        Ok(())
     }
 
     #[test]

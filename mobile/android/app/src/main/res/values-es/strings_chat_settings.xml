@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_history_archive">Archivo del historial</string>
+    <string name="chat_history_variant_temporary">Esta versión está disponible hasta que cierres la aplicación. No se ha podido guardar de forma segura.</string>
+    <string name="chat_history_show_retained_in_chat">Ver la versión anterior en el chat</string>
+    <string name="chat_history_retained_readonly">Versión anterior verificada, solo lectura</string>
+    <string name="chat_history_return_current">Volver al chat actual</string>
+    <string name="chat_history_retained_unavailable">No se pudo verificar una versión anterior completa. El chat actual no cambió.</string>
+    <string name="chat_history_retained_fork_unconfirmed">Bifurcación sin confirmar. Repite en el mismo mensaje para consultar la misma operación.</string>
+    <string name="chat_quick_picker_model">Modelo</string>
+    <string name="chat_quick_picker_uia_unavailable">No hay otra UIA disponible para este chat.</string>
+    <string name="chat_quick_picker_uia_local_only">La selección de UIA solo está disponible en chats locales.</string>
+    <string name="chat_quick_picker_model_unavailable">La selección de modelo no está disponible para este chat.</string>
+    <string name="chat_history_partial_readonly">Solo se muestra la parte más reciente de esta versión. No se puede bifurcar desde esta vista parcial.</string>
+    <string name="chat_history_open_paged_archive">Abrir el archivo paginado</string>
+    <string name="chat_owner_status_action">Verificar el estado del servidor responsable</string>
+    <string name="chat_owner_status_unavailable">No se pudo verificar el estado del servidor responsable.</string>
+    <string name="chat_owner_status_idle">Estado verificado del servidor: inactivo</string>
+    <string name="chat_owner_status_active">Estado verificado del servidor: activo</string>
+    <string name="chat_owner_status_interrupted">Estado verificado del servidor: interrumpido</string>
+    <string name="chat_owner_status_failed">Estado verificado del servidor: error</string>
+    <string name="chat_owner_status_import_required">Importa por separado el documento de perfil de confianza para configurar el estado del servidor responsable.</string>
+</resources>

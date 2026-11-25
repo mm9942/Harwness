@@ -27,6 +27,12 @@ use crate::cli::AttachArgs;
 /// liegt; dann dort statt hier ableiten.
 const DEFAULT_SOCKET_REL: &str = "harw/session.sock";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeRoute {
+    OnionOnly,
+    DirectOptIn,
+}
+
 /// Wohin verbunden wird.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Target {
@@ -37,6 +43,7 @@ pub(crate) enum Target {
         alias: String,
         endpoint: String,
         expected_node: String,
+        route: NodeRoute,
     },
 }
 
@@ -82,10 +89,19 @@ fn target_from_record(record: &HostAlias) -> Result<Target, String> {
     if let Some(path) = record.endpoint.strip_prefix("unix:") {
         return Ok(Target::Unix(PathBuf::from(path)));
     }
-    let endpoint = record
-        .endpoint
-        .strip_prefix("node:")
-        .ok_or_else(|| "invalid node endpoint".to_owned())?;
+    let (endpoint, route) = if let Some(endpoint) = record.endpoint.strip_prefix("node-direct:") {
+        if is_onion_endpoint(endpoint) {
+            return Err("Für Onion-Adressen ist `node:`, nicht `node-direct:` erforderlich.".into());
+        }
+        (endpoint, NodeRoute::DirectOptIn)
+    } else {
+        let endpoint = record.endpoint.strip_prefix("node:")
+            .ok_or_else(|| "invalid node endpoint".to_owned())?;
+        if !is_onion_endpoint(endpoint) {
+            return Err("Direkte Verbindungen sind für diesen Alias aus. Verwende einen .onion-Locator oder konfiguriere bewusst `node-direct:`.".into());
+        }
+        (endpoint, NodeRoute::OnionOnly)
+    };
     let expected_node = record
         .expected_node
         .clone()
@@ -94,14 +110,53 @@ fn target_from_record(record: &HostAlias) -> Result<Target, String> {
         alias: record.alias.clone(),
         endpoint: endpoint.to_owned(),
         expected_node,
+        route,
     })
+}
+
+fn is_onion_endpoint(endpoint: &str) -> bool {
+    endpoint.rsplit_once(':').is_some_and(|(host, _)| {
+        host.trim_end_matches('.').to_ascii_lowercase().ends_with(".onion")
+    })
+}
+
+impl Target {
+    /// Report the selected transport without leaking endpoint or key material.
+    pub(crate) const fn transport_name(&self) -> &'static str {
+        match self {
+            Self::Unix(_) => "unix",
+            Self::Node { .. } => "authenticated_node",
+        }
+    }
+
+    pub(crate) async fn connect(
+        self,
+        home_override: Option<PathBuf>,
+        options: ConnectOptions,
+    ) -> Result<RemotePort, String> {
+        let connection = match self {
+            Self::Unix(path) => connect_unix(path.clone(), options)
+                .await
+                .map_err(|e| format!("Verbindung zu {} fehlgeschlagen: {e}", path.display()))?,
+            Self::Node {
+                alias,
+                endpoint,
+                expected_node,
+                route,
+            } => {
+                connect_node_target(&alias, &endpoint, &expected_node, route, home_override, options)
+                    .await?
+            }
+        };
+        Ok(RemotePort::new(connection))
+    }
 }
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-fn resolve_target(args: &AttachArgs) -> Result<Target, String> {
+pub(crate) fn resolve_target(args: &AttachArgs) -> Result<Target, String> {
     if let Some(socket) = &args.socket {
         return Ok(Target::Unix(socket.clone()));
     }
@@ -126,26 +181,14 @@ fn resolve_target(args: &AttachArgs) -> Result<Target, String> {
 /// Deutscher Fehlertext: Auflösung, Verbindung oder Attach-Fehler.
 pub fn run(args: &AttachArgs, home_override: Option<PathBuf>) -> Result<(), String> {
     let target = resolve_target(args)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| format!("Runtime konnte nicht gestartet werden: {e}"))?;
     runtime.block_on(async move {
         let options = ConnectOptions::new("harw attach");
-        let connection = match target {
-            Target::Unix(path) => connect_unix(path.clone(), options)
-                .await
-                .map_err(|e| format!("Verbindung zu {} fehlgeschlagen: {e}", path.display()))?,
-            Target::Node {
-                alias,
-                endpoint,
-                expected_node,
-            } => {
-                connect_node_target(&alias, &endpoint, &expected_node, home_override, options)
-                    .await?
-            }
-        };
-        let port: Arc<dyn SessionPort> = Arc::new(RemotePort::new(connection));
+        let port: Arc<dyn SessionPort> = Arc::new(target.connect(home_override, options).await?);
         let session = match &args.session {
             Some(query) => Some(
                 resolve_session(port.as_ref(), query)
@@ -175,12 +218,31 @@ async fn connect_node_target(
     alias: &str,
     endpoint: &str,
     expected_node: &str,
+    route: NodeRoute,
     home_override: Option<PathBuf>,
     options: ConnectOptions,
 ) -> Result<harw_session_remote::RemoteConnection, String> {
+    if route == NodeRoute::OnionOnly && !cfg!(feature = "onion") {
+        return Err(format!("Host-Alias `{alias}`: dieses harw enthält keinen Tor-Client; kein Direktrückfall"));
+    }
     let home = crate::home::resolve_home(home_override)?;
+    let local = load_node_identity(&home).await?;
+    let profile = crate::session_serve_remote::remote_state_dir(&home)?;
+    let text = crate::session_serve_remote::read_peer_pins(&profile.join(crate::session_listener::PEERS_FILE))?;
+    let (peers, _) = crate::session_listener::parse_peers(&text);
+    let verifier = TranscriptWrappedVerifier::new(peers);
+    match route {
+        NodeRoute::DirectOptIn =>
+            connect_authenticated_node(alias, endpoint, expected_node, &local, &verifier, options).await,
+        NodeRoute::OnionOnly =>
+            connect_onion_node(alias, endpoint, expected_node, &local, &verifier, options, &profile).await,
+    }
+}
+
+/// Use the existing active-profile AuthHub credential, never a new key.
+async fn load_node_identity(home: &Path) -> Result<LocalNode, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("Arbeitsverzeichnis: {e}"))?;
-    let config = load_node_config(&home, &cwd)?;
+    let config = load_node_config(home, &cwd)?;
     let node = config
         .harness
         .session_listener
@@ -203,21 +265,203 @@ async fn connect_node_target(
     let signer = AuthHubNodeSigner::new(Arc::new(crate::session_listener::HubSign(client)), &node)
         .and_then(|signer| signer.with_self_check(public_key.clone()))
         .map_err(|e| format!("node signer: {e}"))?;
-    let local = LocalNode::new(
+    Ok(LocalNode::new(
         NodeIdentity {
             node_id: node.clone(),
             public_key,
             key_ref: format!("harw.node-identity/{}", node.as_str()),
         },
         Arc::new(signer),
-    );
-    let peers_path = crate::session_serve_remote::remote_state_dir(&home)?
-        .join(crate::session_listener::PEERS_FILE);
-    let text = std::fs::read_to_string(&peers_path)
-        .map_err(|e| format!("Peer-Pins {}: {e}", peers_path.display()))?;
-    let (peers, _) = crate::session_listener::parse_peers(&text);
-    let verifier = TranscriptWrappedVerifier::new(peers);
-    connect_authenticated_node(alias, endpoint, expected_node, &local, &verifier, options).await
+    ))
+}
+
+#[cfg(feature = "onion")]
+pub(crate) async fn fenced_owner_status(
+    owner: Target,
+    hub: Target,
+    home_override: Option<PathBuf>,
+    session: harw_types::SessionId,
+) -> Result<harw_protocol::session_wire::OwnerObservationStatus, String> {
+    use std::time::Duration;
+    use harw_node_transport::{ClientOptions, PinnedPeers, node_key_fingerprint};
+    use harw_onion::{OnionClient, OnionClientConfig, OnionLocator};
+    use harw_session_remote::OwnerStatusDevice;
+
+    fn target(target: Target) -> Result<(OnionLocator, NodeId), String> {
+        let Target::Node { endpoint, expected_node, route: NodeRoute::OnionOnly, .. } = target else {
+            return Err("Fenced owner status requires two pinned Onion aliases; no direct fallback".into());
+        };
+        let locator = endpoint.parse::<OnionLocator>().map_err(|_| "Invalid pinned v3 Onion locator")?;
+        let node = NodeId::try_from_str(expected_node).map_err(|_| "Invalid pinned node identity")?;
+        Ok((locator, node))
+    }
+
+    fn exact_pin(text: &str, expected: &NodeId) -> Option<Vec<u8>> {
+        let mut matches = text.lines().map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once('|'))
+            .filter(|(node, _)| node.trim() == expected.as_str());
+        let (_, hex) = matches.next()?;
+        if matches.next().is_some() { return None; }
+        crate::session_listener::decode_hex(hex.trim())
+    }
+
+    let (owner_locator, owner_node) = target(owner)?;
+    let (hub_locator, hub_node) = target(hub)?;
+    if owner_node == hub_node || owner_locator.host() == hub_locator.host() {
+        return Err("Fenced owner status requires distinct owner and Hub identities and Onion services".into());
+    }
+
+    let home = crate::home::resolve_home(home_override)?;
+    let profile = crate::session_serve_remote::remote_state_dir(&home)?;
+    let pins = crate::session_serve_remote::read_private_peer_pins(&profile)
+        .map_err(|_| "Fenced owner status: profile peer pins unavailable or ambiguous")?;
+    let local = load_node_identity(&home).await
+        .map_err(|_| "Fenced owner status: active enrolled profile identity unavailable")?;
+    let owner_key = exact_pin(&pins, &owner_node).ok_or("Fenced owner status: owner key is not pinned in this profile")?;
+    let hub_key = exact_pin(&pins, &hub_node).ok_or("Fenced owner status: Hub key is not pinned in this profile")?;
+    if &owner_node == local.node_id() || &hub_node == local.node_id()
+        || owner_key == hub_key || owner_key == local.identity.public_key
+        || hub_key == local.identity.public_key || node_key_fingerprint(&owner_key).is_none()
+        || node_key_fingerprint(&hub_key).is_none()
+    {
+        return Err("Fenced owner status: device, owner and Hub must have distinct valid node keys".into());
+    }
+    let mut owner_pins = PinnedPeers::new();
+    owner_pins.pin(owner_node.clone(), owner_key).map_err(|_| "Fenced owner status: invalid owner key pin")?;
+    let mut hub_pins = PinnedPeers::new();
+    hub_pins.pin(hub_node.clone(), hub_key).map_err(|_| "Fenced owner status: invalid Hub key pin")?;
+    let owner_verifier = TranscriptWrappedVerifier::new(owner_pins);
+    let hub_verifier = TranscriptWrappedVerifier::new(hub_pins);
+    let device = OwnerStatusDevice::from_enrolled_node(&local)
+        .map_err(|_| "Fenced owner status: invalid active device key")?;
+
+    let ensure_same_profile = || -> Result<(), String> {
+        let current = crate::session_serve_remote::remote_state_dir(&home)?;
+        if current != profile
+            || !crate::session_serve_remote::read_private_peer_pins(&profile).is_ok_and(|current| current == pins)
+        {
+            return Err("Fenced owner status: profile or peer pins changed during the operation".into());
+        }
+        Ok(())
+    };
+    ensure_same_profile()?;
+
+    let tor_root = profile.join("attach-tor-client");
+    let state = tor_root.join("state");
+    let cache = tor_root.join("cache");
+    for path in [&tor_root, &state, &cache] {
+        crate::session_serve::private_dir(path)?;
+    }
+    let client = OnionClient::launch(&OnionClientConfig::new(state, cache))
+        .map_err(|_| "Fenced owner status: Onion client unavailable")?;
+    let timeout = Duration::from_secs(120);
+    let (owner_io, hub_io) = tokio::try_join!(
+        client.dial(&owner_locator, timeout),
+        client.dial(&hub_locator, timeout),
+    ).map_err(|_| "Fenced owner status: a pinned Onion link could not be reached; no fallback")?;
+    let transport = ClientOptions {
+        handshake_timeout: Duration::from_secs(30),
+        ..ClientOptions::default()
+    };
+    let mut options = ConnectOptions::new("harw gateway control fenced-owner-status");
+    options.limits.hello_timeout = options.limits.hello_timeout.max(Duration::from_secs(60));
+    let (mut owner_link, mut hub_link) = tokio::try_join!(
+        device.connect_owner_over(owner_io, &owner_node, &owner_verifier, options, &transport),
+        device.connect_hub_over(hub_io, &hub_node, &hub_verifier, &transport),
+    ).map_err(|_| "Fenced owner status: a pinned peer could not be authenticated or refused Observe")?;
+    ensure_same_profile()?;
+
+    // Arm both authenticated Onion links before starting the short owner
+    // reservation. Never auto-repeat an ambiguous reservation or fall back to V1.
+    let status = owner_link.reserve(session).await
+        .map_err(|_| "Fenced owner status: owner reservation unavailable")?
+        .read(&mut hub_link).await
+        .map_err(|_| "Fenced owner status: the owner and Hub did not confirm the status")?;
+    ensure_same_profile()?;
+    drop((owner_link, hub_link, client));
+    Ok(status)
+}
+
+#[cfg(feature = "onion")]
+async fn connect_onion_node(
+    alias: &str, endpoint: &str, expected_node: &str,
+    local: &LocalNode, verifier: &dyn NodeVerifier, mut options: ConnectOptions,
+    profile: &Path,
+) -> Result<harw_session_remote::RemoteConnection, String> {
+    use std::time::Duration;
+    use harw_onion::{OnionClient, OnionClientConfig, OnionLocator};
+
+    let locator = endpoint.parse::<OnionLocator>()
+        .map_err(|_| format!("Host-Alias `{alias}`: ungültiger v3-.onion-Locator; kein Direktrückfall"))?;
+    let node = NodeId::try_from_str(expected_node)
+        .map_err(|e| format!("Host-Alias `{alias}` node id: {e}"))?;
+    let tor_root = profile.join("attach-tor-client");
+    let state = tor_root.join("state");
+    let cache = tor_root.join("cache");
+    for path in [&tor_root, &state, &cache] {
+        crate::session_serve::private_dir(path)?;
+    }
+    let client = OnionClient::launch(&OnionClientConfig::new(state, cache))
+        .map_err(|_| format!("Host-Alias `{alias}`: Tor-Client nicht verfügbar; kein Direktrückfall"))?;
+    let stream = client.dial(&locator, Duration::from_secs(120)).await
+        .map_err(|_| format!("Host-Alias `{alias}`: Onion-Verbindung fehlgeschlagen; kein Direktrückfall"))?;
+    options.limits.hello_timeout = options.limits.hello_timeout.max(Duration::from_secs(60));
+    let transport = harw_node_transport::ClientOptions {
+        handshake_timeout: Duration::from_secs(30),
+        ..harw_node_transport::ClientOptions::default()
+    };
+    harw_session_remote::conn::connect_node_over(
+        CliOnionStream { stream, _client: client }, &node, local, verifier, options, &transport,
+    ).await.map_err(|error| format!("Host-Alias `{alias}`: authentifizierte Onion-Verbindung fehlgeschlagen: {error}"))
+}
+
+#[cfg(not(feature = "onion"))]
+async fn connect_onion_node(
+    alias: &str, _endpoint: &str, _expected_node: &str,
+    _local: &LocalNode, _verifier: &dyn NodeVerifier, _options: ConnectOptions,
+    _profile: &Path,
+) -> Result<harw_session_remote::RemoteConnection, String> {
+    Err(format!("Host-Alias `{alias}`: dieses harw enthält keinen Tor-Client; kein Direktrückfall"))
+}
+
+/// Retain the embedded client's storage/runtime for the live HTTP/WS tunnel.
+#[cfg(feature = "onion")]
+struct CliOnionStream {
+    stream: harw_onion::OnionStream,
+    _client: harw_onion::OnionClient,
+}
+
+#[cfg(feature = "onion")]
+impl tokio::io::AsyncRead for CliOnionStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(self.get_mut().stream.as_mut(), cx, buf)
+    }
+}
+
+#[cfg(feature = "onion")]
+impl tokio::io::AsyncWrite for CliOnionStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(self.get_mut().stream.as_mut(), cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(self.get_mut().stream.as_mut(), cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(self.get_mut().stream.as_mut(), cx)
+    }
 }
 
 pub(crate) async fn connect_authenticated_node(
@@ -228,6 +472,9 @@ pub(crate) async fn connect_authenticated_node(
     verifier: &dyn NodeVerifier,
     options: ConnectOptions,
 ) -> Result<harw_session_remote::RemoteConnection, String> {
+    if is_onion_endpoint(endpoint) {
+        return Err("Onion-Locators are never forwarded to direct TCP or DNS.".into());
+    }
     let expected_node = NodeId::try_from_str(expected_node)
         .map_err(|e| format!("Host-Alias `{alias}` node id: {e}"))?;
     let addr = tokio::net::lookup_host(endpoint)
@@ -344,7 +591,7 @@ mod tests {
     fn node_alias_retains_required_identity_pin() {
         let record = harw_session_remote::alias::HostAlias {
             alias: "lab".to_owned(),
-            endpoint: "node:127.0.0.1:7443".to_owned(),
+            endpoint: "node-direct:127.0.0.1:7443".to_owned(),
             expected_node: Some("gateway-a".to_owned()),
         };
         assert_eq!(
@@ -353,6 +600,7 @@ mod tests {
                 alias: "lab".to_owned(),
                 endpoint: "127.0.0.1:7443".to_owned(),
                 expected_node: "gateway-a".to_owned(),
+                route: NodeRoute::DirectOptIn,
             })
         );
         let mut missing = record;

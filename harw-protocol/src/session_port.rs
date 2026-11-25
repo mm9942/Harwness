@@ -17,18 +17,48 @@ use std::pin::Pin;
 
 use harw_types::SessionId;
 
+use crate::methods::{
+    METHOD_ARCHIVE_CHECKPOINT_DESCRIBE, METHOD_ARCHIVE_CHECKPOINT_ISSUE,
+    METHOD_ARCHIVE_CHECKPOINT_PAGE, METHOD_ARCHIVE_CHECKPOINT_PREVIOUS, METHOD_FORK_INCLUSIVE,
+};
 use crate::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, FrameEnvelope,
-    GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams,
-    GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult, GatewayStatus,
-    GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams,
-    HistoryParams, InterruptParams, RespondResult, SessionSummary, SetEffortParams, SetModeParams,
-    SetModelParams, SubmitParams, SubmitResult, ToolCallParams, ToolCallResultFrame,
-    ToolCancelParams, ToolListParams, ToolListResult,
+    ArchiveCheckpointDescribeV1, ArchiveCheckpointInfoV1, ArchiveCheckpointIssueV1,
+    ArchiveCheckpointPageV1, ArchiveCheckpointPreviousV1, ArchiveCheckpointRowsV1,
+    ArchiveRetainedRevisionV1, ForkInclusiveV1,
+};
+
+use crate::methods::{
+    METHOD_AGENTS_LIST, METHOD_AGENTS_STOP, METHOD_JOBS_CANCEL, METHOD_JOBS_GET, METHOD_JOBS_LIST,
+    METHOD_JOBS_RETRY,
+    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_MEDIA_GET, METHOD_SECRET_PUT, METHOD_SESSION_ADOPT,
+    METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE, METHOD_SESSION_PROJECTS,
+    METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT, METHOD_STEPUP_CANCEL, METHOD_STEPUP_CONFIRM,
+};
+use crate::session_wire::{
+    AgentStopParams, AgentsListParams, AgentsListResult, JobDetail, JobTargetParams, JobsListParams,
+    JobsListResult, ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
+    CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult, ConfigGetParams,
+    ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams, CreateParams,
+    FrameEnvelope, GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo,
+    GatewayListenerSetParams, GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult,
+    GatewayStatus, GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck,
+    HelloParams, HistoryParams, InterruptParams, MediaGetParams, MediaGetResult, PageParams, PageResult, ProjectsParams,
+    ProjectsResult, RenameParams, RespondResult, SecretPutParams, SecretPutResult, SessionRow,
+    SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SetProjectParams,
+    StepUpCancelParams, StepUpConfirmParams, SubmitParams, SubmitResult, ToolCallParams,
+    ToolCallResultFrame, ToolCancelParams, ToolListParams, ToolListResult,
 };
 
 /// Boxed future returned by every port method.
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
+
+/// Answer of a port implementation that does not serve an optional method.
+fn unsupported<'a, T: Send + 'a>(method: &'static str) -> PortFuture<'a, T> {
+    Box::pin(std::future::ready(Err(PortError::Protocol(format!(
+        "{method} is not served by this port"
+    )))))
+}
 
 /// A stream of frames for one attachment. `Ok(None)` ends the stream.
 pub trait FrameSource: Send {
@@ -52,6 +82,221 @@ pub trait SessionPort: Send + Sync {
     fn set_model(&self, params: SetModelParams) -> PortFuture<'_, ()>;
     fn set_mode(&self, params: SetModeParams) -> PortFuture<'_, ()>;
     fn set_effort(&self, params: SetEffortParams) -> PortFuture<'_, ()>;
+
+    /// Explicit optional direct-owner read. The port must already own the
+    /// exact, negotiated and independently authenticated originating connection.
+    fn direct_owner_status(&self, _session: SessionId) -> PortFuture<'_, crate::session_wire::OwnerObservationStatus> {
+        unsupported(crate::methods::METHOD_DIRECT_OWNER_STATUS)
+    }
+
+    /// Reserve one exact observation on this independently authenticated
+    /// owner connection. This is not a grant or a standalone challenge.
+    fn reserve_owner_observation(
+        &self,
+        _session: SessionId,
+    ) -> PortFuture<'_, crate::owner_placement::OwnerObservationReservationReceipt> {
+        unsupported(crate::methods::METHOD_RESERVE_OWNER_OBSERVATION)
+    }
+
+    /// Hub-selected status on the original independently authenticated owner
+    /// connection. No fallback to the owner-local unplaced status method.
+    fn fenced_direct_owner_status(
+        &self,
+        _selection: crate::owner_placement::FencedDirectOwnerStatus,
+    ) -> PortFuture<'_, crate::session_wire::OwnerObservationStatus> {
+        unsupported(crate::methods::METHOD_DIRECT_OWNER_STATUS_FENCED)
+    }
+
+    /// Host-issued archived revision selector (observe + steer, negotiated V5).
+    fn archive_checkpoint_issue(&self, _params: ArchiveCheckpointIssueV1) -> PortFuture<'_, ArchiveCheckpointInfoV1> {
+        unsupported(METHOD_ARCHIVE_CHECKPOINT_ISSUE)
+    }
+
+    /// Re-authorize and check a retained server-owned selector (negotiated V5).
+    fn archive_checkpoint_describe(&self, _params: ArchiveCheckpointDescribeV1) -> PortFuture<'_, ArchiveCheckpointInfoV1> {
+        unsupported(METHOD_ARCHIVE_CHECKPOINT_DESCRIBE)
+    }
+
+    /// Bounded visible rows in a server-authenticated checkpoint.
+    fn archive_checkpoint_page(&self, _params: ArchiveCheckpointPageV1) -> PortFuture<'_, ArchiveCheckpointRowsV1> {
+        unsupported(METHOD_ARCHIVE_CHECKPOINT_PAGE)
+    }
+
+    /// Discover one previous retained rewrite via a distinct negotiated feature.
+    fn archive_checkpoint_previous(
+        &self,
+        _params: ArchiveCheckpointPreviousV1,
+    ) -> PortFuture<'_, Option<ArchiveRetainedRevisionV1>> {
+        unsupported(METHOD_ARCHIVE_CHECKPOINT_PREVIOUS)
+    }
+
+    /// Create or return the single durable target of this exact operation.
+    fn fork_inclusive(&self, _params: ForkInclusiveV1) -> PortFuture<'_, SessionSummary> {
+        unsupported(METHOD_FORK_INCLUSIVE)
+    }
+
+    /// Strictly separate, optional Cloud Assistant on the authenticated peer.
+    fn cloud_assistant_status(&self) -> PortFuture<'_, crate::session_wire::CloudAssistantSnapshot> {
+        unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_STATUS)
+    }
+    fn cloud_assistant_provision(&self) -> PortFuture<'_, crate::session_wire::CloudAssistantSnapshot> {
+        unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_PROVISION)
+    }
+    fn cloud_assistant_submit(
+        &self,
+        _params: crate::session_wire::CloudAssistantSubmit,
+    ) -> PortFuture<'_, crate::session_wire::CloudAssistantSnapshot> {
+        unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_SUBMIT)
+    }
+    /// Never interpret freeform slash commands or take a cross-room selector.
+    fn cloud_assistant_submit_with_recall(
+        &self,
+        _params: crate::session_wire::CloudAssistantRecallSubmit,
+    ) -> PortFuture<'_, crate::session_wire::CloudAssistantSnapshot> {
+        unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_SUBMIT_WITH_RECALL)
+    }
+    fn cloud_assistant_revoke(&self) -> PortFuture<'_, crate::session_wire::CloudAssistantSnapshot> {
+        unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_REVOKE)
+    }
+
+    /// Optional clean-room shared Assistant; never falls back to the device room.
+    fn cloud_assistant_shared(
+        &self, _input: crate::session_wire::CloudAssistantSharedCommandV1,
+    ) -> PortFuture<'_, crate::session_wire::CloudAssistantSharedSnapshotV1> {
+        unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_SHARED)
+    }
+
+    /// Explicit owner-only empty Cloud work publication or read-only reconciliation.
+    fn manual_cloud_work(
+        &self, _command: crate::session_wire::ManualCloudWorkCommandV1,
+    ) -> PortFuture<'_, crate::session_wire::ManualCloudWorkReplyV1> {
+        unsupported(crate::methods::METHOD_MANUAL_CLOUD_WORK)
+    }
+
+    /// Explicit Cloud Library operations, never implicit session-media access.
+    fn cloud_library(
+        &self, _command: crate::cloud_library::CloudLibraryCommandV1,
+    ) -> PortFuture<'_, crate::cloud_library::CloudLibraryReplyV1> {
+        unsupported(crate::methods::METHOD_CLOUD_LIBRARY)
+    }
+
+    /// `session.projects` (observe, feature `projects`).
+    fn projects(&self, _params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
+        unsupported(METHOD_SESSION_PROJECTS)
+    }
+    /// Read bounded parts from one exact, authorized session attachment.
+    fn session_media_preview(
+        &self,
+        _params: crate::session_wire::SessionMediaPreviewV1,
+    ) -> PortFuture<'_, crate::session_wire::SessionMediaPreviewReplyV1> {
+        unsupported(crate::methods::METHOD_SESSION_MEDIA_PREVIEW)
+    }
+
+    /// `media.get` (observe, feature `media`): the stored bytes of a prompt image of the session.
+    fn media_get(&self, _params: MediaGetParams) -> PortFuture<'_, MediaGetResult> {
+        unsupported(METHOD_MEDIA_GET)
+    }
+    /// `session.page` (observe).
+    fn page(&self, _params: PageParams) -> PortFuture<'_, PageResult> {
+        unsupported(METHOD_SESSION_PAGE)
+    }
+    /// `session.adopt` (steer + mode continue). Same code path as adoption on `submit`.
+    fn adopt(&self, _session: SessionId) -> PortFuture<'_, SessionSummary> {
+        unsupported(METHOD_SESSION_ADOPT)
+    }
+    /// `session.create_in` (steer + continue).
+    fn create_in(&self, _params: CreateInParams) -> PortFuture<'_, SessionSummary> {
+        unsupported(METHOD_SESSION_CREATE_IN)
+    }
+    /// `session.set_project` (steer + continue); returns the updated row.
+    fn set_project(&self, _params: SetProjectParams) -> PortFuture<'_, SessionRow> {
+        unsupported(METHOD_SESSION_SET_PROJECT)
+    }
+    /// Non-creating assignment to an existing project. No transcript or row is returned.
+    fn set_existing_project(&self, _params: SetProjectParams) -> PortFuture<'_, ()> {
+        unsupported(crate::methods::METHOD_SESSION_SET_EXISTING_PROJECT)
+    }
+    fn auto_title_probe(&self, _scope: crate::session_wire::AutoTitleSession) -> PortFuture<'_, bool> {
+        unsupported(crate::methods::METHOD_AUTO_TITLE_PROBE)
+    }
+    fn auto_title_seed(&self, _scope: crate::session_wire::AutoTitleSession)
+        -> PortFuture<'_, Option<crate::session_wire::AutoTitleSeed>>
+    {
+        unsupported(crate::methods::METHOD_AUTO_TITLE_SEED)
+    }
+    fn auto_title_publish(&self, _params: crate::session_wire::AutoTitlePublish)
+        -> PortFuture<'_, crate::session_wire::AutoTitlePublication>
+    {
+        unsupported(crate::methods::METHOD_AUTO_TITLE_PUBLISH)
+    }
+    /// `session.rename` (steer + continue); returns the updated row.
+    fn rename(&self, _params: RenameParams) -> PortFuture<'_, SessionRow> {
+        unsupported(METHOD_SESSION_RENAME)
+    }
+    /// `session.archive` (steer + continue); returns the updated row.
+    fn archive(&self, _params: ArchiveParams) -> PortFuture<'_, SessionRow> {
+        unsupported(METHOD_SESSION_ARCHIVE)
+    }
+    /// `commands.list` (observe, feature `manage`): every command like the TUI popup, with availability.
+    fn commands_list(&self, _params: CommandsListParams) -> PortFuture<'_, CommandsListResult> {
+        unsupported(METHOD_COMMANDS_LIST)
+    }
+    /// `command.run` (observe at the host; the allow-list decides per form, W00 D5 amendment).
+    fn command_run(&self, _params: CommandRunParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_COMMAND_RUN)
+    }
+    /// `catalog.get` (observe): redacted providers, models, roles, live model.
+    fn catalog_get(&self, _params: CatalogGetParams) -> PortFuture<'_, CatalogResult> {
+        unsupported(METHOD_CATALOG_GET)
+    }
+    /// `config.get` (observe): allow-listed keys only.
+    fn config_get(&self, _params: ConfigGetParams) -> PortFuture<'_, ConfigGetResult> {
+        unsupported(METHOD_CONFIG_GET)
+    }
+    /// `config.set` (control + approve, feature `stepup`): answers a step-up challenge, writes nothing.
+    fn config_set(&self, _params: ConfigSetParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_CONFIG_SET)
+    }
+    /// `config.reset` (control + approve, feature `stepup`).
+    fn config_reset(&self, _params: ConfigResetParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_CONFIG_RESET)
+    }
+    /// `secret.put` (control + approve, feature `stepup`): write-only staging, never returns the value.
+    fn secret_put(&self, _params: SecretPutParams) -> PortFuture<'_, SecretPutResult> {
+        unsupported(METHOD_SECRET_PUT)
+    }
+    /// `stepup.confirm` (control + approve): single use, owner bound, 60 s.
+    fn stepup_confirm(&self, _params: StepUpConfirmParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_STEPUP_CONFIRM)
+    }
+    /// `stepup.cancel` (own step-ups only; an unknown id answers `NotFound`, never `Ok(())`).
+    fn stepup_cancel(&self, _params: StepUpCancelParams) -> PortFuture<'_, ()> {
+        unsupported(METHOD_STEPUP_CANCEL)
+    }
+    /// `jobs.list` (observe, feature `overview`): the durable jobs of the profile.
+    fn jobs_list(&self, _params: JobsListParams) -> PortFuture<'_, JobsListResult> {
+        unsupported(METHOD_JOBS_LIST)
+    }
+    /// `jobs.get` (observe): detail of one job.
+    fn jobs_get(&self, _params: JobTargetParams) -> PortFuture<'_, JobDetail> {
+        unsupported(METHOD_JOBS_GET)
+    }
+    /// `jobs.cancel` (steer): cancels a pending, ready or running job.
+    fn jobs_cancel(&self, _params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_JOBS_CANCEL)
+    }
+    /// `jobs.retry` (steer): requeues a failed or cancelled job.
+    fn jobs_retry(&self, _params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_JOBS_RETRY)
+    }
+    /// `agents.list` (observe): running child agents across sessions and the agent library.
+    fn agents_list(&self, _params: AgentsListParams) -> PortFuture<'_, AgentsListResult> {
+        unsupported(METHOD_AGENTS_LIST)
+    }
+    /// `agents.stop` (steer): stops a running child agent of a session.
+    fn agents_stop(&self, _params: AgentStopParams) -> PortFuture<'_, CommandRunResult> {
+        unsupported(METHOD_AGENTS_STOP)
+    }
 }
 
 /// The tool surface of the gateway as seen by an agent principal (R18 D-A).
@@ -182,6 +427,10 @@ pub enum PortError {
         refusal: ToolRefusal,
         detail: String,
     },
+    /// The session is busy (lease held by TUI/job/another gateway) or the
+    /// connection is overloaded. Not a transport failure. `reason` is a short
+    /// display text.
+    Busy(String),
 }
 
 impl fmt::Display for PortError {
@@ -195,6 +444,7 @@ impl fmt::Display for PortError {
             Self::ToolRefused { refusal, detail } => {
                 write!(f, "tool call refused ({}): {detail}", refusal.label())
             }
+            Self::Busy(reason) => write!(f, "session busy: {reason}"),
         }
     }
 }
@@ -214,6 +464,7 @@ impl PortError {
             Self::Protocol(_) => error_codes::INVALID_PARAMS,
             Self::Revoked => error_codes::REVOKED,
             Self::ToolRefused { refusal, .. } => refusal.code(),
+            Self::Busy(_) => error_codes::BUSY,
         }
     }
 
@@ -231,6 +482,7 @@ impl PortError {
             error_codes::DENIED | error_codes::HELLO_REQUIRED => Self::Denied(message),
             error_codes::NOT_FOUND => Self::NotFound,
             error_codes::REVOKED => Self::Revoked,
+            error_codes::BUSY => Self::Busy(message),
             error_codes::INVALID_PARAMS
             | error_codes::METHOD_NOT_FOUND
             | error_codes::PARSE_ERROR => Self::Protocol(message),
@@ -250,11 +502,12 @@ mod tests {
             PortError::NotFound,
             PortError::Revoked,
             PortError::Protocol("bad".into()),
+            PortError::Busy("Läuft gerade in der TUI".into()),
         ] {
             let back = PortError::from_code(
                 error.code(),
                 match &error {
-                    PortError::Denied(m) | PortError::Protocol(m) => m.clone(),
+                    PortError::Denied(m) | PortError::Protocol(m) | PortError::Busy(m) => m.clone(),
                     _ => String::new(),
                 },
             );
@@ -285,5 +538,131 @@ mod tests {
         fn assert_error<E: std::error::Error + Send + Sync + 'static>() {}
         assert_error::<PortError>();
         assert_eq!(PortError::Revoked.to_string(), "session access revoked");
+    }
+
+    #[test]
+    fn busy_has_its_own_code_and_display() {
+        let busy = PortError::Busy("running elsewhere".into());
+        assert_eq!(busy.code(), crate::session_wire::error_codes::BUSY);
+        assert_eq!(busy.to_string(), "session busy: running elsewhere");
+        assert!(!matches!(
+            PortError::from_code(busy.code(), "x".into()),
+            PortError::Transport(_)
+        ));
+    }
+
+    struct Bare;
+    impl super::SessionPort for Bare {
+        fn hello(
+            &self,
+            _: crate::session_wire::HelloParams,
+        ) -> super::PortFuture<'_, crate::session_wire::HelloAck> {
+            unreachable!()
+        }
+        fn list(&self) -> super::PortFuture<'_, Vec<crate::session_wire::SessionSummary>> {
+            unreachable!()
+        }
+        fn create(
+            &self,
+            _: crate::session_wire::CreateParams,
+        ) -> super::PortFuture<'_, crate::session_wire::SessionSummary> {
+            unreachable!()
+        }
+        fn attach(
+            &self,
+            _: crate::session_wire::AttachParams,
+        ) -> super::PortFuture<'_, (crate::session_wire::AttachAck, Box<dyn super::FrameSource>)>
+        {
+            unreachable!()
+        }
+        fn detach(&self, _: harw_types::SessionId) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn history(
+            &self,
+            _: crate::session_wire::HistoryParams,
+        ) -> super::PortFuture<'_, Vec<crate::session_wire::FrameEnvelope>> {
+            unreachable!()
+        }
+        fn submit(
+            &self,
+            _: crate::session_wire::SubmitParams,
+        ) -> super::PortFuture<'_, crate::session_wire::SubmitResult> {
+            unreachable!()
+        }
+        fn interrupt(&self, _: crate::session_wire::InterruptParams) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn resume(&self, _: harw_types::SessionId) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn close(&self, _: harw_types::SessionId) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn respond(
+            &self,
+            _: crate::session_wire::ApprovalRespondParams,
+        ) -> super::PortFuture<'_, crate::session_wire::RespondResult> {
+            unreachable!()
+        }
+        fn set_model(&self, _: crate::session_wire::SetModelParams) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn set_mode(&self, _: crate::session_wire::SetModeParams) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+        fn set_effort(&self, _: crate::session_wire::SetEffortParams) -> super::PortFuture<'_, ()> {
+            unreachable!()
+        }
+    }
+
+    fn ready<T>(future: super::PortFuture<'_, T>) -> Result<T, PortError> {
+        use std::task::{Context, Poll, Waker};
+        let mut future = future;
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("default body must be ready immediately"),
+        }
+    }
+
+    #[test]
+    fn minor3_default_bodies_answer_protocol_error() {
+        use super::SessionPort;
+        let session = harw_types::SessionId::try_from_str("s-synthetic").ok();
+        if let Some(session) = session {
+            let err = ready(Bare.adopt(session)).err();
+            assert!(matches!(err, Some(PortError::Protocol(m)) if m.contains("session.adopt")));
+        }
+    }
+
+    #[test]
+    fn minor4_default_bodies_answer_protocol_error() {
+        use super::SessionPort;
+        let run: Result<crate::session_wire::CommandRunParams, _> =
+            serde_json::from_value(serde_json::json!({"line": "/status", "client_msg_id": "m-1"}));
+        if let Ok(params) = run {
+            let err = ready(Bare.command_run(params)).err();
+            assert!(matches!(err, Some(PortError::Protocol(m)) if m.contains("command.run")));
+        } else {
+            panic!("command.run params must decode");
+        }
+        let secret: Result<crate::session_wire::SecretPutParams, _> =
+            serde_json::from_value(serde_json::json!({
+                "name": "key-1",
+                "for_provider": "provider-test",
+                "value": "sk-test-FAKE-0000000000000000"
+            }));
+        if let Ok(params) = secret {
+            let err = ready(Bare.secret_put(params)).err();
+            assert!(
+                matches!(err, Some(PortError::Protocol(m)) if m.contains("secret.put")
+                && !m.contains("FAKE"))
+            );
+        } else {
+            panic!("secret.put params must decode");
+        }
     }
 }

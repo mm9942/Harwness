@@ -14,30 +14,66 @@
 //! ([`ClientCaps::for_wire_minor`]). Revoking a connection, device or agent
 //! principal cancels its in-flight tool calls; draining refuses new ones and
 //! lets in-flight calls finish.
+//!
+//! Sharing profile sessions (plan §3.2-§3.5, contract K-W1 §8.3): with a
+//! [`ProfileShare`] ([`SessionHost::open_with_profile`]) the host lists, pages
+//! and reads TUI sessions of the profile store without writing anything.
+//! Steering one adopts it first (a hosted record with the caller's creator
+//! authority, created at most once). Every turn of a shared session runs
+//! under the session lease (`HolderKind::Gateway`); a lease held elsewhere
+//! answers `BUSY` (or `SubmitResult::Denied` for a minor-2 client). Attached
+//! profile sessions without a host turn are watched for transcript growth and
+//! lease changes every [`HostConfig::profile_head_poll`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
+use harw_protocol::methods::{
+    METHOD_AGENTS_LIST, METHOD_AGENTS_STOP, METHOD_JOBS_CANCEL, METHOD_JOBS_GET, METHOD_JOBS_LIST,
+    METHOD_JOBS_RETRY, METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_SECRET_PUT, METHOD_STEPUP_CANCEL,
+    METHOD_STEPUP_CONFIRM,
+};
 use harw_protocol::session_wire::{
-    ApprovalRespondParams, AttachAck, AttachParams, CreateParams, GatewayConnectionInfo,
-    GatewayConnectionsResult, GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams,
-    GatewayListenersResult, GatewayRevokeParams, GatewayRevokeResult, GatewayStatus,
-    GatewayToolRights, GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams,
-    HistoryParams, InterruptParams, PrincipalSummary, RespondResult, SESSION_WIRE_MINOR,
-    SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SubmitParams, SubmitResult,
+    AgentStopParams, AgentsListParams, AgentsListResult, JobDetail, JobTargetParams,
+    JobsListParams, JobsListResult, ApprovalRespondParams, ArchiveParams, AttachAck, AttachParams, CatalogGetParams, CatalogResult,
+    CommandEffect, CommandRunParams, CommandRunResult, CommandsListParams, CommandsListResult,
+    ConfigGetParams, ConfigGetResult, ConfigResetParams, ConfigSetParams, CreateInParams,
+    CreateParams, DEFAULT_PAGE_LIMIT, GatewayConnectionInfo, GatewayConnectionsResult,
+    GatewayDrainParams, GatewayListenerInfo, GatewayListenerSetParams, GatewayListenersResult,
+    GatewayRevokeParams, GatewayRevokeResult, GatewayStatus, GatewayToolRights,
+    GatewayToolRightsParams, GatewayToolsResult, HelloAck, HelloParams, HistoryParams, HolderInfo,
+    InterruptParams, MANAGE_WIRE_MINOR, MediaGetParams, MediaGetResult, MAX_PAGE_LIMIT, NO_PROJECT_KEY, PROJECTS_WIRE_MINOR,
+    PageParams, PageResult, PrincipalSummary, ProjectsParams, ProjectsResult, ReadOnlyReason,
+    RenameParams, RespondResult, RowOrigin, SESSION_WIRE_MINOR, SecretPutParams, SecretPutResult,
+    SessionRow, SessionRowPurpose, SessionSummary, SetEffortParams, SetModeParams, SetModelParams, SetProjectParams,
+    ShareInfo, StepUpCancelParams, StepUpConfirmParams, SubmitParams, SubmitResult,
     TOOL_GATEWAY_WIRE_MINOR, ToolCallParams, ToolCallResultFrame, ToolCancelParams, ToolListParams,
-    ToolListResult, features,
+    ToolListResult, features, refusal_codes,
 };
 use harw_protocol::{
     ApprovalRequest, ClientCaps, Cursor, FrameEnvelope, FrameSource, GatewayPort, HostedState,
-    PortError, PortFuture, PresenceEntry, SessionEvent, SessionFrame, SessionPort, ToolPort,
+    PortError, PortFuture, PresenceEntry, SessionEvent, SessionFrame, SessionPort, StreamProfile, ToolPort,
     ToolRefusal, TurnEvent,
 };
+use harw_session_store::{
+    HolderKind, LastOrigin, SessionLease, SessionStoreError, TitleSource, TranscriptStore, meta, peek_holder,
+};
 use harw_types::{DeviceId, SessionId, TenantId};
+use harw_protocol::session_wire::{
+    ARCHIVE_CHECKPOINT_WIRE_MINOR, ArchiveCheckpointDescribeV1, ArchiveCheckpointInfoV1,
+    ArchiveCheckpointIssueV1, ArchiveCheckpointPageV1, ArchiveCheckpointPreviousV1,
+    ArchiveCheckpointRowsV1, ArchiveRetainedRevisionV1, ForkInclusiveV1,
+};
 use tokio::sync::watch;
 
+use harw_protocol::cloud_library::{
+    CLOUD_LIBRARY_WIRE_MINOR, CloudLibraryCommandV1, CloudLibraryReplyV1,
+};
+use crate::cloud_library::{self, CloudLibrary};
 use crate::agents::{AgentRegistry, rights_of};
 use crate::approvals::{ApprovalBackend, ResolveOutcome};
 use crate::arbiter::{Arbiter, ArbiterLimits};
@@ -51,9 +87,14 @@ use crate::identity::{
     AgentPrincipal, ClientIdentity, ConnectionId, Need, ToolGrant, admit, admit_tool_call,
     tenant_admits,
 };
+use crate::index::{
+    DENIED_NOT_SHARED, DENIED_READ_ONLY, ProfileRow, ProfileShare, ResolvedProject, ShareMode, busy_reason,
+    decode_cursor, encode_cursor, wire_holder, wire_last_origin,
+};
 use crate::live_ring::LiveRing;
-use crate::record::{HostedSessionRecord, RecordStore};
-use crate::replay::{TranscriptSource, history_before, replay, tail_start};
+use crate::ops::{OpsCaller, OpsPort, OpsRun, OpsSession, SessionAction, tier_for_caps};
+use crate::record::{CreateOutcome, HostedSessionRecord, RecordStore};
+use crate::replay::{TranscriptSource, history_before, replay_page, tail_start};
 use crate::tool_host::{SessionScope, ToolEvents, ToolHost};
 
 /// Host configuration.
@@ -70,6 +111,9 @@ pub struct HostConfig {
     pub max_history_page: u32,
     /// Keep-alive frame interval.
     pub heartbeat: Duration,
+    /// Interval of the head watch of attached profile sessions (plan §3.2
+    /// step 10).
+    pub profile_head_poll: Duration,
 }
 
 impl HostConfig {
@@ -82,21 +126,69 @@ impl HostConfig {
             arbiter: ArbiterLimits::default(),
             max_history_page: 500,
             heartbeat: Duration::from_secs(15),
+            profile_head_poll: Duration::from_secs(2),
         }
     }
 }
 
 /// Features this host implements.
 const HOST_FEATURES: &[&str] = &[
+    features::CLOUD_ASSISTANT_V1,
+    features::CLOUD_ASSISTANT_RECALL_V1,
+    features::CLOUD_ASSISTANT_SHARED_V1,
+    features::AUTO_TITLE_CAS_V1,
+    features::AUTO_TITLE_SEED_V1,
+    features::SESSION_DREAM_ROWS_V1,
+    features::SESSION_SYSTEM_ROWS_V1,
+    features::EXISTING_PROJECT_ASSIGNMENT_V1,
     features::COMPACT,
     features::HISTORY,
     features::CHILD_FRAMES,
     features::TOOLS,
     features::GATEWAY,
+    features::COMPACT_REASONING,
+    features::JOB_FRAMES,
+    features::PROJECTS,
+    features::MANAGE,
+    features::STEPUP,
+    features::IMAGES,
+    features::MEDIA,
+    features::SESSION_MEDIA_PREVIEW_V1,
+    features::OVERVIEW,
+    features::ARCHIVE_CHECKPOINT_V1,
+    features::ARCHIVE_RETAINED_REWRITE_V1,
+    features::EXACT_REWIND_V1,
+    features::EXACT_REWIND_RECEIPT_V1,
+    features::EXACT_TURN_INTERRUPT_V1,
+    features::CLOUD_LIBRARY_V1,
+    features::MANUAL_CLOUD_WORK_V1,
+    features::DIRECT_OWNER_STATUS_V1,
+    features::DIRECT_OWNER_STATUS_FENCED_V1,
 ];
 
 /// Features that exist only from [`TOOL_GATEWAY_WIRE_MINOR`] on.
 const R18_FEATURES: &[&str] = &[features::TOOLS, features::GATEWAY];
+
+/// Features that exist only from [`PROJECTS_WIRE_MINOR`] on. Granted with or
+/// without sharing (a client then shows its empty state).
+const PROJECT_FEATURES: &[&str] = &[features::PROJECTS];
+
+/// Features that exist only from [`MANAGE_WIRE_MINOR`] on (contract K-W3c
+/// §8.2 no. 9). `manage` needs installed ops, `stepup` additionally
+/// `manage` and [`OpsPort::stepup_enabled`].
+const MANAGE_FEATURES: &[&str] = &[features::MANAGE, features::STEPUP, features::OVERVIEW];
+
+/// Answer of a session action on a profile session without a host record.
+const TEXT_SESSION_NOT_HOSTED: &str = "Session läuft nicht auf dem Gateway; erst übernehmen";
+/// Answer of a session action without a session (normally refused by the ops backend already).
+const TEXT_SESSION_REQUIRED: &str = "braucht eine Session";
+
+/// Denied: the project key is unknown or its root failed validation.
+const DENIED_UNKNOWN_PROJECT: &str = "unbekanntes Projekt";
+/// Denied: the session's first record is not a CLI session.
+const DENIED_FOREIGN_ORIGIN: &str = "Session stammt nicht aus der TUI";
+/// Denied: the session has no valid working directory.
+const DENIED_NO_WORKDIR: &str = "Session hat keinen gültigen Arbeitsordner";
 
 /// One live connection as `gateway.connections.list` shows it.
 struct ConnEntry {
@@ -115,6 +207,8 @@ struct AttachEntry {
     device: Option<DeviceId>,
     queue: AttachmentQueue,
     presence: PresenceEntry,
+    /// The connection negotiated feature `projects` (receives `holder`).
+    projects: bool,
 }
 
 struct SlotState {
@@ -128,6 +222,36 @@ struct SlotState {
     pending_settings: Vec<Setting>,
     /// A turn is parked on an approval.
     parked: bool,
+    /// Profile session read without a hosted record: `record` is a
+    /// synthetic in-memory view and is never saved.
+    ephemeral: bool,
+    /// Session lease held for the host's turns (shared profile store only),
+    /// from the submit until the final turn outcome.
+    lease: Option<SessionLease>,
+    /// Transcript head the driver's cached state reflects (set when a host
+    /// turn ends). `None`: the driver hydrates from the transcript.
+    driver_head: Option<u64>,
+    /// Lease holder last announced to `projects` attachments.
+    seen_holder: Option<HolderInfo>,
+}
+
+impl SlotState {
+    fn new(record: HostedSessionRecord, limits: ArbiterLimits, head: u64, ephemeral: bool) -> Self {
+        Self {
+            record,
+            arbiter: Arbiter::new(limits),
+            ring: LiveRing::default(),
+            durable_head: head,
+            attachments: Vec::new(),
+            cancel: None,
+            pending_settings: Vec::new(),
+            parked: false,
+            ephemeral,
+            lease: None,
+            driver_head: None,
+            seen_holder: None,
+        }
+    }
 }
 
 struct Slot {
@@ -151,6 +275,8 @@ struct HostInner {
     approvals: Arc<dyn ApprovalBackend>,
     driver: Arc<dyn TurnDriver>,
     execution_creators: Mutex<HashMap<SessionId, ClientIdentity>>,
+    archive_checkpoint_storage: Mutex<()>,
+    cloud_library: std::sync::OnceLock<Arc<CloudLibrary>>,
     slots: Mutex<HashMap<SessionId, Arc<Slot>>>,
     revoked_devices: Mutex<HashSet<DeviceId>>,
     revoked_connections: Mutex<HashSet<ConnectionId>>,
@@ -161,6 +287,21 @@ struct HostInner {
     connections: Mutex<BTreeMap<ConnectionId, ConnEntry>>,
     /// R18 configured listeners (`gateway.listeners.*`).
     listeners: Mutex<Vec<GatewayListenerInfo>>,
+    /// Sharing of profile (TUI) sessions; `None` without sharing.
+    profile: Option<ProfileShare>,
+    /// Minor-4 operations backend (`manage`/`stepup`); empty until
+    /// [`SessionHost::install_ops`].
+    ops: std::sync::OnceLock<Arc<dyn OpsPort>>,
+    /// Backend of the `overview` feature (global jobs and agents views); empty
+    /// until [`SessionHost::install_overview`].
+    overview: std::sync::OnceLock<Arc<crate::overview::Overview>>,
+    cloud_assistant: std::sync::OnceLock<Arc<crate::cloud_assistant::CloudAssistant>>,
+    user_memberships: std::sync::OnceLock<Arc<dyn crate::membership::UserMembershipResolver>>,
+    owner_process: std::sync::OnceLock<owner_relay::ProcessCoordinates>,
+    #[cfg(feature = "owner-creation-receipts")]
+    owner_creation: std::sync::OnceLock<crate::owner_creation::InstalledOwnerCreation>,
+    direct_owner_placement: std::sync::OnceLock<Arc<dyn owner_relay::DirectOwnerPlacementAuthority>>,
+    owner_observation_reservations: owner_relay::reservation::OwnerObservationReservations,
 }
 
 /// The persistent session host. Cheap to clone.
@@ -201,6 +342,32 @@ impl SessionHost {
         approvals: Arc<dyn ApprovalBackend>,
         tools: ToolHost,
     ) -> Result<Self, HostError> {
+        Self::open_inner(config, driver, transcripts, approvals, tools, None)
+    }
+
+    /// Like [`SessionHost::open_with_tools`], sharing the profile sessions of
+    /// `share.index` (plan §3.2). `transcripts` must read the same store as
+    /// `share.index.sessions_root()`. [`SessionHost::open`] and
+    /// [`SessionHost::open_with_tools`] never share.
+    pub fn open_with_profile(
+        config: HostConfig,
+        driver: Arc<dyn TurnDriver>,
+        transcripts: Arc<dyn TranscriptSource>,
+        approvals: Arc<dyn ApprovalBackend>,
+        tools: ToolHost,
+        share: ProfileShare,
+    ) -> Result<Self, HostError> {
+        Self::open_inner(config, driver, transcripts, approvals, tools, Some(share))
+    }
+
+    fn open_inner(
+        config: HostConfig,
+        driver: Arc<dyn TurnDriver>,
+        transcripts: Arc<dyn TranscriptSource>,
+        approvals: Arc<dyn ApprovalBackend>,
+        tools: ToolHost,
+        profile: Option<ProfileShare>,
+    ) -> Result<Self, HostError> {
         let records = RecordStore::new(&config.state_dir);
         let epoch = records.next_epoch()?;
         let interrupted = records.recover_after_restart(epoch)?;
@@ -220,6 +387,8 @@ impl SessionHost {
                 approvals,
                 driver,
                 execution_creators: Mutex::new(HashMap::new()),
+                archive_checkpoint_storage: Mutex::new(()),
+                cloud_library: std::sync::OnceLock::new(),
                 slots: Mutex::new(HashMap::new()),
                 revoked_devices: Mutex::new(HashSet::new()),
                 revoked_connections: Mutex::new(HashSet::new()),
@@ -227,14 +396,123 @@ impl SessionHost {
                 tools,
                 connections: Mutex::new(BTreeMap::new()),
                 listeners: Mutex::new(Vec::new()),
+                profile,
+                ops: std::sync::OnceLock::new(),
+                overview: std::sync::OnceLock::new(),
+                cloud_assistant: std::sync::OnceLock::new(),
+                user_memberships: std::sync::OnceLock::new(),
+                owner_process: std::sync::OnceLock::new(),
+                #[cfg(feature = "owner-creation-receipts")]
+                owner_creation: std::sync::OnceLock::new(),
+                direct_owner_placement: std::sync::OnceLock::new(),
+                owner_observation_reservations: Default::default(),
             }),
         })
+    }
+
+    /// Install a separated creation-only authority after protected startup.
+    /// Launcher must hold and revalidate the canonical private writer guard.
+    /// No connected device, shared host or ordinary RPC can install it.
+    ///
+    /// # Errors
+    /// Refuses sharing, a draining/unprotected host or conflicting setup.
+    #[cfg(feature = "owner-creation-receipts")]
+    pub fn install_owner_creation_authority(
+        &self,
+        authority: crate::owner_creation::OwnerCreationAuthority,
+        guard_is_live: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), HostError> {
+        if self.inner.profile.is_some() || self.inner.is_draining()
+            || self.inner.owner_process.get().is_some()
+        {
+            return Err(HostError::Denied("owner creation authority requires an isolated writer".into()));
+        }
+        let installed = crate::owner_creation::InstalledOwnerCreation::new(authority, guard_is_live)?;
+        self.inner.owner_creation.set(installed)
+            .map_err(|_| HostError::Denied("owner creation authority is already installed".into()))
+    }
+
+    /// Export only evidence for this exact current isolated producer to
+    /// trusted local composition, never through the device session wire.
+    ///
+    /// # Errors
+    /// Refuses absent, inconsistent, stale or unguarded evidence.
+    #[cfg(feature = "owner-creation-receipts")]
+    pub fn owner_creation_receipt(
+        &self, tenant: &TenantId, session: &SessionId,
+    ) -> Result<crate::owner_creation::OwnerCreationReceipt, HostError> {
+        let unavailable = || HostError::Denied("owner creation evidence is unavailable".into());
+        let authority = self.inner.owner_creation.get().ok_or_else(unavailable)?;
+        if self.inner.is_draining() { return Err(unavailable()); }
+        authority.check_live()?;
+        let receipt = crate::owner_creation::read_owner_creation_receipt(
+            &self.inner.config.state_dir, tenant, session,
+        )?;
+        if receipt.claims().epoch.get() != self.inner.epoch
+            || !authority.verifies(&receipt) || self.inner.is_draining()
+        {
+            return Err(unavailable());
+        }
+        authority.check_live()?;
+        Ok(receipt)
+    }
+
+    /// Install the separate Cloud Assistant for this server-side profile.
+    /// No feature is offered by embedded or local hosts without this service.
+    pub fn install_cloud_assistant(
+        &self,
+        assistant: Arc<crate::cloud_assistant::CloudAssistant>,
+    ) -> Result<(), HostError> {
+        self.inner.cloud_assistant.set(assistant)
+            .map_err(|_| HostError::Protocol("Cloud Assistant already configured".into()))
+    }
+
+    /// Mount trusted current membership lookup on a specific authenticated
+    /// ingress. It does not extend the capability ceiling or expose an RPC.
+    ///
+    /// # Errors
+    /// A second installation on the same host is rejected.
+    pub fn install_user_memberships(
+        &self, resolver: Arc<dyn crate::membership::UserMembershipResolver>,
+    ) -> Result<(), HostError> {
+        self.inner.user_memberships.set(resolver)
+            .map_err(|_| HostError::Protocol("User membership authority already configured".into()))
     }
 
     /// Host epoch (increments on every open).
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.inner.epoch
+    }
+
+    /// Install the operations backend of the minor-4 `manage`/`stepup`
+    /// methods (contract K-W3c §8.2). Without it hello never grants these
+    /// features and the methods are denied. Installing twice is refused.
+    pub fn install_ops(&self, ops: Arc<dyn OpsPort>) -> Result<(), HostError> {
+        self.inner
+            .ops
+            .set(ops)
+            .map_err(|_| HostError::Protocol("ops already installed".into()))
+    }
+
+    /// Install the backend of the `overview` feature (`jobs.*`, `agents.*`).
+    /// Without it hello never grants the feature and the methods are denied.
+    /// Installing twice is refused.
+    pub fn install_overview(&self, overview: Arc<crate::overview::Overview>) -> Result<(), HostError> {
+        self.inner
+            .overview
+            .set(overview)
+            .map_err(|_| HostError::Protocol("overview already installed".into()))
+    }
+
+    /// Install Cloud Library only from trusted gateway composition, before listeners start.
+    /// The server retains ciphertext under its dedicated host profile and device scopes.
+    pub fn install_cloud_library(
+        &self, profile: &std::path::Path, key_file: &std::path::Path,
+    ) -> Result<(), HostError> {
+        let backend = CloudLibrary::open(&self.inner.config.state_dir, profile, key_file)?;
+        self.inner.cloud_library.set(Arc::new(backend))
+            .map_err(|_| HostError::Protocol("cloud library already installed".into()))
     }
 
     /// A port bound to one authenticated client. The identity is fixed for
@@ -270,6 +548,28 @@ impl SessionHost {
             host: Arc::clone(&self.inner),
             identity,
             granted: Mutex::new(None),
+            wire_minor: AtomicU32::new(0),
+            projects: AtomicBool::new(false),
+            manage: AtomicBool::new(false),
+            stepup: AtomicBool::new(false),
+            overview: AtomicBool::new(false),
+            cloud_assistant: AtomicBool::new(false),
+            cloud_assistant_recall: AtomicBool::new(false),
+            cloud_assistant_shared: AtomicBool::new(false),
+            auto_title: AtomicBool::new(false),
+            auto_title_seed: AtomicBool::new(false),
+            dream_session_rows: AtomicBool::new(false),
+            system_session_rows: AtomicBool::new(false),
+            existing_project_assignment: AtomicBool::new(false),
+            archive_checkpoints: AtomicBool::new(false),
+            media_preview: media_preview::PreviewState::new(),
+            archive_retained_rewrites: AtomicBool::new(false),
+            exact_rewind: AtomicBool::new(false),
+            cloud_library: AtomicBool::new(false),
+            manual_cloud_work: AtomicBool::new(false),
+            direct_owner_status: None,
+            direct_owner_status_negotiated: AtomicBool::new(false),
+            fenced_direct_owner_status_negotiated: AtomicBool::new(false),
         })
     }
 
@@ -287,6 +587,9 @@ impl SessionHost {
             self.inner
                 .tools
                 .cancel_connection(connection, "device revoked");
+            if let Some(assistant) = self.inner.cloud_assistant.get() {
+                assistant.cancel_connection(connection);
+            }
         }
         self.inner
             .close_matching(|entry| entry.device.as_ref() == Some(device), revoked_frame);
@@ -488,19 +791,67 @@ impl SessionHost {
         }
     }
 
-    /// Spawn the heartbeat timer on the current Tokio runtime.
+    /// Spawn the heartbeat timer on the current Tokio runtime. With sharing
+    /// it also drives the profile head watch
+    /// ([`SessionHost::poll_profile_heads`]) every
+    /// [`HostConfig::profile_head_poll`].
     #[must_use]
     pub fn spawn_heartbeat(&self) -> tokio::task::JoinHandle<()> {
         let host = self.clone();
         let every = self.inner.config.heartbeat;
+        let poll = self
+            .inner
+            .config
+            .profile_head_poll
+            .max(Duration::from_millis(100));
+        let watch_heads = self.inner.share().is_some();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
             tick.tick().await;
+            let mut heads = tokio::time::interval(poll);
+            heads.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heads.tick().await;
             loop {
-                tick.tick().await;
-                host.heartbeat();
+                tokio::select! {
+                    _ = tick.tick() => host.heartbeat(),
+                    _ = heads.tick(), if watch_heads => host.poll_profile_heads(),
+                }
             }
         })
+    }
+
+    /// One round of the profile head watch (plan §3.2 step 10): for every
+    /// attached shared session without a host turn, send transcript records
+    /// written elsewhere (as replay frames) and lease changes (`holder`
+    /// frames, `projects` connections only). Never writes.
+    pub fn poll_profile_heads(&self) {
+        let Some(share) = self.inner.share() else {
+            return;
+        };
+        let root = share.index.sessions_root();
+        for slot in self.inner.all_slots() {
+            let Ok(mut state) = slot.lock() else { continue };
+            state.attachments.retain(|entry| !entry.queue.is_closed());
+            if state.attachments.is_empty()
+                || state.lease.is_some()
+                || state.arbiter.is_running()
+                || state.parked
+            {
+                continue;
+            }
+            self.inner.observe_head(&slot.id, &mut state);
+            match peek_holder(root, &slot.id) {
+                Ok(holder) => {
+                    let holder = holder.as_ref().map(wire_holder);
+                    if holder != state.seen_holder {
+                        state.publish_holder(&slot.id, holder);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, session = %slot.id.as_str(), "session host: lease peek failed");
+                }
+            }
+        }
     }
 }
 
@@ -660,12 +1011,18 @@ impl HostInner {
         }
         self.tools
             .cancel_connection(connection, "connection revoked");
+        if let Some(assistant) = self.cloud_assistant.get() {
+            assistant.cancel_connection(connection);
+        }
         self.close_matching(|entry| entry.connection == connection, revoked_frame);
     }
 
     fn drain(&self, retry_after_ms: u64) {
         self.draining
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(assistant) = self.cloud_assistant.get() {
+            assistant.cancel_all();
+        }
         self.close_matching(
             |_| true,
             move |_| SessionFrame::HostDraining { retry_after_ms },
@@ -741,16 +1098,7 @@ impl HostInner {
         let head = self.transcripts.head(id)?;
         let slot = Arc::new(Slot {
             id: id.clone(),
-            state: Mutex::new(SlotState {
-                record,
-                arbiter: Arbiter::new(self.config.arbiter),
-                ring: LiveRing::default(),
-                durable_head: head,
-                attachments: Vec::new(),
-                cancel: None,
-                pending_settings: Vec::new(),
-                parked: false,
-            }),
+            state: Mutex::new(SlotState::new(record, self.config.arbiter, head, false)),
         });
         let mut slots = self
             .slots
@@ -759,20 +1107,19 @@ impl HostInner {
         Ok(Arc::clone(slots.entry(id.clone()).or_insert(slot)))
     }
 
-    fn insert_slot(&self, record: HostedSessionRecord) -> Result<Arc<Slot>, HostError> {
+    /// The slot already in memory, without touching the record store.
+    fn loaded_slot(&self, id: &SessionId) -> Option<Arc<Slot>> {
+        self.slots
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(id).cloned())
+    }
+
+    fn insert_slot(&self, record: HostedSessionRecord, head: u64) -> Result<Arc<Slot>, HostError> {
         let id = record.session_id.clone();
         let slot = Arc::new(Slot {
             id: id.clone(),
-            state: Mutex::new(SlotState {
-                record,
-                arbiter: Arbiter::new(self.config.arbiter),
-                ring: LiveRing::default(),
-                durable_head: 0,
-                attachments: Vec::new(),
-                cancel: None,
-                pending_settings: Vec::new(),
-                parked: false,
-            }),
+            state: Mutex::new(SlotState::new(record, self.config.arbiter, head, false)),
         });
         self.slots
             .lock()
@@ -782,9 +1129,15 @@ impl HostInner {
     }
 
     fn summary(&self, state: &SlotState) -> SessionSummary {
+        let record = &state.record;
+        let stored_title = record.fresh_human_origin
+            .then(|| self.share_for(record.tenant.as_ref())).flatten()
+            .and_then(|share| meta::load(share.index.sessions_root(), &record.session_id).ok().flatten())
+            .filter(|stored| stored.title_source != TitleSource::Fallback)
+            .and_then(|stored| stored.title);
         SessionSummary {
-            session_id: state.record.session_id.clone(),
-            title: state.record.title.clone(),
+            session_id: record.session_id.clone(),
+            title: stored_title.or_else(|| record.title.clone()),
             tenant: state.record.tenant.clone(),
             state: state.record.state.clone(),
             attached: u32::try_from(state.attachments.len()).unwrap_or(u32::MAX),
@@ -794,10 +1147,246 @@ impl HostInner {
     }
 
     fn save(&self, state: &mut SlotState) {
+        if state.ephemeral {
+            // A profile session read without adoption never gets a record.
+            return;
+        }
         state.record.updated_at = jiff::Timestamp::now();
         if let Err(error) = self.records.save(&state.record) {
             tracing::warn!(%error, session = %state.record.session_id.as_str(), "session host: record save failed");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile sharing (contract K-W1 §8.3)
+    // -----------------------------------------------------------------------
+
+    /// The active share (`None` without a profile or in mode `off`).
+    fn share(&self) -> Option<&ProfileShare> {
+        self.profile
+            .as_ref()
+            .filter(|share| share.settings.mode != ShareMode::Off)
+    }
+
+    /// The active share, if a caller of tenant `caller` may see its rows.
+    fn share_for(&self, caller: Option<&TenantId>) -> Option<&ProfileShare> {
+        self.share()
+            .filter(|share| tenant_admits(caller, Some(&share.settings.tenant)))
+    }
+
+    /// The slot of `id`: a hosted one, or a read-only view of a visible
+    /// profile session (no record, no file written; plan §3.2 step 5).
+    fn profile_slot(
+        &self,
+        id: &SessionId,
+        caller: Option<&TenantId>,
+    ) -> Result<Arc<Slot>, HostError> {
+        match self.slot(id) {
+            Err(HostError::NotFound) => {}
+            other => return other,
+        }
+        let share = self.share_for(caller).ok_or(HostError::NotFound)?;
+        let row = share.index.row(id)?.ok_or(HostError::NotFound)?;
+        let head = self.transcripts.head(id)?;
+        let now = jiff::Timestamp::now();
+        let record = HostedSessionRecord {
+            session_id: id.clone(),
+            tenant: Some(share.settings.tenant.clone()),
+            owner_principal: String::new(),
+            fresh_human_origin: false,
+            creator_execution: None,
+            manual_cloud_work_receipt: None,
+            exact_rewrites: Vec::new(),
+            workspace: None,
+            title: row.stored_title,
+            created_at: now,
+            updated_at: row.updated_at,
+            state: HostedState::Idle,
+            host_epoch: self.epoch,
+            generation: 0,
+            owner_agent: None,
+            tool_agents: Vec::new(),
+        };
+        let slot = Arc::new(Slot {
+            id: id.clone(),
+            state: Mutex::new(SlotState::new(record, self.config.arbiter, head, true)),
+        });
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| HostError::Storage("slot table poisoned".into()))?;
+        Ok(Arc::clone(slots.entry(id.clone()).or_insert(slot)))
+    }
+
+    /// Install an adopted record: upgrade a read-only view in place (its
+    /// attachments stay) or build a new slot at the current head.
+    fn publish_record(&self, record: HostedSessionRecord) -> Result<Arc<Slot>, HostError> {
+        let id = record.session_id.clone();
+        if let Some(slot) = self.loaded_slot(&id) {
+            let mut state = slot.lock()?;
+            if state.ephemeral {
+                state.record = record;
+                state.ephemeral = false;
+            }
+            drop(state);
+            return Ok(slot);
+        }
+        let head = self.transcripts.head(&id)?;
+        let slot = Arc::new(Slot {
+            id: id.clone(),
+            state: Mutex::new(SlotState::new(record, self.config.arbiter, head, false)),
+        });
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| HostError::Storage("slot table poisoned".into()))?;
+        Ok(Arc::clone(slots.entry(id).or_insert(slot)))
+    }
+
+    /// Take the session lease for a host turn (plan §3.5). No-op without
+    /// sharing or when the slot holds it already. Afterwards the head check:
+    /// a transcript that moved since the driver's last turn here makes the
+    /// driver drop its cached state and hydrate again.
+    ///
+    /// # Errors
+    /// [`HostError::Busy`] with the display reason when another process
+    /// holds the lease; storage errors otherwise.
+    fn ensure_lease(&self, id: &SessionId, state: &mut SlotState) -> Result<(), HostError> {
+        let Some(share) = self.share() else {
+            return Ok(());
+        };
+        if state.lease.is_some() {
+            return Ok(());
+        }
+        let lease =
+            match SessionLease::acquire(share.index.sessions_root(), id, HolderKind::Gateway) {
+                Ok(lease) => lease,
+                Err(SessionStoreError::LeaseHeld { holder, .. }) => {
+                    return Err(HostError::Busy(
+                        busy_reason(holder.map(|holder| holder.kind)).to_owned(),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
+        let head = self.transcripts.head(id)?;
+        if state.driver_head.is_some_and(|seen| seen != head) {
+            tracing::info!(
+                session = %id.as_str(),
+                "session host: transcript changed outside the host; rehydrating"
+            );
+            self.forget_driver_state(id)?;
+            state.driver_head = None;
+        }
+        state.durable_head = head;
+        let holder = Some(wire_holder(lease.holder()));
+        state.lease = Some(lease);
+        state.publish_holder(id, holder);
+        Ok(())
+    }
+
+    /// Drop the driver's cached core state of `id` ([OFFEN-1]).
+    fn forget_driver_state(&self, id: &SessionId) -> Result<(), HostError> {
+        self.driver.forget_session(id)
+    }
+
+    /// Release the turn lease. After a turn, `last_origin = gateway` is
+    /// recorded first (still under the lease).
+    fn release_lease(&self, id: &SessionId, state: &mut SlotState, turn_ran: bool) {
+        let Some(lease) = state.lease.take() else {
+            return;
+        };
+        if turn_ran
+            && let Some(share) = self.share()
+            && let Err(error) = meta::set_last_origin(
+                share.index.sessions_root(),
+                id,
+                LastOrigin::Gateway,
+                jiff::Timestamp::now(),
+            )
+        {
+            tracing::warn!(%error, session = %id.as_str(), "session host: last_origin not recorded");
+        }
+        drop(lease);
+        state.publish_holder(id, None);
+    }
+
+    /// Send records another writer appended since the cached head.
+    fn observe_head(&self, id: &SessionId, state: &mut SlotState) {
+        let head = match self.transcripts.head(id) {
+            Ok(head) => head,
+            Err(error) => {
+                tracing::debug!(%error, session = %id.as_str(), "session host: head read failed");
+                return;
+            }
+        };
+        if head == state.durable_head {
+            return;
+        }
+        let generation = state.record.generation;
+        if head < state.durable_head {
+            // Rewritten elsewhere (retention, repair): start over.
+            state.durable_head = head;
+            let cursor = state.head_cursor();
+            state.publish_side(
+                id,
+                SessionFrame::Resync {
+                    reason: "transcript rewritten outside the host".into(),
+                    head: cursor,
+                },
+            );
+            return;
+        }
+        let budget = (self.config.queue.max_frames / 2).max(1);
+        let page = match replay_page(
+            self.transcripts.as_ref(),
+            id,
+            generation,
+            state.durable_head,
+            budget,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::debug!(%error, session = %id.as_str(), "session host: head replay failed");
+                return;
+            }
+        };
+        state.attachments.retain(|entry| !entry.queue.is_closed());
+        for frame in page.frames {
+            for entry in &state.attachments {
+                entry.queue.push(frame.clone());
+            }
+        }
+        state.durable_head = page.next_sequence.min(head);
+    }
+
+    /// Projects with a running or parked host turn, by project key
+    /// (`""` = no project) [OFFEN-8: TUI leases are not counted].
+    fn active_by_project(
+        &self,
+        share: &ProfileShare,
+        caller: Option<&TenantId>,
+    ) -> HashMap<String, u32> {
+        let active: Vec<SessionId> = self
+            .all_slots()
+            .iter()
+            .filter(|slot| {
+                slot.lock().is_ok_and(|state| {
+                    (state.arbiter.is_running() || state.parked)
+                        && tenant_admits(caller, state.record.tenant.as_ref())
+                })
+            })
+            .map(|slot| slot.id.clone())
+            .collect();
+        let mut out: HashMap<String, u32> = HashMap::new();
+        for id in active {
+            let key = match share.index.row(&id) {
+                Ok(Some(row)) => row.project_key.unwrap_or_default(),
+                Ok(None) | Err(_) => continue,
+            };
+            let entry = out.entry(key).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+        out
     }
 }
 
@@ -855,9 +1444,28 @@ impl SlotState {
         self.record.state = state;
     }
 
+    /// Announce a lease change to the attachments that negotiated
+    /// `projects` (older clients would only decode `Unknown`).
+    fn publish_holder(&mut self, session_id: &SessionId, holder: Option<HolderInfo>) {
+        self.seen_holder.clone_from(&holder);
+        self.attachments.retain(|entry| !entry.queue.is_closed());
+        let envelope = FrameEnvelope {
+            session_id: session_id.clone(),
+            cursor: self.head_cursor(),
+            frame: SessionFrame::Holder {
+                session_id: session_id.clone(),
+                holder,
+            },
+        };
+        for entry in self.attachments.iter().filter(|entry| entry.projects) {
+            entry.queue.push(envelope.clone());
+        }
+    }
+
     /// Fan out a frame that does not belong to a driver turn (gateway tool
-    /// events of an agent-run turn). Buffered in the live ring only while a
-    /// driver turn is active there, so it never outlives the ring's turn.
+    /// events of an agent-run turn, and child-agent and agent-job frames from
+    /// the driver). Buffered in the live ring only while a driver turn is
+    /// active there, so it never outlives the ring's turn.
     fn publish_side(&mut self, session_id: &SessionId, frame: SessionFrame) {
         if self.ring.active_turn().is_some() {
             self.publish(session_id, frame);
@@ -898,6 +1506,7 @@ impl ToolEvents for SlotEvents {
 struct SlotSink {
     host: Weak<HostInner>,
     slot: Arc<Slot>,
+    rewrite_receipt: Option<String>,
 }
 
 impl EventSink for SlotSink {
@@ -907,6 +1516,33 @@ impl EventSink for SlotSink {
         };
         let id = &self.slot.id;
         match event {
+            DriverEvent::HistoryReplaced => {
+                if let Some(host) = self.host.upgrade()
+                    && let Ok(head) = host.transcripts.head(id)
+                {
+                    // This sink belongs to the specific turn that requested
+                    // the rewrite, not a later turn or an approval continuation.
+                    if let Some(receipt) = self.rewrite_receipt.as_deref()
+                        && state.arbiter.running_rewrite() == Some(receipt)
+                        && let Some(index) = state.record.exact_rewrites.iter().position(|entry| {
+                            entry.id == receipt && !entry.committed && head > entry.original_durable
+                        })
+                    {
+                        state.record.exact_rewrites[index].committed = true;
+                        if let Err(error) = host.records.save(&state.record) {
+                            state.record.exact_rewrites[index].committed = false;
+                            tracing::warn!(%error, "committed history edit receipt was not persisted");
+                        }
+                    }
+                    state.durable_head = head;
+                    state.ring.end_turn();
+                    let cursor = state.head_cursor();
+                    state.publish_side(id, SessionFrame::Resync {
+                        reason: "committed prompt replacement".into(),
+                        head: cursor,
+                    });
+                }
+            }
             DriverEvent::DurableAdvanced => {
                 if let Some(host) = self.host.upgrade()
                     && let Ok(head) = host.transcripts.head(id)
@@ -926,13 +1562,27 @@ impl EventSink for SlotSink {
                 parent,
                 role,
                 event,
-            } => state.publish(
+            } => state.publish_side(
                 id,
                 SessionFrame::Child {
                     agent,
                     parent,
                     role,
                     event,
+                },
+            ),
+            DriverEvent::Job {
+                work_id,
+                kind,
+                state: job_state,
+                summary,
+            } => state.publish_side(
+                id,
+                SessionFrame::Job {
+                    work_id,
+                    kind,
+                    state: job_state,
+                    summary,
                 },
             ),
             DriverEvent::ApprovalRequested(request) => {
@@ -947,7 +1597,7 @@ impl EventSink for SlotSink {
 fn pump(host: Arc<HostInner>, slot: Arc<Slot>) {
     tokio::spawn(async move {
         loop {
-            let (input, settings, cancel_rx) = {
+            let next = {
                 let Ok(mut state) = slot.lock() else { return };
                 if state.parked || state.record.state.is_terminal() {
                     return;
@@ -955,20 +1605,36 @@ fn pump(host: Arc<HostInner>, slot: Arc<Slot>) {
                 let Some(input) = state.arbiter.next_input() else {
                     return;
                 };
-                let (cancel_tx, cancel_rx) = watch::channel(false);
-                state.cancel = Some(cancel_tx);
-                let depth = state.arbiter.depth();
-                state.set_state(if depth > 0 {
-                    HostedState::Queued { depth }
-                } else {
-                    HostedState::Running
-                });
-                host.save(&mut state);
-                (
-                    input,
-                    std::mem::take(&mut state.pending_settings),
-                    cancel_rx,
-                )
+                // Normally taken at submit already; a queue resumed after a
+                // restart takes it here (plan §3.5: no turn without lease).
+                match host.ensure_lease(&slot.id, &mut state) {
+                    Err(error) => Err(error),
+                    Ok(()) => {
+                        let (cancel_tx, cancel_rx) = watch::channel(false);
+                        state.cancel = Some(cancel_tx);
+                        let depth = state.arbiter.depth();
+                        state.set_state(if depth > 0 {
+                            HostedState::Queued { depth }
+                        } else {
+                            HostedState::Running
+                        });
+                        host.save(&mut state);
+                        Ok((
+                            input,
+                            std::mem::take(&mut state.pending_settings),
+                            cancel_rx,
+                        ))
+                    }
+                }
+            };
+            let (input, settings, cancel_rx) = match next {
+                Ok(next) => next,
+                Err(error) => {
+                    if !settle(&host, &slot, &TurnOutcome::Failed(error.to_string())) {
+                        return;
+                    }
+                    continue;
+                }
             };
             if let Err(error) = host.prepare_execution(&slot).await {
                 if !settle(&host, &slot, &TurnOutcome::Failed(error.to_string())) {
@@ -984,6 +1650,7 @@ fn pump(host: Arc<HostInner>, slot: Arc<Slot>) {
             let sink: Arc<dyn EventSink> = Arc::new(SlotSink {
                 host: Arc::downgrade(&host),
                 slot: Arc::clone(&slot),
+                rewrite_receipt: input.rewind_before.as_ref().map(|_| input.client_msg_id.clone()),
             });
             let outcome = host
                 .driver
@@ -1014,8 +1681,12 @@ fn settle(host: &HostInner, slot: &Slot, outcome: &TurnOutcome) -> bool {
         state.durable_head = head;
     }
     state.cancel = None;
+    // The driver's state now reflects the transcript up to here (head check
+    // before the next leased turn).
+    state.driver_head = Some(state.durable_head);
     match outcome {
         TurnOutcome::AwaitingApproval => {
+            // The lease stays through the approval pause (plan §3.5).
             state.parked = true;
             state.set_state(HostedState::WaitingForApproval);
             host.save(&mut state);
@@ -1058,6 +1729,10 @@ fn settle(host: &HostInner, slot: &Slot, outcome: &TurnOutcome) -> bool {
                 });
             }
             host.save(&mut state);
+            // Final outcome: keep the lease only for a queued next turn.
+            if closed || state.arbiter.depth() == 0 {
+                host.release_lease(&slot.id, &mut state, true);
+            }
             !closed
         }
     }
@@ -1076,11 +1751,18 @@ fn resume_parked(host: Arc<HostInner>, slot: Arc<Slot>) {
             state.cancel = Some(cancel_tx);
             state.set_state(HostedState::Running);
             host.save(&mut state);
+            // Held since the turn parked; re-taken only if it was lost.
+            if let Err(error) = host.ensure_lease(&slot.id, &mut state) {
+                drop(state);
+                settle(&host, &slot, &TurnOutcome::Failed(error.to_string()));
+                return;
+            }
             cancel_rx
         };
         let sink: Arc<dyn EventSink> = Arc::new(SlotSink {
             host: Arc::downgrade(&host),
             slot: Arc::clone(&slot),
+            rewrite_receipt: None,
         });
         if let Err(error) = host.prepare_execution(&slot).await {
             settle(&host, &slot, &TurnOutcome::Failed(error.to_string()));
@@ -1104,6 +1786,7 @@ struct UnpublishedCreation<'a> {
     host: &'a HostInner,
     session_id: SessionId,
     armed: bool,
+    remove_record: bool,
 }
 
 impl Drop for UnpublishedCreation<'_> {
@@ -1124,7 +1807,9 @@ impl Drop for UnpublishedCreation<'_> {
         if let Ok(mut creators) = self.host.execution_creators.lock() {
             creators.remove(&self.session_id);
         }
-        if let Err(cleanup) = self.host.records.remove(&self.session_id) {
+        if self.remove_record
+            && let Err(cleanup) = self.host.records.remove(&self.session_id)
+        {
             tracing::error!(%cleanup, "session host: failed creation record cleanup");
         }
     }
@@ -1136,12 +1821,46 @@ pub struct HostConnection {
     host: Arc<HostInner>,
     identity: ClientIdentity,
     granted: Mutex<Option<ClientCaps>>,
+    /// Negotiated wire minor (0 before hello).
+    wire_minor: AtomicU32,
+    /// Feature `projects` was granted at hello.
+    projects: AtomicBool,
+    /// Feature `manage` was granted at hello (minor 4).
+    manage: AtomicBool,
+    /// Feature `stepup` was granted at hello (minor 4).
+    stepup: AtomicBool,
+    /// Feature `overview` was granted at hello.
+    overview: AtomicBool,
+    cloud_assistant: AtomicBool,
+    cloud_assistant_recall: AtomicBool,
+    cloud_assistant_shared: AtomicBool,
+    auto_title: AtomicBool,
+    auto_title_seed: AtomicBool,
+    dream_session_rows: AtomicBool,
+    system_session_rows: AtomicBool,
+    existing_project_assignment: AtomicBool,
+    /// Optional V5 durable checkpoint issue/describe was negotiated.
+    archive_checkpoints: AtomicBool,
+    media_preview: media_preview::PreviewState,
+    archive_retained_rewrites: AtomicBool,
+    exact_rewind: AtomicBool,
+    cloud_library: AtomicBool,
+    manual_cloud_work: AtomicBool,
+    direct_owner_status: Option<owner_relay::DirectOwnerStatus>,
+    direct_owner_status_negotiated: AtomicBool,
+    fenced_direct_owner_status_negotiated: AtomicBool,
 }
 
 impl Drop for HostConnection {
     fn drop(&mut self) {
         if let Ok(mut connections) = self.host.connections.lock() {
             connections.remove(&self.identity.connection);
+        }
+        if let Some(ops) = self.host.ops.get() {
+            ops.connection_closed(&self.identity);
+        }
+        if let Some(assistant) = self.host.cloud_assistant.get() {
+            assistant.cancel_connection(self.identity.connection);
         }
     }
 }
@@ -1181,12 +1900,123 @@ impl HostConnection {
             .ok_or(HostError::HelloRequired)
     }
 
+    /// Resolve only this connection's current registered member. No client
+    /// supplies the user, tenant, device, or fingerprint, and the result
+    /// cannot be used as a bearer grant or forwarded to the wire.
+    ///
+    /// # Errors
+    /// Denies unnegotiated, revoked, non-remote or disallowed peers, and
+    /// returns a storage error when the mounted authority cannot be read.
+    pub async fn authenticated_membership(
+        &self,
+    ) -> Result<Option<crate::membership::VerifiedUserMembership>, HostError> {
+        let admit = || {
+            let caps = self.granted()?;
+            if !caps.observe || self.identity.zone != harw_types::TrustZone::Remote
+                || self.identity.strength != harw_types::AuthStrength::MutualTls
+                || self.identity.agent.is_some()
+            {
+                return Err(HostError::Denied("Current user membership is unavailable".into()));
+            }
+            Ok(())
+        };
+        admit()?;
+        let resolver = self.host.user_memberships.get().cloned()
+            .ok_or_else(|| HostError::Denied("Current user membership is unavailable".into()))?;
+        let identity = self.identity.clone();
+        let member = tokio::task::spawn_blocking(move || resolver.resolve_current(&identity))
+            .await.map_err(|_| HostError::Storage("Current user membership lookup stopped".into()))??;
+        admit()?;
+        if member.as_ref().is_some_and(|row| !row.matches(&self.identity)) {
+            return Err(HostError::Revoked);
+        }
+        Ok(member)
+    }
+
+    fn cloud_assistant_owner(
+        &self,
+    ) -> Result<(
+        &Arc<crate::cloud_assistant::CloudAssistant>,
+        crate::cloud_assistant::CloudAssistantGrant,
+    ), HostError> {
+        let caps = self.granted()?;
+        if !self.cloud_assistant.load(Ordering::SeqCst) {
+            return Err(HostError::Denied("Cloud Assistant not negotiated".into()));
+        }
+        let store = self.host.cloud_assistant.get()
+            .ok_or_else(|| HostError::Denied("Cloud Assistant not configured".into()))?;
+        let host = Arc::downgrade(&self.host);
+        let identity = self.identity.clone();
+        let grant = store.grant(&self.identity, caps, move || {
+            let host = host.upgrade().ok_or(HostError::Revoked)?;
+            if host.is_revoked(&identity) {
+                return Err(HostError::Revoked);
+            }
+            let current = host.connections.lock()
+                .map_err(|_| HostError::Revoked)?
+                .get(&identity.connection)
+                .is_some_and(|entry| {
+                    let now = &entry.identity;
+                    now.principal == identity.principal && now.tenant == identity.tenant
+                        && now.device == identity.device
+                        && now.authenticated_node == identity.authenticated_node
+                        && now.authenticated_key_fingerprint == identity.authenticated_key_fingerprint
+                });
+            if !current {
+                return Err(HostError::Revoked);
+            }
+            if host.is_draining() {
+                return Err(HostError::Busy("Cloud Assistant gateway is draining".into()));
+            }
+            Ok(())
+        })?;
+        Ok((store, grant))
+    }
+
     fn admitted_slot(&self, id: &SessionId, need: Need) -> Result<Arc<Slot>, HostError> {
         let granted = self.granted()?;
         let slot = self.host.slot(id)?;
         let tenant = slot.lock()?.record.tenant.clone();
         admit(&self.identity, granted, tenant.as_ref(), need)?;
         Ok(slot)
+    }
+
+    async fn run_cloud_library(
+        &self, input: CloudLibraryCommandV1,
+    ) -> Result<CloudLibraryReplyV1, HostError> {
+        let caps = self.granted()?;
+        if !self.cloud_library.load(Ordering::SeqCst) || !caps.observe || !caps.steer
+            || !cloud_library::authorised(&self.identity) || self.host.is_draining()
+        {
+            return Err(HostError::Denied("cloud library is unavailable".into()));
+        }
+        let backend = self.host.cloud_library.get().cloned().ok_or(HostError::NotFound)?;
+        let permit = backend.admit_worker()?;
+        let host = Arc::clone(&self.host);
+        let identity = self.identity.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let live = || {
+                if host.is_revoked(&identity) { return Err(HostError::Revoked); }
+                if host.is_draining() { return Err(HostError::Denied("host is draining".into())); }
+                Ok(())
+            };
+            backend.run(&identity, input, live, |path, wire| {
+                // This short linearization fence excludes both revocation writers
+                // from the last authorization decision through atomic publication.
+                let devices = host.revoked_devices.lock().map_err(|_| HostError::Revoked)?;
+                let connections = host.revoked_connections.lock().map_err(|_| HostError::Revoked)?;
+                if identity.device.as_ref().is_none_or(|device| devices.contains(device))
+                    || connections.contains(&identity.connection)
+                {
+                    return Err(HostError::Revoked);
+                }
+                if host.is_draining() { return Err(HostError::Denied("host is draining".into())); }
+                cloud_library::write_encrypted(path, wire)
+            })
+        }).await.map_err(|_| HostError::Storage("cloud library worker stopped".into()))??;
+        self.granted()?;
+        Ok(result)
     }
 
     fn hello_sync(&self, params: HelloParams) -> Result<HelloAck, HostError> {
@@ -1217,18 +2047,184 @@ impl HostConnection {
         {
             entry.granted = Some(caps);
         }
-        let features = params
+        let archive_supported = wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+            && caps.observe && caps.steer
+            && self.identity.agent.is_none()
+            && self.host.driver.supports_archive_checkpoints()
+            && self.host.share_for(self.identity.tenant.as_ref())
+                .is_some_and(|share| share.settings.mode == ShareMode::Continue);
+        let retained_rewrites_supported = archive_supported
+            && params.features.iter().any(|feature| feature == features::ARCHIVE_CHECKPOINT_V1);
+        let mut granted_features: Vec<String> = params
             .features
             .iter()
             .filter(|feature| HOST_FEATURES.contains(&feature.as_str()))
             .filter(|feature| {
+                match feature.as_str() {
+                    features::EXISTING_PROJECT_ASSIGNMENT_V1 => wire_minor >= PROJECTS_WIRE_MINOR
+                        && caps.observe && caps.steer && self.identity.agent.is_none()
+                        && params.features.iter().any(|name| name == features::PROJECTS)
+                        && self.host.share_for(self.identity.tenant.as_ref()).is_some_and(|share| {
+                            share.settings.mode == ShareMode::Continue
+                                && share.index.supports_existing_project_assignment()
+                        }),
+                    features::AUTO_TITLE_CAS_V1 | features::AUTO_TITLE_SEED_V1 => wire_minor >= PROJECTS_WIRE_MINOR
+                        && caps.observe && caps.steer && self.identity.agent.is_none()
+                        && self.host.share_for(self.identity.tenant.as_ref()).is_some_and(|share| {
+                            share.settings.mode == ShareMode::Continue
+                        }),
+                    features::SESSION_DREAM_ROWS_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+                        && caps.observe && self.identity.agent.is_none()
+                        && params.features.iter().any(|name| name == features::PROJECTS)
+                        && self.host.share_for(self.identity.tenant.as_ref())
+                            .is_some_and(|share| share.index.supports_dream_session_rows()),
+                    features::SESSION_SYSTEM_ROWS_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+                        && caps.observe && self.identity.agent.is_none()
+                        && params.features.iter().any(|name| name == features::PROJECTS)
+                        && self.host.share_for(self.identity.tenant.as_ref())
+                            .is_some_and(|share| share.index.supports_system_session_rows()),
+                    features::CLOUD_ASSISTANT_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+                        && self.host.cloud_assistant.get().is_some()
+                        && crate::cloud_assistant::CloudAssistant::admits(&self.identity, caps),
+                    features::CLOUD_ASSISTANT_RECALL_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+                        && self.host.cloud_assistant.get().is_some()
+                        && crate::cloud_assistant::CloudAssistant::admits(&self.identity, caps)
+                        && params.features.iter().any(|name| name == features::CLOUD_ASSISTANT_V1),
+                    features::CLOUD_ASSISTANT_SHARED_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+                        && self.host.cloud_assistant.get().is_some()
+                        && self.host.user_memberships.get().is_some()
+                        && crate::cloud_assistant::CloudAssistant::admits(&self.identity, caps)
+                        && params.features.iter().any(|name| name == features::CLOUD_ASSISTANT_V1),
+                    features::SESSION_MEDIA_PREVIEW_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+                        && caps.observe && self.identity.agent.is_none()
+                        && self.host.driver.archive_media_store().is_some(),
+                    features::ARCHIVE_CHECKPOINT_V1 => archive_supported,
+                    features::ARCHIVE_RETAINED_REWRITE_V1 => retained_rewrites_supported,
+                    features::EXACT_REWIND_V1 => retained_rewrites_supported
+                        && self.host.driver.supports_exact_rewind()
+                        && params.features.iter().any(|name| name == features::ARCHIVE_RETAINED_REWRITE_V1),
+                    features::EXACT_TURN_INTERRUPT_V1 => caps.steer,
+                    features::EXACT_REWIND_RECEIPT_V1 => retained_rewrites_supported
+                        && self.host.driver.supports_exact_rewind()
+                        && params.features.iter().any(|name| name == features::EXACT_REWIND_V1)
+                        && params.features.iter().any(|name| name == features::ARCHIVE_RETAINED_REWRITE_V1),
+                    features::MANUAL_CLOUD_WORK_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+                        && crate::cloud_assistant::CloudAssistant::admits(&self.identity, caps)
+                        && self.host.share_for(self.identity.tenant.as_ref())
+                            .is_some_and(|share| share.settings.mode == ShareMode::Continue),
+                    features::DIRECT_OWNER_STATUS_FENCED_V1 =>
+                        wire_minor >= harw_protocol::session_wire::DIRECT_OWNER_STATUS_WIRE_MINOR
+                        && caps.observe && self.host.direct_owner_placement.get().is_some()
+                        && self.direct_owner_status.as_ref().is_some_and(owner_relay::DirectOwnerStatus::reservable)
+                        && self.host.user_memberships.get().is_some(),
+                    features::DIRECT_OWNER_STATUS_V1 => wire_minor >= harw_protocol::session_wire::DIRECT_OWNER_STATUS_WIRE_MINOR
+                        && caps.observe && self.host.direct_owner_placement.get().is_none()
+                        && self.direct_owner_status.as_ref().is_some_and(owner_relay::DirectOwnerStatus::is_live)
+                        && self.host.user_memberships.get().is_some(),
+                    features::CLOUD_LIBRARY_V1 => wire_minor >= CLOUD_LIBRARY_WIRE_MINOR
+                        && caps.observe && caps.steer
+                        && cloud_library::authorised(&self.identity)
+                        && self.host.cloud_library.get().is_some(),
+                    _ => true,
+                }
+            })
+            .filter(|feature| {
                 wire_minor >= TOOL_GATEWAY_WIRE_MINOR || !R18_FEATURES.contains(&feature.as_str())
+            })
+            .filter(|feature| {
+                wire_minor >= PROJECTS_WIRE_MINOR || !PROJECT_FEATURES.contains(&feature.as_str())
+            })
+            .filter(|feature| {
+                wire_minor >= MANAGE_WIRE_MINOR || !MANAGE_FEATURES.contains(&feature.as_str())
             })
             .cloned()
             .collect();
+        // Contract K-W3c §8.2 no. 9: `manage` only with installed ops,
+        // `stepup` only together with `manage` and an enabled step-up slice.
+        let ops = self.host.ops.get();
+        if ops.is_none() {
+            granted_features.retain(|feature| feature.as_str() != features::MANAGE);
+        }
+        let manage = granted_features
+            .iter()
+            .any(|feature| feature.as_str() == features::MANAGE);
+        if !manage || !ops.is_some_and(|ops| ops.stepup_enabled()) {
+            granted_features.retain(|feature| feature.as_str() != features::STEPUP);
+        }
+        let stepup = granted_features
+            .iter()
+            .any(|feature| feature.as_str() == features::STEPUP);
+        if self.host.overview.get().is_none() {
+            granted_features.retain(|feature| feature.as_str() != features::OVERVIEW);
+        }
+        let overview = granted_features
+            .iter()
+            .any(|feature| feature.as_str() == features::OVERVIEW);
+        self.overview.store(overview, Ordering::SeqCst);
+        self.existing_project_assignment.store(
+            granted_features.iter().any(|feature| feature == features::EXISTING_PROJECT_ASSIGNMENT_V1),
+            Ordering::SeqCst,
+        );
+        self.auto_title_seed.store(
+            granted_features.iter().any(|feature| feature == features::AUTO_TITLE_SEED_V1),
+            Ordering::SeqCst,
+        );
+        self.auto_title.store(
+            granted_features.iter().any(|feature| feature == features::AUTO_TITLE_CAS_V1),
+            Ordering::SeqCst,
+        );
+        self.dream_session_rows.store(
+            granted_features.iter().any(|feature| feature == features::SESSION_DREAM_ROWS_V1),
+            Ordering::SeqCst,
+        );
+        self.system_session_rows.store(
+            granted_features.iter().any(|feature| feature == features::SESSION_SYSTEM_ROWS_V1),
+            Ordering::SeqCst,
+        );
+        self.cloud_assistant.store(
+            granted_features.iter().any(|feature| feature == features::CLOUD_ASSISTANT_V1),
+            Ordering::SeqCst,
+        );
+        self.cloud_assistant_recall.store(
+            granted_features.iter().any(|feature| feature == features::CLOUD_ASSISTANT_RECALL_V1),
+            Ordering::SeqCst,
+        );
+        self.cloud_assistant_shared.store(
+            granted_features.iter().any(|feature| feature == features::CLOUD_ASSISTANT_SHARED_V1),
+            Ordering::SeqCst,
+        );
+        self.media_preview.set_negotiated(granted_features.iter()
+            .any(|feature| feature == features::SESSION_MEDIA_PREVIEW_V1));
+        self.archive_checkpoints.store(granted_features.iter()
+            .any(|feature| feature == features::ARCHIVE_CHECKPOINT_V1), Ordering::SeqCst);
+        self.manual_cloud_work.store(granted_features.iter()
+            .any(|feature| feature == features::MANUAL_CLOUD_WORK_V1), Ordering::SeqCst);
+        self.cloud_library.store(granted_features.iter()
+            .any(|feature| feature == features::CLOUD_LIBRARY_V1), Ordering::SeqCst);
+        self.archive_retained_rewrites.store(granted_features.iter()
+            .any(|feature| feature == features::ARCHIVE_RETAINED_REWRITE_V1), Ordering::SeqCst);
+        self.exact_rewind.store(granted_features.iter()
+            .any(|feature| feature == features::EXACT_REWIND_V1), Ordering::SeqCst);
+        self.fenced_direct_owner_status_negotiated.store(
+            granted_features.iter().any(|feature| feature == features::DIRECT_OWNER_STATUS_FENCED_V1),
+            Ordering::Release,
+        );
+        self.direct_owner_status_negotiated.store(
+            granted_features.iter().any(|feature| feature == features::DIRECT_OWNER_STATUS_V1),
+            Ordering::Release,
+        );
+        self.manage.store(manage, Ordering::SeqCst);
+        self.stepup.store(stepup, Ordering::SeqCst);
+        self.wire_minor.store(wire_minor, Ordering::SeqCst);
+        self.projects.store(
+            granted_features
+                .iter()
+                .any(|feature| feature.as_str() == features::PROJECTS),
+            Ordering::SeqCst,
+        );
         Ok(HelloAck {
             wire_minor,
-            features,
+            features: granted_features,
             host_epoch: self.host.epoch,
             granted: caps,
         })
@@ -1239,7 +2235,52 @@ impl HostConnection {
         if !granted.observe {
             return Err(HostError::Denied("capability `observe` not granted".into()));
         }
-        self.summaries()
+        let mut out = self.summaries()?;
+        // Minor-2 clients see the newest profile sessions in the flat list,
+        // prefixed with their project (contract K-W1 §8.3).
+        if !self.has_projects()
+            && let Some(share) = self.host.share_for(self.identity.tenant.as_ref())
+        {
+            let hosted: HashSet<SessionId> = out
+                .iter()
+                .map(|summary| summary.session_id.clone())
+                .collect();
+            for row in share.index.newest(share.settings.legacy_rows)? {
+                if hosted.contains(&row.session_id) {
+                    continue;
+                }
+                let title = match row.project_label.as_deref() {
+                    Some(label) if !label.is_empty() => format!("{label} · {}", row.title),
+                    _ => row.title,
+                };
+                out.push(SessionSummary {
+                    session_id: row.session_id,
+                    title: Some(title),
+                    tenant: Some(share.settings.tenant.clone()),
+                    state: HostedState::Idle,
+                    attached: 0,
+                    updated_at: row.updated_at,
+                    model: None,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Feature `projects` was negotiated at hello.
+    fn has_projects(&self) -> bool {
+        self.projects.load(Ordering::SeqCst)
+    }
+
+    /// Observe admission that also reaches visible profile sessions without
+    /// a record (read-only view, nothing written).
+    fn observed_slot(&self, id: &SessionId) -> Result<Arc<Slot>, HostError> {
+        let granted = self.granted()?;
+        Need::Observe.require(granted)?;
+        let slot = self.host.profile_slot(id, self.identity.tenant.as_ref())?;
+        let tenant = slot.lock()?.record.tenant.clone();
+        admit(&self.identity, granted, tenant.as_ref(), Need::Observe)?;
+        Ok(slot)
     }
 
     /// Summaries of every session visible to this caller's tenant.
@@ -1258,7 +2299,7 @@ impl HostConnection {
                 .lock()
                 .ok()
                 .and_then(|slots| slots.get(&record.session_id).cloned());
-            let summary = match loaded {
+            let mut summary = match loaded {
                 Some(slot) => self.host.summary(&*slot.lock()?),
                 None => SessionSummary {
                     session_id: record.session_id.clone(),
@@ -1270,6 +2311,16 @@ impl HostConnection {
                     model: self.host.driver.model_name(&record.session_id),
                 },
             };
+            // This list uses the durable title sidecar when available; never
+            // publish an automatic title into a second cache that can lag a
+            // manual rename performed by another writer such as the TUI.
+            if record.fresh_human_origin
+                && let Some(share) = self.host.share_for(self.identity.tenant.as_ref())
+                && let Ok(Some(saved)) = meta::load(share.index.sessions_root(), &record.session_id)
+                && saved.title.is_some()
+            {
+                summary.title = saved.title;
+            }
             out.push(summary);
         }
         Ok(out)
@@ -1280,7 +2331,7 @@ impl HostConnection {
         params: &AttachParams,
     ) -> Result<(AttachAck, crate::fanout::AttachmentStream), HostError> {
         let granted = self.granted()?;
-        let slot = self.admitted_slot(&params.session_id, Need::Observe)?;
+        let slot = self.observed_slot(&params.session_id)?;
         let mut state = slot.lock()?;
         let generation = state.record.generation;
         let head = self.host.transcripts.head(&slot.id)?;
@@ -1294,10 +2345,13 @@ impl HostConnection {
         // client never fabricates a cursor. A generation change forces a
         // resync below instead of a stale-position resume.
         let budget = (self.host.config.queue.max_frames / 2).max(1);
+        let floor = self.host.transcripts.canonical_floor(&slot.id, head)?;
+        let tail = tail_start(head, params.tail_items).max(floor);
         let (start, resync) = match params.from {
-            Some(cursor) if cursor.generation == generation => (cursor.durable.min(head), false),
-            Some(_) => (tail_start(head, params.tail_items), true),
-            None => (tail_start(head, params.tail_items), false),
+            Some(cursor) if cursor.generation == generation && cursor.durable >= floor =>
+                (cursor.durable.min(head), false),
+            Some(_) => (tail, true),
+            None => (tail, false),
         };
         let replay_from = Cursor {
             generation,
@@ -1309,39 +2363,48 @@ impl HostConnection {
                 session_id: slot.id.clone(),
                 cursor: replay_from,
                 frame: SessionFrame::Resync {
-                    reason: "transcript generation changed".into(),
+                    reason: "transcript generation or history changed".into(),
                     head: state.head_cursor(),
                 },
             });
         }
-        let frames = replay(
+        let page = replay_page(
             self.host.transcripts.as_ref(),
             &slot.id,
             generation,
             start,
             budget,
         )?;
-        let replayed_to = frames.last().map_or(start, |frame| frame.cursor.durable);
-        for frame in frames {
+        let last_visible = page
+            .frames
+            .last()
+            .map_or(start, |frame| frame.cursor.durable);
+        for frame in page.frames {
             queue.push(frame);
         }
-        if replayed_to < head {
-            // More durable history than fits: let the client page on.
-            queue.push(FrameEnvelope {
+        if page.next_sequence < head {
+            let resume_from = Cursor {
+                generation,
+                durable: page.next_sequence,
+                live: 0,
+            };
+            if page.next_sequence > last_visible {
+                // A cursor is acknowledged by applying a frame, not by
+                // reading Lagged. Checkpoint hidden records on the wire so
+                // conservative clients can advance without skipping a visible item.
+                queue.push(FrameEnvelope {
+                    session_id: slot.id.clone(),
+                    cursor: resume_from,
+                    frame: SessionFrame::Heartbeat,
+                });
+            }
+            // Finish this replay page. A later Presence push must not evict
+            // the checkpoint (or an item) before the client receives it.
+            queue.close(Some(FrameEnvelope {
                 session_id: slot.id.clone(),
-                cursor: Cursor {
-                    generation,
-                    durable: replayed_to,
-                    live: 0,
-                },
-                frame: SessionFrame::Lagged {
-                    resume_from: Cursor {
-                        generation,
-                        durable: replayed_to,
-                        live: 0,
-                    },
-                },
-            });
+                cursor: resume_from,
+                frame: SessionFrame::Lagged { resume_from },
+            }));
         } else {
             // Pending approvals come from the approval store, never from the
             // transcript (PL-65 §3.4 step 3).
@@ -1373,11 +2436,17 @@ impl HostConnection {
                         }
                     }
                     None => {
-                        let frame = state.ring.snapshot().unwrap_or(SessionFrame::Snapshot {
+                        let mut frame = state.ring.snapshot().unwrap_or(SessionFrame::Snapshot {
                             turn_id,
                             assistant_text: String::new(),
                             reasoning_collapsed: false,
+                            reasoning_text: None,
                         });
+                        if params.profile == StreamProfile::Compact
+                            && let SessionFrame::Snapshot { reasoning_text, .. } = &mut frame
+                        {
+                            *reasoning_text = None;
+                        }
                         queue.push(FrameEnvelope {
                             session_id: slot.id.clone(),
                             cursor: state.head_cursor(),
@@ -1418,11 +2487,32 @@ impl HostConnection {
                 true
             }
         });
+        let projects = self.has_projects();
+        if projects && let Some(share) = self.host.share() {
+            // Current lease holder, so the client starts with the right badge.
+            match peek_holder(share.index.sessions_root(), &slot.id) {
+                Ok(Some(holder)) => {
+                    let _ = queue.push(FrameEnvelope {
+                        session_id: slot.id.clone(),
+                        cursor: state.head_cursor(),
+                        frame: SessionFrame::Holder {
+                            session_id: slot.id.clone(),
+                            holder: Some(wire_holder(&holder)),
+                        },
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, session = %slot.id.as_str(), "session host: lease peek failed");
+                }
+            }
+        }
         state.attachments.push(AttachEntry {
             connection,
             device: self.identity.device.clone(),
             queue,
             presence,
+            projects,
         });
         state.broadcast_presence(&slot.id);
         let ack = AttachAck {
@@ -1452,23 +2542,70 @@ impl HostConnection {
         Ok(())
     }
 
-    fn create_sync(&self, params: &CreateParams) -> Result<HostedSessionRecord, HostError> {
+    fn create_sync(&self, params: &CreateParams, destination: SessionId) -> Result<HostedSessionRecord, HostError> {
         let granted = self.granted()?;
         if !granted.steer {
             return Err(HostError::Denied("capability `steer` not granted".into()));
         }
+        let mut record = self.new_record(
+            destination,
+            params.title.as_deref(),
+            params.workspace.clone(),
+            self.identity.tenant.clone(),
+        );
+        record.fresh_human_origin = params.fork_from.is_none() && self.identity.agent.is_none();
+        Ok(record)
+    }
+
+    // Initialize only as part of fresh creation before the record is published.
+    // This is optional evidence: inability to index must not block session creation.
+    fn initialize_title_source(&self, record: &HostedSessionRecord) {
+        if !record.fresh_human_origin || record.title.is_some() || record.generation != 0
+            || !self.auto_title_seed.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let Ok(share) = self.steering_share() else { return; };
+        let Ok(binding) = self.host.driver.archive_journal_binding(&record.session_id) else { return; };
+        let (Ok(root), Ok(shared)) = (
+            std::fs::canonicalize(&binding.root),
+            std::fs::canonicalize(share.index.sessions_root()),
+        ) else { return; };
+        if root == shared &&
+            harw_session_store::title_seed::initialize_title_seed(&root, &record.session_id).is_err()
+        {
+            tracing::warn!("automatic title source initialization was not confirmed");
+        }
+    }
+
+    /// Tenant of a record created or adopted through the profile share. The
+    /// creator revalidation requires the record tenant to equal the creator's
+    /// own tenant, so a tenant-less local owner (which `tenant_admits` lets
+    /// see every tenant) gets a tenant-less record; a tenanted caller already
+    /// passed `steering_share`, so its tenant equals the share's.
+    fn record_tenant(&self) -> Option<TenantId> {
+        self.identity.tenant.clone()
+    }
+
+    /// A fresh record owned by this caller (creator authority from the
+    /// authenticated identity, never from the wire).
+    fn new_record(
+        &self,
+        session_id: SessionId,
+        title: Option<&str>,
+        workspace: Option<String>,
+        tenant: Option<TenantId>,
+    ) -> HostedSessionRecord {
         let now = jiff::Timestamp::now();
-        let session_id = SessionId::new();
-        let title = params
-            .title
-            .as_deref()
+        let title = title
             .map(str::trim)
             .filter(|title| !title.is_empty())
             .map(|title| title.chars().take(200).collect::<String>());
-        Ok(HostedSessionRecord {
+        HostedSessionRecord {
             session_id,
-            tenant: self.identity.tenant.clone(),
+            tenant,
             owner_principal: self.identity.principal.id().to_owned(),
+            fresh_human_origin: false,
             creator_execution: Some(crate::record::CreatorExecutionRequest {
                 binding: Some(crate::record::CreatorExecutionBinding::from_identity(
                     &self.identity,
@@ -1476,7 +2613,9 @@ impl HostConnection {
                 maximum_tier: self.identity.principal.tier(),
                 approval_actor: self.identity.actor.clone(),
             }),
-            workspace: params.workspace.clone(),
+            manual_cloud_work_receipt: None,
+            exact_rewrites: Vec::new(),
+            workspace,
             title,
             created_at: now,
             updated_at: now,
@@ -1487,7 +2626,7 @@ impl HostConnection {
             // calls; its delegates inherit access, other agents do not.
             owner_agent: self.identity.agent.as_ref().map(|agent| agent.id.clone()),
             tool_agents: Vec::new(),
-        })
+        }
     }
 
     fn submit_sync(
@@ -1503,7 +2642,54 @@ impl HostConnection {
                 None,
             ));
         }
+        if params.rewind_before.is_some() && !self.exact_rewind.load(Ordering::SeqCst) {
+            return Ok((SubmitResult::Denied { reason: "exact retained prompt editing is not available on this host".into() }, None));
+        }
+        if let Some(reason) = refuse_images(&params.images) {
+            return Ok((SubmitResult::Denied { reason }, None));
+        }
         let mut state = slot.lock()?;
+        let client_msg_id = params.client_msg_id;
+        let input = TurnInput {
+            session_id: params.session_id.clone(),
+            text: params.text,
+            images: params.images,
+            client_msg_id: client_msg_id.clone(),
+            submitted_by: self.identity.label.clone(),
+            title_seed_human: self.identity.agent.is_none(),
+            actor: self.identity.actor.clone(),
+            origin: self.identity.connection,
+            rewrite_replacement_id: params.rewind_before.as_deref().map(|target| {
+                harw_protocol::session_wire::exact_rewrite_item_id(
+                    &params.session_id, target, params.expect_head, &client_msg_id,
+                )
+            }),
+            rewind_before: params.rewind_before,
+        };
+        // A receipt is a historical fact, never a new authorization. Current
+        // steering admission ran above; still bind to the exact original peer,
+        // request payload, and displayed durable revision before reporting it.
+        if let Some(receipt) = state.record.exact_rewrites.iter()
+            .find(|receipt| receipt.id == input.client_msg_id)
+        {
+            let binding = crate::record::CreatorExecutionBinding::from_identity(&self.identity);
+            if receipt.principal != self.identity.principal.id() || receipt.binding != binding
+                || receipt.fingerprint != *crate::arbiter::fingerprint(&input, params.expect_head, params.force).as_bytes()
+            {
+                return Ok((SubmitResult::Denied {
+                    reason: "submission ID is bound to another exact edit".into(),
+                }, None));
+            }
+            return Ok((if receipt.committed {
+                SubmitResult::Accepted { position: 0 }
+            } else if let Some(position) = state.arbiter.active_position(&input.client_msg_id) {
+                SubmitResult::Accepted { position }
+            } else {
+                SubmitResult::Denied {
+                    reason: "the previous exact edit has no confirmed commit; reload the conversation before starting a new edit".into(),
+                }
+            }, None));
+        }
         match state.record.state {
             HostedState::Closed => {
                 return Ok((
@@ -1523,22 +2709,81 @@ impl HostConnection {
             }
             _ => {}
         }
+        if input.rewind_before.is_some() && state.parked {
+            return Ok((SubmitResult::Denied { reason: "an exact edit needs an idle session".into() }, None));
+        }
+        if state.ephemeral {
+            // Profile sessions are adopted before a submit reaches here.
+            return Err(HostError::NotFound);
+        }
+        // Plan §3.5: no turn without the session lease. Taken only when no
+        // host turn holds it already (running or parked).
+        let idle = !state.arbiter.is_running() && !state.parked;
+        let leased_now = idle && state.lease.is_none();
+        if idle && let Err(error) = self.host.ensure_lease(&params.session_id, &mut state) {
+            return match error {
+                // A minor-2 app maps BUSY onto a broken transport.
+                HostError::Busy(reason) if !self.has_projects() => {
+                    Ok((SubmitResult::Denied { reason }, None))
+                }
+                other => Err(other),
+            };
+        }
+        if input.rewind_before.is_some() && idle {
+            // A cached head is not a rewrite fence after an uncertain write.
+            match self.host.transcripts.head(&params.session_id) {
+                Ok(head) => state.durable_head = head,
+                Err(error) => {
+                    if leased_now {
+                        self.host.release_lease(&params.session_id, &mut state, false);
+                    }
+                    return Err(error);
+                }
+            }
+        }
         let head = Cursor {
             generation: state.record.generation,
             durable: state.durable_head,
             live: 0,
         };
-        let input = TurnInput {
-            session_id: params.session_id.clone(),
-            text: params.text,
-            client_msg_id: params.client_msg_id,
-            submitted_by: self.identity.label.clone(),
-            actor: self.identity.actor.clone(),
-            origin: self.identity.connection,
+        let SlotState { arbiter, record, .. } = &mut *state;
+        let result = arbiter.submit_reserved(input, params.expect_head, params.force, head, |input, fingerprint| {
+            if input.rewind_before.is_none() {
+                return Ok(());
+            }
+            const RECEIPT_WINDOW: usize = 64;
+            if record.exact_rewrites.len() >= RECEIPT_WINDOW {
+                // Never evict a reservation at the same revision: an uncertain
+                // old packet must not be able to rewrite this boundary again.
+                let old = record.exact_rewrites.iter().position(|receipt| {
+                    receipt.original_generation != head.generation
+                        || receipt.original_durable < head.durable
+                }).ok_or_else(|| HostError::Busy("too many unresolved edits at this revision".into()))?;
+                record.exact_rewrites.remove(old);
+            }
+            record.exact_rewrites.push(crate::record::ExactRewriteReceipt {
+                id: input.client_msg_id.clone(),
+                principal: self.identity.principal.id().to_owned(),
+                binding: crate::record::CreatorExecutionBinding::from_identity(&self.identity),
+                fingerprint: *fingerprint.as_bytes(),
+                original_generation: head.generation,
+                original_durable: head.durable,
+                committed: false,
+            });
+            // Reserve before queueing. Uncertain writes intentionally keep the
+            // reservation locally and do not queue; only a later explicit new
+            // request with a new ID and a freshly examined boundary can run.
+            self.host.records.save(record)
+        });
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if leased_now {
+                    self.host.release_lease(&params.session_id, &mut state, false);
+                }
+                return Err(error);
+            }
         };
-        let result = state
-            .arbiter
-            .submit(input, params.expect_head, params.force, head);
         let run = matches!(result, SubmitResult::Accepted { .. })
             && !state.arbiter.is_running()
             && !state.parked;
@@ -1550,6 +2795,11 @@ impl HostConnection {
                 state.set_state(HostedState::Queued { depth });
             }
         }
+        if leased_now && !run && !state.arbiter.is_running() && !state.parked {
+            // Nothing will run (stale, queue full, duplicate): give it back.
+            self.host
+                .release_lease(&params.session_id, &mut state, false);
+        }
         drop(state);
         Ok((result, run.then_some(slot)))
     }
@@ -1557,6 +2807,20 @@ impl HostConnection {
     fn interrupt_sync(&self, params: &InterruptParams) -> Result<(), HostError> {
         let slot = self.admitted_slot(&params.session_id, Need::Steer)?;
         let state = slot.lock()?;
+        if let Some(expected) = params.turn_id.as_ref() {
+            // Do not let a delayed mobile Stop hit a different turn in
+            // the same session. Hold the same slot lock as TurnStarted.
+            if state.ring.active_turn() != Some(expected) {
+                return Err(HostError::Denied("The displayed turn is no longer active".into()));
+            }
+            let cancel = state.cancel.as_ref().ok_or_else(|| {
+                HostError::Denied("The displayed turn cannot currently be interrupted".into())
+            })?;
+            return cancel.send(true).map_err(|_| {
+                HostError::Denied("The displayed turn has already finished".into())
+            });
+        }
+        // Older session-wide callers retain the legacy semantics.
         if let Some(cancel) = &state.cancel {
             let _ = cancel.send(true);
         }
@@ -1582,6 +2846,12 @@ impl HostConnection {
         let owner = state.record.owner_principal == self.identity.principal.id();
         let need = if owner { Need::Steer } else { Need::Control };
         admit(&self.identity, granted, state.record.tenant.as_ref(), need)?;
+        if state.ephemeral {
+            // A TUI session read through the share is not the host's to close.
+            return Err(HostError::Denied(
+                "profile session is not hosted; nothing to close".into(),
+            ));
+        }
         state.arbiter.clear();
         if let Some(cancel) = &state.cancel {
             let _ = cancel.send(true);
@@ -1688,6 +2958,803 @@ impl HostConnection {
             self.apply_settings_now(&id).await?;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Profile sharing: projects, pages, adoption (contract K-W1 §8.3)
+// ---------------------------------------------------------------------------
+
+/// Page size after clamping (`None | 0` -> default, upper bound).
+fn page_limit(limit: Option<u32>) -> usize {
+    let limit = limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .min(MAX_PAGE_LIMIT);
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+/// Why a hosted row cannot be continued (`None`: it can).
+fn hosted_reason(granted: ClientCaps, state: &HostedState) -> Option<ReadOnlyReason> {
+    if !granted.steer {
+        Some(ReadOnlyReason::NoSteer)
+    } else if *state == HostedState::Closed {
+        Some(ReadOnlyReason::Closed)
+    } else {
+        None
+    }
+}
+
+impl HostConnection {
+    /// The share for a steering method: mode `continue`, else the matching
+    /// refusal (`read`: read-only, `off`/no profile: not shared).
+    fn share_for_change(&self) -> Result<&ProfileShare, HostError> {
+        match self.host.profile.as_ref() {
+            Some(share) if share.settings.mode == ShareMode::Continue => Ok(share),
+            Some(share) if share.settings.mode == ShareMode::Read => {
+                Err(HostError::Denied(DENIED_READ_ONLY.into()))
+            }
+            _ => Err(HostError::Denied(DENIED_NOT_SHARED.into())),
+        }
+    }
+
+    /// The share for a steering method on a profile session: mode, `steer`,
+    /// then tenant (a foreign tenant reads as `NotFound`).
+    fn steering_share(&self) -> Result<&ProfileShare, HostError> {
+        let granted = self.granted()?;
+        let share = self.share_for_change()?;
+        Need::Steer.require(granted)?;
+        if !tenant_admits(self.identity.tenant.as_ref(), Some(&share.settings.tenant)) {
+            return Err(HostError::NotFound);
+        }
+        Ok(share)
+    }
+
+    /// True when `turn.submit` on `id` must adopt the profile session first.
+    fn needs_adoption(&self, id: &SessionId) -> Result<bool, HostError> {
+        if self.host.share().is_none() {
+            return Ok(false);
+        }
+        if let Some(slot) = self.host.loaded_slot(id) {
+            return Ok(slot.lock()?.ephemeral);
+        }
+        Ok(self.host.records.load(id)?.is_none())
+    }
+
+    /// Adoption, synchronous part (plan §3.2 step 6): the hosted record of a
+    /// continuable profile session, created at most once (`O_EXCL`; a second
+    /// device gets the first device's record).
+    fn adopt_sync(&self, id: &SessionId) -> Result<HostedSessionRecord, HostError> {
+        let granted = self.granted()?;
+        let share = self.steering_share()?;
+        if let Some(record) = self.host.records.load(id)? {
+            admit(&self.identity, granted, record.tenant.as_ref(), Need::Steer)?;
+            return Ok(record);
+        }
+        let row = share.index.row(id)?.ok_or(HostError::NotFound)?;
+        if !row.origin.is_continuable() {
+            return Err(HostError::Denied(DENIED_FOREIGN_ORIGIN.into()));
+        }
+        if share.index.workdir(id)?.is_none() {
+            return Err(HostError::Denied(DENIED_NO_WORKDIR.into()));
+        }
+        let record = self.new_record(
+            id.clone(),
+            Some(&row.title),
+            None,
+            self.record_tenant(),
+        );
+        match self.host.records.create_if_absent(&record)? {
+            CreateOutcome::Created => {
+                tracing::info!(session = %id.as_str(), "session host: profile session adopted");
+                Ok(record)
+            }
+            CreateOutcome::Existing(existing) => {
+                admit(
+                    &self.identity,
+                    granted,
+                    existing.tenant.as_ref(),
+                    Need::Steer,
+                )?;
+                Ok(*existing)
+            }
+        }
+    }
+
+    /// Adoption: record, fresh creator admission, `last_origin`, slot. No
+    /// `create_session`: the transcript exists.
+    async fn adopt_inner(&self, id: &SessionId) -> Result<Arc<Slot>, HostError> {
+        self.steering_share()?;
+        if let Some(slot) = self.host.loaded_slot(id) {
+            let (ephemeral, tenant) = {
+                let state = slot.lock()?;
+                (state.ephemeral, state.record.tenant.clone())
+            };
+            if !ephemeral {
+                // Already hosted: adoption is idempotent.
+                admit(
+                    &self.identity,
+                    self.granted()?,
+                    tenant.as_ref(),
+                    Need::Steer,
+                )?;
+                return Ok(slot);
+            }
+        }
+        let record = self.adopt_sync(id)?;
+        if let Some(admission) = self.host.execution_admission(&record)? {
+            self.host.driver.prepare_execution(id, admission).await?;
+        }
+        if let Some(share) = self.host.share()
+            && let Err(error) = meta::update(share.index.sessions_root(), id, |meta| {
+                meta.last_origin = Some(LastOrigin::Gateway);
+            })
+        {
+            tracing::warn!(%error, session = %id.as_str(), "session host: adoption meta not updated");
+        }
+        self.host.publish_record(record)
+    }
+
+    fn projects_sync(&self, params: &ProjectsParams) -> Result<ProjectsResult, HostError> {
+        let granted = self.granted()?;
+        Need::Observe.require(granted)?;
+        let device_tier = self.identity.principal.tier();
+        let caller = self.identity.tenant.as_ref();
+        let Some(share) = self.host.share_for(caller) else {
+            let tier = self.host.profile.as_ref().map_or(device_tier, |share| {
+                device_tier.min(share.settings.listener_tier)
+            });
+            return Ok(ProjectsResult {
+                projects: Vec::new(),
+                next_cursor: None,
+                share: ShareInfo {
+                    mode: ShareMode::Off,
+                    tier,
+                },
+            });
+        };
+        let page = share.index.projects(params)?;
+        let active = self.host.active_by_project(share, caller);
+        let projects = page
+            .projects
+            .into_iter()
+            .map(|mut project| {
+                let running = active.get(&project.project_key).copied().unwrap_or(0);
+                project.active_count = project.active_count.saturating_add(running);
+                project
+            })
+            .collect();
+        Ok(ProjectsResult {
+            projects,
+            next_cursor: page.next_cursor,
+            share: ShareInfo {
+                mode: share.settings.mode,
+                tier: device_tier.min(share.settings.listener_tier),
+            },
+        })
+    }
+
+    fn page_sync(&self, params: &PageParams) -> Result<PageResult, HostError> {
+        let granted = self.granted()?;
+        Need::Observe.require(granted)?;
+        let selection = crate::index::ProfileSessionSelection::from_page(params)?;
+        if params.include_system && !self.system_session_rows.load(Ordering::SeqCst) {
+            return Err(HostError::Denied("System session metadata is not available".into()));
+        }
+        if params.include_dreams && !self.dream_session_rows.load(Ordering::SeqCst) {
+            return Err(HostError::Denied("Dream session metadata is not available".into()));
+        }
+        match self.host.share_for(self.identity.tenant.as_ref()) {
+            Some(share) => {
+                let page = share.index.page(params)?;
+                let sessions = page
+                    .rows
+                    .into_iter()
+                    .filter(|row| selection.allows(row))
+                    .map(|row| self.profile_row(share, granted, row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PageResult {
+                    sessions,
+                    next_cursor: page.next_cursor,
+                })
+            }
+            None => self.record_page(granted, params),
+        }
+    }
+
+    /// One `session.page` row of a profile session (hosted when a record
+    /// exists; state, attachments and model then come from the host).
+    fn profile_row(
+        &self,
+        share: &ProfileShare,
+        granted: ClientCaps,
+        row: ProfileRow,
+    ) -> Result<SessionRow, HostError> {
+        if let Some(category) = row.system_category() {
+            // Never inspect the runtime, transcript, or holder of an internal session.
+            return Ok(SessionRow {
+                session_id: row.session_id,
+                title: Some(category.label().to_owned()),
+                project_key: None,
+                updated_at: row.updated_at,
+                turns: None,
+                state: HostedState::Closed,
+                attached: 0,
+                model: None,
+                origin: RowOrigin::Profile,
+                purpose: category.wire(),
+                continuable: false,
+                reason: Some(ReadOnlyReason::ForeignOrigin),
+                holder: None,
+                last_origin: None,
+                first_message: None,
+            });
+        }
+        let id = row.session_id.clone();
+        let (state, attached, model, hosted) = match self.host.loaded_slot(&id) {
+            Some(slot) => {
+                let slot_state = slot.lock()?;
+                let attached = slot_state
+                    .attachments
+                    .iter()
+                    .filter(|entry| !entry.queue.is_closed())
+                    .count();
+                let hosted = !slot_state.ephemeral;
+                (
+                    slot_state.record.state.clone(),
+                    count(attached),
+                    hosted.then(|| self.host.driver.model_name(&id)).flatten(),
+                    hosted,
+                )
+            }
+            None => match self.host.records.load(&id)? {
+                Some(record) => (record.state, 0, self.host.driver.model_name(&id), true),
+                None => (HostedState::Idle, 0, None, false),
+            },
+        };
+        let reason = if hosted {
+            hosted_reason(granted, &state)
+        } else if share.settings.mode != ShareMode::Continue {
+            Some(ReadOnlyReason::ShareReadOnly)
+        } else if !granted.steer {
+            Some(ReadOnlyReason::NoSteer)
+        } else if !row.origin.is_continuable() {
+            Some(ReadOnlyReason::ForeignOrigin)
+        } else if share.index.workdir(&id)?.is_none() {
+            Some(ReadOnlyReason::NoWorkdir)
+        } else if state == HostedState::Closed {
+            Some(ReadOnlyReason::Closed)
+        } else {
+            None
+        };
+        let holder = match peek_holder(share.index.sessions_root(), &id) {
+            Ok(holder) => holder.as_ref().map(wire_holder),
+            Err(error) => {
+                tracing::debug!(%error, session = %id.as_str(), "session host: lease peek failed");
+                None
+            }
+        };
+        Ok(SessionRow {
+            session_id: id,
+            title: row.stored_title,
+            project_key: row.project_key,
+            updated_at: row.updated_at,
+            turns: (row.turns > 0).then_some(row.turns),
+            state,
+            attached,
+            model,
+            origin: if hosted {
+                RowOrigin::Hosted
+            } else {
+                RowOrigin::Profile
+            },
+            purpose: SessionRowPurpose::Unknown,
+            continuable: reason.is_none(),
+            reason,
+            holder,
+            last_origin: row.last_origin.map(wire_last_origin),
+            first_message: row.first_message,
+        })
+    }
+
+    /// A `session.page` row of a hosted session without profile data.
+    fn hosted_row(granted: ClientCaps, summary: SessionSummary) -> SessionRow {
+        let reason = hosted_reason(granted, &summary.state);
+        SessionRow {
+            session_id: summary.session_id,
+            title: summary.title,
+            project_key: None,
+            updated_at: summary.updated_at,
+            turns: None,
+            state: summary.state,
+            attached: summary.attached,
+            model: summary.model,
+            origin: RowOrigin::Hosted,
+            purpose: SessionRowPurpose::Unknown,
+            continuable: reason.is_none(),
+            reason,
+            holder: None,
+            last_origin: None,
+            first_message: None,
+        }
+    }
+
+    /// `session.page` without sharing: the caller's records as rows, newest
+    /// first, paged with the opaque cursor.
+    fn record_page(
+        &self,
+        granted: ClientCaps,
+        params: &PageParams,
+    ) -> Result<PageResult, HostError> {
+        let after = match params.cursor.as_deref() {
+            None => None,
+            Some(cursor) => Some(
+                decode_cursor(cursor)
+                    .ok_or_else(|| HostError::Protocol("invalid cursor".into()))?,
+            ),
+        };
+        if params
+            .project_key
+            .as_deref()
+            .is_some_and(|key| key != NO_PROJECT_KEY)
+        {
+            // Records carry no project.
+            return Ok(PageResult {
+                sessions: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let query = params
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_lowercase);
+        let mut summaries: Vec<SessionSummary> = self
+            .summaries()?
+            .into_iter()
+            .filter(|summary| {
+                query.as_deref().is_none_or(|query| {
+                    summary
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.to_lowercase().contains(query))
+                })
+            })
+            .collect();
+        let sort_key = |summary: &SessionSummary| {
+            (
+                summary.updated_at.as_millisecond(),
+                summary.session_id.as_str().to_owned(),
+            )
+        };
+        summaries.sort_by_key(|summary| std::cmp::Reverse(sort_key(summary)));
+        if let Some((at, key)) = after {
+            let bound = (at.as_millisecond(), key);
+            summaries.retain(|summary| sort_key(summary) < bound);
+        }
+        let limit = page_limit(params.limit);
+        let next_cursor = (summaries.len() > limit)
+            .then(|| summaries.get(limit - 1))
+            .flatten()
+            .map(|last| encode_cursor(last.updated_at, last.session_id.as_str()));
+        summaries.truncate(limit);
+        Ok(PageResult {
+            sessions: summaries
+                .into_iter()
+                .map(|summary| Self::hosted_row(granted, summary))
+                .collect(),
+            next_cursor,
+        })
+    }
+
+    /// The updated row after a profile mutation.
+    fn row_for(&self, share: &ProfileShare, id: &SessionId) -> Result<SessionRow, HostError> {
+        let granted = self.granted()?;
+        if let Some(row) = share.index.row(id)? {
+            return self.profile_row(share, granted, row);
+        }
+        let slot = self.host.slot(id)?;
+        let summary = self.host.summary(&*slot.lock()?);
+        Ok(Self::hosted_row(granted, summary))
+    }
+
+    /// Steering admission of a profile mutation on `id`: the session is a
+    /// visible profile session or a hosted one of the caller's tenant.
+    fn profile_target(&self, id: &SessionId) -> Result<&ProfileShare, HostError> {
+        let share = self.steering_share()?;
+        if share.index.row(id)?.is_some() {
+            return Ok(share);
+        }
+        match self.host.records.load(id)? {
+            Some(record)
+                if tenant_admits(self.identity.tenant.as_ref(), record.tenant.as_ref()) =>
+            {
+                Ok(share)
+            }
+            _ => Err(HostError::NotFound),
+        }
+    }
+
+    fn check_displayed_fork_attachment(&self, state: &SlotState) -> Result<(), HostError> {
+        self.granted()?;
+        if self.identity.agent.is_some() || self.host.is_draining()
+            || state.record.tenant != self.identity.tenant
+            || !state.attachments.iter().any(|attachment|
+                attachment.connection == self.identity.connection && !attachment.queue.is_closed())
+        {
+            return Err(HostError::Denied("This chat is not attached to the current profile".into()));
+        }
+        Ok(())
+    }
+
+    fn check_displayed_fork_source(&self, slot: &Slot, head: Cursor) -> Result<(), HostError> {
+        let state = slot.lock()?;
+        self.check_displayed_fork_attachment(&state)?;
+        if state.record.generation != head.generation || state.durable_head != head.durable
+            || !matches!(state.record.state, HostedState::Idle | HostedState::Interrupted)
+        {
+            return Err(HostError::Busy("Displayed chat changed or is still running; refresh it and try Fork again".into()));
+        }
+        Ok(())
+    }
+
+    async fn prepare_displayed_fork(
+        &self, fork: &harw_protocol::session_wire::ForkFrom,
+    ) -> Result<(Vec<harw_protocol::items::TurnItem>, Option<ResolvedProject>, std::path::PathBuf), HostError> {
+        use harw_protocol::items::{ContentPart, TurnItem};
+        use harw_protocol::session_wire::DISPLAYED_FORK_MAX_ROWS;
+        let picked = fork.displayed.as_ref().ok_or_else(|| HostError::Protocol("missing displayed fork".into()))?;
+        if !(1..=DISPLAYED_FORK_MAX_ROWS).contains(&picked.rows.len()) || picked.head.durable == 0
+            || picked.rows.last().is_none_or(|row| row.item_id != fork.before_item)
+            || picked.rows.iter().any(|row| row.item_id.is_empty() || row.item_id.len() > 128
+                || !row.item_id.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err(HostError::Denied("The entire displayed fork selection is unavailable".into()));
+        }
+        let share = self.profile_target(&fork.session_id)?;
+        let slot = self.observed_slot(&fork.session_id)?;
+        self.check_displayed_fork_source(&slot, picked.head)?;
+        let binding = self.host.driver.archive_journal_binding(&fork.session_id)?;
+        let root = std::fs::canonicalize(&binding.root)?;
+        if root != std::fs::canonicalize(share.index.sessions_root())? {
+            return Err(HostError::Denied("The displayed chat belongs to a different profile".into()));
+        }
+        let project = match meta::load(&root, &fork.session_id)? {
+            Some(source) if source.project_key.is_some() => {
+                let key = source.project_key.filter(|key| !key.is_empty()).ok_or(HostError::NotFound)?;
+                let workdir = share.index.workdir(&fork.session_id)?.ok_or(HostError::NotFound)?;
+                if source.project_root.as_deref() != Some(workdir.as_path()) {
+                    return Err(HostError::Denied("The displayed chat project could not be verified".into()));
+                }
+                Some(ResolvedProject { project_key: key.clone(), project_root: workdir, label: key })
+            }
+            _ => None,
+        };
+        let source = fork.session_id.clone();
+        let selection = picked.clone();
+        let source_root = root.clone();
+        let driver = Arc::clone(&self.host.driver);
+        let items = tokio::task::spawn_blocking(move || {
+            // Do not pull a newer/uncommitted transcript after the user tapped. Tie
+            // the read to the exact source store and the same canonical cursor.
+            let _lease = if let Some(lease) = SessionLease::held_here(&source_root, &source) {
+                lease
+            } else {
+                SessionLease::acquire(&source_root, &source, HolderKind::Gateway)?
+            };
+            let reader = crate::replay::StoreTranscripts::new(TranscriptStore::new(&source_root));
+            let items = reader.displayed_fork_prefix(&source, &selection, &binding.thread)?;
+            let mut seen = std::collections::HashSet::new();
+            let mut media_bytes = 0u64;
+            for item in &items {
+                if let TurnItem::UserMessage(message) = item {
+                    for part in &message.content {
+                        let ContentPart::Media { media, .. } = part else { continue; };
+                        if seen.insert(media.clone()) {
+                            media_bytes = media_bytes.saturating_add(media.bytes());
+                            let store = driver.archive_media_store()
+                                .ok_or_else(|| HostError::Denied("Displayed attachments are not available in this profile".into()))?;
+                            if seen.len() > 128 || media_bytes > 128 * 1024 * 1024
+                                || media.bytes() > store.limits().max_bytes || !store.contains(media)
+                            {
+                                return Err(HostError::Denied("An attachment in the displayed chat is missing or exceeds the fork limit; nothing was copied".into()));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok::<_, HostError>(items)
+        }).await.map_err(|_| HostError::Storage("Displayed fork source reader stopped".into()))??;
+        self.profile_target(&fork.session_id)?;
+        self.check_displayed_fork_source(&slot, picked.head)?;
+        Ok((items, project, root))
+    }
+
+    /// Publish only the supplied fresh destination. Displayed callers reserve
+    /// their exact target before this function can create or write anything.
+    async fn create_prepared(
+        &self,
+        params: CreateParams,
+        destination: SessionId,
+        displayed: Option<(Vec<harw_protocol::items::TurnItem>, Option<ResolvedProject>, std::path::PathBuf)>,
+    ) -> Result<SessionSummary, HostError> {
+        let record = self.create_sync(&params, destination)?;
+        #[cfg(feature = "owner-creation-receipts")]
+        let creation_authority = self.host.owner_creation.get().filter(|_| {
+            displayed.is_none() && record.fresh_human_origin && record.generation == 0
+                && self.identity.zone == harw_types::TrustZone::Remote
+                && self.identity.strength == harw_types::AuthStrength::MutualTls
+                && self.identity.device.is_some() && self.identity.authenticated_node.is_some()
+                && self.identity.authenticated_key_fingerprint.is_some_and(|key| key != [0; 32])
+                && record.tenant.is_some()
+        });
+        #[cfg(feature = "owner-creation-receipts")]
+        let _creator_gate = if let Some(authority) = creation_authority {
+            let gate = authority.gate.try_lock()
+                .map_err(|_| HostError::Busy("isolated writer is publishing a record".into()))?;
+            authority.check_live()?;
+            self.host.records.require_absent(&record.session_id)?;
+            if self.host.loaded_slot(&record.session_id).is_some() || self.host.is_draining() {
+                return Err(HostError::Denied("isolated writer cannot publish this record".into()));
+            }
+            Some(gate)
+        } else {
+            None
+        };
+        #[cfg(feature = "owner-creation-receipts")]
+        let creation_guarded = creation_authority.is_some();
+        #[cfg(not(feature = "owner-creation-receipts"))]
+        let creation_guarded = false;
+        let mut publication = UnpublishedCreation {
+            host: &self.host,
+            session_id: record.session_id.clone(),
+            armed: true,
+            remove_record: !creation_guarded,
+        };
+        if let Some(admission) = self.host.execution_admission(&record)? {
+            self.host
+                .driver
+                .prepare_execution(&record.session_id, admission)
+                .await?;
+        }
+        if let Some((_, project, root)) = &displayed {
+            let target = self.host.driver.archive_journal_binding(&record.session_id)?;
+            if std::fs::canonicalize(&target.root)? != *root {
+                return Err(HostError::Denied("Fork destination is outside the source profile".into()));
+            }
+            if let Some(project) = project {
+                meta::update(root, &record.session_id, |meta| {
+                    meta.cwd = Some(project.project_root.clone());
+                    meta.project_root = Some(project.project_root.clone());
+                    meta.project_key = Some(project.project_key.clone());
+                    meta.last_origin = Some(LastOrigin::Gateway);
+                })?;
+            }
+        }
+        self.host
+            .driver
+            .create_session(&record.session_id, record.title.as_deref())
+            .await?;
+        let head = match (displayed, &params.fork_from) {
+            (Some((items, _, _)), Some(fork)) => {
+                let source = self.observed_slot(&fork.session_id)?;
+                let head = fork.displayed.as_ref().ok_or_else(|| HostError::Protocol("missing displayed fork".into()))?.head;
+                self.check_displayed_fork_source(&source, head)?;
+                self.host.driver.seed_fork_history(&record.session_id, items).await?
+            }
+            (None, Some(fork)) => self.fork_into(&record.session_id, fork).await?,
+            (None, None) => 0,
+            (Some(_), None) => return Err(HostError::Protocol("missing fork source".into())),
+        };
+        self.initialize_title_source(&record);
+        if creation_guarded {
+            #[cfg(feature = "owner-creation-receipts")]
+            if let Some(authority) = creation_authority {
+                authority.check_live()?;
+                self.granted()?;
+                if self.host.is_draining() {
+                    return Err(HostError::Denied("isolated writer is draining".into()));
+                }
+                // No existing or uncertain record is removed in rollback.
+                if !matches!(self.host.records.create_if_absent(&record)?, CreateOutcome::Created) {
+                    return Err(HostError::Denied("isolated writer record already exists".into()));
+                }
+                publication.remove_record = true;
+            }
+        } else {
+            self.host.records.save(&record)?;
+        }
+        let slot = self.host.insert_slot(record, head)?;
+        let state = slot.lock()?;
+        let summary = self.host.summary(&state);
+        publication.armed = false;
+        #[cfg(feature = "owner-creation-receipts")]
+        if let Some(authority) = creation_authority
+            && !self.host.is_draining() && self.granted().is_ok()
+        {
+            // Complete the ordinary create regardless of sidecar availability.
+            // Returning an error now could cause a duplicate user-visible create.
+            let _ = authority.persist_committed(&self.host.records, &state.record, self.host.epoch);
+        }
+        Ok(summary)
+    }
+
+    /// Fork: the caller must be able to see the source session (same rule as steering it).
+    async fn fork_into(
+        &self,
+        new: &SessionId,
+        fork: &harw_protocol::session_wire::ForkFrom,
+    ) -> Result<u64, HostError> {
+        if fork.before_item.is_empty()
+            || fork.before_item.len() > 128
+            || !fork.before_item.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(HostError::Denied("invalid fork target".into()));
+        }
+        self.profile_target(&fork.session_id)?;
+        let source_slot = self.observed_slot(&fork.session_id)?;
+        let generation = source_slot.lock()?.record.generation;
+        // SlotState::durable_head is a replay cache. It may not advance
+        // until an inference leg finishes, even after a user item is fsynced.
+        let committed_head = self
+            .host
+            .driver
+            .committed_fork_head(new, &fork.session_id)
+            .await?
+            .ok_or_else(|| {
+                HostError::Denied("fork source has no verified completed write in this host".into())
+            })?;
+        let source = fork.session_id.clone();
+        let before = fork.before_item.clone();
+        let transcripts = Arc::clone(&self.host.transcripts);
+        let items = tokio::task::spawn_blocking(move || {
+            transcripts.fork_prefix(&source, &before, committed_head)
+        })
+        .await
+        .map_err(|_| HostError::Storage("fork snapshot reader stopped".into()))??;
+        // Re-authorize and fence identity before persisting any of the
+        // source's contents. Only the new slot can be materialized by the driver.
+        if self
+            .host
+            .driver
+            .committed_fork_head(new, &fork.session_id)
+            .await?
+            != Some(committed_head)
+        {
+            return Err(HostError::Busy(
+                "fork source journal has changed; try again".into(),
+            ));
+        }
+        self.profile_target(&fork.session_id)?;
+        let current = self.observed_slot(&fork.session_id)?;
+        if !Arc::ptr_eq(&source_slot, &current) || current.lock()?.record.generation != generation {
+            return Err(HostError::Denied("fork source generation changed".into()));
+        }
+        self.host.driver.seed_fork_history(new, items).await
+    }
+
+    async fn create_in_inner(&self, params: CreateInParams) -> Result<SessionSummary, HostError> {
+        let share = self.steering_share()?;
+        let project = share
+            .index
+            .resolve_project(&params.project_key)?
+            .ok_or_else(|| HostError::Denied(DENIED_UNKNOWN_PROJECT.into()))?;
+        let mut record = self.new_record(
+            SessionId::new(),
+            params.title.as_deref(),
+            None,
+            self.record_tenant(),
+        );
+        record.fresh_human_origin = self.identity.agent.is_none();
+        let mut publication = UnpublishedCreation {
+            host: &self.host,
+            session_id: record.session_id.clone(),
+            armed: true,
+            remove_record: true,
+        };
+        if let Some(admission) = self.host.execution_admission(&record)? {
+            self.host
+                .driver
+                .prepare_execution(&record.session_id, admission)
+                .await?;
+        }
+        // The project goes into the meta before the driver writes anything,
+        // so the TUI and the index see the session in its project.
+        meta::update(share.index.sessions_root(), &record.session_id, |meta| {
+            meta.cwd = Some(project.project_root.clone());
+            meta.project_root = Some(project.project_root.clone());
+            meta.project_key = Some(project.project_key.clone());
+            meta.last_origin = Some(LastOrigin::Gateway);
+        })?;
+        self.host
+            .driver
+            .create_session(&record.session_id, record.title.as_deref())
+            .await?;
+        self.initialize_title_source(&record);
+        self.host.records.save(&record)?;
+        let slot = self.host.insert_slot(record, 0)?;
+        let summary = self.host.summary(&*slot.lock()?);
+        publication.armed = false;
+        Ok(summary)
+    }
+
+    fn set_project_sync(&self, params: &SetProjectParams) -> Result<SessionRow, HostError> {
+        let id = &params.session_id;
+        let share = self.profile_target(id)?;
+        let root = share.index.sessions_root();
+        if params.project_key == NO_PROJECT_KEY {
+            // "Ohne Projekt": drop the assignment, keep the working directory.
+            meta::update(root, id, |meta| {
+                meta.project_root = None;
+                meta.project_key = None;
+            })?;
+        } else {
+            let project = share
+                .index
+                .resolve_project(&params.project_key)?
+                .ok_or_else(|| HostError::Denied(DENIED_UNKNOWN_PROJECT.into()))?;
+            meta::set_project(
+                root,
+                id,
+                Some(project.project_root.as_path()),
+                Some(project.project_root.as_path()),
+                Some(project.project_key.as_str()),
+            )?;
+        }
+        self.row_for(share, id)
+    }
+
+    fn set_existing_project_sync(&self, params: &SetProjectParams) -> Result<(), HostError> {
+        if !self.existing_project_assignment.load(Ordering::SeqCst) || self.host.is_draining() {
+            return Err(HostError::Denied("Existing project assignment unavailable".into()));
+        }
+        if params.project_key.is_empty() || params.project_key.len() > 128 {
+            return Err(HostError::Denied(DENIED_UNKNOWN_PROJECT.into()));
+        }
+        let share = self.profile_target(&params.session_id)?;
+        let project = share.index.resolve_existing_project(&params.project_key)?
+            .ok_or_else(|| HostError::Denied(DENIED_UNKNOWN_PROJECT.into()))?;
+        self.granted()?;
+        if self.host.is_draining() {
+            return Err(HostError::Denied("Existing project assignment unavailable".into()));
+        }
+        meta::set_project(
+            share.index.sessions_root(),
+            &params.session_id,
+            Some(project.project_root.as_path()),
+            Some(project.project_root.as_path()),
+            Some(project.project_key.as_str()),
+        )?;
+        Ok(())
+    }
+
+    fn rename_sync(&self, params: &RenameParams) -> Result<SessionRow, HostError> {
+        let id = &params.session_id;
+        let title = params.title.trim();
+        if title.is_empty() {
+            return Err(HostError::Protocol("empty title".into()));
+        }
+        let share = self.profile_target(id)?;
+        meta::set_title(share.index.sessions_root(), id, title, TitleSource::Manual)?;
+        let slot = match self.host.loaded_slot(id) {
+            Some(slot) => Some(slot),
+            None if self.host.records.load(id)?.is_some() => Some(self.host.slot(id)?),
+            None => None,
+        };
+        if let Some(slot) = slot {
+            let mut state = slot.lock()?;
+            state.record.title = Some(title.chars().take(200).collect());
+            self.host.save(&mut state);
+        }
+        self.row_for(share, id)
+    }
+
+    fn archive_sync(&self, params: &ArchiveParams) -> Result<SessionRow, HostError> {
+        let id = &params.session_id;
+        let share = self.profile_target(id)?;
+        meta::set_archived(share.index.sessions_root(), id, params.archived)?;
+        self.row_for(share, id)
     }
 }
 
@@ -2019,6 +4086,404 @@ impl HostConnection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Minor 4: `manage` / `stepup` admission (contract K-W3c §8.2)
+// ---------------------------------------------------------------------------
+
+/// The negotiated feature a minor-4 method needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManageFeature {
+    /// `commands.list`, `command.run`, `catalog.get`, `config.get`.
+    Manage,
+    /// `config.set|reset`, `secret.put`, `stepup.confirm|cancel`.
+    Stepup,
+}
+
+/// Caps of the step-up confirmed global writes (K-W3b 7.4, R8).
+const NEED_CONTROL_APPROVE: &[Need] = &[Need::Control, Need::Approve];
+/// Caps of the read-only manage methods and `stepup.cancel`.
+const NEED_OBSERVE: &[Need] = &[Need::Observe];
+/// Caps of the mutating `overview` methods.
+const NEED_STEER: &[Need] = &[Need::Steer];
+
+/// Why the attached images of a `turn.submit` are refused, `None` when fine.
+fn refuse_images(images: &[harw_protocol::session_wire::SubmitImage]) -> Option<String> {
+    use harw_protocol::session_wire::{MAX_SUBMIT_IMAGE_B64_BYTES, MAX_SUBMIT_IMAGES};
+    if images.is_empty() {
+        return None;
+    }
+    if images.len() > MAX_SUBMIT_IMAGES {
+        return Some(format!("at most {MAX_SUBMIT_IMAGES} images per message"));
+    }
+    let mut total = 0usize;
+    for image in images {
+        if !matches!(
+            image.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            return Some("unsupported image type".into());
+        }
+        if image.data_b64.is_empty() {
+            return Some("empty image".into());
+        }
+        total = total.saturating_add(image.data_b64.len());
+    }
+    (total > MAX_SUBMIT_IMAGE_B64_BYTES).then(|| "images too large".to_owned())
+}
+
+/// A refused `command.run` answer with a gateway refusal code.
+fn refused_run(code: &str, text: &str) -> CommandRunResult {
+    CommandRunResult {
+        ok: false,
+        text: text.to_owned(),
+        data: None,
+        effect: CommandEffect::Refused,
+        reason_code: Some(code.to_owned()),
+        stepup: None,
+    }
+}
+
+impl HostConnection {
+    /// Admission steps 1-5 and 7 of contract K-W3c §8.2 (first failure
+    /// wins): hello, negotiated feature, installed ops, profile tenant,
+    /// caps. Returns the backend and the host-built caller. Logs only the
+    /// method and the connection, never parameters.
+    fn manage_admit(
+        &self,
+        method: &'static str,
+        feature: ManageFeature,
+        needs: &[Need],
+    ) -> Result<(&Arc<dyn OpsPort>, OpsCaller), HostError> {
+        let granted = self.granted()?;
+        tracing::debug!(
+            method,
+            connection = self.identity.connection.0,
+            "manage call"
+        );
+        match feature {
+            ManageFeature::Manage if !self.manage.load(Ordering::SeqCst) => {
+                return Err(HostError::Denied("feature `manage` not negotiated".into()));
+            }
+            ManageFeature::Stepup if !self.stepup.load(Ordering::SeqCst) => {
+                return Err(HostError::Denied("feature `stepup` not negotiated".into()));
+            }
+            ManageFeature::Manage | ManageFeature::Stepup => {}
+        }
+        let ops =
+            self.host.ops.get().ok_or_else(|| {
+                HostError::Denied("management not offered by this gateway".into())
+            })?;
+        let share = self.host.share();
+        if self.identity.tenant.is_some()
+            && self.host.share_for(self.identity.tenant.as_ref()).is_none()
+        {
+            return Err(HostError::Denied(
+                "management not offered for this tenant".into(),
+            ));
+        }
+        for need in needs {
+            need.require(granted)?;
+        }
+        Ok((ops, self.ops_caller(granted, share)))
+    }
+
+    /// Step 7: the caller the ops backend sees. Effective tier is the
+    /// granted tier capped by the listener tier of the profile share.
+    fn ops_caller(&self, granted: ClientCaps, share: Option<&ProfileShare>) -> OpsCaller {
+        let tier = tier_for_caps(granted);
+        OpsCaller {
+            identity: self.identity.clone(),
+            granted,
+            tier: share.map_or(tier, |share| tier.min(share.settings.listener_tier)),
+            profile_tenant: share.map(|share| share.settings.tenant.clone()),
+        }
+    }
+
+    /// Step 6: the referenced session after observe admission. A hosted
+    /// session needs its record's tenant to admit the caller; a profile
+    /// session must be visible to the caller's tenant (else `NotFound`).
+    fn ops_session(&self, id: Option<SessionId>) -> Result<Option<OpsSession>, HostError> {
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        // `observed_slot`: a hosted slot (record store) first, otherwise a
+        // read-only view of a visible profile session; then tenant + observe.
+        let slot = self.observed_slot(&id)?;
+        let hosted = !slot.lock()?.ephemeral;
+        let model = self.host.driver.model_name(&id);
+        Ok(Some(OpsSession {
+            session_id: id,
+            hosted,
+            model,
+        }))
+    }
+
+    /// Step 8: run the typed session way an `OpsRun::Session` asks for,
+    /// with the host's own admission (`steer` for interrupt, `control` for
+    /// settings). Success answers `result`; a host error is the answer.
+    async fn run_session_action(
+        &self,
+        session: Option<OpsSession>,
+        action: SessionAction,
+        result: CommandRunResult,
+    ) -> Result<CommandRunResult, HostError> {
+        let Some(session) = session else {
+            return Ok(refused_run(
+                refusal_codes::SESSION_REQUIRED,
+                TEXT_SESSION_REQUIRED,
+            ));
+        };
+        if !session.hosted {
+            return Ok(refused_run(
+                refusal_codes::SESSION_NOT_HOSTED,
+                TEXT_SESSION_NOT_HOSTED,
+            ));
+        }
+        let id = session.session_id;
+        match action {
+            SessionAction::Interrupt => self.interrupt_sync(&InterruptParams {
+                session_id: id,
+                turn_id: None,
+            })?,
+            SessionAction::SetModel(model) => self.set(id, Setting::Model(model)).await?,
+            SessionAction::SetMode(mode) => self.set(id, Setting::Mode(mode)).await?,
+            SessionAction::SetEffort(effort) => self.set(id, Setting::Effort(effort)).await?,
+        }
+        Ok(result)
+    }
+
+    /// Admission of the `overview` methods: hello, negotiated feature,
+    /// installed backend, profile tenant, caps. Returns the backend and the
+    /// tenant the job records are filtered by. Logs only the method.
+    fn overview_admit(
+        &self,
+        method: &'static str,
+        needs: &[Need],
+    ) -> Result<(&Arc<crate::overview::Overview>, Option<TenantId>), HostError> {
+        let granted = self.granted()?;
+        tracing::debug!(
+            method,
+            connection = self.identity.connection.0,
+            "overview call"
+        );
+        if !self.overview.load(Ordering::SeqCst) {
+            return Err(HostError::Denied("feature `overview` not negotiated".into()));
+        }
+        let overview = self
+            .host
+            .overview
+            .get()
+            .ok_or_else(|| HostError::Denied("overview not offered by this host".into()))?;
+        let share = self.host.share_for(self.identity.tenant.as_ref());
+        if self.identity.tenant.is_some() && share.is_none() {
+            return Err(HostError::Denied(
+                "overview not offered for this tenant".into(),
+            ));
+        }
+        for need in needs {
+            need.require(granted)?;
+        }
+        Ok((overview, self.identity.tenant.clone()))
+    }
+
+    async fn jobs_list_inner(&self, params: JobsListParams) -> Result<JobsListResult, HostError> {
+        let (overview, tenant) = self.overview_admit(METHOD_JOBS_LIST, NEED_OBSERVE)?;
+        overview.jobs_list(tenant.as_ref(), &params)
+    }
+
+    async fn jobs_get_inner(&self, params: JobTargetParams) -> Result<JobDetail, HostError> {
+        let (overview, tenant) = self.overview_admit(METHOD_JOBS_GET, NEED_OBSERVE)?;
+        overview.jobs_get(tenant.as_ref(), &params.work_id)
+    }
+
+    async fn jobs_cancel_inner(
+        &self,
+        params: JobTargetParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (overview, tenant) = self.overview_admit(METHOD_JOBS_CANCEL, NEED_STEER)?;
+        overview.jobs_cancel(tenant.as_ref(), &self.identity.actor, &params.work_id)
+    }
+
+    async fn jobs_retry_inner(
+        &self,
+        params: JobTargetParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (overview, tenant) = self.overview_admit(METHOD_JOBS_RETRY, NEED_STEER)?;
+        overview.jobs_retry(tenant.as_ref(), &self.identity.actor, &params.work_id)
+    }
+
+    async fn agents_list_inner(
+        &self,
+        _params: AgentsListParams,
+    ) -> Result<AgentsListResult, HostError> {
+        let (overview, _tenant) = self.overview_admit(METHOD_AGENTS_LIST, NEED_OBSERVE)?;
+        let can_stop = self.granted()?.steer;
+        let mut running = Vec::new();
+        for agent in self.host.driver.live_agents() {
+            let slot = self
+                .host
+                .slots
+                .lock()
+                .ok()
+                .and_then(|slots| slots.get(&agent.session_id).cloned());
+            let Some(slot) = slot else {
+                continue;
+            };
+            let tenant = slot.lock()?.record.tenant.clone();
+            if !crate::identity::tenant_admits(self.identity.tenant.as_ref(), tenant.as_ref()) {
+                continue;
+            }
+            running.push(harw_protocol::session_wire::RunningAgent {
+                agent_id: agent.agent_id,
+                session_id: agent.session_id,
+                parent: agent.parent,
+                role: agent.role,
+                model: agent.model,
+                state: agent.state,
+                current_tool: agent.current_tool,
+                started_ms: agent.started_ms,
+                tool_calls: agent.tool_calls,
+                can_stop,
+            });
+        }
+        Ok(AgentsListResult {
+            running,
+            library: overview.library(),
+        })
+    }
+
+    async fn agents_stop_inner(
+        &self,
+        params: AgentStopParams,
+    ) -> Result<CommandRunResult, HostError> {
+        self.overview_admit(METHOD_AGENTS_STOP, NEED_STEER)?;
+        // Session admission: tenant and `steer` on the owning session.
+        let _slot = self.admitted_slot(&params.session_id, Need::Steer)?;
+        if params.agent_id.is_empty() || params.agent_id.len() > 200 {
+            return Err(HostError::Protocol("invalid agent_id".into()));
+        }
+        let stopped = self
+            .host
+            .driver
+            .stop_agent(&params.session_id, &params.agent_id)
+            .await?;
+        Ok(if stopped {
+            CommandRunResult {
+                ok: true,
+                text: format!("Agent {} wird gestoppt.", params.agent_id),
+                data: None,
+                effect: CommandEffect::Applied,
+                reason_code: None,
+                stepup: None,
+            }
+        } else {
+            refused_run(
+                refusal_codes::OP_FAILED,
+                "Kein laufender Agent mit dieser Kennung.",
+            )
+        })
+    }
+
+    async fn commands_list_inner(
+        &self,
+        params: CommandsListParams,
+    ) -> Result<CommandsListResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_COMMANDS_LIST, ManageFeature::Manage, NEED_OBSERVE)?;
+        let session = self.ops_session(params.session_id.clone())?;
+        ops.commands_list(caller, session, params).await
+    }
+
+    async fn command_run_inner(
+        &self,
+        params: CommandRunParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_COMMAND_RUN, ManageFeature::Manage, NEED_OBSERVE)?;
+        let session = self.ops_session(params.session_id.clone())?;
+        match ops.command_run(caller, session.clone(), params).await? {
+            OpsRun::Done(result) => Ok(result),
+            OpsRun::Session { action, result } => {
+                self.run_session_action(session, action, result).await
+            }
+        }
+    }
+
+    async fn catalog_get_inner(
+        &self,
+        params: CatalogGetParams,
+    ) -> Result<CatalogResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_CATALOG_GET, ManageFeature::Manage, NEED_OBSERVE)?;
+        let session = self.ops_session(params.session_id.clone())?;
+        ops.catalog_get(caller, session, params).await
+    }
+
+    async fn config_get_inner(
+        &self,
+        params: ConfigGetParams,
+    ) -> Result<ConfigGetResult, HostError> {
+        let (ops, caller) =
+            self.manage_admit(METHOD_CONFIG_GET, ManageFeature::Manage, NEED_OBSERVE)?;
+        ops.config_get(caller, params).await
+    }
+
+    async fn config_set_inner(
+        &self,
+        params: ConfigSetParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) = self.manage_admit(
+            METHOD_CONFIG_SET,
+            ManageFeature::Stepup,
+            NEED_CONTROL_APPROVE,
+        )?;
+        ops.config_set(caller, params).await
+    }
+
+    async fn config_reset_inner(
+        &self,
+        params: ConfigResetParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) = self.manage_admit(
+            METHOD_CONFIG_RESET,
+            ManageFeature::Stepup,
+            NEED_CONTROL_APPROVE,
+        )?;
+        ops.config_reset(caller, params).await
+    }
+
+    async fn secret_put_inner(
+        &self,
+        params: SecretPutParams,
+    ) -> Result<SecretPutResult, HostError> {
+        let (ops, caller) = self.manage_admit(
+            METHOD_SECRET_PUT,
+            ManageFeature::Stepup,
+            NEED_CONTROL_APPROVE,
+        )?;
+        ops.secret_put(caller, params).await
+    }
+
+    async fn stepup_confirm_inner(
+        &self,
+        params: StepUpConfirmParams,
+    ) -> Result<CommandRunResult, HostError> {
+        let (ops, caller) = self.manage_admit(
+            METHOD_STEPUP_CONFIRM,
+            ManageFeature::Stepup,
+            NEED_CONTROL_APPROVE,
+        )?;
+        ops.stepup_confirm(caller, params).await
+    }
+
+    async fn stepup_cancel_inner(&self, params: StepUpCancelParams) -> Result<(), HostError> {
+        // Observe only: the registry cancels the caller's own step-ups only.
+        let (ops, caller) =
+            self.manage_admit(METHOD_STEPUP_CANCEL, ManageFeature::Stepup, NEED_OBSERVE)?;
+        ops.stepup_cancel(caller, params).await
+    }
+}
+
 fn count(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -2028,6 +4493,95 @@ fn port<T: Send + 'static>(result: Result<T, HostError>) -> PortFuture<'static, 
 }
 
 impl SessionPort for HostConnection {
+    fn manual_cloud_work(
+        &self, command: harw_protocol::session_wire::ManualCloudWorkCommandV1,
+    ) -> PortFuture<'_, harw_protocol::session_wire::ManualCloudWorkReplyV1> {
+        Box::pin(async move { self.run_manual_cloud_work(command).await.map_err(PortError::from) })
+    }
+
+    fn direct_owner_status(&self, session: SessionId) -> PortFuture<'_, harw_protocol::session_wire::OwnerObservationStatus> {
+        Box::pin(async move { self.direct_owner_status_for(&session).await.map_err(PortError::from) })
+    }
+
+    fn reserve_owner_observation(
+        &self,
+        session: SessionId,
+    ) -> PortFuture<'_, harw_protocol::owner_placement::OwnerObservationReservationReceipt> {
+        Box::pin(async move { self.reserve_direct_owner_observation(session).await.map_err(PortError::from) })
+    }
+
+    fn fenced_direct_owner_status(
+        &self,
+        selection: harw_protocol::owner_placement::FencedDirectOwnerStatus,
+    ) -> PortFuture<'_, harw_protocol::session_wire::OwnerObservationStatus> {
+        Box::pin(async move { self.fenced_direct_owner_status_for(selection).await.map_err(PortError::from) })
+    }
+
+    fn cloud_assistant_status(&self) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSnapshot> {
+        Box::pin(async move {
+            let (store, grant) = self.cloud_assistant_owner()?;
+            store.status(grant).await.map_err(PortError::from)
+        })
+    }
+
+    fn cloud_assistant_provision(&self) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSnapshot> {
+        Box::pin(async move {
+            let (store, grant) = self.cloud_assistant_owner()?;
+            store.provision(grant).await.map_err(PortError::from)
+        })
+    }
+
+    fn cloud_assistant_submit(&self, params: harw_protocol::session_wire::CloudAssistantSubmit) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSnapshot> {
+        Box::pin(async move {
+            let (store, grant) = self.cloud_assistant_owner()?;
+            store.submit(grant, params).await.map_err(PortError::from)
+        })
+    }
+
+    fn cloud_assistant_submit_with_recall(
+        &self, params: harw_protocol::session_wire::CloudAssistantRecallSubmit,
+    ) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSnapshot> {
+        Box::pin(async move {
+            let (store, grant) = self.cloud_assistant_owner()?;
+            if !self.cloud_assistant_recall.load(Ordering::SeqCst) {
+                return Err(HostError::Denied("Cloud Assistant recall not negotiated".into()).into());
+            }
+            store.submit_with_recall(grant, params).await.map_err(PortError::from)
+        })
+    }
+
+    fn cloud_assistant_shared(
+        &self, input: harw_protocol::session_wire::CloudAssistantSharedCommandV1,
+    ) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSharedSnapshotV1> {
+        Box::pin(async move {
+            let (store, device_grant) = self.cloud_assistant_owner()?;
+            if !self.cloud_assistant_shared.load(Ordering::SeqCst) {
+                return Err(HostError::Denied("Shared Cloud Assistant not negotiated".into()).into());
+            }
+            let member = self.authenticated_membership().await?
+                .ok_or_else(|| HostError::Denied("Shared Cloud Assistant requires current user membership".into()))?;
+            let resolver = self.host.user_memberships.get().cloned()
+                .ok_or_else(|| HostError::Denied("Current user membership unavailable".into()))?;
+            let identity = self.identity.clone();
+            let expected = member.clone();
+            let pending_resolver = resolver.clone();
+            let grant = store.shared_grant(device_grant, &member, move || {
+                match resolver.resolve_current(&identity)? {
+                    Some(current) if current == expected => Ok(()),
+                    _ => Err(HostError::Revoked),
+                }
+            }, move |pending| pending_resolver.binding_is_current(pending))?;
+            store.shared_command(grant, input).await.map_err(PortError::from)
+        })
+    }
+
+    fn cloud_assistant_revoke(&self) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSnapshot> {
+        Box::pin(async move {
+            let (store, grant) = self.cloud_assistant_owner()?;
+            store.revoke(grant).await.map_err(PortError::from)
+        })
+    }
+
     fn hello(&self, params: HelloParams) -> PortFuture<'_, HelloAck> {
         port(self.hello_sync(params))
     }
@@ -2037,32 +4591,13 @@ impl SessionPort for HostConnection {
     }
 
     fn create(&self, params: CreateParams) -> PortFuture<'_, SessionSummary> {
-        Box::pin(
-            async move {
-                let record = self.create_sync(&params)?;
-                let mut publication = UnpublishedCreation {
-                    host: &self.host,
-                    session_id: record.session_id.clone(),
-                    armed: true,
-                };
-                if let Some(admission) = self.host.execution_admission(&record)? {
-                    self.host
-                        .driver
-                        .prepare_execution(&record.session_id, admission)
-                        .await?;
-                }
-                self.host
-                    .driver
-                    .create_session(&record.session_id, record.title.as_deref())
-                    .await?;
-                self.host.records.save(&record)?;
-                let slot = self.host.insert_slot(record)?;
-                let summary = self.host.summary(&*slot.lock()?);
-                publication.armed = false;
-                Ok(summary)
+        Box::pin(async move {
+            if params.fork_from.as_ref().is_some_and(|source| source.displayed.is_some()) {
+                self.create_displayed_once(params).await
+            } else {
+                self.create_prepared(params, SessionId::new(), None).await
             }
-            .map_err_port(),
-        )
+        }.map_err_port())
     }
 
     fn attach(&self, params: AttachParams) -> PortFuture<'_, (AttachAck, Box<dyn FrameSource>)> {
@@ -2076,9 +4611,46 @@ impl SessionPort for HostConnection {
         port(self.detach_sync(&session))
     }
 
+    fn archive_checkpoint_issue(
+        &self,
+        params: ArchiveCheckpointIssueV1,
+    ) -> PortFuture<'_, ArchiveCheckpointInfoV1> {
+        Box::pin(async move { self.issue_checkpoint_wire(params).await.map_err(PortError::from) })
+    }
+
+    fn archive_checkpoint_describe(
+        &self,
+        params: ArchiveCheckpointDescribeV1,
+    ) -> PortFuture<'_, ArchiveCheckpointInfoV1> {
+        Box::pin(async move { self.describe_checkpoint_wire(params).await.map_err(PortError::from) })
+    }
+
+    fn archive_checkpoint_page(
+        &self, params: ArchiveCheckpointPageV1,
+    ) -> PortFuture<'_, ArchiveCheckpointRowsV1> {
+        Box::pin(async move { self.page_checkpoint_wire(params).await.map_err(PortError::from) })
+    }
+
+    fn archive_checkpoint_previous(
+        &self,
+        params: ArchiveCheckpointPreviousV1,
+    ) -> PortFuture<'_, Option<ArchiveRetainedRevisionV1>> {
+        Box::pin(async move { self.previous_checkpoint_wire(params).await.map_err(PortError::from) })
+    }
+
+    fn cloud_library(&self, input: CloudLibraryCommandV1) -> PortFuture<'_, CloudLibraryReplyV1> {
+        Box::pin(async move {
+            self.run_cloud_library(input).await.map_err(PortError::from)
+        })
+    }
+
+    fn fork_inclusive(&self, params: ForkInclusiveV1) -> PortFuture<'_, SessionSummary> {
+        Box::pin(async move { self.fork_inclusive_wire(params).await.map_err(PortError::from) })
+    }
+
     fn history(&self, params: HistoryParams) -> PortFuture<'_, Vec<FrameEnvelope>> {
         let result = (|| {
-            let slot = self.admitted_slot(&params.session_id, Need::Observe)?;
+            let slot = self.observed_slot(&params.session_id)?;
             let generation = slot.lock()?.record.generation;
             if params.before.generation != generation {
                 return Err(HostError::Protocol(
@@ -2098,13 +4670,25 @@ impl SessionPort for HostConnection {
     }
 
     fn submit(&self, params: SubmitParams) -> PortFuture<'_, SubmitResult> {
-        let result = self.submit_sync(params).map(|(result, run)| {
-            if let Some(slot) = run {
-                pump(Arc::clone(&self.host), slot);
+        Box::pin(
+            async move {
+                // A denied edit must not adopt or otherwise mutate a source.
+                if params.rewind_before.is_some() && !self.exact_rewind.load(Ordering::SeqCst) {
+                    return Ok(SubmitResult::Denied { reason: "exact retained prompt editing is not available on this host".into() });
+                }
+                // A profile session without a record is adopted first (same
+                // code as `session.adopt`).
+                if self.needs_adoption(&params.session_id)? {
+                    self.adopt_inner(&params.session_id).await?;
+                }
+                let (result, run) = self.submit_sync(params)?;
+                if let Some(slot) = run {
+                    pump(Arc::clone(&self.host), slot);
+                }
+                Ok(result)
             }
-            result
-        });
-        port(result)
+            .map_err_port(),
+        )
     }
 
     fn interrupt(&self, params: InterruptParams) -> PortFuture<'_, ()> {
@@ -2153,6 +4737,132 @@ impl SessionPort for HostConnection {
             self.set(params.session_id, Setting::Effort(params.effort))
                 .map_err_port(),
         )
+    }
+
+    fn projects(&self, params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
+        port(self.projects_sync(&params))
+    }
+
+    fn session_media_preview(
+        &self,
+        params: harw_protocol::session_wire::SessionMediaPreviewV1,
+    ) -> PortFuture<'_, harw_protocol::session_wire::SessionMediaPreviewReplyV1> {
+        Box::pin(async move { self.preview_session_media(params).await.map_err(PortError::from) })
+    }
+
+    fn media_get(&self, params: MediaGetParams) -> PortFuture<'_, MediaGetResult> {
+        Box::pin(async move { self.read_legacy_session_media(params).await.map_err(PortError::from) })
+    }
+
+    fn page(&self, params: PageParams) -> PortFuture<'_, PageResult> {
+        port(self.page_sync(&params))
+    }
+
+    fn adopt(&self, session: SessionId) -> PortFuture<'_, SessionSummary> {
+        Box::pin(
+            async move {
+                let slot = self.adopt_inner(&session).await?;
+                let summary = self.host.summary(&*slot.lock()?);
+                Ok(summary)
+            }
+            .map_err_port(),
+        )
+    }
+
+    fn create_in(&self, params: CreateInParams) -> PortFuture<'_, SessionSummary> {
+        Box::pin(self.create_in_inner(params).map_err_port())
+    }
+
+    fn set_project(&self, params: SetProjectParams) -> PortFuture<'_, SessionRow> {
+        port(self.set_project_sync(&params))
+    }
+
+    fn set_existing_project(&self, params: SetProjectParams) -> PortFuture<'_, ()> {
+        port(self.set_existing_project_sync(&params))
+    }
+
+    fn auto_title_probe(&self, scope: harw_protocol::session_wire::AutoTitleSession) -> PortFuture<'_, bool> {
+        port(self.auto_title_probe_sync(&scope))
+    }
+
+    fn auto_title_seed(&self, scope: harw_protocol::session_wire::AutoTitleSession)
+        -> PortFuture<'_, Option<harw_protocol::session_wire::AutoTitleSeed>>
+    {
+        port(self.auto_title_seed_sync(&scope))
+    }
+
+    fn auto_title_publish(&self, params: harw_protocol::session_wire::AutoTitlePublish)
+        -> PortFuture<'_, harw_protocol::session_wire::AutoTitlePublication>
+    {
+        port(self.auto_title_publish_sync(&params))
+    }
+
+    fn rename(&self, params: RenameParams) -> PortFuture<'_, SessionRow> {
+        port(self.rename_sync(&params))
+    }
+
+    fn archive(&self, params: ArchiveParams) -> PortFuture<'_, SessionRow> {
+        port(self.archive_sync(&params))
+    }
+
+    fn commands_list(&self, params: CommandsListParams) -> PortFuture<'_, CommandsListResult> {
+        Box::pin(self.commands_list_inner(params).map_err_port())
+    }
+
+    fn command_run(&self, params: CommandRunParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.command_run_inner(params).map_err_port())
+    }
+
+    fn catalog_get(&self, params: CatalogGetParams) -> PortFuture<'_, CatalogResult> {
+        Box::pin(self.catalog_get_inner(params).map_err_port())
+    }
+
+    fn config_get(&self, params: ConfigGetParams) -> PortFuture<'_, ConfigGetResult> {
+        Box::pin(self.config_get_inner(params).map_err_port())
+    }
+
+    fn config_set(&self, params: ConfigSetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.config_set_inner(params).map_err_port())
+    }
+
+    fn config_reset(&self, params: ConfigResetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.config_reset_inner(params).map_err_port())
+    }
+
+    fn secret_put(&self, params: SecretPutParams) -> PortFuture<'_, SecretPutResult> {
+        Box::pin(self.secret_put_inner(params).map_err_port())
+    }
+
+    fn stepup_confirm(&self, params: StepUpConfirmParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.stepup_confirm_inner(params).map_err_port())
+    }
+
+    fn stepup_cancel(&self, params: StepUpCancelParams) -> PortFuture<'_, ()> {
+        Box::pin(self.stepup_cancel_inner(params).map_err_port())
+    }
+
+    fn jobs_list(&self, params: JobsListParams) -> PortFuture<'_, JobsListResult> {
+        Box::pin(self.jobs_list_inner(params).map_err_port())
+    }
+
+    fn jobs_get(&self, params: JobTargetParams) -> PortFuture<'_, JobDetail> {
+        Box::pin(self.jobs_get_inner(params).map_err_port())
+    }
+
+    fn jobs_cancel(&self, params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.jobs_cancel_inner(params).map_err_port())
+    }
+
+    fn jobs_retry(&self, params: JobTargetParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.jobs_retry_inner(params).map_err_port())
+    }
+
+    fn agents_list(&self, params: AgentsListParams) -> PortFuture<'_, AgentsListResult> {
+        Box::pin(self.agents_list_inner(params).map_err_port())
+    }
+
+    fn agents_stop(&self, params: AgentStopParams) -> PortFuture<'_, CommandRunResult> {
+        Box::pin(self.agents_stop_inner(params).map_err_port())
     }
 }
 
@@ -2232,5 +4942,841 @@ where
     }
 }
 
+#[allow(dead_code, reason = "archived fork is an internal host capability, not negotiated by wire")]
+mod manual_cloud_work;
+mod media_preview;
+mod owner_relay;
+pub use owner_relay::{
+    ClaimedOwnerObservation, CurrentOwnerPlacement, DirectOwnerPlacementAuthority, OwnerObservationScope,
+    OwnerObservationStatus, OwnerProcessPin,
+};
+mod archived_import;
+mod auto_title;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ops_tests;
+
+/// Acceptance S3 (contract K-W1 §8.3): sharing profile sessions. Synthetic
+/// ids and temp dirs only.
+#[cfg(test)]
+mod share_tests {
+    use std::collections::HashMap;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use harw_protocol::session_wire::{
+        AttachParams, CreateInParams, HelloParams, HistoryParams, HolderKind as WireHolderKind,
+        PageParams, ProjectsParams, ReadOnlyReason, SubmitParams, SubmitResult, features,
+    };
+    use harw_protocol::{Cursor, FrameSource, PortError, SessionFrame, SessionPort, StreamProfile};
+    use harw_types::{PermissionTier, SessionId, TenantId};
+
+    use super::{HostConfig, HostConnection, SessionHost};
+    use crate::approvals::MemoryApprovals;
+    use crate::driver::{
+        CancelSignal, DriverFuture, EventSink, ExecutionAdmission, Setting, TurnDriver, TurnInput,
+        TurnOutcome,
+    };
+    use crate::error::HostError;
+    use crate::identity::ClientIdentity;
+    use crate::identity::test_identity::scoped;
+    use crate::index::{
+        DENIED_READ_ONLY, ProfileIndex, ProfilePage, ProfileRow, ProfileShare, ProjectPage,
+        ResolvedProject, ShareMode, ShareSettings, SystemSessionCategory, ThreadOrigin,
+    };
+    use crate::record::CreateOutcome;
+    use crate::replay::MemoryTranscripts;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Minimal runtime: admission and creation succeed, turns complete.
+    struct QuietDriver;
+
+    impl TurnDriver for QuietDriver {
+        fn prepare_execution(&self, _: &SessionId, _: ExecutionAdmission) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn create_session(&self, _: &SessionId, _: Option<&str>) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn run_turn(
+            &self,
+            _: TurnInput,
+            _: CancelSignal,
+            _: Arc<dyn EventSink>,
+        ) -> DriverFuture<'_, TurnOutcome> {
+            Box::pin(async { Ok(TurnOutcome::Completed) })
+        }
+
+        fn resume_after_approval(
+            &self,
+            _: &SessionId,
+            _: CancelSignal,
+            _: Arc<dyn EventSink>,
+        ) -> DriverFuture<'_, TurnOutcome> {
+            Box::pin(async { Ok(TurnOutcome::Completed) })
+        }
+
+        fn apply_setting(&self, _: &SessionId, _: Setting) -> DriverFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn model_name(&self, _: &SessionId) -> Option<String> {
+            None
+        }
+    }
+
+    /// Scripted profile index over a temp profile store.
+    struct FakeIndex {
+        root: PathBuf,
+        rows: Mutex<Vec<ProfileRow>>,
+        workdirs: Mutex<HashMap<SessionId, PathBuf>>,
+        projects: HashMap<String, ResolvedProject>,
+    }
+
+    impl ProfileIndex for FakeIndex {
+        fn sessions_root(&self) -> &Path {
+            &self.root
+        }
+
+        fn supports_dream_session_rows(&self) -> bool {
+            true
+        }
+
+        fn supports_system_session_rows(&self) -> bool {
+            true
+        }
+
+        fn projects(&self, _: &ProjectsParams) -> Result<ProjectPage, HostError> {
+            Ok(ProjectPage {
+                projects: Vec::new(),
+                next_cursor: None,
+            })
+        }
+
+        fn page(&self, _: &PageParams) -> Result<ProfilePage, HostError> {
+            Ok(ProfilePage {
+                rows: self.newest(usize::MAX)?,
+                next_cursor: None,
+            })
+        }
+
+        fn row(&self, id: &SessionId) -> Result<Option<ProfileRow>, HostError> {
+            Ok(self
+                .rows
+                .lock()
+                .map_err(|_| HostError::Storage("rows poisoned".into()))?
+                .iter()
+                .find(|row| &row.session_id == id && !row.is_system())
+                .cloned())
+        }
+
+        fn newest(&self, limit: usize) -> Result<Vec<ProfileRow>, HostError> {
+            let mut rows: Vec<ProfileRow> = self
+                .rows
+                .lock()
+                .map_err(|_| HostError::Storage("rows poisoned".into()))?
+                .iter()
+                .filter(|row| !row.archived)
+                .cloned()
+                .collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
+            rows.truncate(limit);
+            Ok(rows)
+        }
+
+        fn resolve_project(&self, key: &str) -> Result<Option<ResolvedProject>, HostError> {
+            Ok(self.projects.get(key).cloned())
+        }
+
+        fn workdir(&self, id: &SessionId) -> Result<Option<PathBuf>, HostError> {
+            Ok(self
+                .workdirs
+                .lock()
+                .map_err(|_| HostError::Storage("workdirs poisoned".into()))?
+                .get(id)
+                .cloned())
+        }
+    }
+
+    struct Share {
+        state: tempfile::TempDir,
+        profile: tempfile::TempDir,
+        host: SessionHost,
+        index: Arc<FakeIndex>,
+        tenant: TenantId,
+    }
+
+    fn tenant() -> TestResult<TenantId> {
+        Ok(TenantId::try_from_str("tenant-test")?)
+    }
+
+    fn share_fixture(mode: ShareMode, legacy_rows: usize) -> TestResult<Share> {
+        let state = tempfile::tempdir()?;
+        let profile = tempfile::tempdir()?;
+        let tenant = tenant()?;
+        let index = Arc::new(FakeIndex {
+            root: profile.path().to_path_buf(),
+            rows: Mutex::new(Vec::new()),
+            workdirs: Mutex::new(HashMap::new()),
+            projects: HashMap::new(),
+        });
+        let host = SessionHost::open_with_profile(
+            HostConfig::new(state.path().to_path_buf()),
+            Arc::new(QuietDriver) as Arc<dyn TurnDriver>,
+            Arc::new(MemoryTranscripts::new()),
+            Arc::new(MemoryApprovals::new()),
+            crate::tool_host::ToolHost::disabled(),
+            ProfileShare {
+                settings: ShareSettings {
+                    mode,
+                    tenant: tenant.clone(),
+                    legacy_rows,
+                    listener_tier: PermissionTier::Operator,
+                },
+                index: Arc::clone(&index) as Arc<dyn ProfileIndex>,
+            },
+        )?;
+        Ok(Share {
+            state,
+            profile,
+            host,
+            index,
+            tenant,
+        })
+    }
+
+    impl Share {
+        /// A visible profile session; continuable when `origin` is Cli.
+        fn add_row(
+            &self,
+            origin: ThreadOrigin,
+            project: Option<&str>,
+            title: &str,
+        ) -> TestResult<SessionId> {
+            let id = SessionId::new();
+            let count = self.index.rows.lock().map_err(|_| "rows poisoned")?.len();
+            let millis = 1_764_000_000_000_i64 + i64::try_from(count)? * 1_000;
+            self.index
+                .rows
+                .lock()
+                .map_err(|_| "rows poisoned")?
+                .push(ProfileRow {
+                    session_id: id.clone(),
+                    title: title.to_owned(),
+                    stored_title: Some(title.to_owned()),
+                    project_key: project.map(|label| format!("{label}-0123456789ab")),
+                    project_label: project.map(str::to_owned),
+                    updated_at: jiff::Timestamp::from_millisecond(millis)?,
+                    turns: 1,
+                    first_message: Some("hallo".into()),
+                    origin,
+                    last_origin: None,
+                    archived: false,
+                });
+            self.index
+                .workdirs
+                .lock()
+                .map_err(|_| "workdirs poisoned")?
+                .insert(id.clone(), self.profile.path().to_path_buf());
+            Ok(id)
+        }
+    }
+
+    async fn connect(
+        host: &SessionHost,
+        identity: ClientIdentity,
+        wire_minor: u32,
+        with_projects: bool,
+    ) -> TestResult<HostConnection> {
+        let connection = host.connect(identity)?;
+        let features = if with_projects {
+            vec![features::PROJECTS.to_owned()]
+        } else {
+            Vec::new()
+        };
+        connection
+            .hello(HelloParams {
+                client_label: "test".into(),
+                wire_minor,
+                features,
+                requested_caps: None,
+            })
+            .await?;
+        Ok(connection)
+    }
+
+    fn attach(session: &SessionId) -> AttachParams {
+        AttachParams {
+            session_id: session.clone(),
+            from: None,
+            profile: StreamProfile::Full,
+            tail_items: 200,
+        }
+    }
+
+    #[tokio::test]
+    async fn dream_rows_require_negotiation_and_do_not_grant_transcript_actions() -> TestResult {
+        use harw_protocol::session_wire::{SessionRowPurpose, SESSION_WIRE_MINOR};
+        let fx = share_fixture(ShareMode::Continue, 20)?;
+        let normal = fx.add_row(ThreadOrigin::Cli, None, "Dream")?;
+        // Deliberately attach unredacted private metadata to the mock index
+        // row. The wire must redact it independently from the real indexes.
+        let dream = fx.add_row(ThreadOrigin::System(SystemSessionCategory::Dream), None, "INTERNAL CONTEXT")?;
+        let legacy = connect(
+            &fx.host, scoped(10, PermissionTier::Operator, &fx.tenant), SESSION_WIRE_MINOR, true,
+        ).await?;
+        let invalid = legacy.page(PageParams { include_dreams: true, ..PageParams::default() }).await;
+        assert!(matches!(invalid, Err(PortError::Denied(_))));
+        assert!(legacy.page(PageParams::default()).await?.sessions.into_iter()
+            .all(|row| row.session_id != dream));
+
+        let caller = fx.host.connect(scoped(11, PermissionTier::Observer, &fx.tenant))?;
+        let ack = caller.hello(HelloParams {
+            client_label: "Dream metadata fixture".into(),
+            wire_minor: SESSION_WIRE_MINOR,
+            features: vec![features::PROJECTS.into(), features::SESSION_DREAM_ROWS_V1.into()],
+            requested_caps: None,
+        }).await?;
+        assert!(ack.features.iter().any(|feature| feature == features::SESSION_DREAM_ROWS_V1));
+        let rows = caller.page(PageParams { include_dreams: true, ..PageParams::default() }).await?.sessions;
+        assert!(rows.iter().any(|row| row.session_id == normal && row.purpose == SessionRowPurpose::Unknown));
+        let row = rows.iter().find(|row| row.session_id == dream).ok_or("missing Dream row")?;
+        assert_eq!(row.purpose, SessionRowPurpose::Dream);
+        assert_eq!(row.title.as_deref(), Some("Dream"));
+        assert_eq!(row.reason, Some(ReadOnlyReason::ForeignOrigin));
+        assert!(!row.continuable && row.first_message.is_none() && row.model.is_none());
+        assert!(matches!(caller.attach(attach(&dream)).await, Err(PortError::NotFound)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn system_metadata_is_negotiated_redacted_and_profile_scoped() -> TestResult {
+        use harw_protocol::session_wire::{SessionRowPurpose, SESSION_WIRE_MINOR};
+        let fx = share_fixture(ShareMode::Read, 20)?;
+        fx.add_row(ThreadOrigin::Cli, None, "Ledger")?;
+        let internal = fx.add_row(
+            ThreadOrigin::System(SystemSessionCategory::Ledger), None, "PRIVATE CONTEXT",
+        )?;
+        let hello = || HelloParams {
+            client_label: "System metadata fixture".into(), wire_minor: SESSION_WIRE_MINOR,
+            features: vec![features::PROJECTS.into(), features::SESSION_SYSTEM_ROWS_V1.into()],
+            requested_caps: None,
+        };
+        let caller = fx.host.connect(scoped(22, PermissionTier::Observer, &fx.tenant))?;
+        let ack = caller.hello(hello()).await?;
+        assert!(ack.features.iter().any(|name| name == features::SESSION_SYSTEM_ROWS_V1));
+        assert!(caller.page(PageParams::default()).await?.sessions.iter()
+            .all(|row| row.purpose == SessionRowPurpose::Unknown));
+        let params = PageParams { include_system: true, ..PageParams::default() };
+        let page = caller.page(params.clone()).await?;
+        assert_eq!(page.sessions.len(), 1);
+        let row = &page.sessions[0];
+        assert_eq!(row.session_id, internal);
+        assert_eq!(row.purpose, SessionRowPurpose::Ledger);
+        assert_eq!(row.title.as_deref(), Some("Ledger"));
+        assert!(row.first_message.is_none() && row.model.is_none() && !row.continuable);
+        assert!(matches!(caller.attach(attach(&internal)).await, Err(PortError::NotFound)));
+        let invalid = caller.page(PageParams { include_dreams: true, ..params.clone() }).await;
+        assert!(matches!(invalid, Err(PortError::Protocol(_))));
+
+        let other = TenantId::try_from_str("other-profile")?;
+        let foreign = fx.host.connect(scoped(23, PermissionTier::Observer, &other))?;
+        let ack = foreign.hello(hello()).await?;
+        assert!(!ack.features.iter().any(|name| name == features::SESSION_SYSTEM_ROWS_V1));
+        assert!(matches!(foreign.page(params).await, Err(PortError::Denied(_))));
+        Ok(())
+    }
+
+    fn submit(session: &SessionId) -> SubmitParams {
+        SubmitParams {
+            session_id: session.clone(),
+            text: "weiter".into(),
+            expect_head: Cursor {
+                generation: 0,
+                durable: 0,
+                live: 0,
+            },
+            client_msg_id: "msg-1".into(),
+            force: true,
+            images: Vec::new(),
+            rewind_before: None,
+        }
+    }
+
+    /// Simulates a TUI process holding the lease: its own fd, locked, with
+    /// holder JSON (flock is per open file description).
+    fn hold_lease_as_tui(root: &Path, id: &SessionId) -> TestResult<std::fs::File> {
+        let path = harw_session_store::lease_path(root, id)?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        fs4::FileExt::try_lock(&file).map_err(|_| "lease already locked")?;
+        file.set_len(0)?;
+        file.write_all(br#"{"holder":"tui","pid":4242,"since":"2026-11-22T10:00:00Z"}"#)?;
+        file.sync_data()?;
+        Ok(file)
+    }
+
+    /// Every file below `dir`, relative, sorted.
+    fn files_below(dir: &Path) -> TestResult<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(next) = stack.pop() {
+            for entry in std::fs::read_dir(&next)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path.strip_prefix(dir)?.to_path_buf());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Frames already queued, without waiting for more.
+    async fn drain(source: &mut Box<dyn FrameSource>) -> TestResult<Vec<SessionFrame>> {
+        let mut frames = Vec::new();
+        while let Ok(next) = tokio::time::timeout(Duration::from_millis(50), source.next()).await {
+            match next? {
+                Some(envelope) => frames.push(envelope.frame),
+                None => break,
+            }
+        }
+        Ok(frames)
+    }
+
+    #[tokio::test]
+    async fn manual_cloud_work_lost_ack_resolves_same_blank_session_after_reconnect() -> TestResult {
+        use harw_protocol::session_wire::{ManualCloudWorkCommandV1 as Command, ManualCloudWorkReplyV1 as Reply};
+        use harw_types::{ApprovalActor, AuthStrength, DeviceId, IngressSurface, NodeId, Principal, PrincipalKind, TrustZone};
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let caller = |id, key| -> TestResult<ClientIdentity> {
+            let mut identity = scoped(id, PermissionTier::Operator, &fx.tenant);
+            let device = DeviceId::try_from_str("work-fixture-phone")?;
+            identity.principal = Principal::trusted_ingress(
+                PrincipalKind::Human, format!("device:{}", device.as_str()), IngressSurface::Web, PermissionTier::Operator);
+            identity.actor = ApprovalActor::Operator { id: format!("device:{}", device.as_str()) };
+            identity.device = Some(device);
+            identity.zone = TrustZone::Remote;
+            identity.strength = AuthStrength::MutualTls;
+            identity.authenticated_node = Some(NodeId::try_from_str("work-fixture-node")?);
+            identity.authenticated_key_fingerprint = Some([key; 32]);
+            Ok(identity)
+        };
+        let init = |label| HelloParams {
+            client_label: label,
+            wire_minor: harw_protocol::session_wire::SESSION_WIRE_MINOR,
+            features: vec![features::MANUAL_CLOUD_WORK_V1.into()],
+            requested_caps: None,
+        };
+        let command = Command::CreateEmpty { operation_id: "lost-ack-op".into() };
+        let remote = fx.host.connect(caller(1001, 1)?)?;
+        let ack = remote.hello(init("first".into())).await?;
+        assert!(ack.features.iter().any(|feature| feature == features::MANUAL_CLOUD_WORK_V1));
+        let Reply::Created { session: original } = remote.manual_cloud_work(command.clone()).await? else {
+            return Err("create failed".into());
+        };
+        drop(remote);
+        let reconnect = fx.host.connect(caller(1002, 1)?)?;
+        reconnect.hello(init("reconnect".into())).await?;
+        let resolved = reconnect.manual_cloud_work(Command::Resolve { operation_id: "lost-ack-op".into() }).await?;
+        assert!(matches!(resolved, Reply::Created { session } if session.session_id == original.session_id));
+        assert!(matches!(reconnect.manual_cloud_work(command.clone()).await?, Reply::Created { session } if session.session_id == original.session_id));
+        let rotated = fx.host.connect(caller(1003, 2)?)?;
+        rotated.hello(init("new key".into())).await?;
+        assert!(matches!(rotated.manual_cloud_work(command).await, Err(PortError::Denied(_))));
+        assert_eq!(reconnect.list().await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn foreign_tenant_sees_no_profile_rows() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let foreign = TenantId::try_from_str("tenant-other")?;
+        let legacy = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &foreign),
+            2,
+            false,
+        )
+        .await?;
+        assert!(legacy.list().await?.is_empty());
+        let modern = connect(
+            &fx.host,
+            scoped(2, PermissionTier::Operator, &foreign),
+            3,
+            true,
+        )
+        .await?;
+        let projects = modern.projects(ProjectsParams::default()).await?;
+        assert!(projects.projects.is_empty());
+        assert_eq!(projects.share.mode, ShareMode::Off);
+        assert!(
+            modern
+                .page(PageParams::default())
+                .await?
+                .sessions
+                .is_empty()
+        );
+        assert!(matches!(
+            modern.attach(attach(&id)).await,
+            Err(PortError::NotFound)
+        ));
+        assert!(matches!(
+            modern.adopt(id.clone()).await,
+            Err(PortError::NotFound)
+        ));
+
+        // Control: the share tenant does see the row.
+        let own = connect(
+            &fx.host,
+            scoped(3, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let page = own.page(PageParams::default()).await?;
+        assert_eq!(page.sessions.len(), 1);
+        assert!(
+            page.sessions[0].continuable,
+            "{:?}",
+            page.sessions[0].reason
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observer_attach_writes_no_record() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let observer = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Observer, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let state_before = files_below(fx.state.path())?;
+        let profile_before = files_below(fx.profile.path())?;
+
+        let (ack, _stream) = observer.attach(attach(&id)).await?;
+        assert_eq!(ack.session.session_id, id);
+        observer
+            .history(HistoryParams {
+                session_id: id.clone(),
+                before: ack.head,
+                limit: 10,
+            })
+            .await?;
+        observer.detach(id.clone()).await?;
+
+        assert_eq!(files_below(fx.state.path())?, state_before);
+        assert_eq!(files_below(fx.profile.path())?, profile_before);
+        assert!(fx.host.inner.records.load(&id)?.is_none());
+        // An observer cannot adopt.
+        assert!(matches!(
+            observer.adopt(id).await,
+            Err(PortError::Denied(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adopted_record_has_caller_creator_execution() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let identity = scoped(1, PermissionTier::Operator, &fx.tenant);
+        let caller = connect(&fx.host, identity.clone(), 3, true).await?;
+        let summary = caller.adopt(id.clone()).await?;
+        assert_eq!(summary.session_id, id);
+        assert_eq!(summary.tenant.as_ref(), Some(&fx.tenant));
+
+        let record = fx.host.inner.records.load(&id)?.ok_or("record missing")?;
+        assert_eq!(record.owner_principal, identity.principal.id());
+        assert_eq!(record.title.as_deref(), Some("titel"));
+        assert_eq!(record.workspace, None);
+        let creator = record.creator_execution.ok_or("creator missing")?;
+        assert_eq!(
+            creator.binding,
+            Some(crate::record::CreatorExecutionBinding::from_identity(
+                &identity
+            ))
+        );
+        assert_eq!(creator.approval_actor, identity.actor);
+        assert_eq!(creator.maximum_tier, identity.principal.tier());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_devices_adopt_one_record() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let first_identity = scoped(1, PermissionTier::Operator, &fx.tenant);
+        let first = connect(&fx.host, first_identity.clone(), 3, true).await?;
+        let second = connect(
+            &fx.host,
+            scoped(2, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+
+        let a = first.adopt(id.clone()).await?;
+        let b = second.adopt(id.clone()).await?;
+        assert_eq!(a.session_id, b.session_id);
+        let records: Vec<_> = fx
+            .host
+            .inner
+            .records
+            .list()?
+            .into_iter()
+            .filter(|record| record.session_id == id)
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner_principal, first_identity.principal.id());
+
+        // The losing side of a race gets the winner's record unchanged.
+        let late = second.new_record(id.clone(), Some("anders"), None, Some(fx.tenant.clone()));
+        match fx.host.inner.records.create_if_absent(&late)? {
+            CreateOutcome::Existing(existing) => assert_eq!(*existing, records[0]),
+            CreateOutcome::Created => return Err("second create must not win".into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn turn_with_held_lease_is_busy_with_reason() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let _tui = hold_lease_as_tui(fx.profile.path(), &id)?;
+        match caller.submit(submit(&id)).await {
+            Err(PortError::Busy(reason)) => assert_eq!(reason, "Läuft gerade in der TUI"),
+            other => return Err(format!("expected busy, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_client_gets_denied_instead_of_busy() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            2,
+            false,
+        )
+        .await?;
+        let _tui = hold_lease_as_tui(fx.profile.path(), &id)?;
+        match caller.submit(submit(&id)).await? {
+            SubmitResult::Denied { reason } => assert_eq!(reason, "Läuft gerade in der TUI"),
+            other => return Err(format!("expected denied, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_mode_submit_is_denied() -> TestResult {
+        let fx = share_fixture(ShareMode::Read, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        match caller.submit(submit(&id)).await {
+            Err(PortError::Denied(reason)) => assert_eq!(reason, DENIED_READ_ONLY),
+            other => return Err(format!("expected denied, got {other:?}").into()),
+        }
+        assert!(fx.host.inner.records.load(&id)?.is_none());
+        // Reading still works, and the row says why it is read-only.
+        let page = caller.page(PageParams::default()).await?;
+        assert_eq!(page.sessions[0].reason, Some(ReadOnlyReason::ShareReadOnly));
+        caller.attach(attach(&id)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_list_prefixes_project_and_respects_limit() -> TestResult {
+        let fx = share_fixture(ShareMode::Read, 2)?;
+        fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel eins")?;
+        fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel zwei")?;
+        fx.add_row(ThreadOrigin::Cli, None, "titel drei")?;
+        let legacy = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            2,
+            false,
+        )
+        .await?;
+        let list = legacy.list().await?;
+        let titles: Vec<_> = list.iter().filter_map(|s| s.title.as_deref()).collect();
+        assert_eq!(titles, vec!["titel drei", "proj · titel zwei"]);
+        assert!(list.iter().all(|s| s.tenant.as_ref() == Some(&fx.tenant)));
+
+        // A `projects` client pages instead and gets no legacy rows.
+        let modern = connect(
+            &fx.host,
+            scoped(2, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        assert!(modern.list().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_feature_only_from_minor_3() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        for (minor, granted) in [(2, false), (3, true)] {
+            let connection =
+                fx.host
+                    .connect(scoped(minor, PermissionTier::Operator, &fx.tenant))?;
+            let ack = connection
+                .hello(HelloParams {
+                    client_label: "test".into(),
+                    wire_minor: minor,
+                    features: vec![features::PROJECTS.to_owned()],
+                    requested_caps: None,
+                })
+                .await?;
+            assert_eq!(
+                ack.features.iter().any(|f| f == features::PROJECTS),
+                granted,
+                "minor {minor}"
+            );
+            assert_eq!(connection.has_projects(), granted);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn holder_frame_only_to_projects_connections() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Cli, Some("proj"), "titel")?;
+        let modern = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let legacy = connect(
+            &fx.host,
+            scoped(2, PermissionTier::Operator, &fx.tenant),
+            2,
+            false,
+        )
+        .await?;
+        let (_, mut modern_stream) = modern.attach(attach(&id)).await?;
+        let (_, mut legacy_stream) = legacy.attach(attach(&id)).await?;
+        drain(&mut modern_stream).await?;
+        drain(&mut legacy_stream).await?;
+
+        let tui = hold_lease_as_tui(fx.profile.path(), &id)?;
+        fx.host.poll_profile_heads();
+        let seen = drain(&mut modern_stream).await?;
+        assert!(
+            seen.iter().any(|frame| matches!(
+                frame,
+                SessionFrame::Holder { holder: Some(info), .. } if info.kind == WireHolderKind::Tui
+            )),
+            "{seen:?}"
+        );
+        let legacy_seen = drain(&mut legacy_stream).await?;
+        assert!(
+            !legacy_seen
+                .iter()
+                .any(|frame| matches!(frame, SessionFrame::Holder { .. })),
+            "{legacy_seen:?}"
+        );
+
+        // Unchanged holder: no repeat. Released: `holder: None`.
+        fx.host.poll_profile_heads();
+        assert!(drain(&mut modern_stream).await?.is_empty());
+        drop(tui);
+        fx.host.poll_profile_heads();
+        let freed = drain(&mut modern_stream).await?;
+        assert!(
+            freed
+                .iter()
+                .any(|frame| matches!(frame, SessionFrame::Holder { holder: None, .. })),
+            "{freed:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_origin_row_is_not_continuable() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let id = fx.add_row(ThreadOrigin::Web, None, "aus dem web")?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let page = caller.page(PageParams::default()).await?;
+        let row = page.sessions.first().ok_or("row missing")?;
+        assert!(!row.continuable);
+        assert_eq!(row.reason, Some(ReadOnlyReason::ForeignOrigin));
+        assert!(matches!(
+            caller.adopt(id.clone()).await,
+            Err(PortError::Denied(_))
+        ));
+        assert!(fx.host.inner.records.load(&id)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_in_unknown_key_is_denied() -> TestResult {
+        let fx = share_fixture(ShareMode::Continue, 100)?;
+        let caller = connect(
+            &fx.host,
+            scoped(1, PermissionTier::Operator, &fx.tenant),
+            3,
+            true,
+        )
+        .await?;
+        let before = files_below(fx.state.path())?;
+        match caller
+            .create_in(CreateInParams {
+                project_key: "nirgends-0123456789ab".into(),
+                title: None,
+            })
+            .await
+        {
+            Err(PortError::Denied(reason)) => assert_eq!(reason, super::DENIED_UNKNOWN_PROJECT),
+            other => return Err(format!("expected denied, got {other:?}").into()),
+        }
+        assert_eq!(files_below(fx.state.path())?, before);
+        assert!(files_below(fx.profile.path())?.is_empty());
+        Ok(())
+    }
+}

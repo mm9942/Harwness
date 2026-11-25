@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="harw_local_vision_parallel_title">Lokale Bildanalyse · Parallelität</string>
+    <string name="harw_local_vision_parallel_explainer">Wähle 1–5 (Standard: 3). Bei jedem neuen Stapel werden das geladene Modell, freier Speicher und CPU geprüft. Bei Bedarf starten weniger Analysen gleichzeitig. Laufende Stapel und API-Anfragen bleiben unverändert.</string>
+    <string name="harw_local_vision_parallel_requested">Eingestelltes Maximum: %1$d</string>
+    <string name="harw_local_vision_parallel_estimate">Nach aktueller Ressourcenlage bis zu %1$d gleichzeitig. Beim Start wird neu geprüft.</string>
+    <plurals name="harw_local_vision_parallel_images">
+        <item quantity="one">%d Bild</item>
+        <item quantity="other">%d Bilder</item>
+    </plurals>
+</resources>

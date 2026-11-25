@@ -22,6 +22,12 @@
 //! `resume_after_approval` entry point. That entry point does not record
 //! approvals the resumed turn parks on again; the driver therefore issues the
 //! missing durable record itself whenever a leg parks.
+//!
+//! When the core attributes the ask to the DoD taint of the turn (PL-100
+//! decision O1), the parked request's `summary` carries that reason; the
+//! wire shape of `ApprovalRequest` is unchanged. Surfaces that render
+//! `summary` show the reason; `harw_session_client::ApprovalSummary` does not
+//! carry `summary` yet, so remote SDK hosts miss it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -30,18 +36,20 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use harw_core::cancel::{CancelReason, CancelToken};
+use harw_core::dod_taint::pending_ask_reason;
 use harw_core::mode::InteractionMode;
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
-    AgentSession, ApprovalResolution, ModelProvider, StateStore, TurnInput as CoreTurnInput,
-    TurnOutcome as CoreOutcome, resume_after_approval, run_turn_durable,
+    AgentEvent, AgentEventKind, AgentSession, ApprovalResolution, ModelProvider, StateStore,
+    TurnInput as CoreTurnInput, TurnOutcome as CoreOutcome, resume_after_approval,
+    run_turn_durable,
 };
 use harw_protocol::approvals::ApprovalKind;
-use harw_protocol::{ApprovalRequest, SessionEvent, TurnEvent};
+use harw_protocol::{AgentOrchestrationStatus, ApprovalRequest, SessionEvent, TurnEvent};
 use harw_session_host::HostError;
 use harw_session_host::driver::{
-    CancelSignal, DriverEvent, DriverFuture, EventSink, ExecutionAdmission, Setting, TurnDriver,
-    TurnInput, TurnOutcome,
+    CancelSignal, DriverEvent, DriverFuture, EventSink, ExecutionAdmission, LiveAgent, Setting,
+    TurnDriver, TurnInput, TurnOutcome,
 };
 use harw_session_store::{
     ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, SessionStoreError,
@@ -105,6 +113,10 @@ pub struct ParkedApproval {
 /// with a scripted fake. All calls are per session; the driver guarantees one
 /// leg (turn or resume) at a time per session (host arbiter).
 pub trait CoreRuntime: Send + Sync + 'static {
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        None
+    }
+
     /// Trusted host admission; production runtimes must use it in assembly.
     fn prepare_execution(
         &self,
@@ -122,6 +134,33 @@ pub trait CoreRuntime: Send + Sync + 'static {
         _session_id: &SessionId,
     ) -> Result<(), DriverBridgeError> {
         Ok(())
+    }
+
+    /// Drop the cached core of an established session; the next leg hydrates from the transcript again. No tombstone, admission stays.
+    fn forget_session(&self, _session_id: &SessionId) -> Result<(), DriverBridgeError> {
+        Ok(())
+    }
+
+    /// Actual completed-write cursor of the same host's source transcript.
+    fn committed_fork_head<'a>(
+        &'a self,
+        _new: &'a SessionId,
+        _source: &'a SessionId,
+    ) -> CoreFuture<'a, Option<u64>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Install a verified visible prefix into a new runtime.
+    fn seed_fork_history<'a>(
+        &'a self,
+        _new: &'a SessionId,
+        _items: Vec<harw_protocol::items::TurnItem>,
+    ) -> CoreFuture<'a, u64> {
+        Box::pin(async {
+            Err(DriverBridgeError::Runtime(
+                "runtime does not support fork".into(),
+            ))
+        })
     }
 
     /// Prepare the session (idempotent).
@@ -165,6 +204,23 @@ pub trait CoreRuntime: Send + Sync + 'static {
 
     /// Model name for summaries, when known.
     fn model_name(&self, session_id: &SessionId) -> Option<String>;
+
+    /// Destination for live events of the session's child agents and agent
+    /// jobs, also between legs. The driver calls it at the start of every leg
+    /// with that leg's sink; the runtime keeps using the most recent sink
+    /// until the next call. Default: ignored.
+    fn bind_live_sink(&self, _session_id: &SessionId, _sink: Arc<dyn EventSink>) {}
+
+    /// Child agents admitted below any hosted session. Default: none.
+    fn live_agents(&self) -> Vec<LiveAgent> {
+        Vec::new()
+    }
+
+    /// Requests cancellation of a child agent below `session_id`; `true` when
+    /// a running agent was signalled. Default: no agent known.
+    fn stop_agent(&self, _session_id: &SessionId, _agent_id: &str) -> bool {
+        false
+    }
 }
 
 /// Runtime of a driver built by [`CoreTurnDriver::new`]: nothing composed
@@ -225,6 +281,8 @@ pub struct CoreTurnDriver {
     controls: Mutex<HashMap<SessionId, TurnControl>>,
     /// Request id each parked session waits on (set when a leg parks).
     parked: Mutex<HashMap<SessionId, ItemId>>,
+    /// Where prompt images are checked and stored; `None` = images refused.
+    media: Option<Arc<harw_media::MediaStore>>,
 }
 
 impl std::fmt::Debug for CoreTurnDriver {
@@ -265,7 +323,55 @@ impl CoreTurnDriver {
             approvals: ApprovalStore::new(&config.sessions_root),
             controls: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
+            media: None,
         })
+    }
+
+    /// Store prompt images (`turn.submit` `images`) in `store`. The caller
+    /// installs the same store as the process media source so the provider
+    /// can read the images back.
+    #[must_use]
+    pub fn with_media_store(mut self, store: Arc<harw_media::MediaStore>) -> Self {
+        self.media = Some(store);
+        self
+    }
+
+    /// Open (creating) the media store at `root` (`<home>/media`), install it
+    /// as the process media source and use it for prompt images.
+    ///
+    /// # Errors
+    /// [`DriverBridgeError::Runtime`] when the store cannot be opened.
+    pub fn with_media_root(self, root: &std::path::Path) -> Result<Self, DriverBridgeError> {
+        let store = Arc::new(harw_media::MediaStore::open(root).map_err(|error| {
+            DriverBridgeError::Runtime(format!("media store {}: {error}", root.display()))
+        })?);
+        harw_core::install_media_source(Arc::clone(&store) as _);
+        Ok(self.with_media_store(store))
+    }
+
+    /// Decode, check and store the images of a submission.
+    fn ingest_images(
+        &self,
+        images: &[harw_protocol::session_wire::SubmitImage],
+    ) -> Result<Vec<harw_protocol::MediaRef>, DriverBridgeError> {
+        use base64::Engine as _;
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.media.as_ref().ok_or_else(|| {
+            DriverBridgeError::Runtime("this host has no media store for prompt images".into())
+        })?;
+        images
+            .iter()
+            .map(|image| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(image.data_b64.as_bytes())
+                    .map_err(|_| DriverBridgeError::Runtime("image is not valid base64".into()))?;
+                store
+                    .put(&bytes)
+                    .map_err(|error| DriverBridgeError::Runtime(format!("image refused: {error}")))
+            })
+            .collect()
     }
 
     /// Build the production driver: [`HarwCoreRuntime`] over `factory`.
@@ -500,6 +606,98 @@ fn forward(sink: &Arc<dyn EventSink>, event: CoreEvent) {
     });
 }
 
+/// Shared cell holding the sink of the most recent leg of one session.
+type LiveSink = Arc<Mutex<Option<Arc<dyn EventSink>>>>;
+
+/// Aborts the per-slot forwarder when its slot is dropped.
+struct LiveForwarder(tokio::task::AbortHandle);
+
+impl Drop for LiveForwarder {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Wire state name of an orchestration status; `None` for pure progress.
+fn job_state(status: AgentOrchestrationStatus) -> Option<&'static str> {
+    match status {
+        AgentOrchestrationStatus::Progress => None,
+        AgentOrchestrationStatus::Admitted => Some("admitted"),
+        AgentOrchestrationStatus::Running => Some("running"),
+        AgentOrchestrationStatus::Paused => Some("paused"),
+        AgentOrchestrationStatus::Completed => Some("completed"),
+        AgentOrchestrationStatus::Failed => Some("failed"),
+        AgentOrchestrationStatus::Cancelled => Some("cancelled"),
+    }
+}
+
+/// Maps a hub event of the session tree rooted at `root` to a live driver
+/// event. Root turn events already arrive through the leg's channel.
+fn live_driver_event(root: &SessionId, event: AgentEvent) -> Option<DriverEvent> {
+    match event.kind {
+        AgentEventKind::Turn(ev) if event.agent != *root => Some(DriverEvent::Child {
+            agent: event.agent,
+            parent: event.parent,
+            role: event.role,
+            event: ev,
+        }),
+        AgentEventKind::Turn(_) => None,
+        AgentEventKind::Orchestration(o) => job_state(o.status).map(|state| DriverEvent::Job {
+            work_id: o.child_session_id.as_str().to_owned(),
+            kind: "agent".to_owned(),
+            state: state.to_owned(),
+            summary: Some(o.role),
+        }),
+        _ => None,
+    }
+}
+
+/// Forwards hub events into the currently bound sink (dropped while none).
+async fn forward_live(
+    mut rx: tokio::sync::broadcast::Receiver<AgentEvent>,
+    root: SessionId,
+    sink: LiveSink,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if let Some(mapped) = live_driver_event(&root, event) {
+                    let bound = sink.lock().ok().and_then(|cell| cell.clone());
+                    if let Some(bound) = bound {
+                        bound.emit(mapped);
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::debug!(skipped, "session driver: live agent events lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Human-readable summary of a parked tool approval.
+///
+/// # Description
+/// `reason` is the core's attribution of the ask, today only the DoD taint
+/// (PL-100 decision O1, `harw_core::dod_taint::pending_ask_reason`, already
+/// escaped). It is appended to the summary because the wire
+/// `ApprovalRequest` denies unknown fields: older peers keep parsing the
+/// request and simply show the longer text.
+///
+/// # Arguments
+/// - `tool` (`&str`): the parked tool's name.
+/// - `reason` (`Option<&str>`): the attributed reason, if any.
+///
+/// # Returns
+/// `tool '<tool>' requires approval`, plus `; <reason>` when a reason exists.
+fn approval_summary(tool: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("tool '{tool}' requires approval; {reason}"),
+        None => format!("tool '{tool}' requires approval"),
+    }
+}
+
 fn resolution_of(record: &ApprovalResolutionRecord) -> ApprovalResolution {
     match record.decision {
         ReviewDecision::Approved | ReviewDecision::ApprovedOnce => ApprovalResolution::Approve,
@@ -513,6 +711,43 @@ fn resolution_of(record: &ApprovalResolutionRecord) -> ApprovalResolution {
 }
 
 impl TurnDriver for CoreTurnDriver {
+    fn supports_archive_checkpoints(&self) -> bool {
+        self.runtime.archive_state_store().is_some()
+    }
+
+    fn supports_exact_rewind(&self) -> bool {
+        self.runtime.archive_state_store().is_some()
+    }
+
+    fn archive_published_head(
+        &self,
+        source: &SessionId,
+    ) -> Result<Option<std::num::NonZeroU64>, HostError> {
+        let Some(store) = self.runtime.archive_state_store() else {
+            return Ok(None);
+        };
+        store
+            .committed_fork_head(source)
+            .map(|head| head.and_then(std::num::NonZeroU64::new))
+            .map_err(|_| HostError::Storage("archive clock is unavailable".into()))
+    }
+
+    fn archive_journal_binding(
+        &self,
+        target: &SessionId,
+    ) -> Result<harw_session_host::driver::ArchiveJournalBinding, HostError> {
+        let (root, thread) = self
+            .runtime
+            .archive_state_store()
+            .and_then(|store| store.archive_journal_binding(target))
+            .ok_or(HostError::NotImplemented("archive journal binding"))?;
+        Ok(harw_session_host::driver::ArchiveJournalBinding { root, thread })
+    }
+
+    fn archive_media_store(&self) -> Option<&harw_media::MediaStore> {
+        self.media.as_deref()
+    }
+
     fn prepare_execution(
         &self,
         session_id: &SessionId,
@@ -534,6 +769,41 @@ impl TurnDriver for CoreTurnDriver {
         self.runtime
             .discard_unpublished_session(session_id)
             .map_err(HostError::from)
+    }
+
+    fn forget_session(&self, session_id: &SessionId) -> Result<(), HostError> {
+        self.runtime
+            .forget_session(session_id)
+            .map_err(HostError::from)
+    }
+
+    fn committed_fork_head(
+        &self,
+        new: &SessionId,
+        source: &SessionId,
+    ) -> DriverFuture<'_, Option<u64>> {
+        let new = new.clone();
+        let source = source.clone();
+        Box::pin(async move {
+            self.runtime
+                .committed_fork_head(&new, &source)
+                .await
+                .map_err(HostError::from)
+        })
+    }
+
+    fn seed_fork_history(
+        &self,
+        new: &SessionId,
+        items: Vec<harw_protocol::items::TurnItem>,
+    ) -> DriverFuture<'_, u64> {
+        let new = new.clone();
+        Box::pin(async move {
+            self.runtime
+                .seed_fork_history(&new, items)
+                .await
+                .map_err(HostError::from)
+        })
     }
 
     fn create_session(&self, session_id: &SessionId, title: Option<&str>) -> DriverFuture<'_, ()> {
@@ -560,11 +830,27 @@ impl TurnDriver for CoreTurnDriver {
                 submitted_by = %input.submitted_by,
                 "session driver: turn start"
             );
-            let control = TurnControl::new();
+            let rewrite_sink = Arc::clone(&sink);
+            let media = self.media.clone();
+            let control = TurnControl::new()
+                .with_hosted_title_source(input.title_seed_human)
+                .with_rewrite_replacement_id(input.rewrite_replacement_id.clone())
+                .with_history_replaced(Arc::new(move || {
+                    rewrite_sink.emit(DriverEvent::HistoryReplaced);
+                }))
+                .with_rewind_media_check(Arc::new(move |reference| {
+                    media.as_ref().is_some_and(|store| store.contains(reference))
+                }));
             let token = control.cancel_token().clone();
             self.remember_control(&input.session_id, control.clone())?;
             let (tx, rx) = mpsc::unbounded_channel();
-            let core_input = CoreTurnInput::user(input.text).with_control(control);
+            let media = self.ingest_images(&input.images).map_err(HostError::from)?;
+            let core_input = CoreTurnInput::user(input.text)
+                .with_images(media)
+                .with_rewind_before(input.rewind_before.clone())
+                .with_control(control);
+            self.runtime
+                .bind_live_sink(&input.session_id, Arc::clone(&sink));
             let leg = self.runtime.run_turn(&input.session_id, core_input, tx);
             let result = Self::pump(leg, rx, &mut cancel, &token, &sink).await;
             self.settle(&input.session_id, &sink, result)
@@ -596,6 +882,7 @@ impl TurnDriver for CoreTurnDriver {
                 None => record.actor,
             };
             let (tx, rx) = mpsc::unbounded_channel();
+            self.runtime.bind_live_sink(&session_id, Arc::clone(&sink));
             let leg = self
                 .runtime
                 .resume_after_approval(&session_id, bound, resolution, tx);
@@ -618,6 +905,15 @@ impl TurnDriver for CoreTurnDriver {
 
     fn model_name(&self, session_id: &SessionId) -> Option<String> {
         self.runtime.model_name(session_id)
+    }
+
+    fn live_agents(&self) -> Vec<LiveAgent> {
+        self.runtime.live_agents()
+    }
+
+    fn stop_agent(&self, session_id: &SessionId, agent_id: &str) -> DriverFuture<'_, bool> {
+        let stopped = self.runtime.stop_agent(session_id, agent_id);
+        Box::pin(async move { Ok(stopped) })
     }
 }
 
@@ -642,6 +938,9 @@ pub struct CoreSession {
     pub model: Arc<dyn ModelProvider>,
     /// Durable state store (transcript) for its turns.
     pub store: Arc<dyn StateStore>,
+    /// The session's child-agent spawner, when the assembly has one. Lets the
+    /// driver list and stop child agents across sessions.
+    pub spawner: Option<Arc<harw_core::ManagedAgentSpawner>>,
 }
 
 /// Gateway-supplied assembly of one core session (registry, sandbox,
@@ -650,6 +949,12 @@ pub struct CoreSession {
 /// The approval actor in the session's spawn context is what the durable
 /// approval record binds; the responding connection's actor must match it.
 pub trait CoreSessionFactory: Send + Sync + 'static {
+    /// Authoritative factory-wide store used by source and future target.
+    /// A factory with per-core storage must not claim this capability.
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        None
+    }
+
     /// Build using the host's current, authenticated creator ceiling. An
     /// effectful factory must override this instead of discarding authority.
     fn build_with_execution(
@@ -683,6 +988,7 @@ struct Slot {
     core: CoreSession,
     session_events: mpsc::UnboundedReceiver<SessionEvent>,
     turn_events: mpsc::UnboundedReceiver<TurnEvent>,
+    _live: Option<LiveForwarder>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -699,6 +1005,9 @@ pub struct HarwCoreRuntime {
     approvals: ApprovalStore,
     slots: Mutex<SlotMap>,
     models: Mutex<HashMap<SessionId, String>>,
+    live_sinks: Mutex<HashMap<SessionId, LiveSink>>,
+    /// Child-agent spawner of every built session (global agent views).
+    spawners: Mutex<HashMap<SessionId, Arc<harw_core::ManagedAgentSpawner>>>,
 }
 
 impl std::fmt::Debug for HarwCoreRuntime {
@@ -717,6 +1026,30 @@ impl HarwCoreRuntime {
             approvals: ApprovalStore::new(sessions_root),
             slots: Mutex::new(HashMap::new()),
             models: Mutex::new(HashMap::new()),
+            live_sinks: Mutex::new(HashMap::new()),
+            spawners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn note_spawner(&self, session: &SessionId, spawner: Option<Arc<harw_core::ManagedAgentSpawner>>) {
+        if let Ok(mut spawners) = self.spawners.lock() {
+            match spawner {
+                Some(spawner) => {
+                    spawners.insert(session.clone(), spawner);
+                }
+                None => {
+                    spawners.remove(session);
+                }
+            }
+        }
+    }
+
+    /// The shared live-sink cell of `session` (fresh and unshared when the
+    /// table is poisoned).
+    fn live_sink(&self, session: &SessionId) -> LiveSink {
+        match self.live_sinks.lock() {
+            Ok(mut table) => Arc::clone(table.entry(session.clone()).or_default()),
+            Err(_) => LiveSink::default(),
         }
     }
 
@@ -761,24 +1094,43 @@ impl HarwCoreRuntime {
             ));
         }
         let wiring = SessionWiring { event_tx, turn_tx };
-        let mut core = match admission
-            .as_ref()
-            .and_then(|state| state.admission.as_ref())
-        {
-            Some(admission) => self
-                .factory
-                .build_with_execution(session_id, title, wiring, admission)?,
-            None => self.factory.build(session_id, title, wiring)?,
-        };
+        let factory = Arc::clone(&self.factory);
+        let id = session_id.clone();
+        let title = title.map(str::to_owned);
+        let execution = admission.as_ref().and_then(|state| state.admission.clone());
+        // Building the runtime reads workspace configuration and trusted policy from disk.
+        // Leave socket handling and heartbeat timers on the async workers.
+        let mut core = tokio::task::spawn_blocking(move || match execution {
+            Some(execution) => {
+                factory.build_with_execution(&id, title.as_deref(), wiring, &execution)
+            }
+            None => factory.build(&id, title.as_deref(), wiring),
+        })
+        .await
+        .map_err(|error| {
+            DriverBridgeError::Runtime(format!("session builder stopped: {error}"))
+        })??;
         core.session
             .hydrate_from_store(core.store.as_ref())
             .await
             .map_err(|error| DriverBridgeError::Core(format!("hydrate: {error}")))?;
         self.note_model(session_id, core.session.active_model());
+        self.note_spawner(session_id, core.spawner.clone());
+        let live = core.session.agent_events().map(|hub| {
+            LiveForwarder(
+                tokio::spawn(forward_live(
+                    hub.subscribe(),
+                    session_id.clone(),
+                    self.live_sink(session_id),
+                ))
+                .abort_handle(),
+            )
+        });
         let slot = Arc::new(tokio::sync::Mutex::new(Slot {
             core,
             session_events,
             turn_events,
+            _live: live,
         }));
         // Hydration awaits external storage. Admission may have changed while
         // it ran; never publish a legacy/wider core under a newer admission.
@@ -841,6 +1193,10 @@ where
 }
 
 impl CoreRuntime for HarwCoreRuntime {
+    fn archive_state_store(&self) -> Option<&dyn StateStore> {
+        self.factory.archive_state_store()
+    }
+
     fn prepare_execution(
         &self,
         session_id: &SessionId,
@@ -872,6 +1228,7 @@ impl CoreRuntime for HarwCoreRuntime {
             .checked_add(1)
             .ok_or_else(|| DriverBridgeError::Runtime("admission generation exhausted".into()))?;
         self.slots()?.remove(session_id);
+        self.note_spawner(session_id, None);
         admissions.insert(
             session_id.clone(),
             AdmissionState {
@@ -893,6 +1250,7 @@ impl CoreRuntime for HarwCoreRuntime {
             .checked_add(1)
             .ok_or_else(|| DriverBridgeError::Runtime("admission generation exhausted".into()))?;
         self.slots()?.remove(session_id);
+        self.note_spawner(session_id, None);
         // Keep a tombstone so an older asynchronous hydration cannot publish
         // after rollback (including the None -> scoped -> None ABA case).
         admissions.insert(
@@ -906,6 +1264,27 @@ impl CoreRuntime for HarwCoreRuntime {
             .lock()
             .map_err(|_| DriverBridgeError::Runtime("model table poisoned".into()))?
             .remove(session_id);
+        if let Ok(mut sinks) = self.live_sinks.lock() {
+            sinks.remove(session_id);
+        }
+        Ok(())
+    }
+
+    fn forget_session(&self, session_id: &SessionId) -> Result<(), DriverBridgeError> {
+        // Same lock order as prepare_execution: admissions before slots.
+        let mut admissions = self
+            .admissions
+            .lock()
+            .map_err(|_| DriverBridgeError::Runtime("admission table poisoned".into()))?;
+        // Bump the generation so an in-flight hydration cannot publish the
+        // forgotten core; the admission itself stays (no tombstone).
+        if let Some(state) = admissions.get_mut(session_id) {
+            state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                DriverBridgeError::Runtime("admission generation exhausted".into())
+            })?;
+        }
+        self.slots()?.remove(session_id);
+        self.note_spawner(session_id, None);
         Ok(())
     }
 
@@ -915,6 +1294,68 @@ impl CoreRuntime for HarwCoreRuntime {
         title: Option<&'a str>,
     ) -> CoreFuture<'a, ()> {
         Box::pin(async move { self.slot(session_id, title).await.map(|_| ()) })
+    }
+
+    fn committed_fork_head<'a>(
+        &'a self,
+        new: &'a SessionId,
+        source: &'a SessionId,
+    ) -> CoreFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            // Cloud and embedded LocalHost share the factory's StateStore.
+            // The fresh destination has no inference; the source runtime
+            // need not even have a cached core. Separate stores yield None.
+            let target = self.slot(new, None).await?;
+            let store = Arc::clone(&target.lock().await.core.store);
+            store
+                .committed_fork_head(source)
+                .map_err(|error| DriverBridgeError::Core(error.to_string()))
+        })
+    }
+
+    fn seed_fork_history<'a>(
+        &'a self,
+        new: &'a SessionId,
+        items: Vec<harw_protocol::items::TurnItem>,
+    ) -> CoreFuture<'a, u64> {
+        Box::pin(async move {
+            let target_slot = self.slot(new, None).await?;
+            let mut guard = target_slot.lock().await;
+            if !guard.core.session.history().items().is_empty()
+                || guard
+                    .core
+                    .store
+                    .committed_fork_head(new)
+                    .map_err(|error| DriverBridgeError::Core(error.to_string()))?
+                    .is_some()
+                || items.iter().any(|item| {
+                    !matches!(
+                        item,
+                        harw_protocol::items::TurnItem::UserMessage(_)
+                            | harw_protocol::items::TurnItem::AssistantMessage(_)
+                    )
+                })
+            {
+                return Err(DriverBridgeError::Runtime(
+                    "fork destination is not a fresh chat".into(),
+                ));
+            }
+            let seed = harw_core::ConversationHistory::from_items(items);
+            guard
+                .core
+                .store
+                .save_history(new, &seed)
+                .await
+                .map_err(|error| DriverBridgeError::Core(error.to_string()))?;
+            let head = guard
+                .core
+                .store
+                .committed_fork_head(new)
+                .map_err(|error| DriverBridgeError::Core(error.to_string()))?
+                .ok_or_else(|| DriverBridgeError::Core("fork seed cursor unavailable".into()))?;
+            *guard.core.session.history_mut() = seed;
+            Ok(head)
+        })
     }
 
     fn run_turn<'a>(
@@ -930,6 +1371,7 @@ impl CoreRuntime for HarwCoreRuntime {
                 core,
                 session_events,
                 turn_events,
+                ..
             } = &mut *guard;
             let leg = run_turn_durable(
                 &mut core.session,
@@ -958,6 +1400,7 @@ impl CoreRuntime for HarwCoreRuntime {
                 core,
                 session_events,
                 turn_events,
+                ..
             } = &mut *guard;
             // Non-consuming entry point: the host's backend already resolved
             // the durable request (see the module docs).
@@ -987,6 +1430,11 @@ impl CoreRuntime for HarwCoreRuntime {
             };
             let tool = pending.call.name.as_str().to_owned();
             let turn_id = session.current_turn().cloned().unwrap_or_else(TurnId::new);
+            // PL-100 O1: the reason rides in `summary`; the wire struct stays
+            // unchanged because it denies unknown fields. Only consumers that
+            // render `summary` show it: `harw_session_client::describe` drops
+            // the field today, so remote SDK hosts do not see the reason yet.
+            let reason = pending_ask_reason(session);
             Ok(Some(ParkedApproval {
                 request: ApprovalRequest {
                     id: ApprovalId::from_str(pending.request.as_str()),
@@ -996,7 +1444,7 @@ impl CoreRuntime for HarwCoreRuntime {
                         tool_name: tool.clone(),
                         arguments: pending.call.arguments.clone(),
                     },
-                    summary: format!("tool '{tool}' requires approval"),
+                    summary: approval_summary(&tool, reason.as_deref()),
                     risk: RiskLevel::Medium,
                     requested_at: pending.requested_at,
                     timeout_at: pending.timeout_at,
@@ -1043,6 +1491,55 @@ impl CoreRuntime for HarwCoreRuntime {
     fn model_name(&self, session_id: &SessionId) -> Option<String> {
         self.models.lock().ok()?.get(session_id).cloned()
     }
+
+    fn live_agents(&self) -> Vec<LiveAgent> {
+        let Ok(spawners) = self.spawners.lock() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (session, spawner) in spawners.iter() {
+            for record in spawner.list_descendants_for(session) {
+                let state = match record.status {
+                    harw_core::child_controller::ChildStatus::Running => "running",
+                    harw_core::child_controller::ChildStatus::Admitted | harw_core::child_controller::ChildStatus::Paused => "waiting",
+                    harw_core::child_controller::ChildStatus::Completed => "done",
+                    harw_core::child_controller::ChildStatus::Failed | harw_core::child_controller::ChildStatus::Cancelled => "failed",
+                };
+                out.push(LiveAgent {
+                    agent_id: record.child.as_str().to_owned(),
+                    session_id: session.clone(),
+                    parent: Some(record.parent.as_str().to_owned()),
+                    role: record.role.clone(),
+                    model: record.model_route(),
+                    state: state.to_owned(),
+                    current_tool: None,
+                    started_ms: u64::try_from(record.admitted_at.as_millisecond()).unwrap_or(0),
+                    tool_calls: record.live.tool_calls,
+                });
+            }
+        }
+        out
+    }
+
+    fn stop_agent(&self, session_id: &SessionId, agent_id: &str) -> bool {
+        let spawner = self
+            .spawners
+            .lock()
+            .ok()
+            .and_then(|spawners| spawners.get(session_id).cloned());
+        let Some(spawner) = spawner else {
+            return false;
+        };
+        let child = SessionId::from_str(agent_id.to_owned());
+        spawner.owns_descendant(session_id, &child) && spawner.request_cancellation(&child)
+    }
+
+    fn bind_live_sink(&self, session_id: &SessionId, sink: Arc<dyn EventSink>) {
+        let cell = self.live_sink(session_id);
+        if let Ok(mut bound) = cell.lock() {
+            *bound = Some(sink);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1056,6 +1553,26 @@ mod tests {
         let driver = CoreTurnDriver::new(CoreDriverConfig::new(root)).map_err(|e| e.to_string())?;
         assert_eq!(driver.model_name(&SessionId::new()), None);
         Ok(())
+    }
+
+    /// PL-100 O1: the DoD-taint reason rides in the summary; without one
+    /// the summary keeps its previous text.
+    #[test]
+    fn the_summary_carries_the_taint_reason_only_when_there_is_one() {
+        assert_eq!(
+            approval_summary("job.stop", None),
+            "tool 'job.stop' requires approval"
+        );
+        let reason = harw_core::dod_taint::ask_reason("job.stop");
+        let summary = approval_summary("job.stop", Some(&reason));
+        assert!(
+            summary.starts_with("tool 'job.stop' requires approval; "),
+            "{summary}"
+        );
+        assert!(
+            summary.ends_with(harw_core::dod_taint::TAINT_REASON),
+            "{summary}"
+        );
     }
 }
 
@@ -1113,6 +1630,7 @@ mod admission_races {
                 ),
                 model: Arc::new(harw_core::EchoModelProvider::new("unused")),
                 store: Arc::clone(&self.0) as Arc<dyn StateStore>,
+                spawner: None,
             })
         }
     }
@@ -1151,6 +1669,373 @@ mod admission_races {
             .await?
             .is_err()
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod live_events {
+    use super::*;
+    use harw_core::state_store::StateStoreResult;
+    use harw_core::{AgentEventHub, ConversationHistory};
+    use harw_protocol::AgentOrchestrationEvent;
+    use harw_protocol::items::TurnItem;
+    use harw_session_host::identity::ConnectionId;
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<DriverEvent>>);
+
+    impl RecordingSink {
+        fn count(&self) -> usize {
+            self.0.lock().map_or(0, |events| events.len())
+        }
+
+        fn child_agents(&self) -> Vec<SessionId> {
+            self.0.lock().map_or_else(
+                |_| Vec::new(),
+                |events| {
+                    events
+                        .iter()
+                        .filter_map(|event| match event {
+                            DriverEvent::Child { agent, .. } => Some(agent.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                },
+            )
+        }
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: DriverEvent) {
+            if let Ok(mut events) = self.0.lock() {
+                events.push(event);
+            }
+        }
+    }
+
+    fn reasoning(agent: &SessionId, parent: Option<&SessionId>) -> AgentEvent {
+        AgentEvent {
+            agent: agent.clone(),
+            parent: parent.cloned(),
+            role: "explorer".to_owned(),
+            kind: AgentEventKind::Turn(TurnEvent::ReasoningDelta {
+                turn_id: TurnId::new(),
+                text: "thinking".to_owned(),
+            }),
+        }
+    }
+
+    fn orchestration(child: &SessionId, status: AgentOrchestrationStatus) -> AgentEvent {
+        AgentEvent {
+            agent: child.clone(),
+            parent: None,
+            role: "explorer".to_owned(),
+            kind: AgentEventKind::Orchestration(AgentOrchestrationEvent {
+                schema_version: AgentOrchestrationEvent::CURRENT_SCHEMA_VERSION,
+                event_id: "evt-1".to_owned(),
+                root_session_id: SessionId::new(),
+                parent_session_id: SessionId::new(),
+                child_session_id: child.clone(),
+                turn_id: None,
+                role: "explorer".to_owned(),
+                depth: 1,
+                task: None,
+                status,
+                usage: None,
+                duration_ms: None,
+                progress: None,
+                detail: None,
+                tool_calls: None,
+                model: None,
+                provider: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn child_turn_events_map_to_child_frames_and_root_events_are_skipped() -> TestResult {
+        let root = SessionId::new();
+        let child = SessionId::new();
+        let mapped = live_driver_event(&root, reasoning(&child, Some(&root)));
+        match mapped {
+            Some(DriverEvent::Child {
+                agent,
+                parent,
+                role,
+                event: TurnEvent::ReasoningDelta { text, .. },
+            }) => {
+                assert_eq!(agent, child);
+                assert_eq!(parent, Some(root.clone()));
+                assert_eq!(role, "explorer");
+                assert_eq!(text, "thinking");
+            }
+            other => return Err(format!("unexpected mapping: {other:?}").into()),
+        }
+        assert!(live_driver_event(&root, reasoning(&root, None)).is_none());
+        let knowledge = AgentEvent {
+            agent: child,
+            parent: None,
+            role: "knowledge".to_owned(),
+            kind: AgentEventKind::Knowledge {
+                area: "jobs".into(),
+                id: None,
+            },
+        };
+        assert!(live_driver_event(&root, knowledge).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn orchestration_maps_to_job_states_without_progress() -> TestResult {
+        let root = SessionId::new();
+        let child = SessionId::new();
+        match live_driver_event(
+            &root,
+            orchestration(&child, AgentOrchestrationStatus::Completed),
+        ) {
+            Some(DriverEvent::Job {
+                work_id,
+                kind,
+                state,
+                summary,
+            }) => {
+                assert_eq!(work_id, child.as_str());
+                assert_eq!(kind, "agent");
+                assert_eq!(state, "completed");
+                assert_eq!(summary.as_deref(), Some("explorer"));
+            }
+            other => return Err(format!("unexpected mapping: {other:?}").into()),
+        }
+        assert!(
+            live_driver_event(
+                &root,
+                orchestration(&child, AgentOrchestrationStatus::Progress)
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    struct InstantStore;
+
+    impl StateStore for InstantStore {
+        fn save_turn<'a>(
+            &'a self,
+            _: &'a SessionId,
+            _: &'a TurnItem,
+        ) -> Pin<Box<dyn Future<Output = StateStoreResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn load_history<'a>(
+            &'a self,
+            _: &'a SessionId,
+        ) -> Pin<Box<dyn Future<Output = StateStoreResult<ConversationHistory>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(ConversationHistory::new()) })
+        }
+    }
+
+    struct HubFactory {
+        hub: AgentEventHub,
+    }
+
+    impl CoreSessionFactory for HubFactory {
+        fn build(
+            &self,
+            session_id: &SessionId,
+            _: Option<&str>,
+            wiring: SessionWiring,
+        ) -> Result<CoreSession, DriverBridgeError> {
+            Ok(CoreSession {
+                session: AgentSession::new_with_id(
+                    session_id.clone(),
+                    harw_types::roles::AgentRole::Assistant,
+                    None,
+                    harw_extension_api::ExtensionRegistryBuilder::default().build(),
+                    wiring.event_tx,
+                )
+                .with_agent_events(self.hub.clone()),
+                model: Arc::new(harw_core::EchoModelProvider::new("unused")),
+                store: Arc::new(InstantStore),
+                spawner: None,
+            })
+        }
+    }
+
+    async fn wait_for(sink: &RecordingSink, count: usize) -> TestResult {
+        for _ in 0..200 {
+            if sink.count() >= count {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Err("timed out waiting for live events".into())
+    }
+
+    #[tokio::test]
+    async fn child_events_reach_the_bound_sink_between_legs() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let hub = AgentEventHub::default();
+        let runtime = HarwCoreRuntime::new(Arc::new(HubFactory { hub: hub.clone() }), dir.path());
+        let sid = SessionId::new();
+        let sink_a = Arc::new(RecordingSink::default());
+        let sink_b = Arc::new(RecordingSink::default());
+        runtime.bind_live_sink(&sid, Arc::clone(&sink_a) as Arc<dyn EventSink>);
+        runtime.open_session(&sid, None).await?;
+
+        let child_one = SessionId::new();
+        hub.publish(reasoning(&child_one, Some(&sid)));
+        wait_for(&sink_a, 1).await?;
+        assert_eq!(sink_a.child_agents(), vec![child_one]);
+
+        // Root events never show up; the ordered child event after it proves
+        // the forwarder already processed the root one.
+        hub.publish(reasoning(&sid, None));
+        let child_two = SessionId::new();
+        hub.publish(reasoning(&child_two, Some(&sid)));
+        wait_for(&sink_a, 2).await?;
+        assert_eq!(sink_a.count(), 2);
+        assert!(!sink_a.child_agents().contains(&sid));
+
+        runtime.bind_live_sink(&sid, Arc::clone(&sink_b) as Arc<dyn EventSink>);
+        let child_three = SessionId::new();
+        hub.publish(reasoning(&child_three, Some(&sid)));
+        wait_for(&sink_b, 1).await?;
+        assert_eq!(sink_b.child_agents(), vec![child_three]);
+        assert_eq!(sink_a.count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forget_session_drops_slot_without_tombstone() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let hub = AgentEventHub::default();
+        let runtime = HarwCoreRuntime::new(Arc::new(HubFactory { hub }), dir.path());
+        let sid = SessionId::new();
+        runtime.open_session(&sid, None).await?;
+        assert!(runtime.slots()?.get(&sid).is_some());
+        runtime.forget_session(&sid)?;
+        assert!(runtime.slots()?.get(&sid).is_none());
+        // No tombstone: the next leg hydrates lazily again.
+        assert!(
+            runtime
+                .admissions
+                .lock()
+                .map_err(|_| "admission table poisoned")?
+                .get(&sid)
+                .is_none()
+        );
+        runtime.open_session(&sid, None).await?;
+        assert!(runtime.slots()?.get(&sid).is_some());
+
+        // With a recorded admission state: the admission is kept unchanged,
+        // only the generation moves. `ExecutionAdmission::new` is crate-private
+        // to the host, so the state is seeded directly here.
+        let other = SessionId::new();
+        let seeded = AdmissionState {
+            generation: 3,
+            admission: None,
+        };
+        runtime
+            .admissions
+            .lock()
+            .map_err(|_| "admission table poisoned")?
+            .insert(other.clone(), seeded.clone());
+        runtime.forget_session(&other)?;
+        let after = runtime
+            .admissions
+            .lock()
+            .map_err(|_| "admission table poisoned")?
+            .get(&other)
+            .cloned()
+            .ok_or("admission state vanished")?;
+        assert_eq!(after.admission, seeded.admission);
+        assert!(after.generation > seeded.generation);
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct BindRecorder(Mutex<Vec<SessionId>>);
+
+    impl CoreRuntime for BindRecorder {
+        fn open_session<'a>(&'a self, _: &'a SessionId, _: Option<&'a str>) -> CoreFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn run_turn<'a>(
+            &'a self,
+            _: &'a SessionId,
+            _: CoreTurnInput,
+            _: CoreEvents,
+        ) -> CoreFuture<'a, CoreOutcome> {
+            Box::pin(async { Ok(CoreOutcome::Completed) })
+        }
+
+        fn resume_after_approval<'a>(
+            &'a self,
+            _: &'a SessionId,
+            _: ApprovalActor,
+            _: ApprovalResolution,
+            _: CoreEvents,
+        ) -> CoreFuture<'a, CoreOutcome> {
+            Box::pin(async { Ok(CoreOutcome::Completed) })
+        }
+
+        fn parked_approval<'a>(
+            &'a self,
+            _: &'a SessionId,
+        ) -> CoreFuture<'a, Option<ParkedApproval>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn apply_setting<'a>(&'a self, _: &'a SessionId, _: Setting) -> CoreFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn model_name(&self, _: &SessionId) -> Option<String> {
+            None
+        }
+
+        fn bind_live_sink(&self, session_id: &SessionId, _: Arc<dyn EventSink>) {
+            if let Ok(mut bound) = self.0.lock() {
+                bound.push(session_id.clone());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_binds_the_leg_sink() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let runtime = Arc::new(BindRecorder::default());
+        let driver = CoreTurnDriver::with_runtime(
+            CoreDriverConfig::new(dir.path().to_path_buf()),
+            Arc::clone(&runtime) as Arc<dyn CoreRuntime>,
+        )?;
+        let session = SessionId::new();
+        let input = TurnInput {
+            session_id: session.clone(),
+            text: "hello".to_owned(),
+            images: Vec::new(),
+            client_msg_id: "msg-1".to_owned(),
+            submitted_by: "tester".to_owned(),
+            title_seed_human: false,
+            actor: ApprovalActor::Operator {
+                id: "op".to_owned(),
+            },
+            origin: ConnectionId::next(),
+            rewind_before: None,
+            rewrite_replacement_id: None,
+        };
+        let cancel = tokio::sync::watch::channel(false).1;
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+        let outcome = TurnDriver::run_turn(&driver, input, cancel, sink).await?;
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        let bound = runtime.0.lock().map_err(|_| "poisoned")?.clone();
+        assert_eq!(bound, vec![session]);
         Ok(())
     }
 }

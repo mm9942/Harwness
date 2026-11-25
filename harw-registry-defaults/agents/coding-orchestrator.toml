@@ -25,7 +25,7 @@
 # (`child_orchestrators`), die hier bewusst leer bleibt.
 #
 # ── Budget ──────────────────────────────────────────────────────────────────
-# Jede Dimension liegt unter der des `root-orchestrator` (120000 / 80 / 900):
+# Jede Dimension liegt unter der des `root-orchestrator` (1500000 / 600 / 14400):
 # ein Kind verfügt nie über mehr Budget als sein Parent (monoton).
 
 schema = "harwness.agent/v1"

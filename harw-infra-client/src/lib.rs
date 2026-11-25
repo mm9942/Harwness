@@ -52,6 +52,7 @@ mod error;
 pub mod info;
 mod key;
 mod network;
+mod posture;
 mod security;
 mod token;
 mod transport;
@@ -72,7 +73,13 @@ pub use key::{
     CreatedKey, KeyContext, KeyDescription, KeyProfile, KeyRef, KeyRefError, KeyState,
     MAX_KEY_NAME_LEN, PublicKeyBytes, WrappedKey,
 };
+#[cfg(target_os = "linux")]
+pub use network::{OwnerActivationObservation, OwnerEpochClient};
 pub use network::{DEFAULT_NETWORK_SOCKET, NetworkControlClient};
+pub use posture::{
+    DisplayId, DodPosture, DodPostureStatus, InstructionId, Posture, PostureFinding, PostureId,
+    PosturePeer, PostureSeverity, UntrustedText,
+};
 pub use security::{
     ContextVerification, DEFAULT_SECURITY_SOCKET, MAX_CONTEXT_ID_LEN, SecurityHubClient,
 };

@@ -15,6 +15,9 @@ harw-session-host = { path = "../harw-session-host" }
 harw-session-store = { path = "../harw-session-store" }
 # The runtime the driver wraps (`run_turn_durable`, `resume_after_approval_durable`).
 harw-core = { path = "../harw-core" }
+# Prompt images: decode the wire bytes and store them (`MediaStore::put`).
+harw-media = { path = "../harw-media" }
+base64 = "0.23.1"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 thiserror = "2"
 tracing = { workspace = true }

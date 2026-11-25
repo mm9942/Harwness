@@ -108,6 +108,9 @@ see Section 2 for the field's current, implemented rule.
 | `tui.status_expiry` | `StatusExpiryMode` (`consolidate`/`hide`) | `consolidate` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
 | `tui.goal_mode` | `bool` | `false` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
 | `tui.reasoning` | `ReasoningDisplayMode` (`message`/`collapsed`/`hidden`) | `message` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.language` | `UiLanguage` (`en`, `de`, `es`, `fr`, `pt`, `ja`, `zh-CN`, `ko`, `vi`, `hi`) | `en` | `harness_config.rs` (`TuiSection`) | not in this table yet; follow-up: register like `footer_counts` |
+| `tui.footer_counts` | `bool` | `false` | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
+| `tui.cell_aspect` | `Option<f32>` (cell width / height, valid 0.2–1.5; unset = measured via `window_size()`, else 0.5) | unset | `harness_config.rs` (`TuiSection`) | `ProfileReplaces` (`merge.rs`) |
 
 ### 1.4 `[session]` (`harness_config.rs:306-343`, Defaults `429-437`)
 
@@ -230,6 +233,7 @@ remote_ocr = "ask"   # "off" (default) | "ask" | "on"
 | `sandbox.tmux.mode` | `TmuxOperationModeToml` (`inspect`/`write`) | — (required field) | `harness_config.rs:220` | Part of `sandbox.tmux`, see above |
 | `sandbox.tmux.socket_path` | `String` (absolute path) | — (required field) | `harness_config.rs:221` | Part of `sandbox.tmux`, see above |
 | `sandbox.execution` | `Option<SandboxExecutionToml>` (`chain`/`legacy`) | `None` → `chain` (`SandboxSection::effective_execution`) | `harness_config.rs` (`SandboxSection`) | `ProfileReplaces` via `merge_sandbox` (PL-97 E2) |
+| `sandbox.host_lease_ttl_secs` | `Option<u64>` (seconds, 1..=604800) | `None` → 28800 (`SandboxSection::effective_host_lease_ttl_secs`) | `harness_config.rs` (`SandboxSection`) | `ProfileReplaces` via `merge_sandbox` (PL-100 Phase 4, ADR 0002) |
 
 ### 1.13 `[internal_models]` (`internal_models.rs:139-193`)
 
@@ -362,7 +366,7 @@ UIA" with a notice. Details: `tui-roles-models-modes.md` §1.1.
 | TOML path | Type | Default | Allowed | Merge today |
 |---|---|---|---|---|
 | `agents.max_root_orchestrators` | `Option<u32>` | `1` | 1–4 | `MinBound` for the untrusted project (`merge_agent_limits`) — 🔒 |
-| `agents.max_sub_orchestrators` | `Option<u32>` | `2` | 1–6 | as above — 🔒 |
+| `agents.max_sub_orchestrators` | `Option<u32>` | `3` | 1–6 | as above — 🔒 |
 | `agents.max_sub_orchestrator_depth` | `Option<u32>` | `2` | 1–3 | as above — 🔒 |
 | `agents.max_spawn_depth` | `Option<u32>` | `4` | 1–6 | as above — 🔒 |
 
@@ -384,7 +388,7 @@ attempt to raise one is ignored and reported as a `ScopeDiagnostic`.
 ```toml
 [agents]
 max_root_orchestrators = 1
-max_sub_orchestrators = 2
+max_sub_orchestrators = 3
 max_sub_orchestrator_depth = 2
 max_spawn_depth = 4
 ```
@@ -436,7 +440,7 @@ and this document is not re-counted on every addition).
 Parsed from the same `config.toml`, with the same layer mechanics, but
 outside `HarnessConfig` itself: `[network]` (4 fields: `allow_hosts`,
 `allow_private`, `researcher_web_hosts` and `research_web` —
-`"allowlist"` (default) or `"open"`; a restricted layer may only move
+`"open"` (default) or `"allowlist"` (opt-in); a restricted layer may only move
 `research_web` towards `"allowlist"`), `[browser]`
 (5 fields), `[dod]` (4 fields), `[web]` (3 fields) — see Section 3. These four
 sections are **not** `HarnessConfig` fields (`harness_config.rs` does not
@@ -522,6 +526,7 @@ This table now matches `FIELD_TABLE` in `harw-config/src/scope.rs`.
 | `permissions.extra_roots` | **GLOBAL, intersection** (decided 2026-09-21) | `Intersection` | Extends allowed working roots — like `permissions.allow`, a potential rights expansion; same intersection logic: a profile can only reference a subset of the globally set roots, never open a new one. | 🔒 |
 | `sandbox.cargo.*` | GLOBAL exclusive | profile may not set/override | Trust anchor for the cargo sandbox; module docs (`harness_config.rs:70-74`) explicitly require these values to be read only from the trusted configuration at runtime setup. Direct analogy to `browser.geckodriver_path`/`geckodriver_sha256` and `dod.proof_key_dir`, which are already never taken from a repo layer (`browser_toml.rs:18-25`, `dod_toml.rs:22-31`). | 🔒 |
 | `sandbox.tmux.*` | GLOBAL exclusive | profile may not set/override | see above | 🔒 |
+| `sandbox.host_lease_ttl_secs` | **PROFILE** (PL-100 Phase 4) | `ProfileReplaces` | Duration of a host work phase (`SessionLease`) and upper bound of its ledger permits; default 8 h, 1 s to 7 days, `0` or more is a parse error ([ADR 0002](../adr/0002-session-lease-expiry.md)). Home and profile set it; the untrusted project layer cannot (`merge_sandbox`), so a cloned repository can never lengthen host phases. | 🔒 |
 | `sandbox.execution` | **PROFILE** (PL-97 E2) | `ProfileReplaces` | Chooses how `shell.exec`, `job.start` and child agents start their processes: `chain` (the job runtime's sandbox chain, the default) or `legacy` (the previous host-job path). Home and profile set it; the untrusted project layer cannot set it (`merge_sandbox`), so a cloned repository can never switch a session to the weaker path. | 🔒 |
 | `internal_models.*` (all 12 fields, including `auto_classifier`) | PROFILE | last explicitly set value wins (already correctly implemented) | Model routing for auxiliary tasks is user preference/cost control, not an access restriction. | |
 | `compaction.absolute_ceiling_tokens` | **GLOBAL as an upper bound (minimum)** (decided 2026-09-21) | `MinBound` | An admin enforces a cost ceiling; the profile may only lower it, never exceed the global limit. | |
@@ -820,7 +825,7 @@ subsection numbers, so the table can be checked 1:1 against Section 1.
 **1.2 `[logging]`** (3): `logging.level`, `logging.target_module_paths`,
 `logging.json` — all Profile / `ProfileReplaces`.
 
-**1.3 `[tui]`** (6): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`, `tui.status_expiry`, `tui.goal_mode`, `tui.reasoning`
+**1.3 `[tui]`** (7 registered + `tui.language` pending): `tui.theme`, `tui.keybindings_file`, `tui.child_stream`, `tui.status_expiry`, `tui.goal_mode`, `tui.reasoning`, `tui.footer_counts`, `tui.cell_aspect` (the last two, added 2026-11-22, follow the same pattern; `tui.language` exists in `TuiSection` but is missing from the field table)
 — all Profile / `ProfileReplaces`.
 
 **1.4 `[session]`** (5 fields)

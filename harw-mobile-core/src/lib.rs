@@ -70,6 +70,8 @@ pub enum EntryKind {
     User(String),
     /// What the agent answered.
     Assistant(String),
+    /// Provider-supplied display text, separate from the assistant answer.
+    Reasoning(String),
     /// A tool call.
     Tool {
         /// Tool name.
@@ -88,6 +90,19 @@ pub struct Entry {
     key: String,
     /// What it shows.
     pub kind: EntryKind,
+    /// Stored images of a user message (from `ContentPart::Media`), in order.
+    pub media: Vec<harw_protocol::MediaRef>,
+    /// Typed presentation when the flattened user row would contain an image marker.
+    /// The existing flattened text stays unchanged for exact displayed-fork proofs.
+    pub user_presentation: Option<UserPresentation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPresentation {
+    /// Authored text only, including any literal image-marker lines.
+    pub text: String,
+    /// Count of typed media parts, including legacy parts without a stored reference.
+    pub image_count: u32,
 }
 
 impl Entry {
@@ -222,8 +237,34 @@ impl SessionView {
 
     /// Add the chat entry of `item` unless one with its key exists.
     fn item(&mut self, item: &TurnItem) {
+        let mut media = Vec::new();
+        let mut user_presentation = None;
         let (key, kind) = match item {
-            TurnItem::UserMessage(m) => (m.id.as_str(), EntryKind::User(text_of(&m.content))),
+            TurnItem::UserMessage(m) => {
+                media = m
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Media { media, .. } => Some(media.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let flat = text_of(&m.content);
+                let image_count = m.content.iter().filter(|part| {
+                    matches!(part, ContentPart::Media { .. } | ContentPart::ImageUrl { .. })
+                }).count();
+                if image_count != 0 || flat.split('\n').any(|line| line == "[image]") {
+                    let authored = m.content.iter().filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    }).collect::<Vec<_>>().join("\n");
+                    user_presentation = Some(UserPresentation {
+                        text: authored,
+                        image_count: u32::try_from(image_count).unwrap_or(u32::MAX),
+                    });
+                }
+                (m.id.as_str(), EntryKind::User(flat))
+            }
             TurnItem::AssistantMessage(m) => {
                 // The full message replaces the partial text shown so far.
                 self.live = None;
@@ -237,7 +278,18 @@ impl SessionView {
                 },
             ),
             TurnItem::Error(e) => (e.id.as_str(), EntryKind::Error(e.message.clone())),
-            TurnItem::ToolResult(_) | TurnItem::Reasoning(_) => return,
+            TurnItem::Reasoning(reasoning) => {
+                // This is the same display field as Harw TUI. Never expose raw_content.
+                let text = reasoning.summary_text.join("\n");
+                if text.trim().is_empty() {
+                    return;
+                }
+                let cut = text.floor_char_boundary(
+                    text.len().min(harw_protocol::session_wire::MAX_VISIBLE_REASONING_BYTES),
+                );
+                (reasoning.id.as_str(), EntryKind::Reasoning(text[..cut].to_owned()))
+            }
+            TurnItem::ToolResult(_) => return,
         };
         if self.transcript.iter().any(|entry| entry.key == key) {
             return;
@@ -245,6 +297,8 @@ impl SessionView {
         self.transcript.push(Entry {
             key: key.to_owned(),
             kind,
+            media,
+            user_presentation,
         });
         if self.transcript.len() > KEEP_TRANSCRIPT {
             self.transcript.remove(0);
@@ -596,6 +650,25 @@ mod tests {
     }
 
     #[test]
+    fn only_user_visible_reasoning_survives_durable_replay() -> TestResult {
+        let mut view = SessionView::new();
+        let item_with_reasoning = |id: &str, summary_text: Vec<String>| {
+            TurnItem::Reasoning(harw_protocol::items::ReasoningItem {
+                id: harw_types::ItemId::from_str(id),
+                summary_text,
+                raw_content: vec!["do not render this".to_owned()],
+            })
+        };
+        view.apply(&item(1, item_with_reasoning("public", vec!["Provider-visible reasoning".into()])));
+        view.apply(&item(2, item_with_reasoning("private", Vec::new())));
+        ensure(view.transcript().len() == 1, "ignore opaque-only reasoning")?;
+        ensure(
+            view.transcript()[0].kind == EntryKind::Reasoning("Provider-visible reasoning".to_owned()),
+            "show only the public display text",
+        )
+    }
+
+    #[test]
     fn partial_text_is_shown_until_the_full_message_or_the_turn_end() -> TestResult {
         let mut view = SessionView::new();
         let snapshot = |durable: u64, text: &str| {
@@ -605,6 +678,7 @@ mod tests {
                     turn_id: TurnId::from_str("t1"),
                     assistant_text: text.to_owned(),
                     reasoning_collapsed: true,
+                    reasoning_text: None,
                 },
             )
         };

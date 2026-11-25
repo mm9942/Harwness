@@ -227,6 +227,63 @@ pub async fn list_models(
     provider: &harw_config::ProviderToml,
     api_key: Option<&str>,
 ) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    list_models_with_home(provider_name, provider, api_key, None).await
+}
+
+/// Discovers models using the provider's credentials, including a linked ChatGPT plan.
+///
+/// # Errors
+/// Returns a provider, credential, transport, or response decoding error.
+pub async fn list_models_with_home(
+    provider_name: &str,
+    provider: &harw_config::ProviderToml,
+    api_key: Option<&str>,
+    home: Option<&Path>,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let prepared = prepare_discovery(provider, home)?;
+    // Runde 7, Teil L8: Loopback-Endpunkte ohne Proxy ansprechen.
+    let client = crate::http_client_for_endpoint(&prepared.base).map_err(|error| {
+        DiscoveryError::Network {
+            detail: error.to_string(),
+        }
+    })?;
+    discover_prepared(provider_name, provider, api_key, prepared, client).await
+}
+
+/// Wie [`list_models_with_home`], aber mit vom Aufrufer gebautem Client
+/// (z. B. mit gepinnter Aufloesung durch den URL-Guard).
+///
+/// # Errors
+/// Returns a provider, credential, transport, or response decoding error.
+pub(crate) async fn list_models_with_client(
+    provider_name: &str,
+    provider: &harw_config::ProviderToml,
+    api_key: Option<&str>,
+    home: Option<&Path>,
+    client: reqwest::Client,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let prepared = prepare_discovery(provider, home)?;
+    discover_prepared(provider_name, provider, api_key, prepared, client).await
+}
+
+/// Vorbereitete Discovery-Daten: Plan, Codex-Route, Basis und Modell-URL.
+struct PreparedDiscovery {
+    plan: Option<harw_oauth::chatgpt_plan::ChatGptPlanStore>,
+    codex_route: Option<crate::codex::CodexRoute>,
+    base: String,
+    url: String,
+}
+
+/// Berechnet Route, Basis und URL; Fehlerreihenfolge wie bisher
+/// (Plan, Codex-Route, Unsupported) und vor jedem Client-Bau.
+fn prepare_discovery(
+    provider: &harw_config::ProviderToml,
+    home: Option<&Path>,
+) -> Result<PreparedDiscovery, DiscoveryError> {
+    let plan =
+        crate::chatgpt_plan::route(provider, home).map_err(|error| DiscoveryError::Decode {
+            detail: error.to_string(),
+        })?;
     let codex_route =
         crate::codex::CodexRoute::from_provider(provider).map_err(|_| DiscoveryError::Decode {
             detail: "Invalid Codex credential route".into(),
@@ -237,7 +294,7 @@ pub async fn list_models(
         provider.base_url.trim_end_matches('/')
     };
     let url = match provider.api.as_str() {
-        "openai-chat" | "openai-responses" => format!("{base}/models"),
+        "openai-chat" | "openai-responses" | crate::chatgpt_plan::API => format!("{base}/models"),
         "ollama" => {
             let normalized = format!("{}/v1", base.trim_end_matches("/v1"));
             format!("{normalized}/models")
@@ -255,12 +312,27 @@ pub async fn list_models(
             });
         }
     };
+    Ok(PreparedDiscovery {
+        plan,
+        codex_route,
+        base: base.to_owned(),
+        url,
+    })
+}
 
-    // Runde 7, Teil L8: Loopback-Endpunkte ohne Proxy ansprechen.
-    let client =
-        crate::http_client_for_endpoint(base).map_err(|error| DiscoveryError::Network {
-            detail: error.to_string(),
-        })?;
+async fn discover_prepared(
+    provider_name: &str,
+    provider: &harw_config::ProviderToml,
+    api_key: Option<&str>,
+    prepared: PreparedDiscovery,
+    client: reqwest::Client,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let PreparedDiscovery {
+        plan,
+        codex_route,
+        base,
+        url,
+    } = prepared;
 
     if provider.api == "anthropic-messages" {
         // `codex_route` ist für diese `api` immer `None` (siehe
@@ -269,7 +341,16 @@ pub async fn list_models(
     }
 
     let mut request = client.get(&url).timeout(DISCOVERY_TIMEOUT);
-    if let Some(route) = &codex_route {
+    if let Some(store) = &plan {
+        let token = store
+            .access_token()
+            .await
+            .map_err(|error| DiscoveryError::Auth {
+                status: 401,
+                detail: error.to_string(),
+            })?;
+        request = request.bearer_auth(token.expose_secret());
+    } else if let Some(route) = &codex_route {
         let codex_headers = route
             .headers(&client)
             .await
@@ -311,6 +392,9 @@ pub async fn list_models(
         .map_err(|_error| DiscoveryError::Decode {
             detail: format!("Antwort von Provider '{provider_name}' ist kein gültiges JSON"),
         })?;
+    if plan.is_some() {
+        return parse_account_models_response(&body, true);
+    }
     if let Some(route) = &codex_route {
         let models = parse_codex_models_response(&body)?;
         if models.is_empty() {
@@ -335,7 +419,7 @@ pub async fn list_models(
         && provider.api == "openai-chat"
         && models.iter().any(|model| model.context_length.is_none())
     {
-        merge_lmstudio_context_lengths(&client, base, api_key, &mut models).await;
+        merge_lmstudio_context_lengths(&client, &base, api_key, &mut models).await;
     }
     Ok(models)
 }
@@ -498,14 +582,24 @@ fn next_anthropic_page_cursor(body: &Value, page_had_entries: bool) -> Option<St
 }
 
 fn parse_codex_models_response(body: &Value) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    parse_account_models_response(body, false)
+}
+
+fn parse_account_models_response(
+    body: &Value,
+    visible_only: bool,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
     let entries = body
         .get("models")
         .and_then(Value::as_array)
         .ok_or_else(|| DiscoveryError::Decode {
-            detail: "Codex model response is missing its models array".into(),
+            detail: "OpenAI account model response is missing its models array".into(),
         })?;
     Ok(entries
         .iter()
+        .filter(|entry| {
+            !visible_only || entry.get("visibility").and_then(Value::as_str) == Some("list")
+        })
         .filter_map(|entry| {
             let id = entry.get("slug")?.as_str()?.trim();
             if id.is_empty() {

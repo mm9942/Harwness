@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="knowledge_cloud_profile">Perfil Cloud</string>
+    <string name="knowledge_no_profile">No hay ningún perfil Cloud configurado.</string>
+    <string name="knowledge_offline">El perfil Cloud está desconectado.</string>
+    <string name="knowledge_checking">Comprobando la conexión y los permisos de lectura.</string>
+    <string name="knowledge_no_manage">Esta pasarela no ofrece administración móvil.</string>
+    <string name="knowledge_no_observe">Este dispositivo no tiene permiso de lectura para la administración móvil.</string>
+    <string name="knowledge_no_store">Hay conexión, pero la pasarela no permite leer aquí los datos de conocimiento de un chat o proyecto.</string>
+    <string name="knowledge_no_scope">Estos ajustes no están vinculados a ningún chat ni proyecto. Para consultar los datos existentes, abre la sesión o el proyecto correspondiente en el terminal de Harw. Aquí no se cargan datos.</string>
+    <string name="knowledge_memory">Memoria</string>
+    <string name="knowledge_memory_scope">No hay un lector móvil de memoria para este ámbito.</string>
+    <string name="knowledge_diary">Diario</string>
+    <string name="knowledge_diary_scope">Las entradas del diario no se pueden consultar desde esta vista móvil.</string>
+    <string name="knowledge_session_workbench">Espacio de trabajo de la sesión</string>
+    <string name="knowledge_session_workbench_scope">Requiere una sesión abierta y un lector compatible.</string>
+    <string name="knowledge_project_workbench">Espacio de trabajo del proyecto</string>
+    <string name="knowledge_project_workbench_scope">Requiere un proyecto autorizado y un lector compatible.</string>
+    <string name="knowledge_goals">Objetivos</string>
+    <string name="knowledge_goals_scope">Requiere un ámbito de planificación autorizado y un almacén de objetivos conectado.</string>
+    <string name="knowledge_plan">Plan</string>
+    <string name="knowledge_plan_scope">Requiere un ámbito de planificación autorizado y un almacén de planes conectado.</string>
+</resources>

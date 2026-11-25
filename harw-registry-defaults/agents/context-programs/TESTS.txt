@@ -4,8 +4,10 @@ Knoten keine Rust-Module besitzen darf (nur `.toml`-Definitionen unter
 ausführen darf. Die tatsächliche Ausführung ist Sache des zentralen,
 sequenziellen Verifikationslaufs (siehe Bericht).
 
-1. Alle zehn Dateien laden über die Verzeichniskonvention und ergeben den
-   erwarteten abgeleiteten Namen (Dateistamm):
+1. Alle elf Dateien laden über die Verzeichniskonvention und ergeben den
+   erwarteten abgeleiteten Namen (Dateistamm). `security-triage.toml` kam mit
+   PL-100 WP 1.3 hinzu (Sicherheits-Triage; die vier `security-*-triage`-
+   Rollen binden es statt `triage`):
      base.toml            -> "base"
      explore.toml         -> "explore"
      research-deps.toml   -> "research-deps"
@@ -14,6 +16,7 @@ sequenziellen Verifikationslaufs (siehe Bericht).
      implement.toml       -> "implement"
      review.toml          -> "review"
      triage.toml          -> "triage"
+     security-triage.toml -> "security-triage"
      curate.toml          -> "curate"
      orchestrate.toml     -> "orchestrate"
    Prüfmethode (sobald der zentrale Verzeichnis-Loader aus AW6-00 existiert):
@@ -24,16 +27,20 @@ sequenziellen Verifikationslaufs (siehe Bericht).
 2. Keine Namenskollision mit bestehenden Rollen-Definitionen. Geprüft von
    Hand gegen den aktuellen Baum (`agents/*.toml`, Stand dieses Knotens):
    analyst, explorer, planner, researcher-deps, researcher-web, worker-base —
-   keiner der zehn neuen Namen (Punkt 1) ist darunter. Automatisiert zu
+   keiner der elf Namen (Punkt 1) ist darunter. `security-triage` (PL-100)
+   kollidiert auch mit keiner späteren Rolle unter `agents/roles/`
+   (`security-egress-triage`, `security-baseline-triage`,
+   `security-structure-triage`, `security-endpoint-triage`, `intel-scout`,
+   `context-steward`, `matrix-*`). Automatisiert zu
    prüfen, sobald der Loader existiert: `assert!` auf Disjunktheit der beiden
    Namensmengen (Rollen vs. Kontextprogramme), da beide laut AW6-00-Konvention
    denselben Namensraum unter `agents/` teilen (außer `family/`, `families/`,
    `organization/`).
 
-3. Alle neun (explore, research-deps, research-web, plan, implement, review,
-   triage, curate, orchestrate) lösen tatsächlich über `extends` auf `base`
-   auf — keines steht für sich. Prüfmethode: `resolve_context_program` auf
-   jede der neun IDs anwenden und `resolved.trace.steps` auf einen `"base"`-
+3. Alle zehn (explore, research-deps, research-web, plan, implement, review,
+   triage, security-triage, curate, orchestrate) lösen tatsächlich über
+   `extends` auf `base` auf — keines steht für sich. Prüfmethode:
+   `resolve_context_program` auf jede der zehn IDs anwenden und `resolved.trace.steps` auf einen `"base"`-
    Schritt mit `source == "harwness.context.base@1"` prüfen (nicht nur, dass
    irgendein `"base"`-Schritt existiert — der muss exakt auf `base.toml`
    zeigen). Zusätzlich: jede der beiden von `base` ererbten Sektionen
@@ -52,12 +59,12 @@ sequenziellen Verifikationslaufs (siehe Bericht).
    Overlay-Layer mit identischer `id`, nicht auf die erstmalige
    `extends`-Deklaration eines Kindes. Was stattdessen tatsächlich geprüft
    werden kann und sollte, sobald ein Loader existiert:
-     a) Jede der neun `exclude`-Listen ist eine Obermenge der `exclude`-Liste
+     a) Jede der zehn `exclude`-Listen ist eine Obermenge der `exclude`-Liste
         von `base` (`credential.*`, `secret.*`, `sibling_transcripts`,
         `full_parent_transcript`) — das ist die Richtung, in der "nie
         weniger streng als die Basis" tatsächlich strukturell gilt
         (`append_unique` kann nur hinzufügen).
-     b) Keine der neun Definitionen deklariert `exclude`-Einträge, die einen
+     b) Keine der zehn Definitionen deklariert `exclude`-Einträge, die einen
         von der Basis ererbten `exclude`-Eintrag aufheben würden (per
         Konstruktion durch `append_unique` bereits ausgeschlossen — als
         Regressionstest trotzdem sinnvoll, falls die Kaskade sich ändert).
@@ -68,24 +75,28 @@ sequenziellen Verifikationslaufs (siehe Bericht).
         ist (siehe Kopfkommentar der jeweiligen Datei) — eine automatisierte
         "Trust darf nie sinken"-Prüfung wäre technisch möglich
         (`TrustClass::trust_rank` vergleichen), ist hier aber nicht
-        einschlägig, da `trust` in keiner der neun Überschreibungen geändert
-        wird (nur `detail`).
+        einschlägig, da `trust` in keiner Überschreibung der zehn
+        Definitionen geändert wird (nur `detail`; `security-triage`
+        überschreibt keine Basissektion).
 
 5. Ladereihenfolge ist stabil: `worker-base` (Rolle) zuerst, dann
    alphabetisch nach abgeleitetem Namen, unabhängig von Dateisystem-
-   reihenfolge. Für die zehn Dateien dieses Knotens bedeutet das folgende
+   reihenfolge. Für die elf Dateien dieses Knotens bedeutet das folgende
    erwartete Position innerhalb der Gesamtliste aller `agents/**`-Dateien
    (`worker-base` steht laut AW6-00-Konvention immer zuerst, unabhängig von
-   seiner alphabetischen Position; alles danach — inklusive der zehn Namen
-   dieses Knotens — rein alphabetisch nach abgeleitetem Namen):
+   seiner alphabetischen Position; alles danach — inklusive der elf Namen
+   dieses Knotens — rein alphabetisch nach abgeleitetem Namen; die Liste
+   zeigt den Stand von AW6-05 plus `security-triage`, später hinzugekommene
+   Rollen sortieren sich ebenso alphabetisch ein):
      worker-base,
      analyst, base, curate, explore, explorer, implement, orchestrate, plan,
      planner, research-deps, research-web, researcher-deps, researcher-web,
-     review, triage
+     review, security-triage, triage
    Prüfmethode: Loader-Ausgabe als `Vec<String>` einsammeln, mit obiger
    Liste per `assert_eq!` vergleichen.
 
-6. Ein Golden Render je Programm (neun, siehe `golden/*.golden.txt`) —
+6. Ein Golden Render je Programm (neun aus AW6-05 plus `security-triage`,
+   siehe `golden/*.golden.txt`) —
    JEDE dieser Dateien ist von Hand aus der Renderlogik abgeleitet, nicht
    durch einen tatsächlichen Lauf erzeugt (siehe Statuszeile in jeder
    Golden-Datei). Zentral nachzuziehen: sobald ein Renderer für

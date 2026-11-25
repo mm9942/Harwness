@@ -174,8 +174,9 @@ jobs:
     needs: changes
     # Seit PL-60 ist `dod/` kein eigener Workspace mehr; der `check`-Job baut
     # und testet die DoD-Crates bereits mit `--workspace`. Dieser Job prüft
-    # die zweite, sicherheitsrelevante Konfiguration: DoD-Crates und die vier
-    # DoD-Binaries **nur mit `-p`-Auswahl** gebaut und getestet. Resolver 2
+    # die zweite, sicherheitsrelevante Konfiguration: DoD-Crates und die fünf
+    # DoD-Binaries (inkl. des opt-in harw-probe-netlink) **nur mit
+    # `-p`-Auswahl** gebaut und getestet. Resolver 2
     # vereinigt Features nur über die ausgewählten Pakete; so sieht der
     # Job, was die Binaries ohne die Feature-Vereinigung mit Produkt-Crates
     # (z. B. `serde_json/preserve_order`, weitere `rustix`-Features)
@@ -214,10 +215,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap libdbus-1-dev pkg-config
 
-      # Die vier DoD-Binaries gemeinsam, wie `harw-dod/Makefile` (`build`) sie
-      # baut — ohne Produkt-Binaries im selben Feature-Graphen.
+      # PL-100 (Owner-Review 4505015322): Manifest-Schreiber und BTF-Stempel
+      # pruefen, ohne clang/bpftool/Rust (Shell-Fixtures mit Fake-Werkzeugen).
+      - name: BPF manifest writer and BTF stamp checks
+        run: make -C harw-dod/bpf check-manifest-writer check-btf-stamp
+
+      # Die fünf DoD-Binaries gemeinsam, wie `harw-dod/Makefile` (`build`) sie
+      # baut — ohne Produkt-Binaries im selben Feature-Graphen. harw-probe-netlink
+      # wird mitgebaut und installiert, aber nicht automatisch aktiviert (opt-in).
       - name: Build DoD binaries (package-scoped)
-        run: cargo build --locked -p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-warden
+        run: cargo build --locked -p harw-sentinel -p harw-probe-bpf -p harw-probe-fs -p harw-probe-netlink -p harw-warden
 
       # Warden-TCB fürs Log: die Laufzeit-Hülle, die `xtask gates`
       # (warden-dependency-budget) gegen `MAX_WARDEN_RUNTIME_DEPS` zählt.

@@ -47,8 +47,9 @@ pub struct Arbiter {
     queue: VecDeque<TurnInput>,
     /// `client_msg_id` of the running turn, if any.
     running: Option<String>,
-    /// Recently accepted ids, oldest first (LRU order).
-    seen: VecDeque<String>,
+    rewrite_running: bool,
+    /// Recently accepted ids and payload identities, oldest first.
+    seen: VecDeque<(String, blake3::Hash)>,
 }
 
 impl Arbiter {
@@ -58,6 +59,7 @@ impl Arbiter {
             limits,
             queue: VecDeque::new(),
             running: None,
+            rewrite_running: false,
             seen: VecDeque::new(),
         }
     }
@@ -76,25 +78,53 @@ impl Arbiter {
         force: bool,
         head: Cursor,
     ) -> SubmitResult {
+        self.submit_reserved(input, expect_head, force, head, |_, _| Ok(()))
+            .unwrap_or_else(|error| SubmitResult::Denied { reason: error.to_string() })
+    }
+
+    pub(crate) fn submit_reserved(
+        &mut self,
+        input: TurnInput,
+        expect_head: Cursor,
+        force: bool,
+        head: Cursor,
+        reserve: impl FnOnce(&TurnInput, blake3::Hash) -> Result<(), crate::error::HostError>,
+    ) -> Result<SubmitResult, crate::error::HostError> {
         if let Err(reason) = validate(&input) {
-            return SubmitResult::Denied { reason };
+            return Ok(SubmitResult::Denied { reason });
         }
+        let fingerprint = fingerprint(&input, expect_head, force);
         if let Some(position) = self.duplicate_position(&input.client_msg_id) {
-            self.touch(&input.client_msg_id);
-            return SubmitResult::Accepted { position };
+            if self.seen.iter().find(|(id, _)| id == &input.client_msg_id)
+                .is_none_or(|(_, known)| *known != fingerprint)
+            {
+                return Ok(SubmitResult::Denied { reason: "submission ID is bound to another prompt".into() });
+            }
+            self.touch(&input.client_msg_id, fingerprint);
+            return Ok(SubmitResult::Accepted { position });
+        }
+        let rewrite = input.rewind_before.is_some();
+        if rewrite && (force || expect_head.generation != head.generation || expect_head.durable != head.durable) {
+            return Ok(SubmitResult::Stale { head });
+        }
+        if (rewrite && (self.running.is_some() || !self.queue.is_empty()))
+            || self.rewrite_running || self.queue.iter().any(|queued| queued.rewind_before.is_some())
+        {
+            return Ok(SubmitResult::Denied { reason: "an exact edit needs an idle, unqueued session".into() });
         }
         if !force && head.is_durably_ahead_of(&expect_head) {
-            return SubmitResult::Stale { head };
+            return Ok(SubmitResult::Stale { head });
         }
         if self.queue.len() >= self.limits.queue_cap {
-            return SubmitResult::QueueFull;
+            return Ok(SubmitResult::QueueFull);
         }
-        self.touch(&input.client_msg_id);
+        reserve(&input, fingerprint)?;
+        self.touch(&input.client_msg_id, fingerprint);
         self.queue.push_back(input);
         let index = self.queue.len().saturating_sub(1);
-        SubmitResult::Accepted {
+        Ok(SubmitResult::Accepted {
             position: self.position_of(index),
-        }
+        })
     }
 
     /// Pop the next input if no turn is running; marks running.
@@ -104,12 +134,14 @@ impl Arbiter {
         }
         let input = self.queue.pop_front()?;
         self.running = Some(input.client_msg_id.clone());
+        self.rewrite_running = input.rewind_before.is_some();
         Some(input)
     }
 
     /// The running turn ended.
     pub fn finish(&mut self) {
         self.running = None;
+        self.rewrite_running = false;
     }
 
     #[must_use]
@@ -139,13 +171,25 @@ impl Arbiter {
         dropped
     }
 
+    pub(crate) fn active_position(&self, id: &str) -> Option<u32> {
+        if self.running.as_deref() == Some(id) {
+            return Some(0);
+        }
+        self.queue.iter().position(|input| input.client_msg_id == id)
+            .map(|index| self.position_of(index))
+    }
+
+    pub(crate) fn running_rewrite(&self) -> Option<&str> {
+        self.running.as_deref().filter(|_| self.rewrite_running)
+    }
+
     /// Position of a known `client_msg_id`: its queue position while still
     /// queued, 0 when it runs or already ran. `None` for an unknown id.
     fn duplicate_position(&self, id: &str) -> Option<u32> {
         if let Some(index) = self.queue.iter().position(|q| q.client_msg_id == id) {
             return Some(self.position_of(index));
         }
-        if self.running.as_deref() == Some(id) || self.seen.iter().any(|s| s == id) {
+        if self.running.as_deref() == Some(id) || self.seen.iter().any(|(s, _)| s == id) {
             return Some(0);
         }
         None
@@ -157,11 +201,11 @@ impl Arbiter {
     }
 
     /// Mark `id` as most recently used; evict the oldest beyond the window.
-    fn touch(&mut self, id: &str) {
-        if let Some(index) = self.seen.iter().position(|s| s == id) {
+    fn touch(&mut self, id: &str, fingerprint: blake3::Hash) {
+        if let Some(index) = self.seen.iter().position(|(s, _)| s == id) {
             self.seen.remove(index);
         }
-        self.seen.push_back(id.to_owned());
+        self.seen.push_back((id.to_owned(), fingerprint));
         while self.seen.len() > self.limits.idempotency_window {
             self.seen.pop_front();
         }
@@ -174,8 +218,50 @@ impl Default for Arbiter {
     }
 }
 
+pub(crate) fn fingerprint(input: &TurnInput, expect_head: Cursor, force: bool) -> blake3::Hash {
+    let mut hash = blake3::Hasher::new_derive_key("harw session submit receipt v2");
+    fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
+        hash.update(&(bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    // Host-derived actor is stable across connections of the same device, but
+    // another actor must not adopt its receipt by reusing the caller's message ID.
+    match &input.actor {
+        harw_types::ApprovalActor::Operator { id } => {
+            field(&mut hash, b"operator");
+            field(&mut hash, id.as_bytes());
+        }
+        harw_types::ApprovalActor::ChannelPeer { channel, peer } => {
+            field(&mut hash, b"channel_peer");
+            field(&mut hash, channel.as_str().as_bytes());
+            field(&mut hash, peer.as_str().as_bytes());
+        }
+    }
+    if let Some(target) = &input.rewind_before {
+        field(&mut hash, b"exact_rewrite");
+        field(&mut hash, target.as_bytes());
+        // Cosmetic live progress does not move the durable edit boundary.
+        hash.update(&expect_head.generation.to_be_bytes());
+        hash.update(&expect_head.durable.to_be_bytes());
+    } else {
+        field(&mut hash, b"append");
+    }
+    hash.update(&[u8::from(force)]);
+    field(&mut hash, input.text.as_bytes());
+    for image in &input.images {
+        field(&mut hash, image.mime.as_bytes());
+        field(&mut hash, image.data_b64.as_bytes());
+    }
+    hash.finalize()
+}
+
 fn validate(input: &TurnInput) -> Result<(), String> {
-    if input.text.trim().is_empty() {
+    if let Some(target) = &input.rewind_before
+        && (target.is_empty() || target.len() > 128 || !target.bytes().all(|b| b.is_ascii_graphic()) || !input.images.is_empty())
+    {
+        return Err("invalid exact edit target or client image payload".into());
+    }
+    if input.text.trim().is_empty() && !(input.rewind_before.is_some() && input.text.is_empty()) {
         return Err("empty submission".into());
     }
     if input.text.len() > MAX_TEXT_BYTES {
@@ -204,10 +290,14 @@ mod tests {
         Ok(TurnInput {
             session_id: SessionId::try_from_str("s1")?,
             text: "hello".into(),
+            images: Vec::new(),
             client_msg_id: id.into(),
             submitted_by: "test".into(),
+            title_seed_human: false,
             actor: ApprovalActor::Operator { id: "uid:1".into() },
             origin,
+            rewind_before: None,
+            rewrite_replacement_id: None,
         })
     }
 
@@ -221,6 +311,32 @@ mod tests {
 
     fn submit(arbiter: &mut Arbiter, id: &str) -> Result<SubmitResult, InvalidId> {
         Ok(arbiter.submit(input(id, ConnectionId(1))?, at(0), false, at(0)))
+    }
+
+    #[test]
+    fn exact_retry_binds_payload_and_exact_cursor_without_enqueuing_twice() -> TestResult {
+        let mut arbiter = Arbiter::default();
+        let mut request = input("retry", ConnectionId(1))?;
+        request.text.clear();
+        request.rewind_before = Some("target".into());
+        assert_eq!(arbiter.submit(request.clone(), at(9), false, at(8)), SubmitResult::Stale { head: at(8) });
+        assert_eq!(arbiter.submit(request.clone(), at(8), false, at(8)), SubmitResult::Accepted { position: 0 });
+        assert!(arbiter.next_input().is_some());
+        assert_eq!(arbiter.submit(request.clone(), at(8), false, at(12)), SubmitResult::Accepted { position: 0 });
+        request.origin = ConnectionId(2);
+        let same_durable = Cursor { live: 4, ..at(8) };
+        assert_eq!(arbiter.submit(request.clone(), same_durable, false, at(12)), SubmitResult::Accepted { position: 0 });
+        assert!(matches!(arbiter.submit(request.clone(), at(9), false, at(12)), SubmitResult::Denied { .. }));
+        assert!(matches!(arbiter.submit(request.clone(), at(8), true, at(12)), SubmitResult::Denied { .. }));
+        let mut other_actor = request.clone();
+        other_actor.actor = ApprovalActor::Operator { id: "uid:2".into() };
+        assert!(matches!(arbiter.submit(other_actor, at(8), false, at(12)), SubmitResult::Denied { .. }));
+        request.rewind_before = Some("other".into());
+        assert!(matches!(arbiter.submit(request, at(8), false, at(12)), SubmitResult::Denied { .. }));
+        assert!(matches!(arbiter.submit(input("append", ConnectionId(1))?, at(12), false, at(12)), SubmitResult::Denied { .. }));
+        arbiter.finish();
+        assert!(arbiter.next_input().is_none());
+        Ok(())
     }
 
     #[test]

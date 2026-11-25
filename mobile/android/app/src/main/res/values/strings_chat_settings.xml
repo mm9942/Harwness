@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="chat_history_archive">History archive</string>
+    <string name="chat_history_variant_temporary">This version is available for this app session only. It could not be saved securely.</string>
+    <string name="chat_history_show_retained_in_chat">View earlier version in chat</string>
+    <string name="chat_history_retained_readonly">Verified earlier version, read only</string>
+    <string name="chat_history_return_current">Return to the current chat</string>
+    <string name="chat_history_retained_unavailable">No complete earlier version could be verified. The current chat was not changed.</string>
+    <string name="chat_history_retained_fork_unconfirmed">Fork not confirmed. Repeat the same row to check the same operation.</string>
+    <string name="chat_quick_picker_model">Model</string>
+    <string name="chat_quick_picker_uia_unavailable">No other UIA is available for this chat.</string>
+    <string name="chat_quick_picker_uia_local_only">UIA selection is only available in local chats.</string>
+    <string name="chat_quick_picker_model_unavailable">Model selection is unavailable for this chat.</string>
+    <string name="chat_history_partial_readonly">Showing only the newest part of this version. Forking from this partial view is unavailable.</string>
+    <string name="chat_history_open_paged_archive">Open paged archive</string>
+    <string name="chat_owner_status_action">Verify owner status</string>
+    <string name="chat_owner_status_unavailable">Owner status could not be verified.</string>
+    <string name="chat_owner_status_idle">Verified owner status: idle</string>
+    <string name="chat_owner_status_active">Verified owner status: active</string>
+    <string name="chat_owner_status_interrupted">Verified owner status: interrupted</string>
+    <string name="chat_owner_status_failed">Verified owner status: failed</string>
+    <string name="chat_owner_status_import_required">Import the trusted profile document separately to configure owner status.</string>
+</resources>

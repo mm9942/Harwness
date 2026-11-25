@@ -2683,7 +2683,9 @@ mod tests {
             "-=immediate,show=immediate,today=immediate,search=immediate,agents=immediate",
         ),
         ("diff", "immediate", ""),
-        // PL-97 D3: `/dod` liest nur (Status, Funde, Sensoren).
+        // PL-97 D3: `/dod` liest die Suite (Status, Funde, Sensoren). PL-100
+        // WP 1.9: `/dod model set|clear` schreibt nur `[dod.triage] model`
+        // der Home-Config, sofort wie `/settings`.
         ("dod", "immediate", ""),
         (
             "dream",

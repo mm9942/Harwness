@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use harw_protocol::session_wire::{GatewayListenerInfo, ListenerKind};
 use harw_session_com::local::peer_identity;
 use harw_session_com::{ComConfig, ComServer, HostBinder, PortOffer};
 use harw_session_host::SessionHost;
@@ -80,6 +81,8 @@ pub struct UdsConfig {
     pub socket_path: PathBuf,
     /// The only uid that is served. Everything else is dropped.
     pub allowed_uid: u32,
+    /// Optional tenant for workspace sharing with enrolled remote clients.
+    pub tenant: Option<harw_types::TenantId>,
     /// Permission tier granted to the served uid.
     pub tier: PermissionTier,
     /// Maximum simultaneous connections; excess connections are dropped.
@@ -104,6 +107,7 @@ impl UdsConfig {
         Self {
             socket_path: socket_path.into(),
             allowed_uid,
+            tenant: None,
             tier: PermissionTier::Operator,
             max_connections: 16,
             header_timeout: Duration::from_secs(5),
@@ -233,6 +237,13 @@ impl UdsServer {
             socket_id,
             _lock,
         } = self;
+        const LOCAL_LISTENER: &str = "local";
+        host.register_listener(GatewayListenerInfo {
+            name: LOCAL_LISTENER.to_owned(),
+            kind: ListenerKind::LocalUds,
+            address: config.socket_path.display().to_string(),
+            enabled: true,
+        });
         let config = Arc::new(config);
         // The per-connection path (peer identity, upgrade, bounded
         // connections, drain) is the Com layer's; this crate keeps the socket
@@ -258,11 +269,15 @@ impl UdsServer {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
-                            let Some(identity) =
+                            if host.listener_enabled(LOCAL_LISTENER) != Some(true) {
+                                continue;
+                            }
+                            let Some(mut identity) =
                                 peer_identity(&stream, config.allowed_uid, config.tier)
                             else {
                                 continue;
                             };
+                            identity.tenant.clone_from(&config.tenant);
                             if let Err(error) = com.serve_io(stream, identity) {
                                 tracing::warn!(%error, "session daemon: connection dropped");
                             }

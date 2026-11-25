@@ -29,6 +29,8 @@
       "job.status",
       "job.logs",
       "job.stop",
+      "job.suspend",
+      "job.resume",
       "job.list",
       "deps.graph",
       "deps.locked",
@@ -133,9 +135,11 @@
       "fs.view_image",
       "job.list",
       "job.logs",
+      "job.resume",
       "job.start",
       "job.status",
       "job.stop",
+      "job.suspend",
       "palace.recall",
       "palace.search",
       "parent.message",
@@ -239,6 +243,6 @@
   },
   "snapshot": {
     "domain": "harwness.agent-ir.snapshot/v7",
-    "digest": "3390a68a27e5a6378f5d1cc8cf3486209e1c71ed1be7a16bbf261c6b38e1854e"
+    "digest": "1fbccf7abdf38d410e92941e073be5ed4523d8f1d0682fa92ef9da44ba4bf93b"
   }
 }

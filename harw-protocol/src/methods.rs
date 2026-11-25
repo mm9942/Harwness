@@ -33,6 +33,53 @@ pub const METHOD_GATEWAY_LISTENERS_SET: &str = "gateway.listeners.set";
 pub const METHOD_GATEWAY_TOOLS_GRANT: &str = "gateway.tools.grant";
 pub const METHOD_GATEWAY_TOOLS_NARROW: &str = "gateway.tools.narrow";
 
+// Feature `media`.
+pub const METHOD_SESSION_MEDIA_PREVIEW: &str = "session.media.preview";
+pub const METHOD_MEDIA_GET: &str = "media.get";
+
+pub const METHOD_SESSION_PROJECTS: &str = "session.projects";
+pub const METHOD_SESSION_PAGE: &str = "session.page";
+pub const METHOD_SESSION_ADOPT: &str = "session.adopt";
+pub const METHOD_SESSION_CREATE_IN: &str = "session.create_in";
+pub const METHOD_SESSION_SET_PROJECT: &str = "session.set_project";
+pub const METHOD_SESSION_SET_EXISTING_PROJECT: &str = "session.set_existing_project";
+pub const METHOD_SESSION_RENAME: &str = "session.rename";
+pub const METHOD_AUTO_TITLE_SEED: &str = "session.auto_title_seed";
+pub const METHOD_AUTO_TITLE_PROBE: &str = "session.auto_title_probe";
+pub const METHOD_AUTO_TITLE_PUBLISH: &str = "session.auto_title_publish";
+pub const METHOD_SESSION_ARCHIVE: &str = "session.archive";
+pub const METHOD_ARCHIVE_CHECKPOINT_ISSUE: &str = "session.revision_checkpoint.issue";
+pub const METHOD_ARCHIVE_CHECKPOINT_DESCRIBE: &str = "session.revision_checkpoint.describe";
+pub const METHOD_ARCHIVE_CHECKPOINT_PREVIOUS: &str = "session.revision_checkpoint.previous";
+pub const METHOD_ARCHIVE_CHECKPOINT_PAGE: &str = "session.revision_checkpoint.page";
+pub const METHOD_FORK_INCLUSIVE: &str = "session.fork_inclusive";
+pub const METHOD_CLOUD_ASSISTANT_STATUS: &str = "cloud_assistant.status";
+pub const METHOD_CLOUD_ASSISTANT_PROVISION: &str = "cloud_assistant.provision";
+pub const METHOD_CLOUD_ASSISTANT_SUBMIT: &str = "cloud_assistant.submit";
+pub const METHOD_CLOUD_ASSISTANT_SUBMIT_WITH_RECALL: &str = "cloud_assistant.submit_with_recall";
+pub const METHOD_CLOUD_ASSISTANT_REVOKE: &str = "cloud_assistant.revoke";
+pub const METHOD_CLOUD_ASSISTANT_SHARED: &str = "cloud_assistant.shared";
+
+// Minor 4, feature `manage`.
+pub const METHOD_COMMANDS_LIST: &str = "commands.list";
+pub const METHOD_COMMAND_RUN: &str = "command.run";
+pub const METHOD_CATALOG_GET: &str = "catalog.get";
+pub const METHOD_CONFIG_GET: &str = "config.get";
+// Minor 4, feature `stepup`.
+pub const METHOD_CONFIG_SET: &str = "config.set";
+pub const METHOD_CONFIG_RESET: &str = "config.reset";
+pub const METHOD_SECRET_PUT: &str = "secret.put";
+pub const METHOD_STEPUP_CONFIRM: &str = "stepup.confirm";
+pub const METHOD_STEPUP_CANCEL: &str = "stepup.cancel";
+
+// Feature `overview`: global jobs and agents views.
+pub const METHOD_JOBS_LIST: &str = "jobs.list";
+pub const METHOD_JOBS_GET: &str = "jobs.get";
+pub const METHOD_JOBS_CANCEL: &str = "jobs.cancel";
+pub const METHOD_JOBS_RETRY: &str = "jobs.retry";
+pub const METHOD_AGENTS_LIST: &str = "agents.list";
+pub const METHOD_AGENTS_STOP: &str = "agents.stop";
+
 pub const NOTIF_SESSION_EVENT: &str = "event.session";
 pub const NOTIF_TURN_EVENT: &str = "event.turn";
 pub const NOTIF_APPROVAL_REQ: &str = "approval.request";
@@ -55,6 +102,66 @@ pub const SESSION_METHODS: &[&str] = &[
     METHOD_TURN_SUBMIT,
     METHOD_TURN_INTERRUPT,
     METHOD_APPROVAL_RESP,
+];
+
+/// Minor 3, feature `projects`: projects and pages. Own table, NOT part of
+/// `SESSION_METHODS`.
+pub const PROJECT_METHODS: &[&str] = &[
+    METHOD_SESSION_PROJECTS,
+    METHOD_SESSION_PAGE,
+    METHOD_SESSION_ADOPT,
+    METHOD_SESSION_CREATE_IN,
+    METHOD_SESSION_SET_PROJECT,
+    METHOD_SESSION_RENAME,
+    METHOD_SESSION_ARCHIVE,
+];
+
+/// Optional non-creating assignment, separate from the legacy project table.
+pub const EXISTING_PROJECT_ASSIGNMENT_METHODS: &[&str] = &[METHOD_SESSION_SET_EXISTING_PROJECT];
+
+/// Minor 5, feature `archive_checkpoint_v1`. Separate from base commands.
+pub const ARCHIVE_CHECKPOINT_METHODS: &[&str] = &[
+    METHOD_ARCHIVE_CHECKPOINT_ISSUE,
+    METHOD_ARCHIVE_CHECKPOINT_DESCRIBE,
+    METHOD_ARCHIVE_CHECKPOINT_PAGE,
+    METHOD_FORK_INCLUSIVE,
+];
+
+/// Minor 5, optional feature `archive_retained_rewrite_v1`.
+pub const ARCHIVE_RETAINED_REWRITE_METHODS: &[&str] = &[METHOD_ARCHIVE_CHECKPOINT_PREVIOUS];
+
+/// Feature `media`: stored prompt images. Own table.
+pub const MEDIA_METHODS: &[&str] = &[METHOD_MEDIA_GET];
+/// Separate optional V5 exact-occurrence reader.
+pub const SESSION_MEDIA_PREVIEW_METHODS: &[&str] = &[METHOD_SESSION_MEDIA_PREVIEW];
+
+
+/// Minor 4, feature `manage`: typed, allow-listed operation execution (W00 D5
+/// amendment). Own table.
+pub const MANAGE_METHODS: &[&str] = &[
+    METHOD_COMMANDS_LIST,
+    METHOD_COMMAND_RUN,
+    METHOD_CATALOG_GET,
+    METHOD_CONFIG_GET,
+];
+
+/// Minor 4, feature `stepup`: step-up confirmed global writes. Own table.
+pub const STEPUP_METHODS: &[&str] = &[
+    METHOD_CONFIG_SET,
+    METHOD_CONFIG_RESET,
+    METHOD_SECRET_PUT,
+    METHOD_STEPUP_CONFIRM,
+    METHOD_STEPUP_CANCEL,
+];
+
+/// Feature `overview`: global jobs and agents views. Own table.
+pub const OVERVIEW_METHODS: &[&str] = &[
+    METHOD_JOBS_LIST,
+    METHOD_JOBS_GET,
+    METHOD_JOBS_CANCEL,
+    METHOD_JOBS_RETRY,
+    METHOD_AGENTS_LIST,
+    METHOD_AGENTS_STOP,
 ];
 
 /// R18 D-A: the closed `tool.*` method table.
@@ -88,6 +195,15 @@ mod tests {
     fn method_tables_are_disjoint_and_unique() {
         let mut all: Vec<&str> = SESSION_METHODS
             .iter()
+            .chain(PROJECT_METHODS)
+            .chain(EXISTING_PROJECT_ASSIGNMENT_METHODS)
+            .chain(ARCHIVE_CHECKPOINT_METHODS)
+            .chain(ARCHIVE_RETAINED_REWRITE_METHODS)
+            .chain(MEDIA_METHODS)
+            .chain(SESSION_MEDIA_PREVIEW_METHODS)
+            .chain(MANAGE_METHODS)
+            .chain(STEPUP_METHODS)
+            .chain(OVERVIEW_METHODS)
             .chain(TOOL_METHODS)
             .chain(GATEWAY_READ_METHODS)
             .chain(GATEWAY_ADMIN_METHODS)
@@ -99,12 +215,57 @@ mod tests {
         assert_eq!(all.len(), total);
         assert!(TOOL_METHODS.iter().all(|name| name.starts_with("tool.")));
         assert!(
+            PROJECT_METHODS
+                .iter()
+                .all(|name| name.starts_with("session."))
+        );
+        assert!(
             GATEWAY_READ_METHODS
                 .iter()
                 .chain(GATEWAY_ADMIN_METHODS)
                 .all(|name| name.starts_with("gateway."))
         );
+        assert!(
+            MANAGE_METHODS
+                .iter()
+                .chain(STEPUP_METHODS)
+                .all(|n| !n.starts_with("gateway.") && !n.starts_with("tool."))
+        );
         // Schlüsseloperationen bleiben außerhalb jeder Gateway-Fläche.
         assert!(!all.iter().any(|name| name.contains("keys")));
     }
+
+    #[test]
+    fn manage_tables_have_exact_names() {
+        assert_eq!(MANAGE_METHODS.len(), 4);
+        assert_eq!(STEPUP_METHODS.len(), 5);
+        assert_eq!(
+            MANAGE_METHODS,
+            &["commands.list", "command.run", "catalog.get", "config.get"]
+        );
+        assert_eq!(
+            STEPUP_METHODS,
+            &[
+                "config.set",
+                "config.reset",
+                "secret.put",
+                "stepup.confirm",
+                "stepup.cancel"
+            ]
+        );
+    }
 }
+
+/// Device/profile-scoped encrypted library, separately negotiated at minor 5.
+pub const METHOD_CLOUD_LIBRARY: &str = "cloud.library";
+/// Independent manual work create/receipt path, not exposed as a model tool.
+pub const METHOD_MANUAL_CLOUD_WORK: &str = "session.manual_cloud_work";
+
+/// One exact, coarse status on an independently authenticated owner Session connection.
+pub const METHOD_DIRECT_OWNER_STATUS: &str = "session.direct_owner_status";
+
+/// Exact selected placement with one-use Hub selectors on the original direct connection.
+pub const METHOD_DIRECT_OWNER_STATUS_FENCED: &str = "session.direct_owner_status_fenced";
+
+/// Create a short-lived exact Owner observation reservation on the current direct WebSocket.
+pub const METHOD_RESERVE_OWNER_OBSERVATION: &str = "session.reserve_owner_observation";

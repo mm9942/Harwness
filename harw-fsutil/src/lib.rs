@@ -63,6 +63,10 @@ pub mod walk;
 mod test_support;
 
 pub use atomic::{AtomicWriteOptions, AtomicWriteOutcome, write_atomic, write_atomic_with_outcome};
-pub use open::{OpenMode, is_symlink_loop, open_beneath, open_dir_nofollow, open_nofollow};
+pub use open::{
+    OpenMode, ensure_owned_directory, entry_type_at, is_symlink_loop, mkdir_at, open_beneath,
+    open_dir_at, open_dir_nofollow, open_nofollow, read_dir_names, rename_at, same_file_at,
+    unlink_at,
+};
 pub use perm::ensure_private_regular;
 pub use walk::{EntryType, WalkBeneath, WalkEntry, WalkLimits, WalkStop, walk_beneath};

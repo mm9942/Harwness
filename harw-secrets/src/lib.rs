@@ -40,6 +40,7 @@ pub mod record;
 pub mod store;
 #[cfg(test)]
 mod test_support;
+pub mod write_only;
 
 pub use audit::chain::AuditLog;
 pub use audit::checkpoint::{Checkpoint, CheckpointLog};
@@ -58,3 +59,7 @@ pub use kek::{KekProvenance, derive_public_key, derive_secret_key, load_kek_mate
 pub use policy::{AeadAlgo, CryptoPolicy, KemAlgo};
 pub use record::{SecretEnvelopeFormat, SecretMetadata, SecretRecord};
 pub use store::{KekMaterial, SecretStore, V3MigrationReport};
+pub use write_only::{
+    KeyShape, SecretOwner, SecretPutRequest, StagedSecret, StagedSecretHandle, StagedSecretInfo,
+    StagedSecrets, WriteOnlyError, WriteOnlySecretSink,
+};

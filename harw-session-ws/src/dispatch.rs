@@ -1,7 +1,11 @@
 //! Closed method tables (W00 D5, R18 §2.1): one wire request → one typed
 //! port call.
 //!
-//! There is no generic operation execution here. Every method of
+//! There is no generic dispatcher here. Minor 4 adds typed, allow-listed
+//! operation execution (`command.run`, W00 D5 amendment): the line is
+//! resolved against the server's remote allow-list in the host, never here.
+//! Every method of `MANAGE_METHODS` / `STEPUP_METHODS` maps to one
+//! [`SessionPort`] call. Every method of
 //! [`harw_protocol::methods::SESSION_METHODS`] maps to exactly one
 //! [`SessionPort`] call, every method of
 //! [`harw_protocol::methods::TOOL_METHODS`] to one [`ToolPort`] call and
@@ -30,12 +34,35 @@ use harw_protocol::methods::{
     METHOD_SESSION_SET_MODEL, METHOD_TOOL_CALL, METHOD_TOOL_CANCEL, METHOD_TOOL_LIST,
     METHOD_TURN_INTERRUPT, METHOD_TURN_SUBMIT, TOOL_METHODS,
 };
+use harw_protocol::methods::{
+    METHOD_CATALOG_GET, METHOD_COMMAND_RUN, METHOD_COMMANDS_LIST, METHOD_CONFIG_GET,
+    METHOD_CONFIG_RESET, METHOD_CONFIG_SET, METHOD_MEDIA_GET, METHOD_SECRET_PUT,
+    METHOD_STEPUP_CANCEL, METHOD_STEPUP_CONFIRM,
+};
+use harw_protocol::methods::{
+    METHOD_SESSION_ADOPT, METHOD_SESSION_ARCHIVE, METHOD_SESSION_CREATE_IN, METHOD_SESSION_PAGE,
+    METHOD_SESSION_PROJECTS, METHOD_SESSION_RENAME, METHOD_SESSION_SET_PROJECT,
+};
 use harw_protocol::session_wire::{
     ApprovalRespondParams, AttachParams, CreateParams, GatewayDrainParams,
     GatewayListenerSetParams, GatewayRevokeParams, GatewayToolRightsParams, HelloParams,
     HistoryParams, HistoryResult, InterruptParams, ListResult, SessionRef, SetEffortParams,
     SetModeParams, SetModelParams, SubmitParams, ToolCallParams, ToolCancelParams, ToolListParams,
     error_codes,
+};
+use harw_protocol::session_wire::{
+    ArchiveParams, CreateInParams, MediaGetParams, PageParams, ProjectsParams, RenameParams, SetProjectParams,
+};
+use harw_protocol::methods::{
+    METHOD_AGENTS_LIST, METHOD_AGENTS_STOP, METHOD_JOBS_CANCEL, METHOD_JOBS_GET, METHOD_JOBS_LIST,
+    METHOD_JOBS_RETRY,
+};
+use harw_protocol::session_wire::{
+    AgentStopParams, AgentsListParams, JobTargetParams, JobsListParams,
+};
+use harw_protocol::session_wire::{
+    CatalogGetParams, CommandRunParams, CommandsListParams, ConfigGetParams, ConfigResetParams,
+    ConfigSetParams, SecretPutParams, StepUpCancelParams, StepUpConfirmParams,
 };
 use harw_protocol::{
     ClientCaps, FrameSource, GatewayPort, PortError, RequestEnvelope, ResponseEnvelope,
@@ -302,6 +329,59 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
             Ok(params) => encode(id, port.hello(params).await),
             Err(response) => *response,
         },
+        harw_protocol::methods::METHOD_RESERVE_OWNER_OBSERVATION => {
+            match serde_json::from_value::<SessionRef>(params) {
+                Ok(params) => encode(id, port.reserve_owner_observation(params.session_id).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid observation reservation request"),
+            }
+        }
+        harw_protocol::methods::METHOD_DIRECT_OWNER_STATUS_FENCED => {
+            match serde_json::from_value::<harw_protocol::owner_placement::FencedDirectOwnerStatus>(params) {
+                Ok(params) => encode(id, port.fenced_direct_owner_status(params).await),
+                // The selectors and rejected fields are never echoed.
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid fenced owner status request"),
+            }
+        }
+        harw_protocol::methods::METHOD_DIRECT_OWNER_STATUS => {
+            match serde_json::from_value::<SessionRef>(params) {
+                Ok(params) => encode(id, port.direct_owner_status(params.session_id).await),
+                // Do not echo a rejected selector or unexpected fields.
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid owner status request"),
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_STATUS
+        | harw_protocol::methods::METHOD_CLOUD_ASSISTANT_PROVISION
+        | harw_protocol::methods::METHOD_CLOUD_ASSISTANT_REVOKE => {
+            if !is_empty_params(&params) {
+                error_response(id, error_codes::INVALID_PARAMS, "Cloud Assistant takes no selector")
+            } else {
+                let result = match method.as_str() {
+                    harw_protocol::methods::METHOD_CLOUD_ASSISTANT_STATUS => port.cloud_assistant_status().await,
+                    harw_protocol::methods::METHOD_CLOUD_ASSISTANT_PROVISION => port.cloud_assistant_provision().await,
+                    _ => port.cloud_assistant_revoke().await,
+                };
+                encode(id, result)
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SUBMIT => {
+            match serde_json::from_value::<harw_protocol::session_wire::CloudAssistantSubmit>(params) {
+                Ok(params) => encode(id, port.cloud_assistant_submit(params).await),
+                // Never echo invalid fields or request text in a wire error.
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid Cloud Assistant message"),
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SUBMIT_WITH_RECALL => {
+            match serde_json::from_value::<harw_protocol::session_wire::CloudAssistantRecallSubmit>(params) {
+                Ok(params) => encode(id, port.cloud_assistant_submit_with_recall(params).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid Cloud Assistant recall request"),
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SHARED => {
+            match serde_json::from_value::<harw_protocol::session_wire::CloudAssistantSharedCommandV1>(params) {
+                Ok(input) => encode(id, port.cloud_assistant_shared(input).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid shared Cloud Assistant operation"),
+            }
+        }
         METHOD_SESSION_LIST => {
             if is_empty_params(&params) {
                 encode(
@@ -331,6 +411,48 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
             ),
             Err(response) => *response,
         },
+        harw_protocol::methods::METHOD_ARCHIVE_CHECKPOINT_ISSUE => {
+            match decode::<harw_protocol::session_wire::ArchiveCheckpointIssueV1>(&id, params) {
+                Ok(params) => encode(id, port.archive_checkpoint_issue(params).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_ARCHIVE_CHECKPOINT_DESCRIBE => {
+            match decode::<harw_protocol::session_wire::ArchiveCheckpointDescribeV1>(&id, params) {
+                Ok(params) => encode(id, port.archive_checkpoint_describe(params).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_ARCHIVE_CHECKPOINT_PREVIOUS => {
+            match decode::<harw_protocol::session_wire::ArchiveCheckpointPreviousV1>(&id, params) {
+                Ok(params) => encode(id, port.archive_checkpoint_previous(params).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_ARCHIVE_CHECKPOINT_PAGE => {
+            match decode::<harw_protocol::session_wire::ArchiveCheckpointPageV1>(&id, params) {
+                Ok(params) => encode(id, port.archive_checkpoint_page(params).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_MANUAL_CLOUD_WORK => {
+            match decode::<harw_protocol::session_wire::ManualCloudWorkCommandV1>(&id, params) {
+                Ok(command) => encode(id, port.manual_cloud_work(command).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_LIBRARY => {
+            match decode::<harw_protocol::cloud_library::CloudLibraryCommandV1>(&id, params) {
+                Ok(command) => encode(id, port.cloud_library(command).await),
+                Err(response) => *response,
+            }
+        }
+        harw_protocol::methods::METHOD_FORK_INCLUSIVE => {
+            match decode::<harw_protocol::session_wire::ForkInclusiveV1>(&id, params) {
+                Ok(params) => encode(id, port.fork_inclusive(params).await),
+                Err(response) => *response,
+            }
+        }
         METHOD_TURN_SUBMIT => match decode::<SubmitParams>(&id, params) {
             Ok(params) => encode(id, port.submit(params).await),
             Err(response) => *response,
@@ -361,6 +483,128 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
         },
         METHOD_SESSION_SET_EFFORT => match decode::<SetEffortParams>(&id, params) {
             Ok(params) => encode(id, port.set_effort(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_PROJECTS => match decode::<ProjectsParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.projects(params).await),
+            Err(response) => *response,
+        },
+        harw_protocol::methods::METHOD_SESSION_MEDIA_PREVIEW => {
+            match decode::<harw_protocol::session_wire::SessionMediaPreviewV1>(&id, params) {
+                Ok(params) => encode(id, port.session_media_preview(params).await),
+                Err(response) => *response,
+            }
+        }
+        METHOD_MEDIA_GET => match decode::<MediaGetParams>(&id, params) {
+            Ok(params) => encode(id, port.media_get(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_PAGE => match decode::<PageParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.page(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_ADOPT => match decode::<SessionRef>(&id, params) {
+            Ok(target) => encode(id, port.adopt(target.session_id).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_CREATE_IN => match decode::<CreateInParams>(&id, params) {
+            Ok(params) => encode(id, port.create_in(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_SET_PROJECT => match decode::<SetProjectParams>(&id, params) {
+            Ok(params) => encode(id, port.set_project(params).await),
+            Err(response) => *response,
+        },
+        harw_protocol::methods::METHOD_SESSION_SET_EXISTING_PROJECT => {
+            match serde_json::from_value::<SetProjectParams>(params) {
+                Ok(params) => encode(id, port.set_existing_project(params).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid existing project assignment"),
+            }
+        }
+        harw_protocol::methods::METHOD_AUTO_TITLE_PROBE => {
+            match serde_json::from_value::<harw_protocol::session_wire::AutoTitleSession>(params) {
+                Ok(scope) => encode(id, port.auto_title_probe(scope).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid automatic title scope"),
+            }
+        }
+        harw_protocol::methods::METHOD_AUTO_TITLE_SEED => {
+            match serde_json::from_value::<harw_protocol::session_wire::AutoTitleSession>(params) {
+                Ok(scope) => encode(id, port.auto_title_seed(scope).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid automatic title scope"),
+            }
+        }
+        harw_protocol::methods::METHOD_AUTO_TITLE_PUBLISH => {
+            match serde_json::from_value::<harw_protocol::session_wire::AutoTitlePublish>(params) {
+                Ok(params) => encode(id, port.auto_title_publish(params).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid automatic title request"),
+            }
+        }
+        METHOD_SESSION_RENAME => match decode::<RenameParams>(&id, params) {
+            Ok(params) => encode(id, port.rename(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SESSION_ARCHIVE => match decode::<ArchiveParams>(&id, params) {
+            Ok(params) => encode(id, port.archive(params).await),
+            Err(response) => *response,
+        },
+        METHOD_COMMANDS_LIST => match decode::<CommandsListParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.commands_list(params).await),
+            Err(response) => *response,
+        },
+        METHOD_COMMAND_RUN => match decode::<CommandRunParams>(&id, params) {
+            Ok(params) => encode(id, port.command_run(params).await),
+            Err(response) => *response,
+        },
+        METHOD_CATALOG_GET => match decode::<CatalogGetParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.catalog_get(params).await),
+            Err(response) => *response,
+        },
+        METHOD_CONFIG_GET => match decode::<ConfigGetParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.config_get(params).await),
+            Err(response) => *response,
+        },
+        METHOD_CONFIG_SET => match decode::<ConfigSetParams>(&id, params) {
+            Ok(params) => encode(id, port.config_set(params).await),
+            Err(response) => *response,
+        },
+        METHOD_CONFIG_RESET => match decode::<ConfigResetParams>(&id, params) {
+            Ok(params) => encode(id, port.config_reset(params).await),
+            Err(response) => *response,
+        },
+        METHOD_SECRET_PUT => match decode_secret_put(&id, params) {
+            Ok(params) => encode(id, port.secret_put(params).await),
+            Err(response) => *response,
+        },
+        METHOD_STEPUP_CONFIRM => match decode::<StepUpConfirmParams>(&id, params) {
+            Ok(params) => encode(id, port.stepup_confirm(params).await),
+            Err(response) => *response,
+        },
+        METHOD_STEPUP_CANCEL => match decode::<StepUpCancelParams>(&id, params) {
+            Ok(params) => encode(id, port.stepup_cancel(params).await),
+            Err(response) => *response,
+        },
+        METHOD_JOBS_LIST => match decode::<JobsListParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.jobs_list(params).await),
+            Err(response) => *response,
+        },
+        METHOD_JOBS_GET => match decode::<JobTargetParams>(&id, params) {
+            Ok(params) => encode(id, port.jobs_get(params).await),
+            Err(response) => *response,
+        },
+        METHOD_JOBS_CANCEL => match decode::<JobTargetParams>(&id, params) {
+            Ok(params) => encode(id, port.jobs_cancel(params).await),
+            Err(response) => *response,
+        },
+        METHOD_JOBS_RETRY => match decode::<JobTargetParams>(&id, params) {
+            Ok(params) => encode(id, port.jobs_retry(params).await),
+            Err(response) => *response,
+        },
+        METHOD_AGENTS_LIST => match decode::<AgentsListParams>(&id, null_to_object(params)) {
+            Ok(params) => encode(id, port.agents_list(params).await),
+            Err(response) => *response,
+        },
+        METHOD_AGENTS_STOP => match decode::<AgentStopParams>(&id, params) {
+            Ok(params) => encode(id, port.agents_stop(params).await),
             Err(response) => *response,
         },
         _ => error_response(
@@ -421,6 +665,27 @@ fn decode<P: DeserializeOwned>(id: &str, params: Value) -> Result<P, Box<Respons
     })
 }
 
+/// Decodes `secret.put` without echoing any input: a serde error message can
+/// quote a string value, so the detail is replaced by a fixed text.
+fn decode_secret_put(id: &str, params: Value) -> Result<SecretPutParams, Box<ResponseEnvelope>> {
+    serde_json::from_value::<SecretPutParams>(params).map_err(|_| {
+        Box::new(error_response(
+            id.to_owned(),
+            error_codes::INVALID_PARAMS,
+            "invalid secret.put params",
+        ))
+    })
+}
+
+/// `null` params become an empty object, so all-optional param structs decode.
+fn null_to_object(params: Value) -> Value {
+    if params.is_null() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        params
+    }
+}
+
 /// `null` or `{}`: the only params a parameterless method accepts.
 fn is_empty_params(params: &Value) -> bool {
     match params {
@@ -447,6 +712,7 @@ fn encode<T: Serialize>(id: String, result: Result<T, PortError>) -> ResponseEnv
 fn port_error(id: String, error: &PortError) -> ResponseEnvelope {
     match error {
         PortError::ToolRefused { detail, .. } => error_response(id, error.code(), detail.clone()),
+        PortError::Busy(detail) => error_response(id, error.code(), detail.clone()),
         _ => error_response(id, error.code(), error.to_string()),
     }
 }
@@ -463,15 +729,21 @@ fn internal(id: String, error: &serde_json::Error) -> ResponseEnvelope {
 mod tests {
     use std::sync::Mutex;
 
+    use harw_protocol::methods::{MANAGE_METHODS, STEPUP_METHODS};
     use harw_protocol::session_wire::{
         AgentRole, AttachAck, Cursor, FrameEnvelope, GatewayConnectionsResult, GatewayListenerInfo,
         GatewayListenersResult, GatewayRevokeResult, GatewayStatus, GatewayToolRights,
         GatewayToolsResult, HelloAck, ListenerKind, RespondResult, SessionSummary, SubmitResult,
         ToolCallResultFrame, ToolListResult,
     };
+    use harw_protocol::session_wire::{
+        CatalogLive, CatalogResult, CommandsListResult, ConfigGetResult,
+    };
+    use harw_protocol::session_wire::{PageResult, ProjectsResult, ShareInfo, ShareMode};
     use harw_protocol::{
         PortFuture, ProtocolVersion, ResultTrust, ToolCallResult, ToolPlacement, ToolRefusal,
     };
+    use harw_types::PermissionTier;
     use serde_json::json;
 
     use super::*;
@@ -614,6 +886,69 @@ mod tests {
         }
         fn set_mode(&self, _params: SetModeParams) -> PortFuture<'_, ()> {
             self.answer("set_mode", ())
+        }
+        fn projects(&self, _params: ProjectsParams) -> PortFuture<'_, ProjectsResult> {
+            let share = ShareInfo {
+                mode: ShareMode::Read,
+                tier: PermissionTier::Observer,
+            };
+            self.answer(
+                "projects",
+                ProjectsResult {
+                    projects: Vec::new(),
+                    next_cursor: None,
+                    share,
+                },
+            )
+        }
+        fn page(&self, params: PageParams) -> PortFuture<'_, PageResult> {
+            if params.query.as_deref() == Some("busy") {
+                return Box::pin(std::future::ready(Err(PortError::Busy(
+                    "running in the TUI".into(),
+                ))));
+            }
+            self.answer(
+                "page",
+                PageResult {
+                    sessions: Vec::new(),
+                    next_cursor: None,
+                },
+            )
+        }
+        fn commands_list(&self, _params: CommandsListParams) -> PortFuture<'_, CommandsListResult> {
+            self.answer(
+                "commands_list",
+                CommandsListResult {
+                    commands: Vec::new(),
+                    rev: "0000000000000000".to_owned(),
+                },
+            )
+        }
+        fn catalog_get(&self, _params: CatalogGetParams) -> PortFuture<'_, CatalogResult> {
+            self.answer(
+                "catalog_get",
+                CatalogResult {
+                    providers: Vec::new(),
+                    models: Vec::new(),
+                    roles: Vec::new(),
+                    live: CatalogLive::default(),
+                    note: String::new(),
+                },
+            )
+        }
+        fn config_get(&self, _params: ConfigGetParams) -> PortFuture<'_, ConfigGetResult> {
+            self.answer(
+                "config_get",
+                ConfigGetResult {
+                    entries: Vec::new(),
+                },
+            )
+        }
+        fn adopt(&self, _session: SessionId) -> PortFuture<'_, SessionSummary> {
+            self.answer("adopt", self.summary.clone())
+        }
+        fn create_in(&self, _params: CreateInParams) -> PortFuture<'_, SessionSummary> {
+            self.answer("create_in", self.summary.clone())
         }
         fn set_effort(&self, _params: SetEffortParams) -> PortFuture<'_, ()> {
             self.answer("set_effort", ())
@@ -1116,5 +1451,159 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn projects_routes_with_null_params() -> TestResult {
+        let port = FakePort::new(false)?;
+        for method in [METHOD_SESSION_PROJECTS, METHOD_SESSION_PAGE] {
+            let response = plain(dispatch(&port, request(method, Value::Null)).await)?;
+            assert!(response.error.is_none(), "{method}");
+            assert!(response.result.is_some(), "{method}");
+        }
+        assert_eq!(port.calls(), vec!["projects", "page"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_field_in_page_is_invalid_params() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "project_key": "p", "tenant": "other" });
+        let response = plain(dispatch(&port, request(METHOD_SESSION_PAGE, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adopt_and_create_in_route_to_the_port() -> TestResult {
+        let port = FakePort::new(false)?;
+        let adopt = plain(
+            dispatch(
+                &port,
+                request(METHOD_SESSION_ADOPT, json!({ "session_id": "s-1" })),
+            )
+            .await,
+        )?;
+        assert!(adopt.error.is_none());
+        let create = plain(
+            dispatch(
+                &port,
+                request(METHOD_SESSION_CREATE_IN, json!({ "project_key": "proj-a" })),
+            )
+            .await,
+        )?;
+        assert!(create.error.is_none());
+        assert_eq!(port.calls(), vec!["adopt", "create_in"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_round_trips_bare_detail() -> TestResult {
+        let port = FakePort::new(false)?;
+        let response = plain(
+            dispatch(
+                &port,
+                request(METHOD_SESSION_PAGE, json!({ "query": "busy" })),
+            )
+            .await,
+        )?;
+        let error = response.error.ok_or("missing error")?;
+        assert_eq!(error.code, error_codes::BUSY);
+        assert_eq!(error.message, "running in the TUI");
+        assert_eq!(
+            PortError::from_code(error.code, error.message),
+            PortError::Busy("running in the TUI".into())
+        );
+        Ok(())
+    }
+
+    /// `set_project` is not overridden by the fake, so the default body answers.
+    #[tokio::test]
+    async fn default_port_answers_protocol_error_for_projects() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "session_id": "s-1", "project_key": "proj-a" });
+        let response = plain(dispatch(&port, request(METHOD_SESSION_SET_PROJECT, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manage_reads_route_with_null_params() -> TestResult {
+        let port = FakePort::new(false)?;
+        for method in [METHOD_COMMANDS_LIST, METHOD_CATALOG_GET, METHOD_CONFIG_GET] {
+            let response = plain(dispatch(&port, request(method, Value::Null)).await)?;
+            assert!(response.error.is_none(), "{method}");
+            assert!(response.result.is_some(), "{method}");
+        }
+        assert_eq!(
+            port.calls(),
+            vec!["commands_list", "catalog_get", "config_get"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_run_requires_line_and_client_msg_id() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "line": "/status" });
+        let response = plain(dispatch(&port, request(METHOD_COMMAND_RUN, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_field_in_command_run_is_invalid_params() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "line": "/status", "client_msg_id": "m-1", "tier": "owner" });
+        let response = plain(dispatch(&port, request(METHOD_COMMAND_RUN, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secret_put_decode_error_never_echoes_value() -> TestResult {
+        let port = FakePort::new(false)?;
+        let bad = [
+            json!("sk-test-FAKE-0000000000000000"),
+            json!({
+                "name": "k",
+                "for_provider": "p",
+                "value": "sk-test-FAKE-0000000000000000",
+                "x": 1
+            }),
+        ];
+        for params in bad {
+            let response = plain(dispatch(&port, request(METHOD_SECRET_PUT, params)).await)?;
+            assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+            let error = response.error.ok_or("missing error")?;
+            assert_eq!(error.message, "invalid secret.put params");
+            assert!(!error.message.contains("FAKE"));
+        }
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    /// `command.run` is not overridden by the fake, so the default body answers.
+    #[tokio::test]
+    async fn default_port_answers_protocol_error_for_command_run() -> TestResult {
+        let port = FakePort::new(false)?;
+        let params = json!({ "line": "/status", "client_msg_id": "m-1" });
+        let response = plain(dispatch(&port, request(METHOD_COMMAND_RUN, params)).await)?;
+        assert_eq!(error_code(&response), Some(error_codes::INVALID_PARAMS));
+        let error = response.error.ok_or("missing error")?;
+        assert!(error.message.contains("command.run"), "{}", error.message);
+        assert!(port.calls().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn manage_methods_are_not_r18_gated() {
+        for method in MANAGE_METHODS.iter().chain(STEPUP_METHODS) {
+            assert_eq!(required_cap(method), None, "{method}");
+        }
     }
 }
