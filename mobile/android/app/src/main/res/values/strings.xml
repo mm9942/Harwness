@@ -61,4 +61,16 @@
     <string name="notification_turn_done_title">Reply finished</string>
     <string name="notification_turn_done_text">A session has finished its reply</string>
     <string name="model_download_channel">Model downloads</string>
+    <string name="local_backup_title">Local backup</string>
+    <string name="local_backup_scope">Back up provider settings, on-device workspace chats and UIA definitions. Sign-ins, private vault chats and the private library stay on this device.</string>
+    <string name="local_backup_disconnect">Disconnect the local workspace before backing up or restoring.</string>
+    <string name="local_backup_export">Create local backup</string>
+    <string name="local_backup_restore">Restore local backup</string>
+    <string name="local_backup_restore_detail">Matching provider settings are replaced. Existing chats are kept.</string>
+    <string name="local_backup_password">Backup password (at least 12 characters)</string>
+    <string name="local_backup_confirm_password">Repeat backup password</string>
+    <string name="local_backup_exported">Encrypted backup saved.</string>
+    <string name="local_backup_restored">Restored %1$d files.</string>
+    <string name="local_backup_failed">Backup could not be completed. Check the file, password and available space.</string>
+    <string name="local_backup_disconnect_action">Disconnect local workspace</string>
 </resources>

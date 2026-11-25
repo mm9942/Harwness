@@ -808,6 +808,12 @@ internal open class MainActivity : HarwLocaleActivity() {
                     onOpen = ::openSettings,
                     diagnosticsConnection = connection,
                     diagnosticsLocal = viewLocal,
+                    localDisconnected = localState.phase in setOf(ConnectionPhase.DISCONNECTED, ConnectionPhase.FAILED)
+                        && !localState.stopping,
+                    disconnectLocal = {
+                        (application as HarwApplication).localAutostart.suppress()
+                        onDevice.disconnect()
+                    },
                 )
             }
             settingsRoute == SettingsRoute.PinBiometrics -> {
