@@ -445,9 +445,13 @@ impl SwitchingModel {
             return Err(missing());
         }
         if current.0 != wanted || !crate::uia_room::is_pinned_local(&current.3.for_chat(), &id) {
-            // Release the old model before mapping another; share the same
-            // cache lock as the coding host.
-            current.3 = CachedProvider::Other(Arc::new(NoModel));
+            // No remapping while another chat or Library still owns the old
+            // model. Cancellation of a waiting caller does not cancel workers.
+            LOCAL_INFERENCE.wait_idle().await;
+            if matches!(&current.3, CachedProvider::Local { model, .. } if Arc::strong_count(model) > 1) {
+                return Err(local_vision_busy());
+            }
+            *current = (ModelCacheKey::Route(None), None, None, CachedProvider::Other(Arc::new(NoModel)));
             let home = self.home.clone();
             let selected = id.clone();
             let built = load_model(move || build_local_assistant_gguf(&home, &selected))
@@ -488,7 +492,10 @@ impl SwitchingModel {
             // operation finishes. Don't retain two GGUF mappings in the cache.
             LOCAL_INFERENCE.wait_idle().await;
             if cancel.is_cancelled() { return Err(Cancelled); }
-            current.3 = CachedProvider::Other(Arc::new(NoModel));
+            if matches!(&current.3, CachedProvider::Local { model, .. } if Arc::strong_count(model) > 1) {
+                return Err(Busy);
+            }
+            *current = (ModelCacheKey::Route(None), None, None, CachedProvider::Other(Arc::new(NoModel)));
             let home = self.home.clone();
             let id = selected.0.clone();
             // Keep remapping exclusion with the blocking loader even if

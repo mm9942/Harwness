@@ -2232,7 +2232,14 @@ internal class HarwConnection(private val context: Context, private val localBac
     suspend fun libraryVisionChoices(): List<uniffi.harw_mobile_ffi.LocalVisionChoice> {
         val native = core ?: throw MobileException.Disconnected()
         if (!localBackend || !state.value.online) throw MobileException.Disconnected()
-        return withContext(Dispatchers.IO) { native.libraryVisionChoices() }
+        return withContext(Dispatchers.IO) {
+            // Importing a model does not necessarily activate it. Register
+            // the configured directory independently of the active route.
+            uniffi.harw_mobile_ffi.configureLocalModelsDir(
+                context.filesDir.path, ModelStore(context.applicationContext).modelsDir().path,
+            )
+            native.libraryVisionChoices()
+        }
     }
 
     suspend fun cloudLibraryCaptionLocal(

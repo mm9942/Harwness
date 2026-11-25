@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -200,7 +201,7 @@ internal fun CloudAssistantScreen(
                 onDismissRequest = { choosingModel = false },
                 title = { Text("Assistant-Modell wählen") },
                 text = {
-                    LazyColumn {
+                    LazyColumn(Modifier.heightIn(max = 420.dp)) {
                         item {
                             Text("Nur vom Gateway freigegebene Modelle. Der Cloud-Verlauf wird an den gewählten Anbieter gesendet.")
                             TextButton(onClick = { selectedModel = null; choosingModel = false }) { Text("Gateway-Standardmodell") }
