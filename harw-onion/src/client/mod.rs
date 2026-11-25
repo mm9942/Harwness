@@ -5,28 +5,22 @@
 //! [`OnionClient::dial`] carry no peer identity. Authentication happens in
 //! the node transport layered on top.
 
-use std::future::Future;
-use std::path::{Path, PathBuf};
+mod isolation;
+mod retry;
+pub(crate) mod runtime;
+
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arti_client::config::{BoolOrAuto, TorClientConfigBuilder};
-use arti_client::status::BootstrapStatus;
-use arti_client::{ErrorKind, HasKind, StreamPrefs, TorClient, TorClientConfig};
-use futures::StreamExt;
+use arti_client::HasKind;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tor_rtcompat::tokio::TokioRustlsRuntime;
 
-use crate::{BootstrapProgress, OnionError, OnionLocator, OnionStream};
-
-/// The arti client type used by harw (tokio runtime with rustls TLS).
-pub(crate) type ArtiClient = TorClient<TokioRustlsRuntime>;
-
-/// Set once the "this build is outdated" warning has been logged.
-static OUTDATED_WARNED: AtomicBool = AtomicBool::new(false);
+use super::{BootstrapProgress, OnionError, OnionLocator, OnionStream};
+use retry::{circuit_retry_delay, dial_before_deadline, retry_circuit};
+use runtime::{ArtiClient, create_client, map_arti_error, spawn_progress};
 
 /// Storage locations of an embedded Tor client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,7 +106,7 @@ impl OnionClient {
         locator: &OnionLocator,
         timeout: Duration,
     ) -> Result<OnionStream, OnionError> {
-        self.dial_inner(locator, timeout, false).await
+        self.dial_inner(locator, timeout, false, None).await
     }
 
     /// Opens a Tor stream with one fresh-circuit retry for a transient error
@@ -122,7 +116,18 @@ impl OnionClient {
         locator: &OnionLocator,
         timeout: Duration,
     ) -> Result<OnionStream, OnionError> {
-        self.dial_inner(locator, timeout, true).await
+        self.dial_inner(locator, timeout, true, None).await
+    }
+
+    /// Bounds cold bootstrap and circuit establishment independently.
+    pub async fn dial_with_bootstrap_budget(
+        &self,
+        locator: &OnionLocator,
+        bootstrap_timeout: Duration,
+        dial_timeout: Duration,
+    ) -> Result<OnionStream, OnionError> {
+        self.dial_inner(locator, bootstrap_timeout, true, Some(dial_timeout))
+            .await
     }
 
     async fn dial_inner(
@@ -130,17 +135,14 @@ impl OnionClient {
         locator: &OnionLocator,
         timeout: Duration,
         retry: bool,
+        dial_timeout: Option<Duration>,
     ) -> Result<OnionStream, OnionError> {
         let deadline = Instant::now() + timeout;
-        let attempt = async {
+        let attempt = |deadline: Instant| async move {
             let connect = |fresh| async move {
-                let mut prefs = StreamPrefs::new();
-                prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
+                let prefs = isolation::preferences(locator, fresh);
                 if fresh {
-                    // Avoid reusing the first attempt's tunnel or pending request.
-                    // The original Arti client still owns the guard state.
-                    prefs.new_isolation_group();
-                    tracing::debug!(target = %locator.redacted(), "retrying with a fresh onion circuit");
+                    tracing::debug!(onion = %locator.redacted(), "retrying with a fresh onion circuit");
                 }
                 self.client
                     .connect_with_prefs((locator.host(), locator.port()), &prefs)
@@ -164,60 +166,23 @@ impl OnionClient {
                 .await
                 .map_err(|e| map_arti_error(&e, OnionError::Bootstrap))
         };
-        let result = dial_before_deadline(deadline, timeout, bootstrap, attempt).await;
+        let result = match dial_timeout {
+            Some(dial_timeout) => {
+                tokio::time::timeout_at(deadline, bootstrap)
+                    .await
+                    .map_err(|_| OnionError::BootstrapTimeout(timeout))??;
+                let dial_deadline = Instant::now() + dial_timeout;
+                tokio::time::timeout_at(dial_deadline, attempt(dial_deadline))
+                    .await
+                    .map_err(|_| OnionError::ConnectTimeout(dial_timeout))?
+            }
+            None => dial_before_deadline(deadline, timeout, bootstrap, attempt(deadline)).await,
+        };
         if let Err(error) = &result {
-            tracing::debug!(target = %locator.redacted(), %error, "onion dial failed");
+            tracing::debug!(onion = %locator.redacted(), stage = ?error.stage(), "onion dial failed");
         }
         result
     }
-}
-
-async fn dial_before_deadline<T>(
-    deadline: Instant,
-    total: Duration,
-    bootstrap: impl Future<Output = Result<(), OnionError>>,
-    dial: impl Future<Output = Result<T, OnionError>>,
-) -> Result<T, OnionError> {
-    tokio::time::timeout_at(deadline, bootstrap)
-        .await
-        .map_err(|_| OnionError::BootstrapTimeout(total))??;
-    if Instant::now() >= deadline {
-        return Err(OnionError::ConnectTimeout(total));
-    }
-    tokio::time::timeout_at(deadline, dial)
-        .await
-        .map_err(|_| OnionError::ConnectTimeout(total))?
-}
-
-fn circuit_retry_delay(kind: ErrorKind) -> Option<Duration> {
-    match kind {
-        // Arti's Onion directory can lag behind its general bootstrap.
-        ErrorKind::BootstrapRequired => Some(Duration::from_secs(2)),
-        ErrorKind::TorNetworkTimeout
-        | ErrorKind::RemoteNetworkTimeout
-        | ErrorKind::OnionServiceConnectionFailed => Some(Duration::ZERO),
-        _ => None,
-    }
-}
-
-async fn retry_circuit<T, E, F: Future<Output = Result<T, E>>>(
-    initial_budget: Duration,
-    mut connect: impl FnMut(bool) -> F,
-    retry_delay: impl FnOnce(&E) -> Option<Duration>,
-) -> Result<T, E> {
-    match tokio::time::timeout(initial_budget, connect(false)).await {
-        Ok(Ok(stream)) => return Ok(stream),
-        Ok(Err(error)) => {
-            let Some(delay) = retry_delay(&error) else {
-                return Err(error);
-            };
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-        }
-        Err(_) => {}
-    }
-    connect(true).await
 }
 
 impl Drop for OnionClient {
@@ -228,104 +193,12 @@ impl Drop for OnionClient {
     }
 }
 
-/// Installs aws-lc-rs as the process-default rustls provider unless another
-/// provider is already installed, then requires that a default exists.
-///
-/// arti's rustls runtime panics when no process-default provider exists, so
-/// this must run before any [`TokioRustlsRuntime`] or Tor client is created.
-pub(crate) fn install_crypto_provider() -> Result<(), OnionError> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    if rustls::crypto::CryptoProvider::get_default().is_some() {
-        Ok(())
-    } else {
-        Err(OnionError::CryptoProvider)
-    }
-}
-
-/// Builds the arti configuration for the given state and cache directories.
-///
-/// arti's own permission checks on these directories stay enabled.
-pub(crate) fn client_config(
-    state_dir: &Path,
-    cache_dir: &Path,
-) -> Result<TorClientConfig, OnionError> {
-    TorClientConfigBuilder::from_directories(state_dir, cache_dir)
-        .build()
-        .map_err(|e| OnionError::Config(e.to_string()))
-}
-
-/// Installs the crypto provider and creates an unbootstrapped arti client on
-/// the current tokio runtime (bootstrap behaviour: on demand).
-pub(crate) fn create_client(
-    state_dir: &Path,
-    cache_dir: &Path,
-) -> Result<Arc<ArtiClient>, OnionError> {
-    install_crypto_provider()?;
-    let runtime = TokioRustlsRuntime::current().map_err(|e| OnionError::Runtime(e.to_string()))?;
-    let config = client_config(state_dir, cache_dir)?;
-    TorClient::with_runtime(runtime)
-        .config(config)
-        .create_unbootstrapped()
-        .map_err(|e| map_arti_error(&e, OnionError::Runtime))
-}
-
-/// Maps an arti bootstrap status to harw's progress snapshot.
-pub(crate) fn progress_of(status: &BootstrapStatus) -> BootstrapProgress {
-    let fraction = status.as_frac().clamp(0.0, 1.0);
-    // `as` saturates (NaN becomes 0); the value is already within 0..=100.
-    let percent = ((fraction * 100.0).round() as u8).min(100);
-    BootstrapProgress {
-        percent,
-        ready: status.ready_for_traffic(),
-        blocked: status.blocked().map(|b| b.to_string()),
-        summary: status.to_string(),
-    }
-}
-
-/// Publishes the client's bootstrap progress into a watch channel.
-///
-/// The spawned task holds only the event stream, never the client itself,
-/// so it does not keep the client alive.
-pub(crate) fn spawn_progress(
-    client: &ArtiClient,
-) -> (watch::Receiver<BootstrapProgress>, JoinHandle<()>) {
-    let (sender, receiver) = watch::channel(progress_of(&client.bootstrap_status()));
-    let mut events = client.bootstrap_events();
-    let task = tokio::spawn(async move {
-        while let Some(status) = events.next().await {
-            let progress = progress_of(&status);
-            sender.send_if_modified(|current| {
-                if *current == progress {
-                    false
-                } else {
-                    *current = progress;
-                    true
-                }
-            });
-        }
-    });
-    (receiver, task)
-}
-
-/// Maps an arti error: an outdated-software verdict becomes
-/// [`OnionError::Outdated`], anything else is wrapped with `wrap`.
-pub(crate) fn map_arti_error(
-    error: &arti_client::Error,
-    wrap: fn(String) -> OnionError,
-) -> OnionError {
-    if matches!(error.kind(), ErrorKind::SoftwareDeprecated) {
-        if !OUTDATED_WARNED.swap(true, Ordering::Relaxed) {
-            tracing::warn!("the Tor network considers this build's arti outdated; update harw");
-        }
-        OnionError::Outdated
-    } else {
-        wrap(error.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::runtime::{client_config, install_crypto_provider, progress_of};
     use super::*;
+    use arti_client::ErrorKind;
+    use arti_client::status::BootstrapStatus;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

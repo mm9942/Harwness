@@ -85,8 +85,6 @@ pub fn onion_locator() -> Option<String> {
 }
 
 /// How long to wait for the onion service to become reachable.
-#[cfg(feature = "onion")]
-const ONION_REACHABLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Node-handshake bound for connections arriving over Tor.
 #[cfg(feature = "onion")]
 const ONION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -535,8 +533,8 @@ async fn start_onion(
 async fn start_onion(
     dir: &Path,
     intake: harw_node_listener::StreamIntake,
-) -> Result<harw_onion::OnionServer, String> {
-    use harw_onion::{BootstrapProgress, OnionServer, OnionServerConfig};
+) -> Result<harw_onion::OnionSupervisor, String> {
+    use harw_onion::{BootstrapProgress, OnionServer, OnionServerConfig, OnionSupervisor};
 
     crate::session_serve::private_dir(dir)?;
     let state = dir.join("state");
@@ -568,12 +566,14 @@ async fn start_onion(
         }
     };
     // Identität zurückspielen, falls der Zustandsordner fehlt; nach dem Start automatisch sichern.
-    match crate::onion_identity::restore_if_missing(dir) {
-        Ok(true) => eprintln!("  session onion  : Identität aus der Sicherung wiederhergestellt"),
-        Ok(false) => {}
-        Err(error) => eprintln!("  session onion  : Wiederherstellung fehlgeschlagen: {error}"),
+    if crate::onion_identity::restore_if_missing(dir)
+        .map_err(|error| format!("[session_listener] onion identity recovery: {error}"))?
+    {
+        eprintln!("  session onion  : Identität aus der Sicherung wiederhergestellt");
     }
-    let server = OnionServer::launch(OnionServerConfig::new(state, cache), on_progress, handler)
+    let mut config = OnionServerConfig::new(state, cache);
+    config.expected_locator = crate::onion_identity::expected_locator(dir)?;
+    let server = OnionServer::launch(config.clone(), on_progress.clone(), handler.clone())
         .await
         .map_err(|error| format!("[session_listener] onion: {error}"))?;
     write_locator(&dir.join(ONION_LOCATOR_FILE), server.locator())?;
@@ -583,13 +583,8 @@ async fn start_onion(
         Err(error) => eprintln!("  session onion  : Sicherung fehlgeschlagen: {error}"),
     }
     let _ = ONION_LOCATOR.set(server.locator().to_string());
-    if server.wait_reachable(ONION_REACHABLE_TIMEOUT).await {
-        eprintln!("  session onion  : reachable");
-    } else {
-        eprintln!("  session onion  : not confirmed reachable after 180 s; continuing");
-    }
-    tracing::info!(onion = %server.locator().redacted(), "session listener onion service up");
-    Ok(server)
+    tracing::info!(onion = %server.locator().redacted(), "embedded onion service started");
+    Ok(OnionSupervisor::start(server, config, on_progress, handler))
 }
 
 /// Writes `<locator>\n` atomically (tmp file, mode 0600, rename).

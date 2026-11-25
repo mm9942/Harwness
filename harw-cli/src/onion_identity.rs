@@ -36,6 +36,13 @@ fn private_dirs(path: &Path) -> Result<(), String> {
     private_mode(path, 0o700)
 }
 
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    harw_fsutil::write_atomic(path, bytes, harw_fsutil::AtomicWriteOptions::private())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
@@ -60,6 +67,32 @@ pub(crate) fn restore_if_missing(onion_dir: &Path) -> Result<bool, String> {
     }
     write_private(&live, &bytes)?;
     Ok(true)
+}
+
+/// Reads the persisted locator before launching Arti. Once a locator is
+/// recorded, Arti must never generate a replacement key on ordinary startup.
+#[cfg(feature = "onion")]
+pub(crate) fn expected_locator(
+    onion_dir: &Path,
+) -> Result<Option<harw_onion::OnionLocator>, String> {
+    let mut expected = None;
+    for path in [onion_dir.join("locator"), backup_dir(onion_dir).join("locator")] {
+        let locator = match fs::read_to_string(&path) {
+            Ok(text) => text.trim().parse::<harw_onion::OnionLocator>().map_err(|error| {
+                format!("invalid stored Onion locator at {}: {error}", path.display())
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        if expected.as_ref().is_some_and(|previous| previous != &locator) {
+            return Err("live and backup Onion locators disagree".to_owned());
+        }
+        expected = Some(locator);
+    }
+    if expected.is_some() && !key_path(onion_dir).is_file() {
+        return Err("the recorded Onion identity has no usable private key".to_owned());
+    }
+    Ok(expected)
 }
 
 /// Sichert den aktuellen Schlüssel, wenn er sich von der Sicherung unterscheidet. `Ok(true)` = geschrieben.
@@ -129,5 +162,20 @@ mod tests {
         assert!(retired.join("keystore").exists());
         assert!(!key_path(&onion).exists());
         assert!(!restore_if_missing(&onion).unwrap(), "rotation drops the backup");
+    }
+
+    #[cfg(feature = "onion")]
+    #[test]
+    fn recorded_locator_requires_a_restored_key() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let onion = seeded(tmp.path());
+        let text = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:443";
+        fs::write(onion.join("locator"), text)?;
+        assert!(backup_now(&onion)?);
+        fs::remove_file(key_path(&onion))?;
+        assert!(expected_locator(&onion).is_err());
+        assert!(restore_if_missing(&onion)?);
+        assert_eq!(expected_locator(&onion)?, Some(text.parse()?));
+        Ok(())
     }
 }

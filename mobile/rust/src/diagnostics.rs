@@ -255,12 +255,46 @@ impl StreamSignal {
     }
 }
 
+/// Only fixed, non-secret stage labels may enter the diagnostic export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnionFailureStage {
+    TorBootstrap,
+    OnionStream,
+    NodeTransport,
+    Upgrade,
+    SessionHello,
+    Unknown,
+}
+
+impl OnionFailureStage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::TorBootstrap => "tor_bootstrap",
+            Self::OnionStream => "onion_stream",
+            Self::NodeTransport => "node_transport",
+            Self::Upgrade => "upgrade",
+            Self::SessionHello => "session_hello",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnionEvent {
     Connecting {
         connection: ConnectionEpoch,
     },
     Connected {
+        connection: ConnectionEpoch,
+        elapsed_ms: u64,
+    },
+    Failed {
+        connection: ConnectionEpoch,
+        elapsed_ms: u64,
+        stage: OnionFailureStage,
+        retryable: bool,
+    },
+    Cancelled {
         connection: ConnectionEpoch,
         elapsed_ms: u64,
     },
@@ -342,6 +376,18 @@ impl DiagnosticEvent {
             }) => {
                 format!(
                     "domain=onion event=connected connection={} elapsed_ms={elapsed_ms}",
+                    connection.0
+                )
+            }
+            Self::Onion(OnionEvent::Failed { connection, elapsed_ms, stage, retryable }) => {
+                format!(
+                    "domain=onion event=failed connection={} elapsed_ms={elapsed_ms} stage={} retryable={retryable}",
+                    connection.0, stage.label()
+                )
+            }
+            Self::Onion(OnionEvent::Cancelled { connection, elapsed_ms }) => {
+                format!(
+                    "domain=onion event=cancelled connection={} elapsed_ms={elapsed_ms}",
                     connection.0
                 )
             }
@@ -636,6 +682,7 @@ impl DiagnosticLog {
             connection,
             started,
             connected: false,
+            finished: false,
         })
     }
 
@@ -658,11 +705,42 @@ pub(crate) struct OnionDiagnostic<'a> {
     connection: ConnectionEpoch,
     started: Duration,
     connected: bool,
+    finished: bool,
 }
 
 impl OnionDiagnostic<'_> {
+    fn elapsed_ms(&self) -> u64 {
+        self.log.origin.elapsed().saturating_sub(self.started)
+            .as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    pub(crate) fn failed(&mut self, stage: OnionFailureStage, retryable: bool) {
+        if self.connected || self.finished {
+            return;
+        }
+        self.finished = true;
+        let event = DiagnosticEvent::Onion(OnionEvent::Failed {
+            connection: self.connection,
+            elapsed_ms: self.elapsed_ms(),
+            stage,
+            retryable,
+        });
+        self.log.state().ring.record(self.log.origin.elapsed(), Severity::Warn, event);
+    }
+
+    pub(crate) fn cancelled(&mut self) {
+        if self.connected || self.finished {
+            return;
+        }
+        self.finished = true;
+        self.log.info(DiagnosticEvent::Onion(OnionEvent::Cancelled {
+            connection: self.connection,
+            elapsed_ms: self.elapsed_ms(),
+        }));
+    }
+
     pub(crate) fn connected(&mut self) {
-        if self.connected {
+        if self.connected || self.finished {
             return;
         }
         self.connected = true;
@@ -1016,6 +1094,30 @@ mod owner_tests {
         first.clear();
         assert_eq!(first.snapshot().retained, 0);
         assert_eq!(first.level(Domain::Stream), Level::Info);
+    }
+
+    #[test]
+    fn explicit_failed_and_cancelled_dials_are_distinct_and_terminal() {
+        let log = DiagnosticLog::default();
+        log.set_level(Domain::Onion, BaseLevel::Info);
+        {
+            let mut attempt = log.begin_onion().expect("first attempt");
+            attempt.failed(OnionFailureStage::OnionStream, true);
+            attempt.cancelled();
+            attempt.connected();
+        }
+        {
+            let mut attempt = log.begin_onion().expect("second attempt");
+            attempt.cancelled();
+            attempt.failed(OnionFailureStage::Unknown, false);
+        }
+        let snapshot = log.snapshot();
+        assert_eq!(snapshot.retained, 4);
+        assert!(snapshot.text.contains("event=failed connection=1"));
+        assert!(snapshot.text.contains("stage=onion_stream retryable=true"));
+        assert!(snapshot.text.contains("event=cancelled connection=2"));
+        assert!(!snapshot.text.contains("event=disconnected"));
+        assert!(!snapshot.text.contains("event=connected"));
     }
 
     #[test]

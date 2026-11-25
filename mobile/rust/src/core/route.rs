@@ -11,6 +11,7 @@ use crate::identity::ValidatedProfile;
 use crate::{ConnectionRoute, MobileError, RoutePreference, TorBootstrap};
 
 /// Bound for the Tor dial, including a cold bootstrap.
+pub(crate) const ONION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const ONION_DIAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Bound for the node handshake over an onion stream.
 pub(crate) const ONION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -212,7 +213,7 @@ impl Dialer {
             .ok_or_else(|| "this server profile has no .onion route".to_owned())?;
         let client = self.tor_client()?;
         client
-            .dial_with_retry(locator, ONION_DIAL_TIMEOUT)
+            .dial_with_bootstrap_budget(locator, ONION_BOOTSTRAP_TIMEOUT, ONION_DIAL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())
     }

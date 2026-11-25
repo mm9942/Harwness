@@ -26,7 +26,9 @@
 
 use std::fmt;
 use std::str::FromStr;
-use std::time::Duration;
+mod error;
+
+pub use error::{OnionError, OnionStage};
 
 #[cfg(feature = "client")]
 mod client;
@@ -36,7 +38,10 @@ mod server;
 #[cfg(feature = "client")]
 pub use client::{OnionClient, OnionClientConfig};
 #[cfg(feature = "service")]
-pub use server::{AcceptLimits, DEFAULT_NICKNAME, OnionServer, OnionServerConfig};
+pub use server::{
+    AcceptLimits, DEFAULT_NICKNAME, OnionServer, OnionServerConfig, OnionServiceStatus,
+    OnionSupervisor,
+};
 
 /// Virtual port an onion service listens on unless configured otherwise.
 pub const DEFAULT_VIRTUAL_PORT: u16 = 443;
@@ -211,42 +216,6 @@ impl<T> OnionIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Se
 
 /// A boxed, pinned onion stream (`Unpin + Send + 'static`).
 pub type OnionStream = std::pin::Pin<Box<dyn OnionIo>>;
-
-/// Errors of the onion transport.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum OnionError {
-    /// The locator text is not a valid v3 onion locator.
-    #[error("invalid onion locator: {0}")]
-    InvalidLocator(&'static str),
-    /// The Tor client configuration could not be built.
-    #[error("tor configuration: {0}")]
-    Config(String),
-    /// No rustls crypto provider is available for Tor.
-    #[error("no rustls crypto provider is available for Tor")]
-    CryptoProvider,
-    /// The Tor runtime or client could not be created.
-    #[error("tor runtime: {0}")]
-    Runtime(String),
-    /// Tor bootstrap failed.
-    #[error("tor bootstrap failed: {0}")]
-    Bootstrap(String),
-    /// Tor bootstrap did not finish in time.
-    #[error("tor bootstrap did not finish within {0:?}")]
-    BootstrapTimeout(Duration),
-    /// This build's Tor is too old for the current Tor network.
-    #[error("this build's Tor (arti 0.48) is too old for the current Tor network; update harw")]
-    Outdated,
-    /// The onion service failed.
-    #[error("onion service: {0}")]
-    Service(String),
-    /// Connecting to an onion service failed.
-    #[error("onion connect failed: {0}")]
-    Connect(String),
-    /// Connecting to an onion service did not finish in time.
-    #[error("onion connect did not finish within {0:?}")]
-    ConnectTimeout(Duration),
-}
 
 #[cfg(test)]
 mod tests {

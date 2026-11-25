@@ -5,25 +5,29 @@
 //! caller's handler unchanged: Tor gives no client identity, authentication
 //! happens above this crate.
 
+mod accept;
+mod health;
+mod identity;
+mod supervisor;
+
+pub use health::OnionServiceStatus;
+pub use supervisor::OnionSupervisor;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{Stream, StreamExt};
 use safelog::DisplayRedacted;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::task::{JoinHandle, JoinSet};
-use tor_cell::relaycell::msg::Connected;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinHandle;
 use tor_hsservice::config::OnionServiceConfigBuilder;
-use tor_hsservice::{
-    HsNickname, OnionServiceConfig, RendRequest, RunningOnionService, StreamRequest,
-};
-use tor_proto::stream::IncomingStreamRequest;
-use tracing::{debug, info};
+use tor_hsservice::{HsNickname, OnionServiceConfig, RunningOnionService};
+use tracing::info;
 
-use crate::client::{ArtiClient, create_client, map_arti_error, spawn_progress};
+use crate::client::runtime::{ArtiClient, create_client, map_arti_error, spawn_progress};
 use crate::{BootstrapProgress, DEFAULT_VIRTUAL_PORT, OnionError, OnionLocator, OnionStream};
+use accept::{AcceptCtx, accept_loop};
 
 /// Default arti nickname of the harw session onion service. It names the
 /// service's key and state directories inside the arti state directory.
@@ -77,6 +81,8 @@ pub struct OnionServerConfig {
     pub bootstrap_timeout: Duration,
     /// Accept-loop admission limits.
     pub limits: AcceptLimits,
+    /// Previously published locator to verify before bringing the service online.
+    pub expected_locator: Option<OnionLocator>,
 }
 
 impl OnionServerConfig {
@@ -90,6 +96,7 @@ impl OnionServerConfig {
             virtual_port: DEFAULT_VIRTUAL_PORT,
             bootstrap_timeout: DEFAULT_BOOTSTRAP_TIMEOUT,
             limits: AcceptLimits::default(),
+            expected_locator: None,
         }
     }
 }
@@ -103,7 +110,10 @@ pub struct OnionServer {
     locator: OnionLocator,
     // Field order is drop order: tasks first, then the service, then the client.
     tasks: TaskGuard,
-    service: Arc<RunningOnionService>,
+    status: watch::Receiver<OnionServiceStatus>,
+    stream_slots: Arc<Semaphore>,
+    stream_capacity: usize,
+    _service: Arc<RunningOnionService>,
     _client: Arc<ArtiClient>,
 }
 
@@ -142,6 +152,7 @@ impl OnionServer {
             ));
         }
         let service_config = service_config(&config)?;
+        identity::verify_before_launch(&config, &service_config)?;
         let client = create_client(&config.state_dir, &config.cache_dir)?;
 
         let mut tasks = TaskGuard::default();
@@ -164,16 +175,24 @@ impl OnionServer {
             .ok_or_else(|| OnionError::Service("onion service has no address".to_owned()))?;
         let locator =
             OnionLocator::new(&hsid.display_unredacted().to_string(), config.virtual_port)?;
+        if let Some(expected) = &config.expected_locator {
+            identity::require_match(expected, &locator)?;
+        }
 
+        let stream_capacity = config.limits.max_streams.min(Semaphore::MAX_PERMITS);
+        let stream_slots = Arc::new(Semaphore::new(stream_capacity));
         let ctx = Arc::new(AcceptCtx {
             handler,
             limits: config.limits,
             virtual_port: config.virtual_port,
-            stream_slots: Arc::new(Semaphore::new(
-                config.limits.max_streams.min(Semaphore::MAX_PERMITS),
-            )),
+            stream_slots: Arc::clone(&stream_slots),
         });
-        tasks.push(tokio::spawn(accept_loop(rend_requests, ctx)));
+        let (health, status) = watch::channel(OnionServiceStatus::Publishing);
+        let accept_health = health.clone();
+        tasks.push(tokio::spawn(async move {
+            accept_loop(rend_requests, ctx, accept_health).await;
+        }));
+        tasks.push(tokio::spawn(health::observe(Arc::clone(&service), health)));
 
         info!(onion = %locator.redacted(), "onion service launched");
         info!(
@@ -183,7 +202,10 @@ impl OnionServer {
         Ok(Self {
             locator,
             tasks,
-            service,
+            status,
+            stream_slots,
+            stream_capacity,
+            _service: service,
             _client: client,
         })
     }
@@ -194,22 +216,42 @@ impl OnionServer {
         &self.locator
     }
 
-    /// Waits until arti believes the service is fully reachable (descriptor
-    /// published). Returns `false` on timeout.
+    /// Observes Onion publication and terminal task failure throughout the service lifetime.
+    #[must_use]
+    pub fn status(&self) -> watch::Receiver<OnionServiceStatus> {
+        self.status.clone()
+    }
+
+    /// Waits for Arti to report descriptor publication. Returns false on
+    /// timeout or when the accept loop or service status stream terminates.
     pub async fn wait_reachable(&self, timeout: Duration) -> bool {
-        if self.service.status().state().is_fully_reachable() {
-            return true;
-        }
-        let mut events = std::pin::pin!(self.service.status_events());
+        let mut status = self.status();
         let wait = async {
-            while let Some(status) = events.next().await {
-                if status.state().is_fully_reachable() {
-                    return true;
+            loop {
+                match *status.borrow_and_update() {
+                    OnionServiceStatus::Published => return true,
+                    OnionServiceStatus::AcceptLoopEnded | OnionServiceStatus::StatusStreamEnded => {
+                        return false;
+                    }
+                    OnionServiceStatus::Publishing => {}
+                }
+                if status.changed().await.is_err() {
+                    return false;
                 }
             }
-            false
         };
         tokio::time::timeout(timeout, wait).await.unwrap_or(false)
+    }
+
+    fn has_active_streams(&self) -> bool {
+        self.stream_slots.available_permits() < self.stream_capacity
+    }
+
+    async fn stop_and_join(mut self) {
+        self.tasks.abort_all();
+        for task in self.tasks.0.drain(..) {
+            let _ = task.await;
+        }
     }
 
     /// Stops the service (same as dropping it).
@@ -275,183 +317,9 @@ async fn forward_progress<P>(
     }
 }
 
-/// State shared by the accept loop and all circuit tasks.
-struct AcceptCtx<H> {
-    handler: H,
-    limits: AcceptLimits,
-    virtual_port: u16,
-    stream_slots: Arc<Semaphore>,
-}
-
-/// Why a stream request closes its circuit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refusal {
-    /// BEGIN_DIR, RESOLVE or another non-BEGIN request.
-    NotBegin,
-    /// BEGIN to a port other than the virtual port.
-    WrongPort,
-    /// The circuit already carries `max_streams_per_circuit` live streams.
-    CircuitFull,
-}
-
-impl Refusal {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NotBegin => "not a BEGIN request",
-            Self::WrongPort => "wrong virtual port",
-            Self::CircuitFull => "per-circuit stream limit reached",
-        }
-    }
-}
-
-/// Pure per-circuit admission rule. `begin_port` is `Some(port)` for a BEGIN
-/// request and `None` for anything else.
-fn stream_verdict(
-    begin_port: Option<u16>,
-    virtual_port: u16,
-    live_streams: usize,
-    max_streams_per_circuit: u32,
-) -> Result<(), Refusal> {
-    let port = begin_port.ok_or(Refusal::NotBegin)?;
-    if port != virtual_port {
-        return Err(Refusal::WrongPort);
-    }
-    let max = usize::try_from(max_streams_per_circuit).unwrap_or(usize::MAX);
-    if live_streams >= max {
-        return Err(Refusal::CircuitFull);
-    }
-    Ok(())
-}
-
-async fn accept_loop<S, H, F>(rend_requests: S, ctx: Arc<AcceptCtx<H>>)
-where
-    S: Stream<Item = RendRequest> + Send + 'static,
-    H: Fn(OnionStream) -> F + Send + Sync + 'static,
-    F: Future<Output = ()> + Send + 'static,
-{
-    let mut rend_requests = Box::pin(rend_requests);
-    let circuit_slots = Arc::new(Semaphore::new(
-        ctx.limits.max_circuits.min(Semaphore::MAX_PERMITS),
-    ));
-    let mut circuits = JoinSet::new();
-    loop {
-        tokio::select! {
-            next = rend_requests.next() => {
-                let Some(rend) = next else { break };
-                match Arc::clone(&circuit_slots).try_acquire_owned() {
-                    Ok(permit) => {
-                        circuits.spawn(serve_circuit(rend, permit, Arc::clone(&ctx)));
-                    }
-                    Err(_) => {
-                        debug!("onion circuit limit reached; rejecting rendezvous request");
-                        let _ = rend.reject().await;
-                    }
-                }
-            }
-            Some(_) = circuits.join_next(), if !circuits.is_empty() => {}
-        }
-    }
-    debug!("onion rendezvous request stream ended");
-    while circuits.join_next().await.is_some() {}
-}
-
-async fn serve_circuit<H, F>(
-    rend: RendRequest,
-    _circuit_permit: OwnedSemaphorePermit,
-    ctx: Arc<AcceptCtx<H>>,
-) where
-    H: Fn(OnionStream) -> F + Send + Sync + 'static,
-    F: Future<Output = ()> + Send + 'static,
-{
-    let rendezvous = tokio::time::timeout(ctx.limits.rendezvous_timeout, rend.accept()).await;
-    let mut requests = match rendezvous {
-        Ok(Ok(requests)) => requests,
-        Ok(Err(e)) => {
-            debug!(error = %e, "onion rendezvous failed");
-            return;
-        }
-        Err(_) => {
-            debug!("onion rendezvous timed out");
-            return;
-        }
-    };
-    debug!("onion circuit established");
-    // `requests` keeps the circuit open; returning drops it (and aborts the
-    // circuit's handlers via `handlers`).
-    let mut handlers = JoinSet::new();
-    loop {
-        let idle = handlers.is_empty();
-        tokio::select! {
-            next = requests.next() => {
-                let Some(request) = next else { break };
-                while handlers.try_join_next().is_some() {}
-                if !admit_stream(&ctx, &mut handlers, request).await {
-                    return;
-                }
-            }
-            Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
-            () = tokio::time::sleep(ctx.limits.circuit_idle), if idle => {
-                debug!("onion circuit idle; closing");
-                return;
-            }
-        }
-    }
-    debug!("onion circuit closed by peer");
-    while handlers.join_next().await.is_some() {}
-}
-
-/// Accepts one stream request or shuts the circuit down. Returns `false`
-/// when the circuit was shut down.
-async fn admit_stream<H, F>(
-    ctx: &AcceptCtx<H>,
-    handlers: &mut JoinSet<()>,
-    request: StreamRequest,
-) -> bool
-where
-    H: Fn(OnionStream) -> F + Send + Sync + 'static,
-    F: Future<Output = ()> + Send + 'static,
-{
-    let begin_port = match request.request() {
-        IncomingStreamRequest::Begin(begin) => Some(begin.port()),
-        _ => None,
-    };
-    let admitted = stream_verdict(
-        begin_port,
-        ctx.virtual_port,
-        handlers.len(),
-        ctx.limits.max_streams_per_circuit,
-    )
-    .map_err(Refusal::as_str)
-    .and_then(|()| {
-        Arc::clone(&ctx.stream_slots)
-            .try_acquire_owned()
-            .map_err(|_| "global stream limit reached")
-    });
-    let stream_permit = match admitted {
-        Ok(permit) => permit,
-        Err(reason) => {
-            debug!(reason, "closing onion circuit");
-            let _ = request.shutdown_circuit();
-            return false;
-        }
-    };
-    match request.accept(Connected::new_empty()).await {
-        Ok(data_stream) => {
-            let stream: OnionStream = Box::pin(data_stream);
-            let work = (ctx.handler)(stream);
-            handlers.spawn(async move {
-                work.await;
-                drop(stream_permit);
-            });
-            debug!("onion stream accepted");
-        }
-        Err(e) => debug!(error = %e, "onion stream accept failed"),
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
+    use super::accept::{Refusal, stream_verdict};
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
