@@ -268,6 +268,14 @@ Use `make help` for the available build and installation targets.
 
 For complete installation details, see [docs/setup/install.md](docs/setup/install.md).
 
+### Android
+
+Harw Mobile connects an enrolled Android device to a Harw gateway. Onion profiles use embedded Arti on Android and on the gateway. Gateway restarts reuse the enrolled Onion identity when its key is available.
+
+On builds with on-device UIA enabled, the Assistant offers a model picker in local and cloud sessions. The local Library also offers a model picker for image descriptions. Choose a vision-capable local GGUF or a configured provider model with image input.
+
+Use the [phone setup and test guide](mobile/PHONE-TEST.md) for enrollment and device checks, and the [Android release guide](mobile/RELEASE-APK.md) to build and sign an APK.
+
 ## Basic usage
 
 Start an interactive session:
