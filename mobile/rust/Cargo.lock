@@ -3453,6 +3453,7 @@ dependencies = [
  "harw-session-ws",
  "harw-tailscale",
  "harw-types",
+ "harw-vpn",
  "hex",
  "http",
  "jiff 0.2.37",
@@ -3565,11 +3566,13 @@ name = "harw-onion"
 version = "0.10.0"
 dependencies = [
  "arti-client",
+ "async-trait",
  "aws-lc-rs",
  "futures",
  "rustls",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tor-rtcompat",
  "tracing",
 ]
@@ -4364,6 +4367,16 @@ name = "harw-untrusted-text"
 version = "0.10.0"
 
 [[package]]
+name = "harw-vpn"
+version = "0.10.0"
+dependencies = [
+ "bytes",
+ "harw-onion",
+ "smoltcp",
+ "tokio",
+]
+
+[[package]]
 name = "harw-web"
 version = "0.10.0"
 dependencies = [
@@ -4384,6 +4397,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "hash32"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
+dependencies = [
+ "byteorder",
 ]
 
 [[package]]
@@ -4463,6 +4485,16 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "heapless"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "411fdef4df93751117bd9ef8caa0e7f99c65dafec5bd84313eb8e2fdd75e32f2"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -5515,6 +5547,12 @@ name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
+
+[[package]]
+name = "managed"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
 name = "markup5ever"
@@ -7751,6 +7789,20 @@ name = "smawk"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
+
+[[package]]
+name = "smoltcp"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f8b28ad56c6e35524a37dd492af5d1a47e31e1a4d175cd12f89c075f01980f"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "cfg-if",
+ "defmt",
+ "heapless",
+ "managed",
+]
 
 [[package]]
 name = "socket2"

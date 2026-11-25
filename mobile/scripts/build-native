@@ -17,7 +17,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$rust_dir/target}"
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
 jobs="${MOBILE_BUILD_JOBS:-2}"
 local_uia="${HARW_LOCAL_UIA:-0}"
-features=local-llama
+features=local-llama,android-vpn
 case "$local_uia" in
     0) ;;
     1) features+=,vault-uia-chat ;;
