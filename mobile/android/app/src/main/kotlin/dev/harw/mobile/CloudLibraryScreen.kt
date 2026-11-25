@@ -229,9 +229,12 @@ private fun CloudLibraryAttached(
                                     val access = connection.cloudLibraryCaptionAccess(scope, data.revision, asset.assetId)
                                     var retained = false
                                     try {
-                                        val loaded = optionalVisionChoices { device.localVisionChoices() }.orEmpty()
+                                        // Manual selection is explicit; the preferred automatic model
+                                        // only affects ordering, never substitutes another model.
+                                        val installed = optionalVisionChoices { device.libraryVisionChoices() }.orEmpty()
                                         val prefs = context.getSharedPreferences(UI_PREFS, android.content.Context.MODE_PRIVATE)
-                                        val local = eligibleLoadedVisionModels(readLocalVisionPreference(prefs), loaded)
+                                        val preferred = readLocalVisionPreference(prefs).modelId
+                                        val local = installed.sortedByDescending { it.modelId == preferred }
                                         val api = optionalVisionChoices { appApiVisionRoutes(context) }
                                         requireCaptionCurrent(data.revision, asset.assetId)
                                         captionRequest = CloudLibraryCaptionRequest(data.revision, asset, access, local, api)
@@ -492,12 +495,13 @@ private fun CloudLibraryCaptionChoiceDialog(
                     Text("Nur dieses Bild wird von deinem Gateway geladen. Kein Chat und keine anderen Bilder werden verwendet.")
                 }
                 if (request.local.isEmpty() && apiChoices.isEmpty()) item {
-                    Text("Kein passendes lokales Modell geladen und keine geeignete Bild-API eingerichtet.")
+                    Text("Kein passendes lokales Vision-Modell installiert und keine geeignete Bild-API eingerichtet.")
                 }
                 items(request.local) { model ->
                     val candidate = CloudLibraryVisionChoice.Local(model)
                     TextButton(enabled = !busy, onClick = { choice = candidate }) {
-                        Text((if (selected == candidate) "✓ " else "") + "Auf diesem Gerät · ${model.modelId}")
+                        Text((if (selected == candidate) "✓ " else "") + "Auf diesem Gerät · ${model.modelId}" +
+                            if (model.loadedRevision == 0uL) " · wird geladen" else " · geladen")
                     }
                 }
                 items(apiChoices) { route ->

@@ -40,6 +40,12 @@ pub(crate) fn client_config(
     state_dir: &Path,
     cache_dir: &Path,
 ) -> Result<TorClientConfig, OnionError> {
+    client_config_builder(state_dir, cache_dir)
+        .build()
+        .map_err(|error| OnionError::Config(error.to_string()))
+}
+
+pub(super) fn client_config_builder(state_dir: &Path, cache_dir: &Path) -> TorClientConfigBuilder {
     let mut builder = TorClientConfigBuilder::from_directories(state_dir, cache_dir);
     // Learned subsecond circuit deadlines survive process restarts. Keep
     // learning and guard state, with room for slower Onion circuits on both
@@ -48,8 +54,6 @@ pub(crate) fn client_config(
         .override_net_params()
         .insert("cbtmintimeout".into(), 5_000);
     builder
-        .build()
-        .map_err(|e| OnionError::Config(e.to_string()))
 }
 
 /// Installs the crypto provider and creates an unbootstrapped arti client on

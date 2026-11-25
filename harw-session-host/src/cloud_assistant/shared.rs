@@ -199,6 +199,7 @@ impl CloudAssistant {
         if matches!(command, Command::Provision) && room.is_none() {
             let new_room = Room {
                 revoked: false, attempts: Vec::new(), turns: Vec::new(), recalls: Vec::new(),
+                model_receipts: BTreeMap::new(),
                 shared: Some(SharedRoom { owner: proof.clone(), joins: Vec::new() }),
             };
             self.save(grant, &new_room, None)?;

@@ -376,6 +376,19 @@ pub async fn dispatch(port: &dyn SessionPort, request: RequestEnvelope) -> Dispa
                 Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid Cloud Assistant recall request"),
             }
         }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_MODELS => {
+            if !is_empty_params(&params) {
+                error_response(id, error_codes::INVALID_PARAMS, "Cloud Assistant model catalog takes no selector")
+            } else {
+                encode(id, port.cloud_assistant_models().await)
+            }
+        }
+        harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SUBMIT_MODEL => {
+            match serde_json::from_value::<harw_protocol::session_wire::CloudAssistantModelSubmitV1>(params) {
+                Ok(params) => encode(id, port.cloud_assistant_submit_model(params).await),
+                Err(_) => error_response(id, error_codes::INVALID_PARAMS, "invalid Cloud Assistant model request"),
+            }
+        }
         harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SHARED => {
             match serde_json::from_value::<harw_protocol::session_wire::CloudAssistantSharedCommandV1>(params) {
                 Ok(input) => encode(id, port.cloud_assistant_shared(input).await),

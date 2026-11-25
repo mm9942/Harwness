@@ -17,7 +17,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$rust_dir/target}"
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
 jobs="${MOBILE_BUILD_JOBS:-2}"
 local_uia="${HARW_LOCAL_UIA:-0}"
-features=local-llama
+features=local-llama,android-vpn
 case "$local_uia" in
     0) ;;
     1) features+=,vault-uia-chat ;;
@@ -41,15 +41,26 @@ cargo ndk --target arm64-v8a --platform 28 --output-dir "$staging/jniLibs" \
     build --lib --release --features "$features" --locked --jobs "$jobs" "${cargo_network_flags[@]}"
 
 library="$staging/jniLibs/arm64-v8a/libharw_mobile_ffi.so"
-# Attest this exact staged bridge after verifying all private JNI entry points.
-# The marker is build metadata (not a runtime or cryptographic trust anchor).
-if [[ "$local_uia" == 1 ]]; then
-    shopt -s nullglob
-    readers=("$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf)
-    if [[ "${#readers[@]}" != 1 || ! -x "${readers[0]}" ]]; then
-        echo "Cannot locate the NDK llvm-readelf for Local UIA verification." >&2
+shopt -s nullglob
+readers=("$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf)
+if [[ "${#readers[@]}" != 1 || ! -x "${readers[0]}" ]]; then
+    echo "Cannot locate the NDK llvm-readelf for native bridge verification." >&2
+    exit 1
+fi
+symbols=$("${readers[0]}" --dyn-syms --wide "$library")
+for callback in nativeStartWithDns nativeStop nativeSetHubGate; do
+    if ! awk -v symbol="Java_dev_harw_mobile_HarwVpnService_$callback" '
+        $4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == symbol { found = 1 }
+        END { exit !found }
+    ' <<< "$symbols"; then
+        echo "Android VPN bridge is missing $callback." >&2
         exit 1
     fi
+done
+
+# Attest this exact staged bridge after verifying all private UIA JNI entry points.
+# The marker is build metadata (not a runtime or cryptographic trust anchor).
+if [[ "$local_uia" == 1 ]]; then
     bash "$mobile_root/scripts/verify-local-uia-bridge" "$library" "${readers[0]}"
     sha256sum -- "$library" | awk '{ print "harw-local-uia-v2 " $1 }' > "$staging/harw-local-uia"
 fi

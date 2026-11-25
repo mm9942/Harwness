@@ -74,7 +74,20 @@ internal fun rememberChatAgentControl(
         }
     }
     val (all, current, projectDefault) = data ?: return null
-    return ChatAgentControl(current?.name, all.size >= 2 || projectDefault != null) { close ->
+    return ChatAgentControl(current?.name, all.isNotEmpty() || projectDefault != null) { close ->
+        DropdownMenuItem(
+            text = { Text("Aktive Profil-UIA verwenden") },
+            onClick = {
+                if (canChange()) {
+                    close()
+                    scope.launch {
+                        if (withContext(Dispatchers.IO) {
+                            runCatching { store(context).setSessionUia(sessionId, null) }.isSuccess
+                        }) onChanged()
+                    }
+                }
+            },
+        )
         all.forEach { uia ->
             DropdownMenuItem(
                 text = { Text(if (uia.id == current?.id) "✓ ${uia.name}" else uia.name) },

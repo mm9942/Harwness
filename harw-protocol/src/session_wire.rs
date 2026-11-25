@@ -144,6 +144,8 @@ pub mod features {
     pub const CLOUD_ASSISTANT_V1: &str = "cloud_assistant_v1";
     /// Explicit, bounded recall of completed pairs from the same Cloud Assistant room.
     pub const CLOUD_ASSISTANT_RECALL_V1: &str = "cloud_assistant_recall_v1";
+    /// Explicit allowlisted model routes for the authenticated device Assistant.
+    pub const CLOUD_ASSISTANT_MODELS_V1: &str = "cloud_assistant_models_v1";
     /// Explicit newly created shared room, separate from device-room v1.
     pub const CLOUD_ASSISTANT_SHARED_V1: &str = "cloud_assistant_shared_v1";
     pub const ARCHIVE_RETAINED_REWRITE_V1: &str = "archive_retained_rewrite_v1";
@@ -3019,6 +3021,26 @@ pub struct CloudAssistantRecallSubmit {
     pub client_message_id: String,
     pub text: String,
     pub recall_message_ids: Vec<String>,
+}
+
+/// Separate versioned method, so old peers retain their exact wire schema.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudAssistantModelSubmitV1 {
+    pub client_message_id: String,
+    pub text: String,
+    pub model: String,
+    pub recall_message_ids: Vec<String>,
+}
+
+/// Provider/model IDs are not URLs or new authority selectors. A provider's
+/// model ID may itself contain slashes.
+#[must_use]
+pub fn valid_cloud_assistant_model_route(value: &str) -> bool {
+    let Some((provider, model)) = value.split_once('/') else { return false; };
+    !provider.is_empty() && provider.len() <= 128 && !model.is_empty() && value.len() <= 384
+        && provider.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && model.bytes().all(|b| b.is_ascii_graphic() && b != b',')
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

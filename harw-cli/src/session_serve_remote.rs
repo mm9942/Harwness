@@ -782,13 +782,36 @@ pub async fn start_remote(
     start_remote_composed(config, share, Arc::new(driver), Some(model), local, verifier, listener).await
 }
 
-struct GatewayAssistantModel(Arc<dyn ModelProvider>);
+struct GatewayAssistantModel(Arc<dyn ModelProvider>, Vec<String>);
+
+/// The gateway operator explicitly admits model routes to this isolated room.
+/// A device cannot select arbitrary configured credentials or provider URLs.
+fn cloud_assistant_model_allowlist() -> Vec<String> {
+    let Ok(raw) = std::env::var("HARW_CLOUD_ASSISTANT_MODELS") else { return Vec::new(); };
+    if raw.len() > 32 * 1024 { return Vec::new(); }
+    let mut routes: Vec<_> = raw.split(',').map(str::trim)
+        .filter(|route| harw_protocol::session_wire::valid_cloud_assistant_model_route(route))
+        .map(str::to_owned).collect();
+    routes.sort_unstable();
+    routes.dedup();
+    routes.truncate(128);
+    routes
+}
 
 impl harw_session_host::cloud_assistant::CloudAssistantModel for GatewayAssistantModel {
     fn answer<'a>(
         &'a self,
         turns: &'a [harw_protocol::session_wire::CloudAssistantTurn],
         text: &'a str,
+    ) -> harw_session_host::driver::DriverFuture<'a, String> {
+        self.answer_selected(turns, text, None)
+    }
+
+    fn model_choices(&self) -> Vec<String> { self.1.clone() }
+
+    fn answer_selected<'a>(
+        &'a self, turns: &'a [harw_protocol::session_wire::CloudAssistantTurn],
+        text: &'a str, selected: Option<&'a str>,
     ) -> harw_session_host::driver::DriverFuture<'a, String> {
         use harw_core::{ConversationHistory, model::{ModelRequest, StopReason}};
         use harw_session_host::HostError;
@@ -811,6 +834,20 @@ impl harw_session_host::cloud_assistant::CloudAssistantModel for GatewayAssistan
             Vec::new(),
         ).with_max_output_tokens(Some(1024));
         Box::pin(async move {
+            let mut request = request;
+            if let Some(selected) = selected {
+                if !self.1.iter().any(|route| route == selected) {
+                    return Err(HostError::Denied("Selected Assistant model unavailable".into()));
+                }
+                let (provider, model) = selected.split_once('/').ok_or_else(|| HostError::Denied("Invalid Assistant model".into()))?;
+                if self.0.pinned_provider_id().is_some_and(|id| id != provider)
+                    || self.0.pinned_model_id().is_some_and(|id| id != model)
+                {
+                    return Err(HostError::Denied("Gateway model is pinned to a different route".into()));
+                }
+                request = request.with_provider_id(Some(harw_types::ProviderId::from(provider)))
+                    .with_model_id(Some(harw_types::ModelId::from(model)));
+            }
             let response = self.0.respond(request).await.map_err(|_| {
                 HostError::Driver("Cloud Assistant model request failed".into())
             })?;
@@ -928,7 +965,7 @@ fn mount_cloud_services(
         let root = config.remote_dir().join("cloud-assistant-v1");
         let backend = private_dir(&root).ok().and_then(|()| {
             harw_session_host::cloud_assistant::CloudAssistant::open(
-                root, path, profile, Arc::new(GatewayAssistantModel(model)),
+                root, path, profile, Arc::new(GatewayAssistantModel(model, cloud_assistant_model_allowlist())),
             ).ok()
         });
         if backend.is_some_and(|backend| host.install_cloud_assistant(Arc::new(backend)).is_ok()) {

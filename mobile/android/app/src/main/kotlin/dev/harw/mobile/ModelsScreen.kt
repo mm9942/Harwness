@@ -211,7 +211,7 @@ private fun VisionAddonRow(
 
 /** "Bildverständnis" of an imported model: any compatible mmproj file can be attached. */
 @Composable
-private fun ProjectorBlock(
+internal fun ProjectorBlock(
     model: LocalModel,
     manager: ModelManager,
     current: ModelDownloadState,

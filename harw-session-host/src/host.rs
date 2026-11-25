@@ -135,6 +135,7 @@ impl HostConfig {
 const HOST_FEATURES: &[&str] = &[
     features::CLOUD_ASSISTANT_V1,
     features::CLOUD_ASSISTANT_RECALL_V1,
+    features::CLOUD_ASSISTANT_MODELS_V1,
     features::CLOUD_ASSISTANT_SHARED_V1,
     features::AUTO_TITLE_CAS_V1,
     features::AUTO_TITLE_SEED_V1,
@@ -555,6 +556,7 @@ impl SessionHost {
             overview: AtomicBool::new(false),
             cloud_assistant: AtomicBool::new(false),
             cloud_assistant_recall: AtomicBool::new(false),
+            cloud_assistant_models: AtomicBool::new(false),
             cloud_assistant_shared: AtomicBool::new(false),
             auto_title: AtomicBool::new(false),
             auto_title_seed: AtomicBool::new(false),
@@ -1833,6 +1835,7 @@ pub struct HostConnection {
     overview: AtomicBool,
     cloud_assistant: AtomicBool,
     cloud_assistant_recall: AtomicBool,
+    cloud_assistant_models: AtomicBool,
     cloud_assistant_shared: AtomicBool,
     auto_title: AtomicBool,
     auto_title_seed: AtomicBool,
@@ -2090,6 +2093,10 @@ impl HostConnection {
                         && self.host.cloud_assistant.get().is_some()
                         && crate::cloud_assistant::CloudAssistant::admits(&self.identity, caps)
                         && params.features.iter().any(|name| name == features::CLOUD_ASSISTANT_V1),
+                    features::CLOUD_ASSISTANT_MODELS_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
+                        && self.host.cloud_assistant.get().is_some_and(|store| store.has_model_choices())
+                        && crate::cloud_assistant::CloudAssistant::admits(&self.identity, caps)
+                        && params.features.iter().any(|name| name == features::CLOUD_ASSISTANT_V1),
                     features::CLOUD_ASSISTANT_SHARED_V1 => wire_minor >= ARCHIVE_CHECKPOINT_WIRE_MINOR
                         && self.host.cloud_assistant.get().is_some()
                         && self.host.user_memberships.get().is_some()
@@ -2187,6 +2194,10 @@ impl HostConnection {
         );
         self.cloud_assistant_recall.store(
             granted_features.iter().any(|feature| feature == features::CLOUD_ASSISTANT_RECALL_V1),
+            Ordering::SeqCst,
+        );
+        self.cloud_assistant_models.store(
+            granted_features.iter().any(|feature| feature == features::CLOUD_ASSISTANT_MODELS_V1),
             Ordering::SeqCst,
         );
         self.cloud_assistant_shared.store(
@@ -4547,6 +4558,30 @@ impl SessionPort for HostConnection {
                 return Err(HostError::Denied("Cloud Assistant recall not negotiated".into()).into());
             }
             store.submit_with_recall(grant, params).await.map_err(PortError::from)
+        })
+    }
+
+    fn cloud_assistant_models(&self) -> PortFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            let (store, grant) = self.cloud_assistant_owner()?;
+            if !self.cloud_assistant_models.load(Ordering::SeqCst) {
+                return Err(HostError::Denied("Cloud Assistant model selection not negotiated".into()).into());
+            }
+            store.models(grant).await.map_err(PortError::from)
+        })
+    }
+
+    fn cloud_assistant_submit_model(
+        &self, params: harw_protocol::session_wire::CloudAssistantModelSubmitV1,
+    ) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSnapshot> {
+        Box::pin(async move {
+            let (store, grant) = self.cloud_assistant_owner()?;
+            if !self.cloud_assistant_models.load(Ordering::SeqCst)
+                || (!params.recall_message_ids.is_empty() && !self.cloud_assistant_recall.load(Ordering::SeqCst))
+            {
+                return Err(HostError::Denied("Cloud Assistant model or recall selection not negotiated".into()).into());
+            }
+            store.submit_model(grant, params).await.map_err(PortError::from)
         })
     }
 

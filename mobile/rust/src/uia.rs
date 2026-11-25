@@ -30,6 +30,10 @@ const MAX_CONTEXT_CHARS: usize = 2000;
 const MAX_DEFINITION_BYTES: u64 = 64 * 1024;
 const ASSIGN_FILE: &str = "chat-uias.json";
 const MAX_ASSIGNMENTS: usize = 5000;
+const MAX_ASSIGNMENT_BYTES: u64 = 8 * 1024 * 1024;
+// Each Compose picker can instantiate a fresh store. Serialize shared
+// read-modify-write transactions across those instances.
+static ASSIGNMENT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Standardtext der Persoenlichkeit (wie im alten Kit).
 const DEFAULT_PERSONALITY: &str = "Sei klar, respektvoll und transparent. Erkläre Unsicherheit und Risiken offen; behaupte keine ausgeführte Aktion ohne überprüfbare Evidenz. Frage nur nach, wenn die Antwort die Entscheidung wesentlich verändert.";
@@ -151,15 +155,16 @@ impl UiaStore {
 
     /// Die UIA, mit der dieser Chat läuft; `None` = die aktive UIA des Profils.
     pub fn uia_for_session(&self, session_id: String) -> Result<Option<UiaProfile>, MobileError> {
-        let assigned = read_assign(&self.home).sessions.get(&session_id).cloned();
+        check_key(&session_id)?;
+        let assigned = read_assign_checked(&self.home)?.sessions.get(&session_id).cloned();
         Ok(assigned.and_then(|id| self.profile_by_id(&id)))
     }
 
     /// Legt die UIA eines Chats fest (`None` = aktive UIA). Gilt ab der nächsten Antwort in diesem Chat.
     pub fn set_session_uia(&self, session_id: String, uia_id: Option<String>) -> Result<(), MobileError> {
-        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = ASSIGNMENT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         check_key(&session_id)?;
-        let mut assign = read_assign(&self.home);
+        let mut assign = read_assign_checked(&self.home)?;
         match uia_id {
             Some(id) => {
                 if self.profile_by_id(&id).is_none() {
@@ -176,15 +181,16 @@ impl UiaStore {
 
     /// Standard-UIA eines Projekts; neue Chats in diesem Projekt starten damit. `None` = keine eigene.
     pub fn project_default_uia(&self, project_key: String) -> Result<Option<UiaProfile>, MobileError> {
-        let assigned = read_assign(&self.home).projects.get(&project_key).cloned();
+        check_key(&project_key)?;
+        let assigned = read_assign_checked(&self.home)?.projects.get(&project_key).cloned();
         Ok(assigned.and_then(|id| self.profile_by_id(&id)))
     }
 
     /// Legt die Standard-UIA eines Projekts fest (`None` = entfernen).
     pub fn set_project_default_uia(&self, project_key: String, uia_id: Option<String>) -> Result<(), MobileError> {
-        let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = ASSIGNMENT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         check_key(&project_key)?;
-        let mut assign = read_assign(&self.home);
+        let mut assign = read_assign_checked(&self.home)?;
         match uia_id {
             Some(id) => {
                 if self.profile_by_id(&id).is_none() {
@@ -309,17 +315,102 @@ struct Assignments {
     sessions: BTreeMap<String, String>,
     #[serde(default)]
     projects: BTreeMap<String, String>,
+    /// Explicit provider/model bindings of ordinary local sessions.
+    /// Missing means inherit the profile route. Existing backups are valid.
+    #[serde(default)]
+    models: BTreeMap<String, String>,
+    /// Only explicit local caption overrides are stored; direct is the default.
+    #[serde(default)]
+    caption_chats: std::collections::BTreeSet<String>,
 }
 
 fn assign_path(home: &AppHome) -> PathBuf {
     home.profile_dir().join(ASSIGN_FILE)
 }
 
+fn read_assign_checked(home: &AppHome) -> Result<Assignments, MobileError> {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(assign_path(home)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Assignments::default()),
+        Err(_) => return Err(rejected("Chat-Zuordnungen konnten nicht gelesen werden.")),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_ASSIGNMENT_BYTES + 1).read_to_end(&mut bytes)
+        .map_err(|_| rejected("Chat-Zuordnungen konnten nicht gelesen werden."))?;
+    if bytes.len() as u64 > MAX_ASSIGNMENT_BYTES {
+        return Err(rejected("Chat-Zuordnungen sind zu groß."));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| rejected("Chat-Zuordnungen sind beschädigt; nicht überschrieben."))
+}
+
 fn read_assign(home: &AppHome) -> Assignments {
-    std::fs::read(assign_path(home))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    read_assign_checked(home).unwrap_or_default()
+}
+
+pub(crate) fn chat_model(home: &AppHome, session_id: &str) -> Result<Option<String>, MobileError> {
+    check_key(session_id)?;
+    Ok(read_assign_checked(home)?.models.get(session_id).cloned())
+}
+
+/// Shares the UIA assignment transaction and backup format; does not mutate
+/// provider files or the profile's default model.
+pub(crate) fn set_chat_model(
+    home: &AppHome,
+    session_id: &str,
+    selection: Option<String>,
+) -> Result<(), MobileError> {
+    check_key(session_id)?;
+    let _guard = ASSIGNMENT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut assign = read_assign_checked(home)?;
+    match selection {
+        Some(selection) => {
+            if !assign.models.contains_key(session_id) && assign.models.len() >= MAX_ASSIGNMENTS {
+                return Err(rejected("Zu viele Chat-Modellzuordnungen."));
+            }
+            assign.models.insert(session_id.to_owned(), selection);
+        }
+        None => { assign.models.remove(session_id); }
+    }
+    write_assign(home, &mut assign)
+}
+
+pub(crate) fn chat_direct_vision(home: &AppHome, session_id: &str) -> Result<bool, MobileError> {
+    check_key(session_id)?;
+    Ok(!read_assign_checked(home)?.caption_chats.contains(session_id))
+}
+
+pub(crate) fn set_chat_direct_vision(home: &AppHome, session_id: &str, direct: bool) -> Result<(), MobileError> {
+    check_key(session_id)?;
+    let _guard = ASSIGNMENT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut assign = read_assign_checked(home)?;
+    if direct {
+        assign.caption_chats.remove(session_id);
+    } else {
+        if !assign.caption_chats.contains(session_id) && assign.caption_chats.len() >= MAX_ASSIGNMENTS {
+            return Err(rejected("Zu viele Chat-Bildzuordnungen."));
+        }
+        assign.caption_chats.insert(session_id.to_owned());
+    }
+    write_assign(home, &mut assign)
+}
+
+#[cfg(test)]
+#[test]
+fn direct_vision_default_and_caption_override_are_independent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let dir = tempfile::tempdir()?;
+    let home = AppHome::open(dir.path())?;
+    assert!(chat_direct_vision(&home, "one")?);
+    set_chat_direct_vision(&home, "one", false)?;
+    set_chat_model(&home, "two", Some("local-gguf/qwen".into()))?;
+    let reopened = AppHome::open(dir.path())?;
+    assert!(!chat_direct_vision(&reopened, "one")?);
+    assert!(chat_direct_vision(&reopened, "two")?);
+    set_chat_direct_vision(&reopened, "one", true)?;
+    assert!(chat_direct_vision(&reopened, "one")?);
+    assert_eq!(chat_model(&reopened, "two")?.as_deref(), Some("local-gguf/qwen"));
+    Ok(())
 }
 
 fn write_assign(home: &AppHome, assign: &mut Assignments) -> Result<(), MobileError> {
@@ -328,7 +419,42 @@ fn write_assign(home: &AppHome, assign: &mut Assignments) -> Result<(), MobileEr
         assign.sessions.remove(&first);
     }
     let bytes = serde_json::to_vec(assign).map_err(|_| rejected("Zuordnung konnte nicht gespeichert werden."))?;
+    if bytes.len() as u64 > MAX_ASSIGNMENT_BYTES {
+        return Err(rejected("Chat-Zuordnungen sind zu groß."));
+    }
     write_private_atomic(&assign_path(home), &bytes)
+}
+
+#[cfg(test)]
+#[test]
+fn chat_model_assignments_survive_reopen_and_uia_changes() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let dir = tempfile::tempdir()?;
+    let home = AppHome::open(dir.path())?;
+    std::fs::write(assign_path(&home), br#"{"sessions":{"one":"uia-legacy"},"projects":{}}"#)?;
+    set_chat_model(&home, "one", Some("api/a/model".into()))?;
+    set_chat_model(&home, "two", Some("local-gguf/own-qwen".into()))?;
+    let reopened = AppHome::open(dir.path())?;
+    assert_eq!(chat_model(&reopened, "one")?.as_deref(), Some("api/a/model"));
+    assert_eq!(chat_model(&reopened, "two")?.as_deref(), Some("local-gguf/own-qwen"));
+    assert_eq!(read_assign_checked(&reopened)?.sessions.get("one").map(String::as_str), Some("uia-legacy"));
+    let store = UiaStore::new(dir.path().to_string_lossy().into_owned())?;
+    store.set_session_uia("one".into(), None)?;
+    assert_eq!(chat_model(&reopened, "one")?.as_deref(), Some("api/a/model"));
+    set_chat_model(&reopened, "one", None)?;
+    assert_eq!(chat_model(&reopened, "one")?, None);
+    assert_eq!(chat_model(&reopened, "two")?.as_deref(), Some("local-gguf/own-qwen"));
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn corrupt_assignment_file_is_not_overwritten() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let dir = tempfile::tempdir()?;
+    let home = AppHome::open(dir.path())?;
+    std::fs::write(assign_path(&home), b"invalid")?;
+    assert!(set_chat_model(&home, "one", Some("api/model".into())).is_err());
+    assert_eq!(std::fs::read(assign_path(&home))?, b"invalid");
+    Ok(())
 }
 
 fn check_key(key: &str) -> Result<(), MobileError> {
@@ -338,26 +464,72 @@ fn check_key(key: &str) -> Result<(), MobileError> {
     Ok(())
 }
 
-/// Persona-Wechsel für einen Chat: `(system.md der gewählten UIA, system.md der aktiven UIA)`.
-/// `None`, wenn der Chat keine eigene UIA hat oder sie der aktiven entspricht.
-pub(crate) fn session_persona(home: &AppHome, session_id: &str) -> Option<(String, Option<String>)> {
-    let chosen_id = read_assign(home).sessions.get(session_id).cloned()?;
+/// Loads the configured persona for a single turn, including the profile fallback.
+#[cfg(feature = "local-host")]
+pub(crate) fn effective_session_persona(home: &AppHome, session_id: Option<&str>) -> Option<String> {
     let active = home.info().ok()?.active_uia;
-    if active.as_deref() == Some(chosen_id.as_str()) {
-        return None;
-    }
+    let assigned = session_id.and_then(|id| read_assign(home).sessions.get(id).cloned());
     let store = UiaStore { home: home.clone(), lock: Mutex::new(()) };
     let found = store.scan();
     let read = |id: &str| -> Option<String> {
-        let dir = &found.iter().find(|(_, existing, _)| existing == id)?.0;
-        let meta = std::fs::metadata(dir.join("system.md")).ok()?;
-        if meta.len() > MAX_DEFINITION_BYTES {
+        let path = found.iter().find(|(_, existing, _)| existing == id)?.0.join("system.md");
+        if std::fs::metadata(&path).ok()?.len() > MAX_DEFINITION_BYTES {
             return None;
         }
-        std::fs::read_to_string(dir.join("system.md")).ok()
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(with_persona_anchor(&text).unwrap_or(text))
     };
-    let chosen = read(&chosen_id)?;
-    Some((chosen, active.as_deref().and_then(read)))
+    assigned.as_deref().and_then(read).or_else(|| active.as_deref().and_then(read))
+}
+
+/// Preserve the user-configured sections in lean GGUF chats, without importing
+/// the full phone host template or its instructions about tools and files.
+#[cfg(feature = "local-host")]
+pub(crate) fn compact_chat_persona(text: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut include = false;
+    for line in text.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            include = matches!(
+                heading.trim(),
+                "Wer du bist" | "Identität" | "Persönlichkeit" | "Anrede" | "Kontext des Nutzers"
+            );
+        } else if line.starts_with("# ") {
+            include = false;
+        }
+        if include {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    let result = result.trim();
+    if result.is_empty() {
+        None
+    } else {
+        // The provider enforces its own limit; do not silently truncate a persona.
+        Some(result.to_owned())
+    }
+}
+
+#[cfg(all(test, feature = "local-host"))]
+#[test]
+fn lean_persona_preserves_identity_and_personality_without_host_tools() {
+    let setup = CleanSetup {
+        name: "Quinn".into(),
+        identity: "Ich bin Quinn.".into(),
+        personality: "Antworte freundlich.".into(),
+        user_name: "Mia".into(),
+        user_context: "Bevorzugt Deutsch.".into(),
+    };
+    let rendered = render_system(&setup);
+    let compact = compact_chat_persona(&rendered).expect("configured persona");
+    assert!(compact.contains("Du bist Quinn."));
+    assert!(compact.contains("Antworte freundlich."));
+    assert!(compact.contains("Mia"));
+    assert!(compact.contains("Bevorzugt Deutsch."));
+    assert!(!compact.contains("plan.current"));
+    assert!(!compact.contains("## Approvals"));
+    assert!(compact_chat_persona(TEMPLATE_SYSTEM).is_none());
 }
 
 fn rejected(detail: &str) -> MobileError {

@@ -214,7 +214,6 @@ internal fun LocalUiaWorkConversation(
                 onDecide = onDecide,
                 archiveMenu = archiveMenu,
                 agentVersion = agentVersion,
-                showQuickPickers = expectLocal,
                 modifier = Modifier.weight(1f),
             )
         }

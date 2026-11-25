@@ -688,7 +688,8 @@ internal class HarwConnection(private val context: Context, private val localBac
         val profile = start.profile ?: return false
         if (start.stopping || !start.canSetUp) return start.hasConnection
         if (start.hasConnection && !force) return true
-        if (!routeChoiceEnabled(start.routePreference, profile)) {
+        val route = if (HarwVpnService.ownsHub()) RoutePreference.ONION else start.routePreference
+        if (!routeChoiceEnabled(route, profile)) {
             change { it.copy(setupError = context.getString(R.string.harw_route_unavailable)) }
             return false
         }
@@ -785,6 +786,8 @@ internal class HarwConnection(private val context: Context, private val localBac
         model: String? = null,
         opened: (String, String?) -> Unit,
         notice: (String) -> Unit,
+        uiaId: String? = null,
+        onConfigurationFailed: ((String, String?) -> Unit)? = null,
     ) {
         val generation = gate.generation ?: return
         val native = core ?: return
@@ -796,7 +799,14 @@ internal class HarwConnection(private val context: Context, private val localBac
                 val existing = projectKey?.takeIf { it.isNotEmpty() }
                 var assigned: String? = null
                 var note: String? = null
+                var configured = true
                 val session = withContext(Dispatchers.IO) {
+                    val providers = if (current.local) uniffi.harw_mobile_ffi.ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)) else null
+                    val uias = if (current.local) uniffi.harw_mobile_ffi.UiaStore(context.filesDir.path) else null
+                    if (model != null) providers?.validateChatModel(model)
+                    if (uiaId != null && uias?.listUias()?.none { it.id == uiaId } != false) {
+                        error("Dieses UIA-Profil ist nicht verfügbar.")
+                    }
                     val supported = native.projectsSupported()
                     val created = if (existing != null && supported) {
                         assigned = existing
@@ -805,19 +815,26 @@ internal class HarwConnection(private val context: Context, private val localBac
                         native.createSession(null)
                     }
                     if (existing != null && !supported) note = NoProjectsSupportText
-                    if (model != null) {
-                        try {
-                            native.setSessionModel(created.sessionId, model)
-                        } catch (error: Exception) {
-                            if (error is CancellationException) throw error
-                            note = "Modell „$model“ konnte nicht gesetzt werden: ${error.displayMessage()}"
+                    try {
+                        if (model != null) {
+                            if (providers != null) providers.setChatModel(created.sessionId, model)
+                            else native.setSessionModel(created.sessionId, model)
                         }
+                        if (uias != null) {
+                            val selected = uiaId ?: assigned?.let { uias.projectDefaultUia(it)?.id }
+                            if (selected != null) uias.setSessionUia(created.sessionId, selected)
+                        }
+                    } catch (error: Exception) {
+                        if (error is CancellationException) throw error
+                        configured = false
+                        note = "Chat-Konfiguration konnte nicht gesetzt werden. Nachricht nicht gesendet: ${error.displayMessage()}"
                     }
                     created
                 }
                 if (generation == gate.generation) {
                     change { it.copy(sessions = listOf(session) + it.sessions.filterNot { s -> s.sessionId == session.sessionId }) }
-                    opened(session.sessionId, assigned)
+                    if (configured) opened(session.sessionId, assigned)
+                    else onConfigurationFailed?.invoke(session.sessionId, assigned)
                     note?.let(notice)
                     refreshSessions()
                     refreshProjectsQuietly()
@@ -1738,6 +1755,7 @@ internal class HarwConnection(private val context: Context, private val localBac
             CloudAssistantTarget(
                 profile, generation, access,
                 recallSupported = native.cloudAssistantRecallSupported(access),
+                modelsSupported = native.cloudAssistantModelsSupported(access),
                 sharedSupported = shared,
                 sharedDeviceFingerprint = if (shared) native.cloudAssistantSharedDeviceFingerprint(access) else null,
             )
@@ -1757,6 +1775,14 @@ internal class HarwConnection(private val context: Context, private val localBac
         return current && core === native && cloudAssistantSelected(target.profile, target.generation)
     }
 
+    suspend fun cloudAssistantModels(target: CloudAssistantTarget): List<String> {
+        val native = core ?: throw MobileException.Disconnected()
+        if (!target.modelsSupported || !cloudAssistantSelected(target.profile, target.generation)) throw MobileException.Disconnected()
+        val models = withContext(Dispatchers.IO) { native.cloudAssistantModels(target.access) }
+        if (core !== native || !cloudAssistantTargetCurrent(target)) throw MobileException.Disconnected()
+        return models
+    }
+
     /** Explicit specialist RPC only. Never falls through to the normal session composer. */
     suspend fun cloudAssistantCall(
         target: CloudAssistantTarget,
@@ -1771,7 +1797,10 @@ internal class HarwConnection(private val context: Context, private val localBac
                 CloudAssistantCommand.Provision -> native.cloudAssistantProvision(access)
                 CloudAssistantCommand.Revoke -> native.cloudAssistantRevoke(access)
                 is CloudAssistantCommand.Submit -> {
-                    if (operation.recallMessageIds.isEmpty()) {
+                    if (operation.model != null) {
+                        if (!target.modelsSupported) throw MobileException.Denied("Cloud Assistant models not negotiated")
+                        native.cloudAssistantSubmitModel(access, operation.id, operation.text, operation.model, operation.recallMessageIds)
+                    } else if (operation.recallMessageIds.isEmpty()) {
                         native.cloudAssistantSubmit(access, operation.id, operation.text)
                     } else {
                         if (!target.recallSupported) throw MobileException.Denied("Cloud Assistant recall was not negotiated")
@@ -2198,6 +2227,19 @@ internal class HarwConnection(private val context: Context, private val localBac
         val native = core ?: throw MobileException.Disconnected()
         if (localBackend || !state.value.online) throw MobileException.Disconnected()
         return native.cloudLibraryCaptionAccess(scope, revision, assetId)
+    }
+
+    suspend fun libraryVisionChoices(): List<uniffi.harw_mobile_ffi.LocalVisionChoice> {
+        val native = core ?: throw MobileException.Disconnected()
+        if (!localBackend || !state.value.online) throw MobileException.Disconnected()
+        return withContext(Dispatchers.IO) {
+            // Importing a model does not necessarily activate it. Register
+            // the configured directory independently of the active route.
+            uniffi.harw_mobile_ffi.configureLocalModelsDir(
+                context.filesDir.path, ModelStore(context.applicationContext).modelsDir().path,
+            )
+            native.libraryVisionChoices()
+        }
     }
 
     suspend fun cloudLibraryCaptionLocal(

@@ -441,6 +441,16 @@ internal class HarwConnectionService : Service() {
         fun startLocalFrom(activity: android.app.Activity) = startFrom(activity, ConnectLocalAction)
         fun holdFrom(activity: android.app.Activity) = startFrom(activity, HoldExistingAction)
 
+        fun observeVpnHub(context: android.content.Context) {
+            runCatching {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, HarwConnectionService::class.java).setAction(HoldExistingAction),
+                )
+            }
+        }
+
+
         private fun startFrom(activity: android.app.Activity, action: String) {
             ContextCompat.startForegroundService(
                 activity, Intent(activity, HarwConnectionService::class.java).setAction(action),

@@ -91,16 +91,18 @@ pub(crate) async fn open_local(
     let resolver = store.resolver().clone();
     let model_home = home.clone();
     let selection = home.active_route()?;
-    let fingerprint = projector_fingerprint(&home);
+    let fingerprint = projector_fingerprint(&home, selection.as_ref());
     let revision = provider_revision(&home, selection.as_ref());
     let resolver_for_build = resolver.clone();
-    let built = load_model(move || build_active_model(&model_home, &resolver_for_build))
+    let selected = selection.clone();
+    let built = load_model(move || build_selected_model(&model_home, &resolver_for_build, selected.as_ref()))
         .await
         .map_err(|_| host_task_failed())??;
     // The host keeps this wrapper for its whole life: a later provider/model
     // activation is picked up by the next turn (see `SwitchingModel`).
     let model = Arc::new(SwitchingModel {
         home: home.clone(),
+        baseline_persona: crate::uia::effective_session_persona(&home, None),
         resolver,
         current: tokio::sync::Mutex::new((
             ModelCacheKey::Route(selection),
@@ -164,20 +166,19 @@ fn matches_uia_home(home: &crate::home::AppHome, files: &std::path::Path) -> boo
 /// The host builds its model once; without this wrapper a provider activated
 /// later (another route, or the on-device GGUF) would not reach the running
 /// host. Before every turn the wrapper compares the active route and model of
-/// the app home with the one it was built for and rebuilds on a change. The
-/// per-session model ids of the request are cleared: the app-level selection
-/// is what the owner picked on the phone.
+/// the app home with the one it was built for and rebuilds on a change.
+/// Ordinary chat bindings are resolved from the profile's session assignments;
+/// the request's model IDs are cleared only after choosing the concrete route.
 #[cfg(feature = "local-host")]
 pub(crate) struct SwitchingModel {
     home: crate::home::AppHome,
+    baseline_persona: Option<String>,
     resolver: crate::secrets::KeystoreSecretResolver,
-    current: tokio::sync::Mutex<(
-        ModelCacheKey,
-        Option<ProjectorFingerprint>,
-        Option<blake3::Hash>,
-        CachedProvider,
-    )>,
+    current: tokio::sync::Mutex<ProviderCache>,
 }
+
+#[cfg(feature = "local-host")]
+type ProviderCache = (ModelCacheKey, Option<ProjectorFingerprint>, Option<blake3::Hash>, CachedProvider);
 
 #[cfg(feature = "local-host")]
 #[derive(PartialEq, Eq)]
@@ -189,6 +190,7 @@ enum ModelCacheKey {
 }
 
 #[cfg(feature = "local-host")]
+#[derive(Clone)]
 enum CachedProvider {
     Other(Arc<dyn harw_core::ModelProvider>),
     Local {
@@ -338,10 +340,16 @@ static MODEL_REVISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 type ProjectorFingerprint = (String, u64, Option<std::time::SystemTime>);
 
 #[cfg(feature = "local-host")]
-fn projector_fingerprint(home: &crate::home::AppHome) -> Option<ProjectorFingerprint> {
-    let model_id = home.active_local_model().ok()??;
+fn projector_fingerprint(
+    home: &crate::home::AppHome,
+    selection: Option<&(String, String)>,
+) -> Option<ProjectorFingerprint> {
+    let (provider, model_id) = selection?;
+    if provider != crate::home::LOCAL_ROUTE_ID {
+        return None;
+    }
     let dir = home.local_models_dir()?;
-    let path = crate::models::vision_path_in(std::path::Path::new(&dir), &model_id)?;
+    let path = crate::models::vision_path_in(std::path::Path::new(&dir), model_id)?;
     let meta = std::fs::metadata(&path).ok()?;
     Some((path, meta.len(), meta.modified().ok()))
 }
@@ -437,9 +445,13 @@ impl SwitchingModel {
             return Err(missing());
         }
         if current.0 != wanted || !crate::uia_room::is_pinned_local(&current.3.for_chat(), &id) {
-            // Release the old model before mapping another; share the same
-            // cache lock as the coding host.
-            current.3 = CachedProvider::Other(Arc::new(NoModel));
+            // No remapping while another chat or Library still owns the old
+            // model. Cancellation of a waiting caller does not cancel workers.
+            LOCAL_INFERENCE.wait_idle().await;
+            if matches!(&current.3, CachedProvider::Local { model, .. } if Arc::strong_count(model) > 1) {
+                return Err(local_vision_busy());
+            }
+            *current = (ModelCacheKey::Route(None), None, None, CachedProvider::Other(Arc::new(NoModel)));
             let home = self.home.clone();
             let selected = id.clone();
             let built = load_model(move || build_local_assistant_gguf(&home, &selected))
@@ -480,7 +492,10 @@ impl SwitchingModel {
             // operation finishes. Don't retain two GGUF mappings in the cache.
             LOCAL_INFERENCE.wait_idle().await;
             if cancel.is_cancelled() { return Err(Cancelled); }
-            current.3 = CachedProvider::Other(Arc::new(NoModel));
+            if matches!(&current.3, CachedProvider::Local { model, .. } if Arc::strong_count(model) > 1) {
+                return Err(Busy);
+            }
+            *current = (ModelCacheKey::Route(None), None, None, CachedProvider::Other(Arc::new(NoModel)));
             let home = self.home.clone();
             let id = selected.0.clone();
             // Keep remapping exclusion with the blocking loader even if
@@ -585,6 +600,77 @@ impl SwitchingModel {
         crate::session_title::complete_response(output)
     }
 
+    /// Explicit Library choices from the current profile. A revision of zero
+    /// represents an installed pair, not an assertion that it is loaded.
+    pub(crate) fn library_vision_choices(&self) -> Result<Vec<crate::LocalVisionChoice>, MobileError> {
+        if !harw_llama::engine_available() {
+            return Ok(Vec::new());
+        }
+        let Some(dir) = self.home.local_models_dir() else { return Ok(Vec::new()); };
+        let active = harw_home::active_profile_name(self.home.home());
+        if harw_home::profile_dir(self.home.home(), &active).ok().as_deref() != Some(self.home.profile_dir()) {
+            return Err(MobileError::Disconnected);
+        }
+        let loaded = self.local_vision_choices().unwrap_or_default();
+        let mut choices = Vec::new();
+        for model in crate::models::local_models(dir)?.into_iter().take(256) {
+            if self.library_vision_files(&model.id).is_none() { continue; }
+            let choice = loaded.iter().find(|choice| choice.model_id == model.id).cloned()
+                .unwrap_or(crate::LocalVisionChoice {
+                    model_id: model.id, effective_parallelism: 1, loaded_revision: 0,
+                });
+            choices.push(choice);
+        }
+        Ok(choices)
+    }
+
+    fn library_vision_files(&self, id: &str) -> Option<VisionFiles> {
+        let active = harw_home::active_profile_name(self.home.home());
+        if harw_home::profile_dir(self.home.home(), &active).ok().as_deref() != Some(self.home.profile_dir()) {
+            return None;
+        }
+        let dir = self.home.local_models_dir()?;
+        let projector = crate::models::vision_path_in(std::path::Path::new(&dir), id)?;
+        let model = crate::models::model_path(dir, id.to_owned()).ok()?;
+        vision_files(&model, Some(&projector))
+    }
+
+    /// The remote Library explicitly requests one installed local GGUF. It
+    /// does not activate a profile route or access the private vault.
+    pub(crate) async fn describe_installed_library_vision(
+        &self,
+        choice: &crate::LocalVisionChoice,
+        images: Vec<(u64, Arc<[u8]>)>,
+        cancel: &harw_types::cancel::CancelToken,
+        on_result: &(dyn Fn(harw_llama::LocalImageDescription) + Send + Sync),
+    ) -> Result<(), MobileError> {
+        let unavailable = || MobileError::Session {
+            detail: "Das gewählte Vision-Modell ist nicht verfügbar. Bitte Auswahl aktualisieren.".into(),
+        };
+        if choice.loaded_revision != 0 || images.len() != 1 || cancel.is_cancelled() {
+            return Err(unavailable());
+        }
+        let expected = self.library_vision_files(&choice.model_id).ok_or_else(unavailable)?;
+        let selected = Some((crate::home::LOCAL_ROUTE_ID.to_owned(), choice.model_id.clone()));
+        let current = self.cached_provider_for(selected).await.map_err(|_| unavailable())?;
+        let _mapping = Arc::clone(&LOCAL_MODEL_LIFECYCLE).try_lock_owned()
+            .map_err(|_| local_vision_busy())?;
+        let CachedProvider::Local { model, vision_files: Some(files), .. } = &current.3 else {
+            return Err(unavailable());
+        };
+        if files != &expected || self.library_vision_files(&choice.model_id).as_ref() != Some(&expected)
+            || !model.supports_vision() || cancel.is_cancelled()
+        {
+            return Err(unavailable());
+        }
+        let result = model.describe_selected_images(images, cancel, on_result).await;
+        LOCAL_INFERENCE.wait_idle().await;
+        if self.library_vision_files(&choice.model_id).as_ref() != Some(&expected) || cancel.is_cancelled() {
+            return Err(unavailable());
+        }
+        result.map_err(|_| unavailable())
+    }
+
     pub(crate) fn local_vision_choices(
         &self,
     ) -> Result<Vec<crate::LocalVisionChoice>, MobileError> {
@@ -677,27 +763,36 @@ impl SwitchingModel {
     }
 
     async fn provider(&self) -> Result<Arc<dyn harw_core::ModelProvider>, harw_core::ModelError> {
+        let selection = self.home.active_route()
+            .map_err(|e| harw_core::ModelError::RequestFailed(e.to_string()))?;
+        Ok(self.cached_provider_for(selection).await?.3.for_chat())
+    }
+
+    async fn cached_provider_for(
+        &self,
+        selection: Option<(String, String)>,
+    ) -> Result<tokio::sync::MutexGuard<'_, ProviderCache>, harw_core::ModelError> {
         let failed = |detail: String| harw_core::ModelError::RequestFailed(detail);
-        let wanted = self
-            .home
-            .active_route()
-            .map_err(|e| failed(e.to_string()))?;
-        let fingerprint = projector_fingerprint(&self.home);
-        let revision = provider_revision(&self.home, wanted.as_ref());
-        let wanted = ModelCacheKey::Route(wanted);
+        let fingerprint = projector_fingerprint(&self.home, selection.as_ref());
+        let revision = provider_revision(&self.home, selection.as_ref());
+        let wanted = ModelCacheKey::Route(selection.clone());
         let mut current = self.current.lock().await;
         if current.0 != wanted || current.1 != fingerprint || current.2 != revision {
-            // Release the old model first: two loaded GGUFs do not fit in memory.
-            current.3 = CachedProvider::Other(Arc::new(NoModel));
+            // No second large GGUF while an existing pin or worker is alive.
+            LOCAL_INFERENCE.wait_idle().await;
+            if matches!(&current.3, CachedProvider::Local { model, .. } if Arc::strong_count(model) > 1) {
+                return Err(failed("Das lokale Modell wird noch verwendet. Bitte erneut versuchen.".into()));
+            }
+            *current = (ModelCacheKey::Route(None), None, None, CachedProvider::Other(Arc::new(NoModel)));
             let home = self.home.clone();
             let resolver = self.resolver.clone();
-            let built = load_model(move || build_active_model(&home, &resolver))
+            let built = load_model(move || build_selected_model(&home, &resolver, selection.as_ref()))
                 .await
                 .map_err(|_| failed("on-device model switch failed".to_owned()))?
                 .map_err(|e| failed(e.to_string()))?;
             *current = (wanted, fingerprint, revision, built);
         }
-        Ok(current.3.for_chat())
+        Ok(current)
     }
 }
 
@@ -712,31 +807,67 @@ fn local_vision_busy() -> MobileError {
 impl harw_core::ModelProvider for SwitchingModel {
     fn respond<'a>(&'a self, mut request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
         Box::pin(async move {
-            let provider = self.provider().await?;
-            // Pro Chat gewählte UIA: ihre Persona ersetzt die der aktiven UIA in der Systemanweisung.
-            if let Some(session) = harw_core::current_session_id()
-                && let Some((chosen, active)) =
-                    crate::uia::session_persona(&self.home, session.as_str())
-            {
-                request.system_prompt =
-                    swap_persona(&request.system_prompt, &chosen, active.as_deref());
+            let session = harw_core::current_session_id();
+            let persona = session.as_ref().and_then(|id| {
+                crate::uia::effective_session_persona(&self.home, Some(id.as_str()))
+            });
+            if let Some(chosen) = persona.as_deref() {
+                request.system_prompt = with_session_persona(
+                    &request.system_prompt, chosen, self.baseline_persona.as_deref(),
+                );
             }
+            let selection = resolve_chat_route(&self.home, session.as_ref().map(|id| id.as_str()))
+                .map_err(|e| harw_core::ModelError::RequestFailed(e.to_string()))?;
+            let current = self.cached_provider_for(selection).await?;
             request.model_id = None;
             request.provider_id = None;
-            provider.respond(request).await
+            match &current.3 {
+                CachedProvider::Local { model, .. } => {
+                    let compact = persona.as_deref().and_then(crate::uia::compact_chat_persona);
+                    // Keep the cache locked until the local inference worker
+                    // finishes; another chat may not remap the active GGUF.
+                    let direct_vision = session.as_ref().map(|id| {
+                        crate::uia::chat_direct_vision(&self.home, id.as_str())
+                    }).transpose().map_err(|e| harw_core::ModelError::RequestFailed(e.to_string()))?;
+                    let response = model.respond_with_chat_options(request, compact, direct_vision).await;
+                    LOCAL_INFERENCE.wait_idle().await;
+                    response
+                }
+                CachedProvider::Other(model) => {
+                    let model = Arc::clone(model);
+                    drop(current);
+                    model.respond(request).await
+                }
+            }
         })
     }
 }
 
-/// Ersetzt die Persona der aktiven UIA in `prompt` durch die gewählte; fehlt sie dort, wird die gewählte angehängt.
+/// Keep the host instructions and apply the chat's current UIA on every turn.
 #[cfg(feature = "local-host")]
-fn swap_persona(prompt: &str, chosen: &str, active: Option<&str>) -> String {
-    if let Some(active) = active.map(str::trim).filter(|a| !a.is_empty())
-        && prompt.contains(active)
-    {
-        return prompt.replacen(active, chosen.trim(), 1);
+fn with_session_persona(prompt: &str, chosen: &str, baseline: Option<&str>) -> String {
+    let chosen = chosen.trim();
+    if chosen.is_empty() || prompt.contains(chosen) {
+        return prompt.to_owned();
     }
-    format!("{prompt}\n\n## Rolle in diesem Chat\n\n{}", chosen.trim())
+    let role = format!(
+        "## Deine UIA in diesem Chat\n\nDie folgende UIA ist deine Identität in dieser Session. Sprich in ihrer Ich-Form und folge ihren Anweisungen.\n\n{chosen}"
+    );
+    if let Some(previous) = baseline.map(str::trim).filter(|text| !text.is_empty())
+        && prompt.contains(previous)
+    {
+        return prompt.replacen(previous, &role, 1);
+    }
+    format!("{prompt}\n\n{role}")
+}
+
+#[cfg(all(test, feature = "local-host"))]
+#[test]
+fn a_session_persona_replaces_the_original_uias_identity_only() {
+    let prompt = "Host rules\n\nDu bist Atlas.\n\nWorkspace instructions";
+    let changed = with_session_persona(prompt, "Du bist Suri.", Some("Du bist Atlas."));
+    assert!(changed.contains("Host rules") && changed.contains("Workspace instructions"));
+    assert!(changed.contains("Du bist Suri.") && !changed.contains("Du bist Atlas."));
 }
 
 /// Stand-in while the next model loads; never answers.
@@ -776,16 +907,31 @@ const LEAN_TOOLS: &[&str] = &[
     "termux_run",
 ];
 
-/// The model of the active selection: the GGUF on this device when that is the
-/// active provider, else the HTTP route.
+/// Explicit, validated chat binding, otherwise the current profile default.
 #[cfg(feature = "local-host")]
-fn build_active_model(
+fn resolve_chat_route(
+    home: &crate::home::AppHome,
+    session_id: Option<&str>,
+) -> Result<Option<(String, String)>, MobileError> {
+    if let Some(id) = session_id
+        && let Some(selection) = crate::uia::chat_model(home, id)?
+    {
+        return crate::providers::validated_chat_route(home, &selection).map(Some);
+    }
+    home.active_route()
+}
+
+/// Build the captured selection without modifying the profile's route.
+#[cfg(feature = "local-host")]
+fn build_selected_model(
     home: &crate::home::AppHome,
     resolver: &crate::secrets::KeystoreSecretResolver,
+    selection: Option<&(String, String)>,
 ) -> Result<CachedProvider, MobileError> {
-    match home.active_local_model()? {
-        Some(model_id) => build_local_gguf(home, &model_id),
-        None => crate::providers::build_model_provider(home, resolver).map(CachedProvider::Other),
+    match selection {
+        Some((provider, model_id)) if provider == crate::home::LOCAL_ROUTE_ID => build_local_gguf(home, model_id),
+        Some(selection) => crate::providers::build_model_provider_for_route(home, resolver, selection).map(CachedProvider::Other),
+        None => Ok(CachedProvider::Other(Arc::new(NoModel))),
     }
 }
 

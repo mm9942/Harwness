@@ -26,6 +26,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -71,20 +72,28 @@ internal class ChatQuickPickers {
         this.model = model
     }
 
+    var openSettings: (() -> Unit)? by mutableStateOf(null)
+
     fun openAgent() { if (agent.enabled) showAgent() }
     fun openModel() { if (model.enabled) showModel() }
 }
 
 @Composable
-internal fun ChatQuickPickerRow(pickers: ChatQuickPickers) {
+internal fun ChatQuickPickerRow(pickers: ChatQuickPickers, local: Boolean) {
     Box(Modifier.fillMaxWidth()) {
         Row(
-            Modifier.fillMaxWidth(0.5f).padding(end = 12.dp),
+            Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            ChatQuickPickerButton("UIA", pickers.agent, pickers::openAgent, Modifier.weight(1f))
+            if (local) ChatQuickPickerButton("UIA", pickers.agent, pickers::openAgent, Modifier.weight(1f))
             ChatQuickPickerButton(stringResource(R.string.chat_quick_picker_model),
                 pickers.model, pickers::openModel, Modifier.weight(1f))
+            val open = pickers.openSettings
+            ChatQuickPickerButton(
+                stringResource(R.string.chat_quick_picker_settings), ChatQuickChoice(enabled = open != null),
+                { open?.invoke() }, Modifier.weight(1f),
+            )
+
         }
     }
 }
@@ -208,6 +217,7 @@ private fun ScopedChatSettings(
     val deviceVisionState = deviceVision?.state?.collectAsState()?.value
     val localVisionReady = deviceVisionState?.online == true
     var page by remember { mutableStateOf<ChatSettingsPage?>(null) }
+    val openOverview = remember { { page = ChatSettingsPage.Overview } }
     var localModelRefresh by remember { mutableIntStateOf(0) }
     val pickerProject = window.projectKey
     val currentPickerTarget = {
@@ -220,7 +230,7 @@ private fun ScopedChatSettings(
     val localAgent = if (state.local) {
         rememberChatAgentControl(sessionId, window.projectKey, agentVersion, currentPickerTarget, onAgentChanged)
     } else null
-    val localModelLabel = if (state.local) rememberLocalModelLabel(localModelRefresh).value else null
+    val localModelLabel = if (state.local) rememberLocalModelLabel(localModelRefresh, sessionId = sessionId).value else null
     val sessionCatalog = state.manage.catalog?.takeIf { state.manage.catalogSessionId == sessionId }
     val cloudModelLabel = modelChipLabel(session?.model, sessionCatalog?.liveModel, sessionCatalog?.liveProvider)
     val modelBlock = if (state.local) null else modelChipBlock(state.manage.support, active)
@@ -240,6 +250,7 @@ private fun ScopedChatSettings(
     )
     val blockedModel = stringResource(R.string.chat_quick_picker_model_unavailable)
     SideEffect {
+        archiveMenu.quickPickers.openSettings = openOverview
         archiveMenu.quickPickers.publish(
             ChatQuickChoice(localAgent?.selectedName, localAgent?.canChoose == true, blockedAgent),
             ChatQuickChoice((localModelLabel ?: cloudModelLabel).takeUnless { it == "Modell" },
@@ -248,11 +259,14 @@ private fun ScopedChatSettings(
         )
     }
     DisposableEffect(archiveMenu.quickPickers) {
-        onDispose { archiveMenu.quickPickers.publish(ChatQuickChoice(), ChatQuickChoice(), {}, {}) }
+        onDispose {
+            archiveMenu.quickPickers.openSettings = null
+            archiveMenu.quickPickers.publish(ChatQuickChoice(), ChatQuickChoice(), {}, {})
+        }
     }
     // Keep launcher and download completion alive when the settings sheet is hidden.
     val localVisionHint = if (state.local) {
-        rememberLocalVisionHint(window.draft(sessionId).images.isNotEmpty(), localModelRefresh) { localModelRefresh++ }
+        rememberLocalVisionHint(window.draft(sessionId).images.isNotEmpty(), localModelRefresh, sessionId = sessionId) { localModelRefresh++ }
     } else null
 
     IconButton(onClick = { page = ChatSettingsPage.Overview }) {
@@ -272,7 +286,7 @@ private fun ScopedChatSettings(
                     Text("Chat-Einstellungen", style = MaterialTheme.typography.titleMedium)
                     TextButton(onClick = { page = ChatSettingsPage.Overview }) { Text("Übersicht") }
                 }
-                if (state.local) LocalModelSheet(onChanged = { localModelRefresh++ }, canChange = canChangeModel)
+                if (state.local) LocalModelSheet(onChanged = { localModelRefresh++ }, canChange = canChangeModel, sessionId = sessionId)
                 else ModelSwitchSheet(state, connection, sessionId, active, canChange = canChangeModel)
             } else if (page == ChatSettingsPage.Agents) {
                 Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 15.dp)) {
@@ -301,6 +315,7 @@ private fun ScopedChatSettings(
                             )
                         }
                         localVisionHint?.invoke()
+                        LocalChatVisionPolicy(sessionId, canChangeModel)
                     } else if (state.manage.support != null) {
                         AssistChip(
                             onClick = openModels,
@@ -409,4 +424,56 @@ private fun ScopedChatSettings(
     if (active && apiImageEditOpen && chatVisionScope != null) {
         ApiImageEditDialog(isCurrentChat = isCurrentImageEditChat, onClose = { apiImageEditOpen = false })
     }
+}
+
+/** The actual GGUF chat input mode, not the separate manual description tool. */
+@Composable
+private fun LocalChatVisionPolicy(sessionId: String, canChange: () -> Boolean) {
+    val context = LocalContext.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var reload by remember(sessionId) { mutableIntStateOf(0) }
+    var busy by remember(sessionId) { mutableStateOf(false) }
+    var error by remember(sessionId) { mutableStateOf<String?>(null) }
+    val direct by androidx.compose.runtime.produceState<Boolean?>(null, sessionId, reload) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                uniffi.harw_mobile_ffi.ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context))
+                    .chatDirectVision(sessionId)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                error = e.message ?: "Bildmodus konnte nicht gelesen werden"
+                null
+            }
+        }
+    }
+    Text("GGUF-Bildeingabe", style = MaterialTheme.typography.titleSmall)
+    TextButton(enabled = !busy && direct != null && canChange(), onClick = {
+        val next = !(direct ?: return@TextButton)
+        if (!canChange()) return@TextButton
+        scope.launch {
+            busy = true
+            try {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    uniffi.harw_mobile_ffi.ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context))
+                        .setChatDirectVision(sessionId, next)
+                }
+                error = null
+                reload++
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                error = e.message ?: "Bildmodus konnte nicht gespeichert werden"
+            } finally {
+                busy = false
+            }
+        }
+    }) {
+        Text(when (direct) {
+            true -> "Direkt multimodal · wechseln"
+            false -> "Lokale Bildbeschreibung · wechseln"
+            null -> "Bildmodus wird gelesen …"
+        })
+    }
+    Text("Direkt: bis zu vier neue Bilder pro Nachricht im Modellprompt. Beschreibung: lokale Einzelanalyse vor der Antwort. Gilt nur für lokale GGUF-Chats.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
 }

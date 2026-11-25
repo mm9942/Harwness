@@ -197,6 +197,11 @@ impl Default for CoreState {
 
 impl CoreState {
     fn preference_for(&self, profile: &ValidatedProfile) -> RoutePreference {
+        #[cfg(all(feature = "android-vpn", unix))]
+        if crate::android_vpn_jni::hub_is_held() {
+            return RoutePreference::Onion;
+        }
+
         self.route_consent.as_ref()
             .filter(|(approved, _)| approved.same_route_authority(profile))
             .map_or(RoutePreference::Onion, |(_, preference)| *preference)
@@ -484,6 +489,11 @@ impl MobileCore {
             return;
         }
         state.stop("Disconnected. This view is read-only");
+        #[cfg(all(feature = "android-vpn", feature = "onion", unix))]
+        if crate::android_vpn_jni::hub_is_held() {
+            self.shared.dialer.retire_ordinary_tor();
+        }
+
         state.phase = ConnectionPhase::Disconnected;
         state.detail = None;
         state.next_retry_at_ms = None;
@@ -1998,6 +2008,7 @@ async fn drive_connection(
         options.features = requested_features();
         options.features.push(features::CLOUD_ASSISTANT_V1.to_owned());
         options.features.push(features::CLOUD_ASSISTANT_RECALL_V1.to_owned());
+        options.features.push(features::CLOUD_ASSISTANT_MODELS_V1.to_owned());
         options.features.push(features::CLOUD_ASSISTANT_SHARED_V1.to_owned());
         let plan = {
             let preference = shared.state().preference_for(&profile);

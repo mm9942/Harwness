@@ -6,7 +6,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use harw_protocol::session_wire::{
-    ArchiveParams, CloudAssistantRecallSubmit, CloudAssistantSharedCommandV1,
+    ArchiveParams, CloudAssistantModelSubmitV1, CloudAssistantRecallSubmit, CloudAssistantSharedCommandV1,
+    valid_cloud_assistant_model_route,
     CloudAssistantSharedSnapshotV1, CloudAssistantSharedStatusV1, CloudAssistantSnapshot,
     CloudAssistantStatus, CloudAssistantSubmit, CloudAssistantTurn, RenameParams,
     SetProjectParams,
@@ -147,6 +148,43 @@ impl MobileCore {
         access.link.upgrade().is_some_and(|link| {
             enabled(&self.shared.state(), &link, &access.profile)
                 && link.backend.features().iter().any(|feature| feature == features::CLOUD_ASSISTANT_RECALL_V1)
+        })
+    }
+
+    pub fn cloud_assistant_models_supported(&self, access: Arc<CloudAssistantAccess>) -> bool {
+        access.link.upgrade().is_some_and(|link| {
+            enabled(&self.shared.state(), &link, &access.profile)
+                && link.backend.features().iter().any(|feature| feature == features::CLOUD_ASSISTANT_MODELS_V1)
+        })
+    }
+
+    pub fn cloud_assistant_models(&self, access: Arc<CloudAssistantAccess>) -> Result<Vec<String>, MobileError> {
+        if !self.cloud_assistant_models_supported(Arc::clone(&access)) {
+            return Err(MobileError::Denied { detail: "Cloud Assistant model selection not negotiated".into() });
+        }
+        let models = self.assistant_request(access, REQUEST_TIMEOUT, false, |port| port.cloud_assistant_models())?;
+        if models.len() > 128 || models.iter().any(|model| !valid_cloud_assistant_model_route(model)) {
+            return Err(MobileError::Denied { detail: "Invalid Cloud Assistant model catalog".into() });
+        }
+        Ok(models)
+    }
+
+    pub fn cloud_assistant_submit_model(
+        &self, access: Arc<CloudAssistantAccess>, client_message_id: String, text: String,
+        model: String, recall_message_ids: Vec<String>,
+    ) -> Result<MobileCloudAssistantSnapshot, MobileError> {
+        validate_message(&client_message_id, &text)?;
+        if !valid_cloud_assistant_model_route(&model) || recall_message_ids.len() > MAX_RECALL_TURNS
+            || recall_message_ids.iter().enumerate().any(|(idx, id)| {
+                !valid_id(id) || recall_message_ids[..idx].contains(id)
+            })
+            || !self.cloud_assistant_models_supported(Arc::clone(&access))
+            || (!recall_message_ids.is_empty() && !self.cloud_assistant_recall_supported(Arc::clone(&access)))
+        {
+            return Err(MobileError::Denied { detail: "Invalid or unsupported Cloud Assistant model selection".into() });
+        }
+        self.assistant_call(access, SUBMIT_TIMEOUT, move |port| {
+            port.cloud_assistant_submit_model(CloudAssistantModelSubmitV1 { client_message_id, text, model, recall_message_ids })
         })
     }
 

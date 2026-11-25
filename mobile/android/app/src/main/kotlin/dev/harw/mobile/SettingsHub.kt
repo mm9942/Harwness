@@ -52,7 +52,7 @@ import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.setLocalImageConcurrency
 
-internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias, Knowledge, PinBiometrics }
+internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias, Knowledge, PinBiometrics, Vpn }
 
 /** Eltern-Route fuer Zurueck; `null` = Einstellungen schliessen. */
 internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route) {
@@ -60,7 +60,7 @@ internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route)
     SettingsRoute.Connection, SettingsRoute.Models, SettingsRoute.Commands,
     SettingsRoute.Providers, SettingsRoute.Agents, SettingsRoute.Jobs, SettingsRoute.LocalModels,
     SettingsRoute.Files, SettingsRoute.Termux, SettingsRoute.Uias, SettingsRoute.Knowledge,
-    SettingsRoute.PinBiometrics -> SettingsRoute.Hub
+    SettingsRoute.PinBiometrics, SettingsRoute.Vpn -> SettingsRoute.Hub
 }
 
 internal const val UI_PREFS = "harw_ui"
@@ -225,6 +225,8 @@ internal fun SettingsHub(
     onOpen: (SettingsRoute) -> Unit,
     diagnosticsConnection: HarwConnection = connection,
     diagnosticsLocal: Boolean = false,
+    localDisconnected: Boolean,
+    disconnectLocal: () -> Unit,
 ) {
     val context = LocalContext.current
     val cloudBlock = manageOpenBlock(state)?.let { stringResource(it) }
@@ -240,6 +242,12 @@ internal fun SettingsHub(
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 4.dp)) {
             HubSection(stringResource(R.string.settings_hub_profile_section), first = true) {
                 HubRow(stringResource(R.string.settings_hub_connection), connectionSubtitle(state), null) { onOpen(SettingsRoute.Connection) }
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    val vpnPhase by HarwVpnService.phase.collectAsState()
+                    HubRow(stringResource(R.string.vpn_title), stringResource(vpnPhase.text), null) {
+                        onOpen(SettingsRoute.Vpn)
+                    }
+                }
             }
             HubSection(stringResource(R.string.settings_hub_models_section)) {
                 HubRow(stringResource(R.string.settings_hub_cloud_models), stringResource(R.string.settings_hub_cloud_models_detail), cloudBlock) {
@@ -298,6 +306,7 @@ internal fun SettingsHub(
                     openNotificationSettings(context)
                 }
                 AppUpdateHubRow(context)
+                LocalBackupSettings(localDisconnected, disconnectLocal)
                 HubRow(stringResource(R.string.settings_hub_share_diagnostics), stringResource(R.string.settings_hub_share_diagnostics_detail), null) {
                     shareDiagnostic(context, diagnosticReport(state, appVersionOf(context)))
                 }
@@ -474,7 +483,31 @@ private fun LocalImageSettings(context: Context) {
 @Composable
 private fun AppUpdateHubRow(context: Context) {
     val availableUpdate by AppUpdates.available.collectAsState()
-    var updateStatus by remember { mutableStateOf<String?>(null) }
+    val channel by AppUpdates.channel.collectAsState()
+    var selectingChannel by remember { mutableStateOf(false) }
+    val label = if (channel == AppReleaseChannel.Beta) "Beta" else "Stabil"
+    HubRow("Update-Kanal", label, null) { selectingChannel = true }
+    if (selectingChannel) {
+        AlertDialog(
+            onDismissRequest = { selectingChannel = false },
+            title = { Text("Update-Kanal") },
+            text = { Text("Beta enthält Vorabversionen. Beim Wechsel zu Stabil wird die nächste höhere stabile Version angeboten.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    AppUpdates.selectChannel(context, AppReleaseChannel.Beta)
+                    selectingChannel = false
+                }) { Text("Beta") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    AppUpdates.selectChannel(context, AppReleaseChannel.Stable)
+                    selectingChannel = false
+                }) { Text("Stabil") }
+            },
+        )
+    }
+
+    var updateStatus by remember(channel) { mutableStateOf<String?>(null) }
     val updateScope = rememberCoroutineScope()
     val subtitle = availableUpdate?.let { "Version ${it.versionName} ist verfügbar. Tippen zum Installieren." }
         ?: updateStatus
@@ -485,8 +518,9 @@ private fun AppUpdateHubRow(context: Context) {
             AppUpdates.consider(context, known, force = true)
         } else {
             updateStatus = "Suche nach Updates …"
-            updateScope.launch(Dispatchers.IO) {
-                val latest = AppUpdates.fetchLatest()
+            updateScope.launch {
+                val latest = withContext(Dispatchers.IO) { AppUpdates.fetchLatest(channel) }
+                if (AppUpdates.channel.value != channel) return@launch
                 if (latest == null) {
                     updateStatus = "Keine Verbindung zum Update-Dienst."
                 } else if (latest.versionCode > AppUpdates.installedCode(context)) {

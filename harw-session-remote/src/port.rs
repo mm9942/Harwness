@@ -170,6 +170,30 @@ impl SessionPort for RemotePort {
         })
     }
 
+    fn cloud_assistant_models(&self) -> PortFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            if !self.connection.hello_ack().features.iter().any(|f| f == features::CLOUD_ASSISTANT_MODELS_V1) {
+                return Err(harw_protocol::PortError::Denied("Cloud Assistant model selection not negotiated".into()));
+            }
+            self.connection.call(harw_protocol::methods::METHOD_CLOUD_ASSISTANT_MODELS, &serde_json::json!({}), Effect::None).await
+        })
+    }
+
+    fn cloud_assistant_submit_model(
+        &self, params: harw_protocol::session_wire::CloudAssistantModelSubmitV1,
+    ) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSnapshot> {
+        Box::pin(async move {
+            let granted = &self.connection.hello_ack().features;
+            if !granted.iter().any(|f| f == features::CLOUD_ASSISTANT_MODELS_V1)
+                || (!params.recall_message_ids.is_empty()
+                    && !granted.iter().any(|f| f == features::CLOUD_ASSISTANT_RECALL_V1))
+            {
+                return Err(harw_protocol::PortError::Denied("Cloud Assistant model or recall selection not negotiated".into()));
+            }
+            self.connection.call(harw_protocol::methods::METHOD_CLOUD_ASSISTANT_SUBMIT_MODEL, &params, Effect::None).await
+        })
+    }
+
     fn cloud_assistant_revoke(&self) -> PortFuture<'_, harw_protocol::session_wire::CloudAssistantSnapshot> {
         Box::pin(async move {
             if !self.connection.hello_ack().features.iter().any(|f| f == features::CLOUD_ASSISTANT_V1) {

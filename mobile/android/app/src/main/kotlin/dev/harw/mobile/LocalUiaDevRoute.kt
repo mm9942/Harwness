@@ -1059,6 +1059,11 @@ internal fun LocalUiaDevScreen(
             }
             is DevUiaView.Ready -> {
                 var libraryOpen by remember(showing, startInLibrary) { mutableStateOf(startInLibrary) }
+                // Keep the explicit local model while navigating to the
+                // Library and back, but never persist private room selection
+                // in Android saved state or across a retired lease.
+                var chosenModel by remember(showing.chat, lease) { mutableStateOf<uniffi.harw_mobile_ffi.LocalModel?>(null) }
+                var choosingModel by remember(showing.chat, lease) { mutableStateOf(false) }
                 showing.biometricNotice?.let { Text(it, Modifier.padding(horizontal = 16.dp)) }
                 if (libraryOpen) {
                     // Only explicit Library navigation obtains its port. Opening
@@ -1130,8 +1135,6 @@ internal fun LocalUiaDevScreen(
                     }
                     return@Column
                 }
-                var chosenModel by remember(showing.chat, lease) { mutableStateOf<uniffi.harw_mobile_ffi.LocalModel?>(null) }
-                var choosingModel by remember(showing.chat, lease) { mutableStateOf(false) }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     TextButton(onClick = { libraryOpen = true }) { Text("Private Library") }
                     TextButton(
@@ -1140,6 +1143,18 @@ internal fun LocalUiaDevScreen(
                     ) { Text(chosenModel?.label ?: "Modell wählen") }
                 }
                 if (choosingModel) {
+                    val manager = remember(context) { ModelManager(ModelStore(context.applicationContext)) }
+                    val download by ModelDownloads.state.collectAsState()
+                    val activeModel by produceState<String?>(null, showing) {
+                        value = optionalVisionChoices {
+                            withContext(Dispatchers.IO) {
+                                val app = context.applicationContext
+                                uniffi.harw_mobile_ffi.ProviderStore(app.filesDir.path, AndroidPlatformKeystore(app))
+                                    .homeInfo().takeIf { it.activeProvider == "local-gguf" }?.activeModel
+                            }
+                        }
+                    }
+
                     val installed by produceState<List<uniffi.harw_mobile_ffi.LocalModel>?>(null, showing) {
                         value = optionalVisionChoices {
                             withContext(Dispatchers.IO) {
@@ -1154,7 +1169,7 @@ internal fun LocalUiaDevScreen(
                     }
                     AlertDialog(
                         onDismissRequest = { choosingModel = false },
-                        title = { Text("Modell für diesen Assistenten") },
+                        title = { Text("Privater Assistent · lokales Modell") },
                         text = {
                             Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
                                 when {
@@ -1163,6 +1178,17 @@ internal fun LocalUiaDevScreen(
                                 }
                                 TextButton(onClick = { chosenModel = null; choosingModel = false }) {
                                     Text("Aktives lokales Modell verwenden")
+                                }
+                                Text("Dieser Raum verwendet ausschließlich lokale GGUF-Modelle. Private Nachrichten werden nicht an API-Anbieter gesendet.")
+                                val configured = chosenModel ?: installed.orEmpty().firstOrNull { it.id == activeModel }
+                                if (configured != null) {
+                                    ProjectorBlock(
+                                        configured, manager, download,
+                                        (roomState as? UiaRoomState.Open)?.permitsSend != true,
+                                        requestDownload = { file ->
+                                            if (ownerStillCurrent() && session.allowsLocalAction()) ModelDownloads.start(context, file)
+                                        },
+                                    )
                                 }
                                 installed.orEmpty().forEach { model ->
                                     TextButton(onClick = { chosenModel = model; choosingModel = false }) {

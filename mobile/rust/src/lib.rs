@@ -7,6 +7,8 @@ mod codex_local;
 mod core;
 mod device;
 mod device_tools;
+#[cfg(all(feature = "android-vpn", unix))]
+mod android_vpn_jni;
 pub mod diagnostics;
 mod home;
 mod hybrid;

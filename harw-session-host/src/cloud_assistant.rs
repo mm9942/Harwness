@@ -2,7 +2,7 @@
 //! port, tool registry, filesystem contexts, jobs, or local mobile data.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{self, Read},
     os::unix::fs::MetadataExt,
@@ -21,7 +21,8 @@ use harw_fsutil::{
 use harw_protocol::{
     ClientCaps,
     session_wire::{
-        CloudAssistantRecallSubmit, CloudAssistantSnapshot, CloudAssistantStatus,
+        CloudAssistantModelSubmitV1, CloudAssistantRecallSubmit, CloudAssistantSnapshot, CloudAssistantStatus,
+        valid_cloud_assistant_model_route,
         CloudAssistantSubmit, CloudAssistantTurn,
     },
 };
@@ -55,6 +56,17 @@ type Scope = [u8; 32];
 /// this message. Production does not give it tools, sessions or other stores.
 pub trait CloudAssistantModel: Send + Sync {
     fn answer<'a>(&'a self, turns: &'a [CloudAssistantTurn], text: &'a str) -> DriverFuture<'a, String>;
+
+    fn model_choices(&self) -> Vec<String> { Vec::new() }
+
+    fn answer_selected<'a>(
+        &'a self, turns: &'a [CloudAssistantTurn], text: &'a str, model: Option<&'a str>,
+    ) -> DriverFuture<'a, String> {
+        if model.is_some() {
+            return Box::pin(async { Err(HostError::Denied("Explicit Assistant model unavailable".into())) });
+        }
+        self.answer(turns, text)
+    }
 }
 
 pub struct CloudAssistant {
@@ -114,6 +126,9 @@ struct Room {
     // Only references, never another copy of recalled text. Legacy records omit this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     recalls: Vec<RecallAttempt>,
+    // Bind the exact route to the same durable attempt ID. Old rooms omit it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    model_receipts: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shared: Option<shared::SharedRoom>,
 }
@@ -255,6 +270,7 @@ impl CloudAssistant {
                 attempts: Vec::new(),
                 turns: Vec::new(),
                 recalls: Vec::new(),
+                model_receipts: BTreeMap::new(),
                 shared: None,
             };
             store.save(&disk_grant, &room, None)?;
@@ -283,12 +299,49 @@ impl CloudAssistant {
         Ok(result)
     }
 
+    fn allowed_models(&self) -> Vec<String> {
+        let mut models = self.model.model_choices();
+        models.retain(|model| valid_cloud_assistant_model_route(model));
+        models.sort_unstable();
+        models.dedup();
+        models.truncate(128);
+        models
+    }
+
+    pub(crate) fn has_model_choices(&self) -> bool {
+        !self.allowed_models().is_empty()
+    }
+
+    pub(crate) async fn models(self: &Arc<Self>, grant: CloudAssistantGrant) -> Result<Vec<String>> {
+        grant.require_live(self)?;
+        self.disk(move |store| {
+            grant.require_authorized(store)?;
+            store.ready_room(&grant)?;
+            Ok(store.allowed_models())
+        }).await
+    }
+
+    pub(crate) async fn submit_model(
+        self: &Arc<Self>, grant: CloudAssistantGrant, params: CloudAssistantModelSubmitV1,
+    ) -> Result<CloudAssistantSnapshot> {
+        grant.require_live(self)?;
+        let CloudAssistantModelSubmitV1 { client_message_id, text, model, mut recall_message_ids } = params;
+        if grant.shared.is_some() || !self.allowed_models().contains(&model) {
+            return Err(HostError::Denied("Selected Assistant model unavailable".into()));
+        }
+        recall_message_ids.sort_unstable();
+        if !recall_message_ids.is_empty() && !valid_recall_ids(&recall_message_ids) {
+            return Err(HostError::Protocol("Invalid Cloud Assistant recall selection".into()));
+        }
+        self.submit_pinned(grant, CloudAssistantSubmit { client_message_id, text }, recall_message_ids, Some(model)).await
+    }
+
     pub(crate) async fn submit(
         self: &Arc<Self>,
         grant: CloudAssistantGrant,
         params: CloudAssistantSubmit,
     ) -> Result<CloudAssistantSnapshot> {
-        self.submit_pinned(grant, params, Vec::new()).await
+        self.submit_pinned(grant, params, Vec::new(), None).await
     }
 
     pub(crate) async fn submit_with_recall(
@@ -308,6 +361,7 @@ impl CloudAssistant {
             grant,
             CloudAssistantSubmit { client_message_id, text },
             recall_message_ids,
+            None,
         ).await
     }
 
@@ -316,6 +370,7 @@ impl CloudAssistant {
         grant: CloudAssistantGrant,
         params: CloudAssistantSubmit,
         selected: Vec<String>,
+        model: Option<String>,
     ) -> Result<CloudAssistantSnapshot> {
         grant.require_live(self)?;
         if !valid_id(&params.client_message_id) || !valid_text(&params.text, MAX_MESSAGE_BYTES) {
@@ -328,7 +383,8 @@ impl CloudAssistant {
             let (id, text) = (id.clone(), text.clone());
             let disk_grant = grant.clone();
             let revoked = active.revoked.clone();
-            move |store| store.prepare(&disk_grant, &revoked, id, &text, selected)
+            let model = model.clone();
+            move |store| store.prepare(&disk_grant, &revoked, id, &text, selected, model)
         }).await?;
         grant.require_live(self)?;
         active.require_live()?;
@@ -349,7 +405,7 @@ impl CloudAssistant {
             result = tokio::time::timeout(
                 std::time::Duration::from_secs(75),
                 // Don't construct the adapter future at all if already cancelled.
-                async { self.model.answer(&turns, &text).await },
+                async { self.model.answer_selected(&turns, &text, model.as_deref()).await },
             ) => result.map_err(|_| HostError::Driver("Cloud Assistant model timed out".into()))??,
         };
         if !valid_text(&answer, MAX_ANSWER_BYTES) {
@@ -434,11 +490,14 @@ impl CloudAssistant {
 
     fn prepare(
         &self, grant: &CloudAssistantGrant, revoked: &watch::Receiver<bool>,
-        id: String, text: &str, selected: Vec<String>,
+        id: String, text: &str, selected: Vec<String>, model: Option<String>,
     ) -> Result<Prepared> {
         grant.require_authorized(self)?;
         require_running(Some(revoked))?;
         let mut room = self.ready_room(grant)?;
+        if room.attempts.contains(&id) && room.model_receipts.get(&id) != model.as_ref() {
+            return Err(HostError::Protocol("Cloud Assistant message ID reused with different model".into()));
+        }
         let previous_selection = room.recalls.iter().find(|receipt| receipt.message_id == id)
             .map_or(&[][..], |receipt| receipt.selected.as_slice());
         if room.attempts.contains(&id) && previous_selection != selected.as_slice() {
@@ -463,6 +522,9 @@ impl CloudAssistant {
         let context = model_context(&room.turns, &selected)?;
         if !selected.is_empty() {
             room.recalls.push(RecallAttempt { message_id: id.clone(), selected });
+        }
+        if let Some(model) = model {
+            room.model_receipts.insert(id.clone(), model);
         }
         room.attempts.push(id);
         self.save(grant, &room, Some(revoked))?;
@@ -652,6 +714,13 @@ fn validate_room(room: &Room) -> Result<()> {
         }) {
         return Err(storage());
     }
+    if room.model_receipts.len() > room.attempts.len()
+        || room.model_receipts.iter().any(|(id, model)| {
+            !ids.contains(id.as_str()) || !valid_cloud_assistant_model_route(model)
+        })
+    {
+        return Err(storage());
+    }
     let mut recall_receipts = HashSet::new();
     if room.recalls.len() > room.attempts.len() || !room.recalls.iter().all(|receipt| {
         if !recall_receipts.insert(receipt.message_id.as_str()) || !valid_recall_ids(&receipt.selected) {
@@ -692,6 +761,18 @@ mod tests {
 
     struct Echo(AtomicUsize);
     impl CloudAssistantModel for Echo {
+        fn model_choices(&self) -> Vec<String> { vec!["api/model-a".into(), "api/model-b".into()] }
+        fn answer_selected<'a>(
+            &'a self, turns: &'a [CloudAssistantTurn], text: &'a str, model: Option<&'a str>,
+        ) -> DriverFuture<'a, String> {
+            match model {
+                Some(model) => {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move { Ok(model.to_owned()) })
+                }
+                None => self.answer(turns, text),
+            }
+        }
         fn answer<'a>(
             &'a self, _: &'a [CloudAssistantTurn], _: &'a str,
         ) -> DriverFuture<'a, String> {
@@ -736,6 +817,16 @@ mod tests {
             assert_eq!(assistant.submit(grant(&assistant, owner), submit()).await?.turns.len(), 1);
         }
         assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        let select = |model: &str| CloudAssistantModelSubmitV1 {
+            client_message_id: "message-model".into(), text: "Choose a model".into(),
+            model: model.into(), recall_message_ids: Vec::new(),
+        };
+        assert_eq!(assistant.models(grant(&assistant, owner)).await?, vec!["api/model-a", "api/model-b"]);
+        assert!(assistant.submit_model(grant(&assistant, owner), select("api/not-allowed")).await.is_err());
+        assert_eq!(assistant.submit_model(grant(&assistant, owner), select("api/model-a")).await?.turns[1].answer, "api/model-a");
+        assert_eq!(assistant.submit_model(grant(&assistant, owner), select("api/model-a")).await?.turns.len(), 2);
+        assert!(assistant.submit_model(grant(&assistant, owner), select("api/model-b")).await.is_err());
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
         assert!(assistant.status(grant(&assistant, other)).await?.turns.is_empty());
         assert!(!std::fs::read(root.join(CloudAssistant::path(&owner)))?
             .windows("Private message".len()).any(|window| window == b"Private message"));
@@ -748,7 +839,7 @@ mod tests {
         assert!(revoked.turns.is_empty());
         assert!(matches!(assistant.submit(grant(&assistant, owner), submit()).await, Err(HostError::Revoked)));
         assert_eq!(assistant.status(grant(&assistant, other)).await?.status, CloudAssistantStatus::Unprovisioned);
-        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
         Ok(())
     }
 }

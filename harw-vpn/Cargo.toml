@@ -1,0 +1,32 @@
+[package]
+name = "harw-vpn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version = "1.92"
+description = "Bounded packet routing for the Harw Android VPN"
+
+[features]
+embedded-arti = [
+    "harw-onion/vpn-client", "dep:hickory-proto", "dep:http-body-util", "dep:hyper",
+    "dep:hyper-util", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots",
+]
+
+[dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+harw-onion = { path = "../harw-onion" }
+
+hickory-proto = { version = "0.25.2", default-features = false, features = ["std"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["client", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
+webpki-roots = { version = "1", optional = true }
+
+[lints]
+workspace = true
