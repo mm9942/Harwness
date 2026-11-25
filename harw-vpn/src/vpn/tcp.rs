@@ -233,10 +233,16 @@ impl TxToken for WritePacket<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn segment(flow: FlowKey, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> BytesMut {
+    pub(in crate::vpn) fn segment(
+        flow: FlowKey,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> BytesMut {
         use bytes::BufMut as _;
 
         let mut bytes = BytesMut::new();

@@ -13,7 +13,7 @@ use super::{
 pub enum PacketAction {
     Reply(Bytes),
     ExistingTcp(FlowKey),
-    LocalDnsTcp(FlowKey),
+    LocalDnsTcp(FlowKey, bool),
     Dial(DialTicket, Destination),
     Drop,
 }
@@ -56,7 +56,7 @@ impl PacketRouter {
                     .answer(payload)
                     .map(|message| PacketAction::Reply(udp_reply(flow, &message)))
                     .unwrap_or(PacketAction::Drop),
-                Transport::Tcp { .. } => PacketAction::LocalDnsTcp(flow),
+                Transport::Tcp { initial_syn } => PacketAction::LocalDnsTcp(flow, initial_syn),
             });
         }
 
