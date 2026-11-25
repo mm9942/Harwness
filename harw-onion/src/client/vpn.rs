@@ -19,7 +19,7 @@ use tor_rtcompat::{
     CompoundRuntime, NetStreamListener, NetStreamProvider, RuntimeSubstExt, StreamOps,
 };
 
-use super::runtime::{client_config, install_crypto_provider, map_arti_error};
+use super::runtime::{client_config_builder, install_crypto_provider, map_arti_error};
 use crate::{BootstrapProgress, OnionClientConfig, OnionError, OnionLocator, OnionStream};
 
 pub trait RelaySocketProtector: Send + Sync + 'static {
@@ -54,7 +54,12 @@ impl ProtectedOnionClient {
         let runtime = TokioRustlsRuntime::current()
             .map_err(|error| OnionError::Runtime(error.to_string()))?;
         let runtime = runtime.with_tcp_provider(ProtectedTcp(protector));
-        let config = client_config(&config.state_dir, &config.cache_dir)?;
+        let mut config = client_config_builder(&config.state_dir, &config.cache_dir);
+        // Arti's approximate tracked-memory quota is separate from the TUN buffers.
+        config.system().memory().max(128_usize * 1024 * 1024);
+        let config = config
+            .build()
+            .map_err(|error| OnionError::Config(error.to_string()))?;
         let hub = TorClient::with_runtime(runtime)
             .config(config)
             .create_unbootstrapped()
