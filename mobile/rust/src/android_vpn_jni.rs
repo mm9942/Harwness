@@ -272,7 +272,7 @@ fn parse_policy(mode: i32, bytes: &[u8]) -> Option<Policy> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStart<'local>(
+pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStartWithDns<'local>(
     mut caller: EnvUnowned<'local>,
     service: JObject<'local>,
     descriptor: i32,

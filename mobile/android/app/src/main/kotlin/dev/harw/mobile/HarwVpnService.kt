@@ -258,7 +258,7 @@ internal class HarwVpnService : VpnService() {
         val descriptor = tun ?: return
         worker = runCatching {
             System.loadLibrary("harw_mobile_ffi")
-            nativeStart(
+            nativeStartWithDns(
                 descriptor.fd, configDirectory.absolutePath, next.settings.mode,
                 next.settings.nativeRules(), random.nextLong(), hubToken, next.onion, next.settings.dnsEndpoint,
             )
@@ -368,7 +368,7 @@ internal class HarwVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private external fun nativeStart(
+    private external fun nativeStartWithDns(
         fd: Int,
         directory: String,
         mode: Int,

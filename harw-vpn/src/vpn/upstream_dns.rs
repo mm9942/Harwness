@@ -14,7 +14,7 @@ use hyper::header::{ACCEPT, CONTENT_TYPE, HOST};
 use hyper::{Request, Response, StatusCode, Uri, body::Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
@@ -151,20 +151,12 @@ impl DnsUpstream {
                     timeout,
                 )
                 .await?;
-                request_https(tls, uri, message).await
+                let http2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+                request_https(tls, http2, uri, message).await
             }
             Endpoint::Tls { host, port } => {
                 let mut tls = connect_tls(client, host, *port, false, timeout).await?;
-                tls.write_u16(message.len() as u16).await?;
-                tls.write_all(&message).await?;
-                tls.flush().await?;
-                let length = usize::from(tls.read_u16().await?);
-                if !(12..=MAX_MESSAGE).contains(&length) {
-                    return Err(invalid_response());
-                }
-                let mut response = BytesMut::zeroed(length);
-                tls.read_exact(&mut response).await?;
-                Ok(response.freeze())
+                request_tls_dns(&mut tls, message).await
             }
         }
     }
@@ -208,8 +200,28 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-async fn request_https(tls: TlsStream<OnionStream>, uri: &Uri, body: Bytes) -> io::Result<Bytes> {
-    let using_http2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+async fn request_tls_dns(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    message: Bytes,
+) -> io::Result<Bytes> {
+    stream.write_u16(message.len() as u16).await?;
+    stream.write_all(&message).await?;
+    stream.flush().await?;
+    let length = usize::from(stream.read_u16().await?);
+    if !(12..=MAX_MESSAGE).contains(&length) {
+        return Err(invalid_response());
+    }
+    let mut response = BytesMut::zeroed(length);
+    stream.read_exact(&mut response).await?;
+    Ok(response.freeze())
+}
+
+async fn request_https(
+    tls: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    using_http2: bool,
+    uri: &Uri,
+    body: Bytes,
+) -> io::Result<Bytes> {
     let target = if using_http2 {
         uri.clone()
     } else {
@@ -329,6 +341,53 @@ fn invalid_response() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dns_over_tls_uses_length_prefixed_messages() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let message = Bytes::from_static(b"query-bytes!");
+        let response = b"answer-bytes";
+        let peer = async {
+            assert_eq!(server.read_u16().await.unwrap(), 12);
+            let mut received = [0; 12];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"query-bytes!");
+            server.write_u16(12).await.unwrap();
+            server.write_all(response).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(request_tls_dns(&mut client, message), peer);
+        assert_eq!(&result.unwrap()[..], response);
+    }
+
+    #[tokio::test]
+    async fn dns_over_https_posts_wire_format_and_reads_response() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let uri = "https://dns.example.com/dns-query".parse::<Uri>().unwrap();
+        let peer = async {
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(server.read_u8().await.unwrap());
+            }
+            let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+            assert!(headers.starts_with("post /dns-query http/1.1\r\n"));
+            assert!(headers.contains("host: dns.example.com\r\n"));
+            assert!(headers.contains("content-type: application/dns-message\r\n"));
+            let mut body = [0; 5];
+            server.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"query");
+            server.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: 6\r\n\r\nanswer").await.unwrap();
+        };
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                request_https(client, false, &uri, Bytes::from_static(b"query")),
+                peer
+            )
+            .0
+        })
+        .await
+        .unwrap();
+        assert_eq!(&result.unwrap()[..], b"answer");
+    }
 
     #[test]
     fn accepts_only_public_answers_for_the_exact_question() {

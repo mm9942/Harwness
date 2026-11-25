@@ -48,7 +48,7 @@ if [[ "${#readers[@]}" != 1 || ! -x "${readers[0]}" ]]; then
     exit 1
 fi
 symbols=$("${readers[0]}" --dyn-syms --wide "$library")
-for callback in nativeStart nativeStop nativeSetHubGate; do
+for callback in nativeStartWithDns nativeStop nativeSetHubGate; do
     if ! awk -v symbol="Java_dev_harw_mobile_HarwVpnService_$callback" '
         $4 == "FUNC" && $5 == "GLOBAL" && $7 != "UND" && $NF == symbol { found = 1 }
         END { exit !found }
