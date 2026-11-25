@@ -3,7 +3,8 @@
 The restart action is not a PIN reset. It applies only to a first-time setup
 that stopped before Android and the native room writer established a
 recoverable vault. Keep using the existing PIN recovery path when the app
-can authenticate a recoverable room.
+can authenticate a recoverable room. For normal unlock, biometric recovery, and
+app-entry protection, see [Android PIN and biometric unlock](ANDROID-PIN-BIOMETRICS.md).
 
 - The failure screen offers **Restart PIN setup** only after both layers
   accept the exact selected profile scope. It asks for confirmation.
