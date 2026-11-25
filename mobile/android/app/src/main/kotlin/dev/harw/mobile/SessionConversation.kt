@@ -2336,15 +2336,37 @@ internal fun LocalModelChip(hasImages: Boolean = false) {
     }
 }
 
+/** Explicit local chat choice, or the inherited profile default. Split only
+ * once because provider model names can contain slashes. */
+internal fun effectiveLocalModel(
+    store: ProviderStore,
+    sessionId: String? = null,
+    pendingSelection: String? = null,
+): Pair<String?, String?> {
+    val selection = if (sessionId != null) store.chatModel(sessionId) else pendingSelection
+    if (selection != null) {
+        val slash = selection.indexOf('/')
+        require(slash > 0 && slash < selection.lastIndex) { "Ungültige Modellzuordnung" }
+        return selection.substring(0, slash) to selection.substring(slash + 1)
+    }
+    val info = store.homeInfo()
+    return info.activeProvider to info.activeModel
+}
+
 @Composable
-internal fun rememberLocalModelLabel(refresh: Int): androidx.compose.runtime.State<String> {
+internal fun rememberLocalModelLabel(
+    refresh: Int,
+    sessionId: String? = null,
+    pendingSelection: String? = null,
+): androidx.compose.runtime.State<String> {
     val context = LocalContext.current
-    return produceState("Modell", refresh) {
+    return produceState("Modell", refresh, sessionId, pendingSelection) {
         value = withContext(Dispatchers.IO) {
             try {
-                val info = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
-                val base = localModelLabel(info.activeProvider, info.activeModel)
-                if (info.activeProvider == "local-gguf" && localVisionLoaded(info.activeModel)) {
+                val store = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context))
+                val (provider, model) = effectiveLocalModel(store, sessionId, pendingSelection)
+                val base = localModelLabel(provider, model)
+                if (provider == "local-gguf" && localVisionLoaded(model)) {
                     "$base · Bilder"
                 } else {
                     base
@@ -2364,6 +2386,7 @@ private fun rememberImportedProjectorHint(
     modelId: String,
     hasImages: Boolean,
     onActivated: () -> Unit,
+    scoped: Boolean = false,
 ): @Composable () -> Unit {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -2381,7 +2404,7 @@ private fun rememberImportedProjectorHint(
                 if (result.info == null) {
                     error = result.message
                 } else {
-                    ModelManager(ModelStore(context.applicationContext)).useLocal(context.filesDir.path, modelId)
+                    if (!scoped) ModelManager(ModelStore(context.applicationContext)).useLocal(context.filesDir.path, modelId)
                     onActivated()
                 }
             } catch (e: Exception) {
@@ -2418,6 +2441,7 @@ private fun rememberImportedProjectorHint(
 internal fun rememberLocalVisionHint(
     hasImages: Boolean,
     refresh: Int,
+    sessionId: String? = null,
     onActivated: () -> Unit,
 ): @Composable () -> Unit {
     val context = LocalContext.current
@@ -2426,12 +2450,12 @@ internal fun rememberLocalVisionHint(
     var error by remember { mutableStateOf<String?>(null) }
     val download by ModelDownloads.state.collectAsState()
     // Aktives Modell + Add-on; `null` = nichts anzubieten (kein Gerätemodell, kein Add-on, schon geladen).
-    val offer by produceState<VisionOffer?>(null, refresh, tick, download) {
+    val offer by produceState<VisionOffer?>(null, refresh, tick, download, sessionId) {
         value = withContext(Dispatchers.IO) {
             try {
-                val info = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
-                val id = info.activeModel
-                if (info.activeProvider != "local-gguf" || id.isNullOrBlank() || localModelSeesImages(context, id)) {
+                val store = ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context))
+                val (provider, id) = effectiveLocalModel(store, sessionId)
+                if (provider != "local-gguf" || id.isNullOrBlank() || localModelSeesImages(context, id)) {
                     null
                 } else {
                     val catalogAddon = uniffi.harw_mobile_ffi.visionCatalog().firstOrNull { id in it.modelIds }
@@ -2445,7 +2469,7 @@ internal fun rememberLocalVisionHint(
     val offered = offer ?: return {}
     val current = offered.addon
     if (current == null) {
-        return rememberImportedProjectorHint(offered.modelId, hasImages, onActivated)
+        return rememberImportedProjectorHint(offered.modelId, hasImages, onActivated, scoped = sessionId != null)
     }
     val fileId = current.file.id
     var lastFinished by remember { mutableStateOf<ModelDownloadState?>(null) }
@@ -2460,7 +2484,7 @@ internal fun rememberLocalVisionHint(
                         ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)).homeInfo()
                     }
                     val active = info.activeModel?.takeIf { it in current.modelIds } ?: modelId
-                    ModelManager(ModelStore(context.applicationContext)).useLocal(context.filesDir.path, active)
+                    if (sessionId == null) ModelManager(ModelStore(context.applicationContext)).useLocal(context.filesDir.path, active)
                     error = null
                     onActivated()
                 } catch (e: Exception) {
@@ -2529,7 +2553,14 @@ internal fun rememberLocalVisionHint(
 
 /** Zweistufige Auswahl für den On-Device-Host: erst Provider, dann dessen Modelle; gilt ab der nächsten Antwort. */
 @Composable
-internal fun LocalModelSheet(onChanged: () -> Unit, canChange: () -> Boolean = { true }) {
+internal fun LocalModelSheet(
+    onChanged: () -> Unit,
+    canChange: () -> Boolean = { true },
+    sessionId: String? = null,
+    pendingSelection: String? = null,
+    onPick: ((String?) -> Unit)? = null,
+) {
+    val scoped = sessionId != null || onPick != null
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val files = context.filesDir.path
@@ -2540,17 +2571,17 @@ internal fun LocalModelSheet(onChanged: () -> Unit, canChange: () -> Boolean = {
     val localId = "local-gguf"
     class Provider(val id: String, val title: String, val defaultModel: String)
     class Option(val id: String, val title: String)
-    val overview by produceState<Triple<List<Provider>, String?, String?>?>(null, reload) {
+    val overview by produceState<Triple<List<Provider>, String?, String?>?>(null, reload, sessionId, pendingSelection) {
         value = withContext(Dispatchers.IO) {
             try {
                 val store = ProviderStore(files, AndroidPlatformKeystore(context))
-                val info = store.homeInfo()
+                val (selectedProvider, selectedModel) = effectiveLocalModel(store, sessionId, pendingSelection)
                 val localModels = ModelManager(ModelStore(context.applicationContext)).local()
                     .filter { it.state == ModelFileState.COMPLETE }
                 val cloud = store.routes().filter { it.kind != ProviderKind.LOCAL_GGUF }
                     .map { Provider(it.id, it.id, it.defaultModel) }
                 val local = if (localModels.isNotEmpty()) listOf(Provider(localId, "Auf diesem Gerät", "")) else emptyList()
-                Triple(local + cloud, info.activeProvider, info.activeModel)
+                Triple(local + cloud, selectedProvider, selectedModel)
             } catch (e: Exception) {
                 error = e.message ?: "Provider konnten nicht gelesen werden"
                 Triple(emptyList(), null, null)
@@ -2612,6 +2643,30 @@ internal fun LocalModelSheet(onChanged: () -> Unit, canChange: () -> Boolean = {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         error?.let { StatusMessage(it, error = true) }
+        if (scoped && provider == null) {
+            TextButton(enabled = !busy && canChange(), onClick = {
+                if (!canChange()) return@TextButton
+                scope.launch {
+                    busy = true
+                    try {
+                        if (sessionId != null) withContext(Dispatchers.IO) {
+                            ProviderStore(files, AndroidPlatformKeystore(context)).setChatModel(sessionId, null)
+                        }
+                        if (canChange()) {
+                            onPick?.invoke(null)
+                            error = null
+                            reload++
+                            onChanged()
+                        }
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        error = e.message ?: "Standardmodell konnte nicht gewählt werden"
+                    } finally {
+                        busy = false
+                    }
+                }
+            }) { Text("Profil-Standardmodell verwenden") }
+        }
         val (providers, activeProvider, activeModel) = overview ?: Triple(emptyList(), null, null)
         if (provider == null) {
             if (overview == null) {
@@ -2658,17 +2713,32 @@ internal fun LocalModelSheet(onChanged: () -> Unit, canChange: () -> Boolean = {
                                     scope.launch {
                                         busy = true
                                         try {
+                                            val selectedRoute = requireNotNull(chosen)
+                                            val selection = "$selectedRoute/${option.id}"
                                             withContext(Dispatchers.IO) {
-                                                if (chosen == localId) {
+                                                val store = ProviderStore(files, AndroidPlatformKeystore(context))
+                                                if (scoped) {
+                                                    if (selectedRoute == localId) {
+                                                        uniffi.harw_mobile_ffi.configureLocalModelsDir(
+                                                            files, ModelStore(context.applicationContext).modelsDir().path,
+                                                        )
+                                                    }
+                                                    if (sessionId != null) store.setChatModel(sessionId, selection)
+                                                    else store.validateChatModel(selection)
+                                                } else if (selectedRoute == localId) {
                                                     ModelManager(ModelStore(context.applicationContext)).useLocal(files, option.id)
                                                 } else {
-                                                    ProviderStore(files, AndroidPlatformKeystore(context)).activateRoute(chosen!!, option.id)
+                                                    store.activateRoute(selectedRoute, option.id)
                                                 }
                                             }
-                                            error = null
-                                            reload++
-                                            onChanged()
+                                            if (canChange()) {
+                                                onPick?.invoke(selection)
+                                                error = null
+                                                reload++
+                                                onChanged()
+                                            }
                                         } catch (e: Exception) {
+                                            if (e is kotlinx.coroutines.CancellationException) throw e
                                             error = e.message ?: "Modell konnte nicht gewählt werden"
                                         } finally {
                                             busy = false

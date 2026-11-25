@@ -942,6 +942,7 @@ internal open class MainActivity : HarwLocaleActivity() {
                     onSwitch = window::newChatBackend,
                     onProject = window::newChatProject,
                     onModel = window::newChatModel,
+                    onUia = window::newChatUia,
                     onEdit = window::newChatEdit,
                     onAttach = window::newChatAttach,
                     onDetach = window::newChatDetach,
@@ -952,7 +953,8 @@ internal open class MainActivity : HarwLocaleActivity() {
                         if (message.isNotBlank() || images.isNotEmpty()) {
                             target.startChat(
                                 projectKey = draft.projectKey,
-                                model = draft.model.takeIf { !draft.local },
+                                model = draft.model,
+                                uiaId = draft.uiaId.takeIf { draft.local },
                                 opened = { id, assigned ->
                                     viewChosen = true
                                     viewLocal = draft.local
@@ -961,6 +963,14 @@ internal open class MainActivity : HarwLocaleActivity() {
                                     window.openLink(DeepLink(assigned, id))
                                 },
                                 notice = { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() },
+                                onConfigurationFailed = { id, assigned ->
+                                    viewChosen = true
+                                    viewLocal = draft.local
+                                    window.edit(id, message)
+                                    images.forEach { window.attachImage(id, it) }
+                                    window.finishNewChat()
+                                    window.openLink(DeepLink(assigned, id))
+                                },
                             )
                         }
                     },
@@ -1292,12 +1302,14 @@ internal class HarwWindowModel(private val savedState: SavedStateHandle) : ViewM
     }
 
     fun newChatBackend(local: Boolean) {
-        newChat = newChat?.let { if (it.local == local) it else it.copy(local = local, projectKey = null, model = null, error = null) }
+        newChat = newChat?.let { if (it.local == local) it else it.copy(local = local, projectKey = null, model = null, uiaId = null, error = null) }
     }
 
     fun newChatProject(key: String?) { newChat = newChat?.copy(projectKey = key) }
 
-    fun newChatModel(model: String) { newChat = newChat?.copy(model = model) }
+    fun newChatModel(model: String?) { newChat = newChat?.copy(model = model) }
+
+    fun newChatUia(uiaId: String?) { newChat = newChat?.copy(uiaId = uiaId) }
 
     fun newChatEdit(text: String) { newChat = newChat?.copy(text = text, error = null) }
 

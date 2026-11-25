@@ -220,8 +220,9 @@ internal data class NewChatDraft(
     val local: Boolean,
     /** `null` = neues Projekt zum Thema der ersten Nachricht. */
     val projectKey: String? = null,
-    /** Gewaehltes Cloud-Modell `<provider>/<modell>`; `null` = Standard des Servers. */
+    /** Selected route for this draft only; null inherits the host/profile default. */
     val model: String? = null,
+    val uiaId: String? = null,
     val text: String = "",
     val images: List<DraftImage> = emptyList(),
     val error: String? = null,
@@ -241,7 +242,8 @@ internal fun NewChatScreen(
     onBack: () -> Unit,
     onSwitch: (Boolean) -> Unit,
     onProject: (String?) -> Unit,
-    onModel: (String) -> Unit,
+    onModel: (String?) -> Unit,
+    onUia: (String?) -> Unit,
     onEdit: (String) -> Unit,
     onAttach: (DraftImage) -> Unit,
     onDetach: (Int) -> Unit,
@@ -250,7 +252,21 @@ internal fun NewChatScreen(
 ) {
     var menu by rememberSaveable { mutableStateOf(false) }
     var modelsOpen by rememberSaveable { mutableStateOf(false) }
+    var agentsOpen by rememberSaveable { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
     val busy = targetState.creating
+    val localLabel by rememberLocalModelLabel(0, pendingSelection = draft.model.takeIf { draft.local })
+    val agents by produceState<Pair<List<uniffi.harw_mobile_ffi.UiaProfile>, String?>?>(null, draft.local, draft.projectKey, targetState.generation) {
+        value = if (draft.local) kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                val store = uniffi.harw_mobile_ffi.UiaStore(context.filesDir.path)
+                val profiles = store.listUias()
+                val inherited = draft.projectKey?.takeIf { it != NoProjectKey }
+                    ?.let { store.projectDefaultUia(it)?.id } ?: profiles.firstOrNull { it.active }?.id
+                profiles to inherited
+            }.getOrNull()
+        } else null
+    }
     val real = targetState.projects.filter { it.projectKey != NoProjectKey }
     val choice = draft.projectKey
     val topicMode = choice == null
@@ -263,7 +279,31 @@ internal fun NewChatScreen(
         BackendSwitch(local = draft.local, enabled = !busy, onSelect = onSwitch)
         Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 2.dp)) {
             if (draft.local) {
-                LocalModelChip()
+                AssistChip(
+                    onClick = { modelsOpen = true },
+                    enabled = !busy,
+                    label = { Text(localLabel, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                )
+                val selectedAgent = agents?.first?.firstOrNull { it.id == (draft.uiaId ?: agents?.second) }
+                Box {
+                    AssistChip(
+                        onClick = { agentsOpen = true },
+                        enabled = !busy && agents?.first?.isNotEmpty() == true,
+                        label = { Text(selectedAgent?.name?.let { "UIA · $it" } ?: "UIA") },
+                    )
+                    DropdownMenu(expanded = agentsOpen && draft.local, onDismissRequest = { agentsOpen = false }) {
+                        DropdownMenuItem(text = { Text("Projekt-/Profil-Standard") }, onClick = {
+                            onUia(null)
+                            agentsOpen = false
+                        })
+                        agents?.first.orEmpty().forEach { agent ->
+                            DropdownMenuItem(text = { Text(agent.name) }, onClick = {
+                                onUia(agent.id)
+                                agentsOpen = false
+                            })
+                        }
+                    }
+                }
             } else {
                 val block = modelChipBlock(manage.support, true)
                 AssistChip(
@@ -281,16 +321,25 @@ internal fun NewChatScreen(
                 }
             }
         }
-        if (modelsOpen && !draft.local) {
+        if (modelsOpen) {
             ModalBottomSheet(
                 onDismissRequest = { modelsOpen = false },
                 sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
             ) {
-                ModelSwitchSheet(
-                    cloudState, connection, "", true,
-                    pending = draft.model,
-                    onPick = { onModel(it); modelsOpen = false },
-                )
+                if (draft.local) {
+                    LocalModelSheet(
+                        onChanged = {},
+                        canChange = { !connection.state.value.creating && connection.state.value.local },
+                        pendingSelection = draft.model,
+                        onPick = { onModel(it); modelsOpen = false },
+                    )
+                } else {
+                    ModelSwitchSheet(
+                        cloudState, connection, "", true,
+                        pending = draft.model,
+                        onPick = { onModel(it); modelsOpen = false },
+                    )
+                }
             }
         }
         Column(

@@ -786,6 +786,8 @@ internal class HarwConnection(private val context: Context, private val localBac
         model: String? = null,
         opened: (String, String?) -> Unit,
         notice: (String) -> Unit,
+        uiaId: String? = null,
+        onConfigurationFailed: ((String, String?) -> Unit)? = null,
     ) {
         val generation = gate.generation ?: return
         val native = core ?: return
@@ -797,7 +799,14 @@ internal class HarwConnection(private val context: Context, private val localBac
                 val existing = projectKey?.takeIf { it.isNotEmpty() }
                 var assigned: String? = null
                 var note: String? = null
+                var configured = true
                 val session = withContext(Dispatchers.IO) {
+                    val providers = if (current.local) uniffi.harw_mobile_ffi.ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context)) else null
+                    val uias = if (current.local) uniffi.harw_mobile_ffi.UiaStore(context.filesDir.path) else null
+                    if (model != null) providers?.validateChatModel(model)
+                    if (uiaId != null && uias?.listUias()?.none { it.id == uiaId } != false) {
+                        error("Dieses UIA-Profil ist nicht verfügbar.")
+                    }
                     val supported = native.projectsSupported()
                     val created = if (existing != null && supported) {
                         assigned = existing
@@ -806,19 +815,26 @@ internal class HarwConnection(private val context: Context, private val localBac
                         native.createSession(null)
                     }
                     if (existing != null && !supported) note = NoProjectsSupportText
-                    if (model != null) {
-                        try {
-                            native.setSessionModel(created.sessionId, model)
-                        } catch (error: Exception) {
-                            if (error is CancellationException) throw error
-                            note = "Modell „$model“ konnte nicht gesetzt werden: ${error.displayMessage()}"
+                    try {
+                        if (model != null) {
+                            if (providers != null) providers.setChatModel(created.sessionId, model)
+                            else native.setSessionModel(created.sessionId, model)
                         }
+                        if (uias != null) {
+                            val selected = uiaId ?: assigned?.let { uias.projectDefaultUia(it)?.id }
+                            if (selected != null) uias.setSessionUia(created.sessionId, selected)
+                        }
+                    } catch (error: Exception) {
+                        if (error is CancellationException) throw error
+                        configured = false
+                        note = "Chat-Konfiguration konnte nicht gesetzt werden. Nachricht nicht gesendet: ${error.displayMessage()}"
                     }
                     created
                 }
                 if (generation == gate.generation) {
                     change { it.copy(sessions = listOf(session) + it.sessions.filterNot { s -> s.sessionId == session.sessionId }) }
-                    opened(session.sessionId, assigned)
+                    if (configured) opened(session.sessionId, assigned)
+                    else onConfigurationFailed?.invoke(session.sessionId, assigned)
                     note?.let(notice)
                     refreshSessions()
                     refreshProjectsQuietly()

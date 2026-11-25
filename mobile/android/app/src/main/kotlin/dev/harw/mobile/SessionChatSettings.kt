@@ -229,7 +229,7 @@ private fun ScopedChatSettings(
     val localAgent = if (state.local) {
         rememberChatAgentControl(sessionId, window.projectKey, agentVersion, currentPickerTarget, onAgentChanged)
     } else null
-    val localModelLabel = if (state.local) rememberLocalModelLabel(localModelRefresh).value else null
+    val localModelLabel = if (state.local) rememberLocalModelLabel(localModelRefresh, sessionId = sessionId).value else null
     val sessionCatalog = state.manage.catalog?.takeIf { state.manage.catalogSessionId == sessionId }
     val cloudModelLabel = modelChipLabel(session?.model, sessionCatalog?.liveModel, sessionCatalog?.liveProvider)
     val modelBlock = if (state.local) null else modelChipBlock(state.manage.support, active)
@@ -265,7 +265,7 @@ private fun ScopedChatSettings(
     }
     // Keep launcher and download completion alive when the settings sheet is hidden.
     val localVisionHint = if (state.local) {
-        rememberLocalVisionHint(window.draft(sessionId).images.isNotEmpty(), localModelRefresh) { localModelRefresh++ }
+        rememberLocalVisionHint(window.draft(sessionId).images.isNotEmpty(), localModelRefresh, sessionId = sessionId) { localModelRefresh++ }
     } else null
 
     IconButton(onClick = { page = ChatSettingsPage.Overview }) {
@@ -285,7 +285,7 @@ private fun ScopedChatSettings(
                     Text("Chat-Einstellungen", style = MaterialTheme.typography.titleMedium)
                     TextButton(onClick = { page = ChatSettingsPage.Overview }) { Text("Übersicht") }
                 }
-                if (state.local) LocalModelSheet(onChanged = { localModelRefresh++ }, canChange = canChangeModel)
+                if (state.local) LocalModelSheet(onChanged = { localModelRefresh++ }, canChange = canChangeModel, sessionId = sessionId)
                 else ModelSwitchSheet(state, connection, sessionId, active, canChange = canChangeModel)
             } else if (page == ChatSettingsPage.Agents) {
                 Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 15.dp)) {
