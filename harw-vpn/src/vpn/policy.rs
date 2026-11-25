@@ -22,6 +22,7 @@ pub enum Destination {
     PublicName {
         host: String,
         port: u16,
+        ipv6: bool,
     },
     PublicIp(SocketAddr),
 }

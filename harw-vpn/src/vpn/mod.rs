@@ -9,6 +9,8 @@ mod runner;
 mod session;
 mod tcp;
 mod tun;
+#[cfg(all(feature = "embedded-arti", unix))]
+mod upstream_dns;
 
 #[cfg(all(feature = "embedded-arti", unix))]
 pub use arti::dial_with_arti;
@@ -21,6 +23,8 @@ pub use runner::{PacketIo, run_tunnel};
 pub use session::{AdmissionError, DialTicket, VpnSession};
 pub use tcp::TcpStack;
 pub use tun::{FlowKey, Packet, PacketError, Transport};
+#[cfg(all(feature = "embedded-arti", unix))]
+pub use upstream_dns::DnsUpstream;
 
 pub const TUN_MTU: usize = 1280;
 pub const MAX_PENDING_DIALS: usize = 16;

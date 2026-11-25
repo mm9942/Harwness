@@ -260,7 +260,7 @@ internal class HarwVpnService : VpnService() {
             System.loadLibrary("harw_mobile_ffi")
             nativeStart(
                 descriptor.fd, configDirectory.absolutePath, next.settings.mode,
-                next.settings.nativeRules(), random.nextLong(), hubToken, next.onion,
+                next.settings.nativeRules(), random.nextLong(), hubToken, next.onion, next.settings.dnsEndpoint,
             )
         }.getOrDefault(0)
         if (worker == 0L) relayNetwork = null
@@ -376,6 +376,7 @@ internal class HarwVpnService : VpnService() {
         seed: Long,
         hubToken: Long,
         onion: String,
+        dnsEndpoint: String,
     ): Long
     private external fun nativeSetHubGate(token: Long, enabled: Boolean, namespace: Int): Boolean
     private external fun nativeStop(id: Long)

@@ -95,6 +95,7 @@ impl PacketRouter {
             return exit_port(address.port()).then(|| Destination::PublicName {
                 host: host.to_owned(),
                 port: address.port(),
+                ipv6: address.is_ipv6(),
             });
         }
         (exit_port(address.port()) && public_ip(address.ip()))
@@ -110,7 +111,7 @@ fn exit_port(port: u16) -> bool {
     !matches!(port, 0 | 53 | 853)
 }
 
-fn public_ip(ip: IpAddr) -> bool {
+pub(super) fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(address) => {
             let [a, b, c, _] = address.octets();
@@ -276,7 +277,7 @@ mod tests {
         );
         assert!(matches!(
             router.destination(([198, 18, 0, 0], 443).into()),
-            Some(Destination::PublicName { host, port: 443 }) if host == "example.com"
+            Some(Destination::PublicName { host, port: 443, ipv6: false }) if host == "example.com"
         ));
         assert!(router.destination(([198, 18, 0, 1], 443).into()).is_none());
     }

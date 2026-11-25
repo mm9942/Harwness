@@ -92,4 +92,17 @@
     <string name="vpn_shared_uid">These apps share one Android UID and one routing rule.</string>
     <string name="vpn_app_default">Use default</string>
     <string name="vpn_app_outside">Outside VPN</string>
+    <string name="vpn_dns_title">DNS for public sites</string>
+    <string name="vpn_dns_tor">Tor default</string>
+    <string name="vpn_dns_cloudflare">Cloudflare</string>
+    <string name="vpn_dns_google">Google</string>
+    <string name="vpn_dns_adguard">AdGuard DNS</string>
+    <string name="vpn_dns_quad9">Quad9</string>
+    <string name="vpn_dns_custom_https">Custom DoH</string>
+    <string name="vpn_dns_custom_tls">Custom DoT</string>
+    <string name="vpn_dns_https_address">HTTPS resolver URL</string>
+    <string name="vpn_dns_tls_address">TLS resolver hostname or host:port</string>
+    <string name="vpn_dns_scope">Public DNS uses the selected resolver over Tor. Onion names stay in Harw.</string>
+    <string name="vpn_dns_invalid">Enter a valid encrypted DNS endpoint.</string>
+    <string name="vpn_dns_android_settings">Open Android network settings</string>
 </resources>

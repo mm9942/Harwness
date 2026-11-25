@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use harw_onion::{OnionClientConfig, OnionLocator, ProtectedOnionClient, RelaySocketProtector};
 use harw_vpn::vpn::{
-    DnsLeases, FlowKey, PacketIo, Policy, RouteMode, Scope, TunnelEngine, dial_with_arti,
-    run_tunnel,
+    DnsLeases, DnsUpstream, FlowKey, PacketIo, Policy, RouteMode, Scope, TunnelEngine,
+    dial_with_arti, run_tunnel,
 };
 use jni::objects::{Global, JByteArray, JObject, JString};
 use jni::{EnvUnowned, JValue, JavaVM, Outcome, errors, jni_sig, jni_str};
@@ -282,6 +282,7 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStart<'local>(
     seed: i64,
     hub_token: i64,
     locator: JString<'local>,
+    dns_endpoint: JString<'local>,
 ) -> i64 {
     let result = caller.with_env(|env| -> errors::Result<i64> {
         if descriptor < 0 || rules.len(env)? > 4096 * 5 {
@@ -293,6 +294,9 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStart<'local>(
         };
         let directory = PathBuf::from(directory.try_to_string(env)?);
         let Ok(locator) = locator.try_to_string(env)?.parse::<OnionLocator>() else {
+            return Ok(0);
+        };
+        let Ok(upstream) = DnsUpstream::parse(&dns_endpoint.try_to_string(env)?) else {
             return Ok(0);
         };
         let vm = env.get_java_vm()?;
@@ -335,6 +339,7 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStart<'local>(
                         callbacks.clone(),
                         hub_token,
                         locator,
+                        upstream,
                     )),
                     Err(_) => TUN_FAILED,
                 };
@@ -380,6 +385,7 @@ async fn run(
     callbacks: Arc<Callbacks>,
     hub_token: i64,
     locator: OnionLocator,
+    upstream: Option<DnsUpstream>,
 ) -> i32 {
     let Ok(tun) = Tun::new(fd) else {
         return TUN_FAILED;
@@ -416,17 +422,15 @@ async fn run(
         return TOR_FAILED;
     };
     let engine = TunnelEngine::with_dns(policy, Instant::now(), seed, dns);
+    let upstream = upstream.map(Arc::new);
     let result = run_tunnel(
         tun,
         engine,
         |flow| callbacks.owner(flow),
         move |destination, timeout| {
             let client = client.clone();
-            async move {
-                dial_with_arti(&client, destination, timeout)
-                    .await
-                    .map_err(io::Error::other)
-            }
+            let upstream = upstream.clone();
+            async move { dial_with_arti(&client, upstream.as_deref(), destination, timeout).await }
         },
         async {
             let _ = stopped.await;

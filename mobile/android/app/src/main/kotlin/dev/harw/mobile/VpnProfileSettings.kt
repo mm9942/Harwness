@@ -2,6 +2,7 @@ package dev.harw.mobile
 
 import android.content.Context
 import android.content.pm.PackageManager
+import java.net.URI
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import org.json.JSONArray
@@ -11,11 +12,42 @@ internal enum class VpnRoute(val code: Int) { OnionOnly(1), InternetAndOnion(2) 
 
 internal data class VpnAppRule(val packageName: String, val signer: String, val route: VpnRoute)
 
+internal enum class VpnDnsMode(val endpoint: String? = null) {
+    Tor,
+    Cloudflare("https://cloudflare-dns.com/dns-query"),
+    Google("https://dns.google/dns-query"),
+    AdGuard("https://dns.adguard-dns.com/dns-query"),
+    Quad9("https://dns.quad9.net/dns-query"),
+    CustomHttps,
+    CustomTls,
+    ;
+
+    fun endpoint(custom: String): String? {
+        if (this == Tor) return ""
+        endpoint?.let { return it }
+        val input = custom.trim()
+        if (input.isEmpty() || input.length > 512) return null
+        val value = if (this == CustomTls && !input.contains("://")) "tls://$input" else input
+        val uri = runCatching { URI(value) }.getOrNull() ?: return null
+        val host = uri.host ?: return null
+        if (uri.rawUserInfo != null || uri.rawQuery != null || uri.rawFragment != null ||
+            uri.port !in -1..65535 || uri.port == 0 || host.trimEnd('.').endsWith(".onion", true)
+        ) return null
+        return when {
+            this == CustomHttps && uri.scheme == "https" && uri.rawPath.orEmpty().length > 1 -> value
+            this == CustomTls && uri.scheme == "tls" && uri.rawPath.orEmpty() in setOf("", "/") -> value
+            else -> null
+        }
+    }
+}
+
 internal data class VpnProfileSettings(
     val enabled: Boolean = false,
     val deviceWide: Boolean = false,
     val defaultRoute: VpnRoute = VpnRoute.OnionOnly,
     val rules: List<VpnAppRule> = emptyList(),
+    val dnsMode: VpnDnsMode = VpnDnsMode.Tor,
+    val customDns: String = "",
 )
 
 internal class VpnSettingsStore(context: Context) {
@@ -31,6 +63,8 @@ internal class VpnSettingsStore(context: Context) {
                 enabled = json.getBoolean("enabled"),
                 deviceWide = json.getBoolean("deviceWide"),
                 defaultRoute = VpnRoute.valueOf(json.getString("default")),
+                dnsMode = VpnDnsMode.entries.firstOrNull { it.name == json.optString("dnsMode") } ?: VpnDnsMode.Tor,
+                customDns = json.optString("customDns").take(512),
                 rules = (0 until rules.length()).map { index ->
                     val entry = rules.getJSONObject(index)
                     VpnAppRule(
@@ -52,6 +86,7 @@ internal class VpnSettingsStore(context: Context) {
         }
         val value = JSONObject().put("enabled", settings.enabled).put("deviceWide", settings.deviceWide)
             .put("default", settings.defaultRoute.name).put("apps", rules)
+            .put("dnsMode", settings.dnsMode.name).put("customDns", settings.customDns)
         preferences.edit().putString(profileKey, value.toString()).apply()
     }
 
@@ -95,6 +130,7 @@ internal data class ResolvedVpnSettings(
     val mode: Int,
     val packages: Set<String>,
     val rules: Map<Int, VpnRoute>,
+    val dnsEndpoint: String,
 ) {
     fun nativeRules(): ByteArray {
         val frame = ByteBuffer.allocate(rules.size * 5)
@@ -121,5 +157,6 @@ internal fun resolveVpnSettings(
         if (settings.deviceWide) settings.defaultRoute.code else 0,
         packages,
         rules,
+        requireNotNull(settings.dnsMode.endpoint(settings.customDns)) { "Invalid VPN DNS endpoint" },
     )
 }

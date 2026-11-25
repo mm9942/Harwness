@@ -2,10 +2,21 @@ package dev.harw.mobile
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class VpnProfileSettingsTest {
+    @Test
+    fun normalizesPrivateDnsHostAndRejectsUnencryptedCustomUrls() {
+        assertEquals("", VpnDnsMode.Tor.endpoint(""))
+        assertEquals("https://dns.google/dns-query", VpnDnsMode.Google.endpoint(""))
+        assertEquals("tls://dns.example.com:853", VpnDnsMode.CustomTls.endpoint("dns.example.com:853"))
+        assertNull(VpnDnsMode.CustomHttps.endpoint("http://dns.example.com/dns-query"))
+        assertNull(VpnDnsMode.CustomHttps.endpoint("https://user@dns.example.com/dns-query"))
+        assertNull(VpnDnsMode.CustomTls.endpoint("dns.example.com/dns-query"))
+    }
+
     @Test
     fun ignoresRemovedAndResignedPackagesBeforeEncodingUidRules() {
         val settings = VpnProfileSettings(

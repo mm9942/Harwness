@@ -68,6 +68,16 @@ private fun VpnRoute.label(): Int = when (this) {
     VpnRoute.InternetAndOnion -> R.string.vpn_route_internet
 }
 
+private fun VpnDnsMode.label(): Int = when (this) {
+    VpnDnsMode.Tor -> R.string.vpn_dns_tor
+    VpnDnsMode.Cloudflare -> R.string.vpn_dns_cloudflare
+    VpnDnsMode.Google -> R.string.vpn_dns_google
+    VpnDnsMode.AdGuard -> R.string.vpn_dns_adguard
+    VpnDnsMode.Quad9 -> R.string.vpn_dns_quad9
+    VpnDnsMode.CustomHttps -> R.string.vpn_dns_custom_https
+    VpnDnsMode.CustomTls -> R.string.vpn_dns_custom_tls
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun VpnSettingsScreen(state: WorkspaceState, onBack: () -> Unit) {
@@ -115,6 +125,10 @@ internal fun VpnSettingsScreen(state: WorkspaceState, onBack: () -> Unit) {
     }
 
     fun submit(settings: VpnProfileSettings) {
+        if (settings.dnsMode.endpoint(settings.customDns) == null) {
+            error = R.string.vpn_dns_invalid
+            return
+        }
         if (!settings.enabled) {
             apply(settings)
             return
@@ -202,6 +216,29 @@ internal fun VpnSettingsScreen(state: WorkspaceState, onBack: () -> Unit) {
                     } else {
                         Text(stringResource(R.string.vpn_scope_apps_detail), style = MaterialTheme.typography.bodySmall)
                     }
+                    Text(stringResource(R.string.vpn_dns_title), style = MaterialTheme.typography.titleMedium)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        VpnDnsMode.entries.forEach { mode ->
+                            FilterChip(
+                                selected = draft.dnsMode == mode,
+                                onClick = { draft = draft.copy(dnsMode = mode) },
+                                label = { Text(stringResource(mode.label())) },
+                            )
+                        }
+                    }
+                    if (draft.dnsMode == VpnDnsMode.CustomHttps || draft.dnsMode == VpnDnsMode.CustomTls) {
+                        OutlinedTextField(
+                            value = draft.customDns,
+                            onValueChange = { draft = draft.copy(customDns = it.take(512)) },
+                            label = { Text(stringResource(
+                                if (draft.dnsMode == VpnDnsMode.CustomHttps) R.string.vpn_dns_https_address
+                                else R.string.vpn_dns_tls_address,
+                            )) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    Text(stringResource(R.string.vpn_dns_scope), style = MaterialTheme.typography.bodySmall)
                     Button(onClick = { submit(draft) }, enabled = draft != saved && consent == null) {
                         Text(stringResource(R.string.vpn_apply))
                     }
@@ -217,6 +254,9 @@ internal fun VpnSettingsScreen(state: WorkspaceState, onBack: () -> Unit) {
                             runCatching { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
                         }) { Text(stringResource(R.string.vpn_battery_settings)) }
                     }
+                    TextButton(onClick = {
+                        runCatching { context.startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS)) }
+                    }) { Text(stringResource(R.string.vpn_dns_android_settings)) }
                     Text(stringResource(R.string.vpn_dns_help), style = MaterialTheme.typography.bodySmall)
                     HorizontalDivider(Modifier.padding(top = 8.dp))
                 }
