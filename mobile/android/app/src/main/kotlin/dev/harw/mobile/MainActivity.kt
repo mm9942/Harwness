@@ -810,6 +810,9 @@ internal open class MainActivity : HarwLocaleActivity() {
                     diagnosticsLocal = viewLocal,
                 )
             }
+            settingsRoute == SettingsRoute.Vpn -> {
+                VpnSettingsScreen(cloudState, onBack = { openSettings(SettingsRoute.Hub) })
+            }
             settingsRoute == SettingsRoute.PinBiometrics -> {
                 PinBiometricsSettings(app, this, devProfile,
                     onBack = { openSettings(SettingsRoute.Hub) },

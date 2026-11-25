@@ -52,7 +52,7 @@ import uniffi.harw_mobile_ffi.ManageConfigEntry
 import uniffi.harw_mobile_ffi.ManageSupport
 import uniffi.harw_mobile_ffi.setLocalImageConcurrency
 
-internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias, Knowledge, PinBiometrics }
+internal enum class SettingsRoute { Hub, Connection, Models, Commands, Providers, Agents, Jobs, LocalModels, Files, Termux, Uias, Knowledge, PinBiometrics, Vpn }
 
 /** Eltern-Route fuer Zurueck; `null` = Einstellungen schliessen. */
 internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route) {
@@ -60,7 +60,7 @@ internal fun settingsParent(route: SettingsRoute): SettingsRoute? = when (route)
     SettingsRoute.Connection, SettingsRoute.Models, SettingsRoute.Commands,
     SettingsRoute.Providers, SettingsRoute.Agents, SettingsRoute.Jobs, SettingsRoute.LocalModels,
     SettingsRoute.Files, SettingsRoute.Termux, SettingsRoute.Uias, SettingsRoute.Knowledge,
-    SettingsRoute.PinBiometrics -> SettingsRoute.Hub
+    SettingsRoute.PinBiometrics, SettingsRoute.Vpn -> SettingsRoute.Hub
 }
 
 internal const val UI_PREFS = "harw_ui"
@@ -240,6 +240,12 @@ internal fun SettingsHub(
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 4.dp)) {
             HubSection(stringResource(R.string.settings_hub_profile_section), first = true) {
                 HubRow(stringResource(R.string.settings_hub_connection), connectionSubtitle(state), null) { onOpen(SettingsRoute.Connection) }
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    val vpnPhase by HarwVpnService.phase.collectAsState()
+                    HubRow(stringResource(R.string.vpn_title), stringResource(vpnPhase.text), null) {
+                        onOpen(SettingsRoute.Vpn)
+                    }
+                }
             }
             HubSection(stringResource(R.string.settings_hub_models_section)) {
                 HubRow(stringResource(R.string.settings_hub_cloud_models), stringResource(R.string.settings_hub_cloud_models_detail), cloudBlock) {

@@ -122,7 +122,7 @@ internal class HarwVpnService : VpnService() {
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
         jobs.launch {
-            connection.state.map { it.profile }.distinctUntilChanged().collect { refreshProfile() }
+            connection.state.map { it.profile to it.setupPending }.distinctUntilChanged().collect { refreshProfile() }
         }
     }
 
@@ -130,6 +130,7 @@ internal class HarwVpnService : VpnService() {
         val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
         ServiceCompat.startForeground(this, NOTIFICATION, notification(phase.value), type)
         foreground = true
+        lockdownEnabled.value = isLockdownEnabled
         if (intent?.action == STOP && !isLockdownEnabled) {
             disableProfile()
             stopSelf()
@@ -148,8 +149,8 @@ internal class HarwVpnService : VpnService() {
         if (key == null || settings?.enabled != true || onion.isNullOrBlank()) {
             desired = null
             stopWorker()
-            if (tun != null || isAlwaysOn) publish(VpnPhase.Blocked)
-            else if (key != null) stopSelf()
+            if (isAlwaysOn) publish(VpnPhase.Blocked)
+            else if (!connection.state.value.setupPending) stopSelf()
             return
         }
         val resolved = runCatching {
@@ -334,6 +335,7 @@ internal class HarwVpnService : VpnService() {
         .build()
 
     private fun publish(state: VpnPhase) {
+        lockdownEnabled.value = isLockdownEnabled
         mutablePhase.value = state
         notifications.notify(NOTIFICATION, notification(state))
     }
@@ -386,6 +388,8 @@ internal class HarwVpnService : VpnService() {
 
         private val mutablePhase = MutableStateFlow(VpnPhase.Off)
         val phase = mutablePhase.asStateFlow()
+        private val lockdownEnabled = MutableStateFlow(false)
+        val lockdown = lockdownEnabled.asStateFlow()
 
         fun refresh(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, HarwVpnService::class.java))
