@@ -37,6 +37,8 @@ mod server;
 
 #[cfg(feature = "client")]
 pub use client::{OnionClient, OnionClientConfig};
+#[cfg(all(feature = "vpn-client", unix))]
+pub use client::vpn::{ProtectedOnionClient, RelaySocketProtector};
 #[cfg(feature = "service")]
 pub use server::{
     AcceptLimits, DEFAULT_NICKNAME, OnionServer, OnionServerConfig, OnionServiceStatus,

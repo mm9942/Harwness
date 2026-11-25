@@ -4836,6 +4836,7 @@ name = "harw-onion"
 version = "0.10.0"
 dependencies = [
  "arti-client",
+ "async-trait",
  "aws-lc-rs",
  "futures",
  "rustls",
@@ -4843,6 +4844,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tor-cell",
  "tor-hsservice",
  "tor-proto",

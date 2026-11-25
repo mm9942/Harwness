@@ -7,6 +7,8 @@
 
 mod isolation;
 mod retry;
+#[cfg(all(feature = "vpn-client", unix))]
+pub(super) mod vpn;
 pub(crate) mod runtime;
 
 use std::path::PathBuf;
