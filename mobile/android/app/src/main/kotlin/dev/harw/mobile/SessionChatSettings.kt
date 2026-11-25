@@ -216,6 +216,7 @@ private fun ScopedChatSettings(
     val deviceVisionState = deviceVision?.state?.collectAsState()?.value
     val localVisionReady = deviceVisionState?.online == true
     var page by remember { mutableStateOf<ChatSettingsPage?>(null) }
+    val openOverview = remember { { page = ChatSettingsPage.Overview } }
     var localModelRefresh by remember { mutableIntStateOf(0) }
     val pickerProject = window.projectKey
     val currentPickerTarget = {
@@ -248,7 +249,7 @@ private fun ScopedChatSettings(
     )
     val blockedModel = stringResource(R.string.chat_quick_picker_model_unavailable)
     SideEffect {
-        archiveMenu.quickPickers.openSettings = { page = ChatSettingsPage.Overview }
+        archiveMenu.quickPickers.openSettings = openOverview
         archiveMenu.quickPickers.publish(
             ChatQuickChoice(localAgent?.selectedName, localAgent?.canChoose == true, blockedAgent),
             ChatQuickChoice((localModelLabel ?: cloudModelLabel).takeUnless { it == "Modell" },
