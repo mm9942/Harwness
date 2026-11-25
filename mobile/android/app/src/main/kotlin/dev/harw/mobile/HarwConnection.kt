@@ -683,14 +683,6 @@ internal class HarwConnection(private val context: Context, private val localBac
         change { it.copy(setupError = "Start connection: ${error.displayMessage()}") }
     }
 
-    internal fun canRetryCloudConnect(): Boolean =
-        state.value.detail?.let { detail ->
-            detail.contains("tor: onion connect failed: tor: tor operation timed out:") ||
-                detail.contains("tor: onion connect did not finish within") ||
-                detail.contains("tor: tor bootstrap did not finish within") ||
-                detail.contains("tor: attempted to use unbootstrapped client:")
-        } == true
-
     fun connect(force: Boolean = false): Boolean {
         val start = state.value
         val profile = start.profile ?: return false
@@ -716,7 +708,12 @@ internal class HarwConnection(private val context: Context, private val localBac
                     while (isActive && request == lifecycle) {
                         delay(500)
                         val live = withContext(Dispatchers.IO) { native.status() }
-                        if (request == lifecycle) change { it.routeStatus(live.route, live.tor) }
+                        if (request == lifecycle) change {
+                            it.routeStatus(live.route, live.tor).copy(
+                                attempt = live.attempt,
+                                nextRetryAtMs = live.nextRetryAtMs,
+                            )
+                        }
                     }
                 }
                 val status = try {

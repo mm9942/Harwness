@@ -21,7 +21,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -160,18 +159,15 @@ internal class HarwConnectionService : Service() {
                     restoration = scope.launch {
                         try {
                             connection.state.first { !it.setupPending }
-                            val profile = connection.state.value.profile ?: return@launch
-                            val route = connection.state.value.routePreference
-                            for (attempt in 0..2) {
-                                if (attempt > 0) delay(5_000L * attempt)
-                                val current = connection.state.value
-                                if (!canRestoreCloud() || current.profile != profile || current.routePreference != route ||
-                                    current.phase == ConnectionPhase.REVOKED || !connection.connect()
-                                ) return@launch
-                                startObservation()
-                                val result = connection.state.first { it.phase != ConnectionPhase.CONNECTING }
-                                if (result.phase != ConnectionPhase.FAILED || !connection.canRetryCloudConnect()) return@launch
-                            }
+                            val current = connection.state.value
+                            if (!canRestoreCloud() || current.profile == null ||
+                                current.phase == ConnectionPhase.REVOKED || !connection.connect()
+                            ) return@launch
+                            startObservation()
+                            // The native connection driver owns bounded Onion retries,
+                            // for both ordinary connects and sticky service restoration.
+                            // Keep the foreground service alive until that initial run settles.
+                            connection.state.first { it.phase != ConnectionPhase.CONNECTING }
                         } finally {
                             if (kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.isCancelled != true &&
                                 !holdWorkspaceConnection(connection.state.value, localConnection.state.value)

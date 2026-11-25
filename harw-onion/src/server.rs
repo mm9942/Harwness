@@ -174,6 +174,29 @@ impl OnionServer {
             )),
         });
         tasks.push(tokio::spawn(accept_loop(rend_requests, ctx)));
+        // Service launch / general Tor bootstrap are not evidence that clients
+        // can fetch the hidden-service descriptor. Observe reachability for
+        // the whole service lifetime, including degradation after startup.
+        let status_service = Arc::clone(&service);
+        tasks.push(tokio::spawn(async move {
+            let mut events = std::pin::pin!(status_service.status_events());
+            let mut last = None;
+            loop {
+                let reachable = status_service.status().state().is_fully_reachable();
+                if last != Some(reachable) {
+                    if reachable {
+                        info!("onion service reports fully reachable");
+                    } else {
+                        tracing::warn!("onion service reachability not confirmed");
+                    }
+                    last = Some(reachable);
+                }
+                if events.next().await.is_none() {
+                    tracing::warn!("onion service status stream ended");
+                    break;
+                }
+            }
+        }));
 
         info!(onion = %locator.redacted(), "onion service launched");
         info!(
