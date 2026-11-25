@@ -570,6 +570,24 @@ impl ProviderStore {
         self.home.clear_active_route_if(&route_id)
     }
 
+    /// Explicit model binding for an ordinary on-device chat. None inherits
+    /// the profile default; this is intentionally separate from activation.
+    pub fn chat_model(&self, session_id: String) -> Result<Option<String>, MobileError> {
+        crate::uia::chat_model(&self.home, &session_id)
+    }
+
+    /// Validate a draft or existing chat selection without changing any defaults.
+    pub fn validate_chat_model(&self, selection: String) -> Result<(), MobileError> {
+        validated_chat_route(&self.home, &selection).map(|_| ())
+    }
+
+    pub fn set_chat_model(&self, session_id: String, selection: Option<String>) -> Result<(), MobileError> {
+        if let Some(selection) = selection.as_deref() {
+            validated_chat_route(&self.home, selection)?;
+        }
+        crate::uia::set_chat_model(&self.home, &session_id, selection)
+    }
+
     /// Makes a route and model the active selection.
     pub fn activate_route(&self, route_id: String, model: String) -> Result<(), MobileError> {
         check_id(&route_id).map_err(|_| unknown_route())?;
@@ -958,6 +976,26 @@ fn render_route(clean: &CleanRoute, with_auth: bool) -> Result<(String, Provider
     Ok((text, provider))
 }
 
+/// Resolve an explicit selection only from the app's saved catalog or complete
+/// GGUF store. Split once: provider model IDs may themselves contain slashes.
+pub(crate) fn validated_chat_route(home: &AppHome, selection: &str) -> Result<(String, String), MobileError> {
+    let invalid = |detail: &str| MobileError::Session { detail: detail.to_owned() };
+    let (route, model) = selection.split_once('/').ok_or_else(|| invalid("Ungültige Modellzuordnung."))?;
+    check_id(route).map_err(|_| invalid("Ungültiger Provider."))?;
+    check_model(model, false).map_err(|message| MobileError::Session { detail: message })?;
+    if route == LOCAL_ROUTE_ID {
+        let dir = home.local_models_dir().ok_or_else(|| invalid("Der lokale Modellordner fehlt."))?;
+        crate::models::model_path(dir, model.to_owned())?;
+    } else {
+        let path = home.providers_dir().join(format!("{route}.toml"));
+        let provider = read_route_file(&path, route).ok_or_else(unknown_route)?;
+        if !provider.models.iter().any(|id| id == model) {
+            return Err(invalid("Dieses Modell ist nicht mehr beim Provider gespeichert."));
+        }
+    }
+    Ok((route.to_owned(), model.to_owned()))
+}
+
 /// Parses a route file and keeps it only when the app manages it.
 fn read_route_file(path: &std::path::Path, stem: &str) -> Option<ProviderToml> {
     let meta = std::fs::metadata(path).ok()?;
@@ -1091,26 +1129,37 @@ async fn discover(id: &str, provider: &ProviderToml, key: Option<&str>) -> Provi
 
 /// Builds the model provider of the active route.
 #[cfg(feature = "local-host")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_model_provider(
     home: &AppHome,
     resolver: &KeystoreSecretResolver,
 ) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
-    match home.active_route()? {
-        Some((_, model)) if !model.is_empty() => {}
-        _ => {
-            return Err(MobileError::Session {
-                detail: "no active provider route".to_owned(),
-            });
-        }
+    let selection = home.active_route()?.ok_or_else(|| MobileError::Session {
+        detail: "no active provider route".to_owned(),
+    })?;
+    build_model_provider_for_route(home, resolver, &selection)
+}
+
+/// Build against an in-memory route selection, never by rewriting config.toml.
+#[cfg(feature = "local-host")]
+pub(crate) fn build_model_provider_for_route(
+    home: &AppHome,
+    resolver: &KeystoreSecretResolver,
+    selection: &(String, String),
+) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
+    if selection.1.is_empty() {
+        return Err(MobileError::Session { detail: "no active model".into() });
     }
     let layers = harw_home::config_layers_report_at(home.home(), home.workspace())
         .map_err(|e| MobileError::Internal {
             detail: e.to_string(),
         })?
         .layers;
-    let config = harw_config::discover_config(&layers).map_err(|e| MobileError::Internal {
+    let mut config = harw_config::discover_config(&layers).map_err(|e| MobileError::Internal {
         detail: e.to_string(),
     })?;
+    config.harness.default_provider = Some(selection.0.clone());
+    config.harness.default_model = Some(selection.1.clone());
     let (provider, _load) = harw_provider_http::build_provider_with_load_registry_and_home(
         &config,
         home.home(),

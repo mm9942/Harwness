@@ -91,10 +91,11 @@ pub(crate) async fn open_local(
     let resolver = store.resolver().clone();
     let model_home = home.clone();
     let selection = home.active_route()?;
-    let fingerprint = projector_fingerprint(&home);
+    let fingerprint = projector_fingerprint(&home, selection.as_ref());
     let revision = provider_revision(&home, selection.as_ref());
     let resolver_for_build = resolver.clone();
-    let built = load_model(move || build_active_model(&model_home, &resolver_for_build))
+    let selected = selection.clone();
+    let built = load_model(move || build_selected_model(&model_home, &resolver_for_build, selected.as_ref()))
         .await
         .map_err(|_| host_task_failed())??;
     // The host keeps this wrapper for its whole life: a later provider/model
@@ -165,21 +166,19 @@ fn matches_uia_home(home: &crate::home::AppHome, files: &std::path::Path) -> boo
 /// The host builds its model once; without this wrapper a provider activated
 /// later (another route, or the on-device GGUF) would not reach the running
 /// host. Before every turn the wrapper compares the active route and model of
-/// the app home with the one it was built for and rebuilds on a change. The
-/// per-session model ids of the request are cleared: the app-level selection
-/// is what the owner picked on the phone.
+/// the app home with the one it was built for and rebuilds on a change.
+/// Ordinary chat bindings are resolved from the profile's session assignments;
+/// the request's model IDs are cleared only after choosing the concrete route.
 #[cfg(feature = "local-host")]
 pub(crate) struct SwitchingModel {
     home: crate::home::AppHome,
     baseline_persona: Option<String>,
     resolver: crate::secrets::KeystoreSecretResolver,
-    current: tokio::sync::Mutex<(
-        ModelCacheKey,
-        Option<ProjectorFingerprint>,
-        Option<blake3::Hash>,
-        CachedProvider,
-    )>,
+    current: tokio::sync::Mutex<ProviderCache>,
 }
+
+#[cfg(feature = "local-host")]
+type ProviderCache = (ModelCacheKey, Option<ProjectorFingerprint>, Option<blake3::Hash>, CachedProvider);
 
 #[cfg(feature = "local-host")]
 #[derive(PartialEq, Eq)]
@@ -341,10 +340,16 @@ static MODEL_REVISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 type ProjectorFingerprint = (String, u64, Option<std::time::SystemTime>);
 
 #[cfg(feature = "local-host")]
-fn projector_fingerprint(home: &crate::home::AppHome) -> Option<ProjectorFingerprint> {
-    let model_id = home.active_local_model().ok()??;
+fn projector_fingerprint(
+    home: &crate::home::AppHome,
+    selection: Option<&(String, String)>,
+) -> Option<ProjectorFingerprint> {
+    let (provider, model_id) = selection?;
+    if provider != crate::home::LOCAL_ROUTE_ID {
+        return None;
+    }
     let dir = home.local_models_dir()?;
-    let path = crate::models::vision_path_in(std::path::Path::new(&dir), &model_id)?;
+    let path = crate::models::vision_path_in(std::path::Path::new(&dir), model_id)?;
     let meta = std::fs::metadata(&path).ok()?;
     Some((path, meta.len(), meta.modified().ok()))
 }
@@ -680,31 +685,36 @@ impl SwitchingModel {
     }
 
     async fn provider(&self) -> Result<Arc<dyn harw_core::ModelProvider>, harw_core::ModelError> {
-        Ok(self.cached_provider().await?.for_chat())
+        let selection = self.home.active_route()
+            .map_err(|e| harw_core::ModelError::RequestFailed(e.to_string()))?;
+        Ok(self.cached_provider_for(selection).await?.3.for_chat())
     }
 
-    async fn cached_provider(&self) -> Result<CachedProvider, harw_core::ModelError> {
+    async fn cached_provider_for(
+        &self,
+        selection: Option<(String, String)>,
+    ) -> Result<tokio::sync::MutexGuard<'_, ProviderCache>, harw_core::ModelError> {
         let failed = |detail: String| harw_core::ModelError::RequestFailed(detail);
-        let wanted = self
-            .home
-            .active_route()
-            .map_err(|e| failed(e.to_string()))?;
-        let fingerprint = projector_fingerprint(&self.home);
-        let revision = provider_revision(&self.home, wanted.as_ref());
-        let wanted = ModelCacheKey::Route(wanted);
+        let fingerprint = projector_fingerprint(&self.home, selection.as_ref());
+        let revision = provider_revision(&self.home, selection.as_ref());
+        let wanted = ModelCacheKey::Route(selection.clone());
         let mut current = self.current.lock().await;
         if current.0 != wanted || current.1 != fingerprint || current.2 != revision {
-            // Release the old model first: two loaded GGUFs do not fit in memory.
-            current.3 = CachedProvider::Other(Arc::new(NoModel));
+            // No second large GGUF while an existing pin or worker is alive.
+            LOCAL_INFERENCE.wait_idle().await;
+            if matches!(&current.3, CachedProvider::Local { model, .. } if Arc::strong_count(model) > 1) {
+                return Err(failed("Das lokale Modell wird noch verwendet. Bitte erneut versuchen.".into()));
+            }
+            *current = (ModelCacheKey::Route(None), None, None, CachedProvider::Other(Arc::new(NoModel)));
             let home = self.home.clone();
             let resolver = self.resolver.clone();
-            let built = load_model(move || build_active_model(&home, &resolver))
+            let built = load_model(move || build_selected_model(&home, &resolver, selection.as_ref()))
                 .await
                 .map_err(|_| failed("on-device model switch failed".to_owned()))?
                 .map_err(|e| failed(e.to_string()))?;
             *current = (wanted, fingerprint, revision, built);
         }
-        Ok(current.3.clone())
+        Ok(current)
     }
 }
 
@@ -728,15 +738,25 @@ impl harw_core::ModelProvider for SwitchingModel {
                     &request.system_prompt, chosen, self.baseline_persona.as_deref(),
                 );
             }
-            let provider = self.cached_provider().await?;
+            let selection = resolve_chat_route(&self.home, session.as_ref().map(|id| id.as_str()))
+                .map_err(|e| harw_core::ModelError::RequestFailed(e.to_string()))?;
+            let current = self.cached_provider_for(selection).await?;
             request.model_id = None;
             request.provider_id = None;
-            match provider {
+            match &current.3 {
                 CachedProvider::Local { model, .. } => {
                     let compact = persona.as_deref().and_then(crate::uia::compact_chat_persona);
-                    model.respond_with_chat_persona(request, compact).await
+                    // Keep the cache locked until the local inference worker
+                    // finishes; another chat may not remap the active GGUF.
+                    let response = model.respond_with_chat_persona(request, compact).await;
+                    LOCAL_INFERENCE.wait_idle().await;
+                    response
                 }
-                CachedProvider::Other(model) => model.respond(request).await,
+                CachedProvider::Other(model) => {
+                    let model = Arc::clone(model);
+                    drop(current);
+                    model.respond(request).await
+                }
             }
         })
     }
@@ -806,16 +826,31 @@ const LEAN_TOOLS: &[&str] = &[
     "termux_run",
 ];
 
-/// The model of the active selection: the GGUF on this device when that is the
-/// active provider, else the HTTP route.
+/// Explicit, validated chat binding, otherwise the current profile default.
 #[cfg(feature = "local-host")]
-fn build_active_model(
+fn resolve_chat_route(
+    home: &crate::home::AppHome,
+    session_id: Option<&str>,
+) -> Result<Option<(String, String)>, MobileError> {
+    if let Some(id) = session_id
+        && let Some(selection) = crate::uia::chat_model(home, id)?
+    {
+        return crate::providers::validated_chat_route(home, &selection).map(Some);
+    }
+    home.active_route()
+}
+
+/// Build the captured selection without modifying the profile's route.
+#[cfg(feature = "local-host")]
+fn build_selected_model(
     home: &crate::home::AppHome,
     resolver: &crate::secrets::KeystoreSecretResolver,
+    selection: Option<&(String, String)>,
 ) -> Result<CachedProvider, MobileError> {
-    match home.active_local_model()? {
-        Some(model_id) => build_local_gguf(home, &model_id),
-        None => crate::providers::build_model_provider(home, resolver).map(CachedProvider::Other),
+    match selection {
+        Some((provider, model_id)) if provider == crate::home::LOCAL_ROUTE_ID => build_local_gguf(home, model_id),
+        Some(selection) => crate::providers::build_model_provider_for_route(home, resolver, selection).map(CachedProvider::Other),
+        None => Ok(CachedProvider::Other(Arc::new(NoModel))),
     }
 }
 
