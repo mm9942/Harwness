@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 
 use harw_onion::OnionLocator;
 
@@ -18,7 +19,11 @@ pub enum Scope {
 pub enum Destination {
     Onion(OnionLocator),
     /// A destination validated as public by the packet or DNS path.
-    Public,
+    PublicName {
+        host: String,
+        port: u16,
+    },
+    PublicIp(SocketAddr),
 }
 
 pub struct Policy {
@@ -43,7 +48,10 @@ impl Policy {
         matches!(
             (mode, destination),
             (Some(_), Destination::Onion(_))
-                | (Some(RouteMode::InternetAndOnion), Destination::Public)
+                | (
+                    Some(RouteMode::InternetAndOnion),
+                    Destination::PublicName { .. } | Destination::PublicIp(_)
+                )
         )
     }
 }
@@ -58,9 +66,9 @@ mod tests {
             Scope::DeviceWide(RouteMode::InternetAndOnion),
             BTreeMap::from([(1, RouteMode::OnionOnly)]),
         );
-        assert!(!policy.permits(None, &Destination::Public));
-        assert!(!policy.permits(Some(1), &Destination::Public));
-        assert!(policy.permits(Some(2), &Destination::Public));
+        assert!(!policy.permits(None, &Destination::PublicIp(([1, 1, 1, 1], 443).into())));
+        assert!(!policy.permits(Some(1), &Destination::PublicIp(([1, 1, 1, 1], 443).into())));
+        assert!(policy.permits(Some(2), &Destination::PublicIp(([1, 1, 1, 1], 443).into())));
     }
 
     #[test]

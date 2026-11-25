@@ -42,6 +42,10 @@ impl VpnSession {
         }
     }
 
+    pub fn contains(&self, flow: FlowKey) -> bool {
+        self.flows.contains_key(&flow)
+    }
+
     pub fn admit(
         &mut self,
         flow: FlowKey,
@@ -149,18 +153,33 @@ mod tests {
         let mut session = VpnSession::new(policy());
         for port in 1..=MAX_PENDING_DIALS as u16 {
             session
-                .admit(flow(port), Some(1), &Destination::Public, now)
+                .admit(
+                    flow(port),
+                    Some(1),
+                    &Destination::PublicIp(([1, 1, 1, 1], 443).into()),
+                    now,
+                )
                 .unwrap();
         }
         let next = flow(2000);
         assert_eq!(
-            session.admit(next, Some(1), &Destination::Public, now),
+            session.admit(
+                next,
+                Some(1),
+                &Destination::PublicIp(([1, 1, 1, 1], 443).into()),
+                now
+            ),
             Err(AdmissionError::DialLimit)
         );
         session.expire_dials(now + DIAL_TIMEOUT);
         assert!(
             session
-                .admit(next, Some(1), &Destination::Public, now)
+                .admit(
+                    next,
+                    Some(1),
+                    &Destination::PublicIp(([1, 1, 1, 1], 443).into()),
+                    now
+                )
                 .is_ok()
         );
     }
@@ -171,11 +190,21 @@ mod tests {
         let mut session = VpnSession::new(policy());
         let flow = flow(2000);
         let old = session
-            .admit(flow, Some(1), &Destination::Public, now)
+            .admit(
+                flow,
+                Some(1),
+                &Destination::PublicIp(([1, 1, 1, 1], 443).into()),
+                now,
+            )
             .unwrap();
         session.replace_policy(policy());
         let new = session
-            .admit(flow, Some(1), &Destination::Public, now)
+            .admit(
+                flow,
+                Some(1),
+                &Destination::PublicIp(([1, 1, 1, 1], 443).into()),
+                now,
+            )
             .unwrap();
         assert!(!session.connected(old, now));
         assert!(!session.close(old));

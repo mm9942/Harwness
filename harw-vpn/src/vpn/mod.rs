@@ -1,12 +1,14 @@
 mod dns;
 mod flow;
 mod policy;
+mod router;
 mod session;
 mod tun;
 
 pub use dns::{DNS_V4, DNS_V6, DnsLeases};
 pub use flow::{FLOW_CAPACITY, FLOW_DIRECTION_BYTES, FlowBuffer, STREAM_CHUNK_BYTES};
 pub use policy::{Destination, Policy, RouteMode, Scope};
+pub use router::{PacketAction, PacketRouter};
 pub use session::{AdmissionError, DialTicket, VpnSession};
 pub use tun::{FlowKey, Packet, PacketError, Transport};
 
