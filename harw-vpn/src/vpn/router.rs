@@ -203,7 +203,7 @@ fn udp_reply(flow: FlowKey, message: &[u8]) -> Bytes {
     packet.freeze()
 }
 
-fn checksum(parts: &[&[u8]]) -> u16 {
+pub(super) fn checksum(parts: &[&[u8]]) -> u16 {
     let mut sum = 0_u32;
     let mut pairs = parts.iter().flat_map(|part| part.iter().copied());
     while let Some(high) = pairs.next() {

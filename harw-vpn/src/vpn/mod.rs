@@ -3,6 +3,7 @@ mod flow;
 mod policy;
 mod router;
 mod session;
+mod tcp;
 mod tun;
 
 pub use dns::{DNS_V4, DNS_V6, DnsLeases};
@@ -10,6 +11,7 @@ pub use flow::{FLOW_CAPACITY, FLOW_DIRECTION_BYTES, FlowBuffer, STREAM_CHUNK_BYT
 pub use policy::{Destination, Policy, RouteMode, Scope};
 pub use router::{PacketAction, PacketRouter};
 pub use session::{AdmissionError, DialTicket, VpnSession};
+pub use tcp::TcpStack;
 pub use tun::{FlowKey, Packet, PacketError, Transport};
 
 pub const TUN_MTU: usize = 1280;
