@@ -191,6 +191,7 @@ enum ModelCacheKey {
 }
 
 #[cfg(feature = "local-host")]
+#[derive(Clone)]
 enum CachedProvider {
     Other(Arc<dyn harw_core::ModelProvider>),
     Local {
@@ -679,6 +680,10 @@ impl SwitchingModel {
     }
 
     async fn provider(&self) -> Result<Arc<dyn harw_core::ModelProvider>, harw_core::ModelError> {
+        Ok(self.cached_provider().await?.for_chat())
+    }
+
+    async fn cached_provider(&self) -> Result<CachedProvider, harw_core::ModelError> {
         let failed = |detail: String| harw_core::ModelError::RequestFailed(detail);
         let wanted = self
             .home
@@ -699,7 +704,7 @@ impl SwitchingModel {
                 .map_err(|e| failed(e.to_string()))?;
             *current = (wanted, fingerprint, revision, built);
         }
-        Ok(current.3.for_chat())
+        Ok(current.3.clone())
     }
 }
 
@@ -714,17 +719,25 @@ fn local_vision_busy() -> MobileError {
 impl harw_core::ModelProvider for SwitchingModel {
     fn respond<'a>(&'a self, mut request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
         Box::pin(async move {
-            let provider = self.provider().await?;
-            if let Some(session) = harw_core::current_session_id()
-                && let Some(chosen) = crate::uia::effective_session_persona(&self.home, Some(session.as_str()))
-            {
+            let session = harw_core::current_session_id();
+            let persona = session.as_ref().and_then(|id| {
+                crate::uia::effective_session_persona(&self.home, Some(id.as_str()))
+            });
+            if let Some(chosen) = persona.as_deref() {
                 request.system_prompt = with_session_persona(
-                    &request.system_prompt, &chosen, self.baseline_persona.as_deref(),
+                    &request.system_prompt, chosen, self.baseline_persona.as_deref(),
                 );
             }
+            let provider = self.cached_provider().await?;
             request.model_id = None;
             request.provider_id = None;
-            provider.respond(request).await
+            match provider {
+                CachedProvider::Local { model, .. } => {
+                    let compact = persona.as_deref().and_then(crate::uia::compact_chat_persona);
+                    model.respond_with_chat_persona(request, compact).await
+                }
+                CachedProvider::Other(model) => model.respond(request).await,
+            }
         })
     }
 }

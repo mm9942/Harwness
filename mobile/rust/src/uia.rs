@@ -356,6 +356,56 @@ pub(crate) fn effective_session_persona(home: &AppHome, session_id: Option<&str>
     assigned.as_deref().and_then(read).or_else(|| active.as_deref().and_then(read))
 }
 
+/// Preserve the user-configured sections in lean GGUF chats, without importing
+/// the full phone host template or its instructions about tools and files.
+#[cfg(feature = "local-host")]
+pub(crate) fn compact_chat_persona(text: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut include = false;
+    for line in text.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            include = matches!(
+                heading.trim(),
+                "Wer du bist" | "Identität" | "Persönlichkeit" | "Anrede" | "Kontext des Nutzers"
+            );
+        } else if line.starts_with("# ") {
+            include = false;
+        }
+        if include {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    let result = result.trim();
+    if result.is_empty() {
+        None
+    } else {
+        // The provider enforces its own limit; do not silently truncate a persona.
+        Some(result.to_owned())
+    }
+}
+
+#[cfg(all(test, feature = "local-host"))]
+#[test]
+fn lean_persona_preserves_identity_and_personality_without_host_tools() {
+    let setup = CleanSetup {
+        name: "Quinn".into(),
+        identity: "Ich bin Quinn.".into(),
+        personality: "Antworte freundlich.".into(),
+        user_name: "Mia".into(),
+        user_context: "Bevorzugt Deutsch.".into(),
+    };
+    let rendered = render_system(&setup);
+    let compact = compact_chat_persona(&rendered).expect("configured persona");
+    assert!(compact.contains("Du bist Quinn."));
+    assert!(compact.contains("Antworte freundlich."));
+    assert!(compact.contains("Mia"));
+    assert!(compact.contains("Bevorzugt Deutsch."));
+    assert!(!compact.contains("plan.current"));
+    assert!(!compact.contains("## Approvals"));
+    assert!(compact_chat_persona(TEMPLATE_SYSTEM).is_none());
+}
+
 fn rejected(detail: &str) -> MobileError {
     MobileError::Session {
         detail: detail.to_owned(),

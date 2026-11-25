@@ -514,6 +514,32 @@ fn chat_system_prompt(
     system
 }
 
+/// Add only the explicitly selected chat persona, not the full host prompt.
+/// The caller resolves the persona for this request; nothing is stored on the
+/// shared engine, and the lean tool catalogue is unchanged.
+fn apply_lean_chat_persona(
+    messages: &mut [ChatMessage],
+    lean: bool,
+    persona: Option<&str>,
+) -> Result<(), ModelError> {
+    let Some(persona) = persona.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(());
+    };
+    if !lean {
+        return Ok(());
+    }
+    // A profile is bounded before rendering, including UTF-8 and media markers.
+    if persona.chars().count() > 5600 || persona.contains(MEDIA_MARKER) {
+        return Err(ModelError::RequestFailed("invalid lean chat persona".into()));
+    }
+    let system = messages.first_mut().filter(|message| message.role == "system")
+        .ok_or_else(|| ModelError::RequestFailed("missing lean system message".into()))?;
+    system.content.push_str("\n\nSelected chat identity and personality:\n");
+    system.content.push_str(persona);
+    system.content.push_str("\n\nThe tool and access limits stated above still apply.");
+    Ok(())
+}
+
 /// Each image occupies a number even when its data is missing.
 fn numbered_images(items: &[ModelMessage]) -> Vec<(usize, usize, bool)> {
     let mut numbered = Vec::new();
@@ -730,8 +756,9 @@ impl LocalGgufProvider {
         request: &ModelRequest,
         forced: &[usize],
         described: &HashMap<usize, String>,
+        chat_persona: Option<&str>,
     ) -> Result<Job, ModelError> {
-        self.prepare_with_private_image(request, forced, described, None)
+        self.prepare_with_private_image(request, forced, described, None, chat_persona)
     }
 
     /// One explicit in-memory image on the latest user turn, without registering
@@ -782,7 +809,7 @@ impl LocalGgufProvider {
         }
         let turn = self.config.inference.begin(request.cancel.as_ref()).await
             .ok_or(ModelError::Cancelled)?;
-        let job = self.prepare_with_private_image(&request, &[], &HashMap::new(), Some(Box::new(jpeg)))?;
+        let job = self.prepare_with_private_image(&request, &[], &HashMap::new(), Some(Box::new(jpeg)), None)?;
         let (handle, _abort_on_drop) =
             self.spawn_job_with_signal(job, &turn, first_output);
         let generated = handle.await
@@ -797,6 +824,7 @@ impl LocalGgufProvider {
         forced: &[usize],
         described: &HashMap<usize, String>,
         private_image: Option<Box<dyn AsRef<[u8]> + Send>>,
+        chat_persona: Option<&str>,
     ) -> Result<Job, ModelError> {
         // With a projector every image on the ordinary lean route is described
         // in its own short pass. The private route uses raw vision instead.
@@ -813,6 +841,7 @@ impl LocalGgufProvider {
             forced,
             described,
         );
+        apply_lean_chat_persona(&mut messages, self.config.lean, chat_persona)?;
         if private_image.is_some() {
             if !images.is_empty() || messages.iter().any(|message| message.content.contains(MEDIA_MARKER)) {
                 return Err(ModelError::RequestFailed("invalid private vision prompt".into()));
@@ -1085,8 +1114,15 @@ impl LocalGgufProvider {
     }
 }
 
-impl ModelProvider for LocalGgufProvider {
-    fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+impl LocalGgufProvider {
+    /// Respond with the bounded persona of this ordinary chat. The non-lean
+    /// path already uses the caller's complete system prompt. Private vision
+    /// does not use this entry point.
+    pub fn respond_with_chat_persona(
+        &self,
+        request: ModelRequest,
+        chat_persona: Option<String>,
+    ) -> ModelFuture<'_> {
         Box::pin(async move {
             let turn = self
                 .config
@@ -1102,7 +1138,7 @@ impl ModelProvider for LocalGgufProvider {
                 HashMap::new()
             };
             let (generated, tools, stream) = loop {
-                let job = self.prepare(&request, &forced, &described)?;
+                let job = self.prepare(&request, &forced, &described, chat_persona.as_deref())?;
                 let tools = job.tools.clone();
                 let stream = job.stream.clone();
                 let (handle, _abort_on_drop) = self.spawn_job(job, &turn);
@@ -1136,6 +1172,13 @@ impl ModelProvider for LocalGgufProvider {
             }
             Ok(response)
         })
+    }
+
+}
+
+impl ModelProvider for LocalGgufProvider {
+    fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+        self.respond_with_chat_persona(request, None)
     }
 
     fn pinned_model_id(&self) -> Option<String> {
@@ -1311,6 +1354,33 @@ mod standalone_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lean_chat_persona_is_per_request_for_text_and_vision() -> Result<(), ModelError> {
+        for base in [LEAN_SYSTEM_PROMPT, LEAN_VISION_SYSTEM_PROMPT] {
+            let mut quinn = vec![ChatMessage::new("system", base)];
+            let mut other = vec![ChatMessage::new("system", base)];
+            apply_lean_chat_persona(&mut quinn, true, Some("Du bist Quinn."))?;
+            apply_lean_chat_persona(&mut other, true, Some("Du bist Atlas."))?;
+            assert!(quinn[0].content.starts_with(base));
+            assert!(quinn[0].content.contains("Du bist Quinn."));
+            assert!(!quinn[0].content.contains("Du bist Atlas."));
+            assert!(other[0].content.contains("Du bist Atlas."));
+            assert!(!other[0].content.contains("Du bist Quinn."));
+            let mut non_lean = vec![ChatMessage::new("system", "Full host instructions")];
+            apply_lean_chat_persona(&mut non_lean, false, Some("Du bist Quinn."))?;
+            assert_eq!(non_lean[0].content, "Full host instructions");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lean_chat_persona_rejects_oversize_and_media_markers() {
+        let mut messages = vec![ChatMessage::new("system", LEAN_SYSTEM_PROMPT)];
+        assert!(apply_lean_chat_persona(&mut messages, true, Some(&"x".repeat(5601))).is_err());
+        assert!(apply_lean_chat_persona(&mut messages, true, Some(MEDIA_MARKER)).is_err());
+        assert_eq!(messages[0].content, LEAN_SYSTEM_PROMPT);
+    }
 
     #[test]
     fn switch_is_removed_and_reported() {
