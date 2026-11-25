@@ -42,6 +42,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
@@ -62,6 +63,12 @@ private const val UpdateChannel = "harw_updates"
 private const val UpdateJobId = 7411
 internal const val ExtraOpenUpdate = "dev.harw.mobile.OPEN_UPDATE"
 
+internal enum class AppReleaseChannel(val wire: String) {
+    Stable("stable"), Beta("beta");
+
+    fun path(endpoint: String): String = "$UpdateBase/v1/$endpoint?channel=$wire"
+}
+
 internal data class UpdateInfo(
     val versionCode: Int,
     val versionName: String,
@@ -69,23 +76,42 @@ internal data class UpdateInfo(
     val apkUrl: String,
     val sha256: String,
     val size: Long,
+    val channel: AppReleaseChannel = AppReleaseChannel.Stable,
 )
 
-internal fun parseUpdate(json: String): UpdateInfo? = try {
+internal fun parseUpdate(json: String): UpdateInfo? = runCatching {
     val o = JSONObject(json)
     val url = o.getString("apkUrl")
+    val channel = AppReleaseChannel.entries.firstOrNull { it.wire == o.optString("channel", "stable") }
+        ?: return@runCatching null
     // Nur der eigene Dienst darf Pakete liefern.
     if (!url.startsWith("$UpdateBase/apk/")) null
     else UpdateInfo(
         o.getInt("versionCode"), o.optString("versionName"), o.optString("notes"),
-        url, o.getString("sha256").lowercase(), o.optLong("size"),
+        url, o.getString("sha256").lowercase(), o.optLong("size"), channel,
     )
-} catch (_: Exception) {
-    null
-}
+}.getOrNull()
 
 internal object AppUpdates {
     val pending = MutableStateFlow<UpdateInfo?>(null)
+    private val selected = MutableStateFlow(AppReleaseChannel.Stable)
+    val channel = selected.asStateFlow()
+
+    fun restoreChannel(context: Context) {
+        val stored = prefs(context).getString("channel", null)
+        selected.value = AppReleaseChannel.entries.firstOrNull { it.wire == stored } ?: AppReleaseChannel.Stable
+    }
+
+    @Synchronized
+    fun selectChannel(context: Context, next: AppReleaseChannel) {
+        if (selected.value == next) return
+        prefs(context).edit().putString("channel", next.wire).apply()
+        pending.value = null
+        available.value = null
+        context.getSystemService(NotificationManager::class.java).cancel(UpdateJobId)
+        selected.value = next
+    }
+
 
     /** Neueste bekannte Version, die neuer ist als die installierte (auch nach "Später"); für die Einstellungen. */
     val available = MutableStateFlow<UpdateInfo?>(null)
@@ -98,46 +124,57 @@ internal object AppUpdates {
 
     private fun prefs(context: Context) = context.getSharedPreferences(UpdatePrefs, Context.MODE_PRIVATE)
 
-    fun fetchLatest(): UpdateInfo? = try {
-        val c = URL("$UpdateBase/v1/latest").openConnection() as HttpURLConnection
-        c.connectTimeout = 10_000; c.readTimeout = 15_000
-        c.inputStream.bufferedReader().use { parseUpdate(it.readText()) }
+    fun fetchLatest(release: AppReleaseChannel = selected.value): UpdateInfo? = try {
+        val c = URL(release.path("latest")).openConnection() as HttpURLConnection
+        try {
+            c.connectTimeout = 10_000
+            c.readTimeout = 15_000
+            c.inputStream.bufferedReader().use { parseUpdate(it.readText())?.takeIf { info -> info.channel == release } }
+        } finally {
+            c.disconnect()
+        }
     } catch (_: Exception) {
         null
     }
 
     /** Setzt das Angebot, wenn es neuer ist und nicht innerhalb der letzten 24 h auf "Später" gestellt wurde. */
+    @Synchronized
     fun consider(context: Context, info: UpdateInfo, force: Boolean = false) {
+        if (info.channel != selected.value) return
         if (info.versionCode <= installedCode(context)) { pending.value = null; available.value = null; return }
         available.value = info
         val p = prefs(context)
-        val snoozed = p.getInt("snooze_code", 0) == info.versionCode &&
-            System.currentTimeMillis() - p.getLong("snooze_at", 0) < 24 * 3600_000L
+        val snoozed = p.getInt("${info.channel.wire}_snooze_code", 0) == info.versionCode &&
+            System.currentTimeMillis() - p.getLong("${info.channel.wire}_snooze_at", 0) < 24 * 3600_000L
         if (!snoozed || force) pending.value = info
     }
 
     fun snooze(context: Context, info: UpdateInfo) {
-        prefs(context).edit().putInt("snooze_code", info.versionCode).putLong("snooze_at", System.currentTimeMillis()).apply()
+        prefs(context).edit().putInt("${info.channel.wire}_snooze_code", info.versionCode).putLong("${info.channel.wire}_snooze_at", System.currentTimeMillis()).apply()
         pending.value = null
     }
 
     /** SSE: bleibt offen, bis die Coroutine endet; Verbindungsabbrüche werden mit Pause wiederholt. */
-    suspend fun listen(context: Context) {
+    suspend fun listen(context: Context, release: AppReleaseChannel) {
         val job = coroutineContext.job
         withContext(Dispatchers.IO) {
             var wait = 3_000L
-            while (isActive) {
+            while (isActive && selected.value == release) {
                 var conn: HttpURLConnection? = null
                 try {
-                    conn = URI.create("$UpdateBase/v1/events").toURL().openConnection() as HttpURLConnection
+                    conn = URI.create(release.path("events")).toURL().openConnection() as HttpURLConnection
                     conn.connectTimeout = 10_000
                     conn.readTimeout = 70_000
                     conn.setRequestProperty("Accept", "text/event-stream")
                     val c = conn
-                    job.invokeOnCompletion { c.disconnect() }
-                    c.inputStream.bufferedReader().useLines { lines ->
-                        wait = 3_000L
-                        consumeUpdateEvents(context, lines)
+                    val cancelConnection = job.invokeOnCompletion { c.disconnect() }
+                    try {
+                        c.inputStream.bufferedReader().useLines { lines ->
+                            wait = 3_000L
+                            consumeUpdateEvents(context, release, lines)
+                        }
+                    } finally {
+                        cancelConnection.dispose()
                     }
                 } catch (_: Exception) {
                 } finally {
@@ -150,9 +187,10 @@ internal object AppUpdates {
         }
     }
 
-    private fun consumeUpdateEvents(context: Context, lines: Sequence<String>) {
+    private fun consumeUpdateEvents(context: Context, release: AppReleaseChannel, lines: Sequence<String>) {
         var event = ""
         for (line in lines) {
+            if (selected.value != release) return
             when {
                 line.startsWith("event:") -> event = line.removePrefix("event:").trim()
                 line.startsWith("data:") && event == "update" ->
@@ -175,9 +213,11 @@ internal object AppUpdates {
     }
 
     /** Benachrichtigung, wenn die App nicht offen ist; pro Version nur einmal. */
+    @Synchronized
     fun notify(context: Context, info: UpdateInfo) {
+        if (info.channel != selected.value) return
         val p = prefs(context)
-        if (p.getInt("notified_code", 0) >= info.versionCode) return
+        if (p.getInt("${info.channel.wire}_notified_code", 0) >= info.versionCode) return
         val nm = context.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(UpdateChannel, "App-Updates", NotificationManager.IMPORTANCE_DEFAULT))
         val open = PendingIntent.getActivity(
@@ -195,7 +235,7 @@ internal object AppUpdates {
             .build()
         try {
             nm.notify(UpdateJobId, n)
-            p.edit().putInt("notified_code", info.versionCode).apply()
+            p.edit().putInt("${info.channel.wire}_notified_code", info.versionCode).apply()
         } catch (_: SecurityException) {
         }
     }
@@ -265,12 +305,13 @@ internal class UpdateCheckJob : JobService() {
 internal fun UpdateHost(openRequested: Boolean) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-    LaunchedEffect(lifecycle) {
+    val release by AppUpdates.channel.collectAsState()
+    LaunchedEffect(lifecycle, release) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             launch(Dispatchers.IO) {
-                AppUpdates.fetchLatest()?.let { AppUpdates.consider(context, it, force = openRequested) }
+                AppUpdates.fetchLatest(release)?.let { AppUpdates.consider(context, it, force = openRequested) }
             }
-            AppUpdates.listen(context)
+            AppUpdates.listen(context, release)
         }
     }
     val info by AppUpdates.pending.collectAsState()

@@ -338,26 +338,22 @@ fn check_key(key: &str) -> Result<(), MobileError> {
     Ok(())
 }
 
-/// Persona-Wechsel für einen Chat: `(system.md der gewählten UIA, system.md der aktiven UIA)`.
-/// `None`, wenn der Chat keine eigene UIA hat oder sie der aktiven entspricht.
-pub(crate) fn session_persona(home: &AppHome, session_id: &str) -> Option<(String, Option<String>)> {
-    let chosen_id = read_assign(home).sessions.get(session_id).cloned()?;
+/// Loads the configured persona for a single turn, including the profile fallback.
+#[cfg(feature = "local-host")]
+pub(crate) fn effective_session_persona(home: &AppHome, session_id: Option<&str>) -> Option<String> {
     let active = home.info().ok()?.active_uia;
-    if active.as_deref() == Some(chosen_id.as_str()) {
-        return None;
-    }
+    let assigned = session_id.and_then(|id| read_assign(home).sessions.get(id).cloned());
     let store = UiaStore { home: home.clone(), lock: Mutex::new(()) };
     let found = store.scan();
     let read = |id: &str| -> Option<String> {
-        let dir = &found.iter().find(|(_, existing, _)| existing == id)?.0;
-        let meta = std::fs::metadata(dir.join("system.md")).ok()?;
-        if meta.len() > MAX_DEFINITION_BYTES {
+        let path = found.iter().find(|(_, existing, _)| existing == id)?.0.join("system.md");
+        if std::fs::metadata(&path).ok()?.len() > MAX_DEFINITION_BYTES {
             return None;
         }
-        std::fs::read_to_string(dir.join("system.md")).ok()
+        let text = std::fs::read_to_string(path).ok()?;
+        Some(with_persona_anchor(&text).unwrap_or(text))
     };
-    let chosen = read(&chosen_id)?;
-    Some((chosen, active.as_deref().and_then(read)))
+    assigned.as_deref().and_then(read).or_else(|| active.as_deref().and_then(read))
 }
 
 fn rejected(detail: &str) -> MobileError {

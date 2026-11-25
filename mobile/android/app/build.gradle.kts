@@ -65,8 +65,8 @@ android {
         applicationId = "dev.harw.mobile"
         minSdk = 28
         targetSdk = 37
-        versionCode = 40
-        versionName = "0.4.3"
+        versionCode = 41
+        versionName = "0.4.4-beta.1"
         ndk { abiFilters += "arm64-v8a" }
     }
 

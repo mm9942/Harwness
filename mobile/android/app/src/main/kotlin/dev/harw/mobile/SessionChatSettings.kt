@@ -71,20 +71,28 @@ internal class ChatQuickPickers {
         this.model = model
     }
 
+    var openSettings: (() -> Unit)? by mutableStateOf(null)
+
     fun openAgent() { if (agent.enabled) showAgent() }
     fun openModel() { if (model.enabled) showModel() }
 }
 
 @Composable
-internal fun ChatQuickPickerRow(pickers: ChatQuickPickers) {
+internal fun ChatQuickPickerRow(pickers: ChatQuickPickers, local: Boolean) {
     Box(Modifier.fillMaxWidth()) {
         Row(
-            Modifier.fillMaxWidth(0.5f).padding(end = 12.dp),
+            Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            ChatQuickPickerButton("UIA", pickers.agent, pickers::openAgent, Modifier.weight(1f))
+            if (local) ChatQuickPickerButton("UIA", pickers.agent, pickers::openAgent, Modifier.weight(1f))
             ChatQuickPickerButton(stringResource(R.string.chat_quick_picker_model),
                 pickers.model, pickers::openModel, Modifier.weight(1f))
+            val open = pickers.openSettings
+            ChatQuickPickerButton(
+                stringResource(R.string.chat_quick_picker_settings), ChatQuickChoice(enabled = open != null),
+                { open?.invoke() }, Modifier.weight(1f),
+            )
+
         }
     }
 }
@@ -240,6 +248,7 @@ private fun ScopedChatSettings(
     )
     val blockedModel = stringResource(R.string.chat_quick_picker_model_unavailable)
     SideEffect {
+        archiveMenu.quickPickers.openSettings = { page = ChatSettingsPage.Overview }
         archiveMenu.quickPickers.publish(
             ChatQuickChoice(localAgent?.selectedName, localAgent?.canChoose == true, blockedAgent),
             ChatQuickChoice((localModelLabel ?: cloudModelLabel).takeUnless { it == "Modell" },
@@ -248,7 +257,10 @@ private fun ScopedChatSettings(
         )
     }
     DisposableEffect(archiveMenu.quickPickers) {
-        onDispose { archiveMenu.quickPickers.publish(ChatQuickChoice(), ChatQuickChoice(), {}, {}) }
+        onDispose {
+            archiveMenu.quickPickers.openSettings = null
+            archiveMenu.quickPickers.publish(ChatQuickChoice(), ChatQuickChoice(), {}, {})
+        }
     }
     // Keep launcher and download completion alive when the settings sheet is hidden.
     val localVisionHint = if (state.local) {

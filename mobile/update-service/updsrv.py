@@ -2,16 +2,17 @@
 """harw Update-Dienst (upd.harw.dev): Manifest, SSE-Ereignisstrom und APK-Download."""
 import json, os, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = os.environ.get("HARW_UPD_ROOT", os.path.expanduser("~/harw-updates"))
-LATEST = os.path.join(ROOT, "latest.json")
+LATEST = {"stable": "latest.json", "beta": "latest-beta.json"}
 APK_DIR = os.path.join(ROOT, "apk")
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}\.apk$")
 
 
-def read_latest():
+def read_latest(channel):
     try:
-        with open(LATEST, "rb") as f:
+        with open(os.path.join(ROOT, LATEST[channel]), "rb") as f:
             return f.read()
     except OSError:
         return None
@@ -38,21 +39,27 @@ class H(BaseHTTPRequestHandler):
     do_HEAD = lambda self: self.do_GET()
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        request = urlsplit(self.path)
+        path = request.path
+        if path in ("/v1/latest", "/v1/events"):
+            values = parse_qs(request.query, keep_blank_values=True).get("channel", ["stable"])
+            if len(values) != 1 or values[0] not in LATEST:
+                return self._send(400, b'{"error":"unknown channel"}', "application/json")
+            channel = values[0]
         if path == "/v1/latest":
-            data = read_latest()
+            data = read_latest(channel)
             if data is None:
                 return self._send(404, b'{"error":"no release"}', "application/json")
             return self._send(200, data, "application/json")
         if path == "/v1/events":
-            return self._events()
+            return self._events(channel)
         if path.startswith("/apk/"):
             return self._apk(path[5:])
         if path in ("/", "/healthz"):
             return self._send(200, b"harw update service\n")
         self._send(404, b"Nicht gefunden.\n")
 
-    def _events(self):
+    def _events(self, channel):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache, no-transform")
@@ -63,7 +70,7 @@ class H(BaseHTTPRequestHandler):
         idle = 0
         try:
             while True:
-                data = read_latest()
+                data = read_latest(channel)
                 if data is not None and data != last:
                     last = data
                     one = json.dumps(json.loads(data))  # eine Zeile

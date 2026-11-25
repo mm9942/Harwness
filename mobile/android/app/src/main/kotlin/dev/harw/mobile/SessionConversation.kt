@@ -1220,7 +1220,7 @@ internal fun SessionConversation(
             } else null
             PromptComposer(
                 draft = draft,
-                beforeInput = { if (showQuickPickers) ChatQuickPickerRow(archiveMenu.quickPickers) },
+                beforeInput = { if (showQuickPickers) ChatQuickPickerRow(archiveMenu.quickPickers, state.local) },
                 showStop = active && (turnId != null || sendPending || draft.sending || interruptPending),
                 onInterrupt = interrupt,
                 onAttachImage = if (imagesSupported) ({ image ->
@@ -2557,6 +2557,14 @@ internal fun LocalModelSheet(onChanged: () -> Unit, canChange: () -> Boolean = {
             }
         }
     }
+    val manager = remember(context) { ModelManager(ModelStore(context.applicationContext)) }
+    val activeLocal by produceState<uniffi.harw_mobile_ffi.LocalModel?>(null, overview, reload) {
+        val modelId = overview?.takeIf { it.second == localId }?.third
+        value = if (modelId == null) null else runCatching {
+            manager.local().firstOrNull { it.id == modelId && it.state == ModelFileState.COMPLETE }
+        }.getOrNull()
+    }
+    val projectorDownload by ModelDownloads.state.collectAsState()
     val options by produceState<List<Option>?>(null, provider, reload) {
         val chosen = provider
         value = if (chosen == null) null else withContext(Dispatchers.IO) {
@@ -2583,6 +2591,13 @@ internal fun LocalModelSheet(onChanged: () -> Unit, canChange: () -> Boolean = {
         }
     }
     Column(Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (provider == null || provider == localId) activeLocal?.let { model ->
+            ProjectorBlock(
+                model, manager, projectorDownload, busy || !canChange(),
+                requestDownload = { file -> if (canChange()) ModelDownloads.start(context, file) },
+            )
+        }
+
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 if (provider == null) "Provider wählen" else "Modell wählen",

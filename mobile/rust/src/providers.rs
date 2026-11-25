@@ -578,18 +578,22 @@ impl ProviderStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if self.load_route(&route_id)?.is_none() {
-            return Err(unknown_route());
-        }
+        let provider = self.load_route(&route_id)?.ok_or_else(unknown_route)?;
         let path = self.route_path(&route_id);
+        if provider.models.first() == Some(&model) {
+            return self.home.set_active_route(&route_id, &model);
+        }
+        if !provider.models.contains(&model) && provider.models.len() >= MAX_IMPORT_MODELS {
+            return Err(MobileError::Session { detail: "too many models".to_owned() });
+        }
         let text = std::fs::read_to_string(&path)
             .map_err(|_| internal("could not read the provider route file"))?;
         let mut table: toml::Table = toml::from_str(&text)
             .map_err(|_| internal("the provider route file is not valid TOML"))?;
-        table.insert(
-            "models".to_owned(),
-            toml::Value::Array(vec![toml::Value::String(model.clone())]),
-        );
+        let models = std::iter::once(model.clone())
+            .chain(provider.models.into_iter().filter(|id| id != &model))
+            .map(toml::Value::String).collect();
+        table.insert("models".to_owned(), toml::Value::Array(models));
         let rendered = toml::to_string(&table)
             .map_err(|_| internal("could not render the provider route file"))?;
         toml::from_str::<ProviderToml>(&rendered)
@@ -693,14 +697,12 @@ impl ProviderStore {
             None => return Err("an API key is required for this provider".to_owned()),
         };
         let (mut text, mut provider) = render_route(&clean, with_auth)?;
-        #[cfg(feature = "local-host")]
-        if harw_provider_http::is_azure_foundry_chat(&clean.id, &clean.base_url)
-            && let Some((_, previous)) = existing.iter().find(|(id, route)| {
-                id == &clean.id && route.base_url == clean.base_url && route.api == provider.api
-            })
+        if let Some((_, previous)) = existing.iter().find(|(id, route)| {
+            id == &clean.id && route.base_url == clean.base_url && route.api == provider.api
+        })
         {
             for model in &previous.models {
-                if !provider.models.iter().any(|id| id.eq_ignore_ascii_case(model)) {
+                if !provider.models.contains(model) {
                     provider.models.push(model.clone());
                 }
             }
@@ -1438,12 +1440,16 @@ mod tests {
             route("main", ProviderKind::OpenAi, "", "gpt-x"),
             b"sk-test".to_vec(),
         )?;
+        store.set_route_models("main".to_owned(), vec!["gpt-x".to_owned(), "vision-x".to_owned()])?;
         store.activate_route("main".to_owned(), "gpt-y".to_owned())?;
+        assert_eq!(store.route_models("main".to_owned())?, ["gpt-y", "gpt-x", "vision-x"]);
+        store.save_route(route("main", ProviderKind::OpenAi, "", "gpt-x"), Vec::new())?;
+        assert_eq!(store.route_models("main".to_owned())?, ["gpt-x", "gpt-y", "vision-x"]);
         assert!(
             store
                 .routes()?
                 .iter()
-                .any(|r| r.active && r.default_model == "gpt-y")
+                .any(|r| r.active && r.default_model == "gpt-x")
         );
         store.delete_route("main".to_owned())?;
         assert!(store.routes()?.is_empty());

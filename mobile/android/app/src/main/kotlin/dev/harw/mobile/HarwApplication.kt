@@ -15,6 +15,7 @@ internal class HarwApplication : Application() {
         applyLocalImageConcurrency(readLocalImageConcurrency(this))
         // Lokal startet von selbst, sobald ein Modell oder eine Netzwerk-Route nutzbar ist.
         localAutostart.start()
+        AppUpdates.restoreChannel(this)
         AppUpdates.schedule(this)
         subscribeUpdatePush()
     }

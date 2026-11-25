@@ -225,6 +225,8 @@ internal fun SettingsHub(
     onOpen: (SettingsRoute) -> Unit,
     diagnosticsConnection: HarwConnection = connection,
     diagnosticsLocal: Boolean = false,
+    localDisconnected: Boolean,
+    disconnectLocal: () -> Unit,
 ) {
     val context = LocalContext.current
     val cloudBlock = manageOpenBlock(state)?.let { stringResource(it) }
@@ -304,6 +306,7 @@ internal fun SettingsHub(
                     openNotificationSettings(context)
                 }
                 AppUpdateHubRow(context)
+                LocalBackupSettings(localDisconnected, disconnectLocal)
                 HubRow(stringResource(R.string.settings_hub_share_diagnostics), stringResource(R.string.settings_hub_share_diagnostics_detail), null) {
                     shareDiagnostic(context, diagnosticReport(state, appVersionOf(context)))
                 }
@@ -480,7 +483,31 @@ private fun LocalImageSettings(context: Context) {
 @Composable
 private fun AppUpdateHubRow(context: Context) {
     val availableUpdate by AppUpdates.available.collectAsState()
-    var updateStatus by remember { mutableStateOf<String?>(null) }
+    val channel by AppUpdates.channel.collectAsState()
+    var selectingChannel by remember { mutableStateOf(false) }
+    val label = if (channel == AppReleaseChannel.Beta) "Beta" else "Stabil"
+    HubRow("Update-Kanal", label, null) { selectingChannel = true }
+    if (selectingChannel) {
+        AlertDialog(
+            onDismissRequest = { selectingChannel = false },
+            title = { Text("Update-Kanal") },
+            text = { Text("Beta enthält Vorabversionen. Beim Wechsel zu Stabil wird die nächste höhere stabile Version angeboten.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    AppUpdates.selectChannel(context, AppReleaseChannel.Beta)
+                    selectingChannel = false
+                }) { Text("Beta") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    AppUpdates.selectChannel(context, AppReleaseChannel.Stable)
+                    selectingChannel = false
+                }) { Text("Stabil") }
+            },
+        )
+    }
+
+    var updateStatus by remember(channel) { mutableStateOf<String?>(null) }
     val updateScope = rememberCoroutineScope()
     val subtitle = availableUpdate?.let { "Version ${it.versionName} ist verfügbar. Tippen zum Installieren." }
         ?: updateStatus
@@ -491,8 +518,9 @@ private fun AppUpdateHubRow(context: Context) {
             AppUpdates.consider(context, known, force = true)
         } else {
             updateStatus = "Suche nach Updates …"
-            updateScope.launch(Dispatchers.IO) {
-                val latest = AppUpdates.fetchLatest()
+            updateScope.launch {
+                val latest = withContext(Dispatchers.IO) { AppUpdates.fetchLatest(channel) }
+                if (AppUpdates.channel.value != channel) return@launch
                 if (latest == null) {
                     updateStatus = "Keine Verbindung zum Update-Dienst."
                 } else if (latest.versionCode > AppUpdates.installedCode(context)) {

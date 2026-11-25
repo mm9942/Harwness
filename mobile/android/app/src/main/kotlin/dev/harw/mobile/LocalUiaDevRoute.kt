@@ -1140,6 +1140,18 @@ internal fun LocalUiaDevScreen(
                     ) { Text(chosenModel?.label ?: "Modell wählen") }
                 }
                 if (choosingModel) {
+                    val manager = remember(context) { ModelManager(ModelStore(context.applicationContext)) }
+                    val download by ModelDownloads.state.collectAsState()
+                    val activeModel by produceState<String?>(null, showing) {
+                        value = optionalVisionChoices {
+                            withContext(Dispatchers.IO) {
+                                val app = context.applicationContext
+                                uniffi.harw_mobile_ffi.ProviderStore(app.filesDir.path, AndroidPlatformKeystore(app))
+                                    .homeInfo().takeIf { it.activeProvider == "local-gguf" }?.activeModel
+                            }
+                        }
+                    }
+
                     val installed by produceState<List<uniffi.harw_mobile_ffi.LocalModel>?>(null, showing) {
                         value = optionalVisionChoices {
                             withContext(Dispatchers.IO) {
@@ -1154,7 +1166,7 @@ internal fun LocalUiaDevScreen(
                     }
                     AlertDialog(
                         onDismissRequest = { choosingModel = false },
-                        title = { Text("Modell für diesen Assistenten") },
+                        title = { Text("Modell & Bildverständnis") },
                         text = {
                             Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
                                 when {
@@ -1163,6 +1175,16 @@ internal fun LocalUiaDevScreen(
                                 }
                                 TextButton(onClick = { chosenModel = null; choosingModel = false }) {
                                     Text("Aktives lokales Modell verwenden")
+                                }
+                                val configured = chosenModel ?: installed.orEmpty().firstOrNull { it.id == activeModel }
+                                if (configured != null) {
+                                    ProjectorBlock(
+                                        configured, manager, download,
+                                        (roomState as? UiaRoomState.Open)?.permitsSend != true,
+                                        requestDownload = { file ->
+                                            if (ownerStillCurrent() && session.allowsLocalAction()) ModelDownloads.start(context, file)
+                                        },
+                                    )
                                 }
                                 installed.orEmpty().forEach { model ->
                                     TextButton(onClick = { chosenModel = model; choosingModel = false }) {

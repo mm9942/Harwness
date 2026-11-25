@@ -101,6 +101,7 @@ pub(crate) async fn open_local(
     // activation is picked up by the next turn (see `SwitchingModel`).
     let model = Arc::new(SwitchingModel {
         home: home.clone(),
+        baseline_persona: crate::uia::effective_session_persona(&home, None),
         resolver,
         current: tokio::sync::Mutex::new((
             ModelCacheKey::Route(selection),
@@ -170,6 +171,7 @@ fn matches_uia_home(home: &crate::home::AppHome, files: &std::path::Path) -> boo
 #[cfg(feature = "local-host")]
 pub(crate) struct SwitchingModel {
     home: crate::home::AppHome,
+    baseline_persona: Option<String>,
     resolver: crate::secrets::KeystoreSecretResolver,
     current: tokio::sync::Mutex<(
         ModelCacheKey,
@@ -713,13 +715,12 @@ impl harw_core::ModelProvider for SwitchingModel {
     fn respond<'a>(&'a self, mut request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
         Box::pin(async move {
             let provider = self.provider().await?;
-            // Pro Chat gewählte UIA: ihre Persona ersetzt die der aktiven UIA in der Systemanweisung.
             if let Some(session) = harw_core::current_session_id()
-                && let Some((chosen, active)) =
-                    crate::uia::session_persona(&self.home, session.as_str())
+                && let Some(chosen) = crate::uia::effective_session_persona(&self.home, Some(session.as_str()))
             {
-                request.system_prompt =
-                    swap_persona(&request.system_prompt, &chosen, active.as_deref());
+                request.system_prompt = with_session_persona(
+                    &request.system_prompt, &chosen, self.baseline_persona.as_deref(),
+                );
             }
             request.model_id = None;
             request.provider_id = None;
@@ -728,15 +729,31 @@ impl harw_core::ModelProvider for SwitchingModel {
     }
 }
 
-/// Ersetzt die Persona der aktiven UIA in `prompt` durch die gewählte; fehlt sie dort, wird die gewählte angehängt.
+/// Keep the host instructions and apply the chat's current UIA on every turn.
 #[cfg(feature = "local-host")]
-fn swap_persona(prompt: &str, chosen: &str, active: Option<&str>) -> String {
-    if let Some(active) = active.map(str::trim).filter(|a| !a.is_empty())
-        && prompt.contains(active)
-    {
-        return prompt.replacen(active, chosen.trim(), 1);
+fn with_session_persona(prompt: &str, chosen: &str, baseline: Option<&str>) -> String {
+    let chosen = chosen.trim();
+    if chosen.is_empty() || prompt.contains(chosen) {
+        return prompt.to_owned();
     }
-    format!("{prompt}\n\n## Rolle in diesem Chat\n\n{}", chosen.trim())
+    let role = format!(
+        "## Deine UIA in diesem Chat\n\nDie folgende UIA ist deine Identität in dieser Session. Sprich in ihrer Ich-Form und folge ihren Anweisungen.\n\n{chosen}"
+    );
+    if let Some(previous) = baseline.map(str::trim).filter(|text| !text.is_empty())
+        && prompt.contains(previous)
+    {
+        return prompt.replacen(previous, &role, 1);
+    }
+    format!("{prompt}\n\n{role}")
+}
+
+#[cfg(all(test, feature = "local-host"))]
+#[test]
+fn a_session_persona_replaces_the_original_uias_identity_only() {
+    let prompt = "Host rules\n\nDu bist Atlas.\n\nWorkspace instructions";
+    let changed = with_session_persona(prompt, "Du bist Suri.", Some("Du bist Atlas."));
+    assert!(changed.contains("Host rules") && changed.contains("Workspace instructions"));
+    assert!(changed.contains("Du bist Suri.") && !changed.contains("Du bist Atlas."));
 }
 
 /// Stand-in while the next model loads; never answers.
