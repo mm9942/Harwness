@@ -55,8 +55,26 @@ internal class VpnSettingsStore(context: Context) {
         preferences.edit().putString(profileKey, value.toString()).apply()
     }
 
+    // Reserve a separate address block for each service. Mark the last owner
+    // quarantined from this start even if Android killed it without a callback.
+    fun reserveDnsNamespace(now: Long = System.currentTimeMillis()): Int? = synchronized(dnsLock) {
+        val previous = preferences.getInt("dns_namespace", -1)
+        val namespace = (1..DNS_NAMESPACES).asSequence()
+            .map { (previous + it) % DNS_NAMESPACES }
+            .firstOrNull { candidate ->
+                val retiredAt = preferences.getLong("dns_retired_$candidate", 0)
+                candidate != previous && now >= retiredAt && now - retiredAt >= DNS_QUARANTINE_MS
+            } ?: return@synchronized null
+        val update = preferences.edit().putInt("dns_namespace", namespace)
+        if (previous in 0 until DNS_NAMESPACES) update.putLong("dns_retired_$previous", now)
+        if (update.commit()) namespace else null
+    }
+
     companion object {
         private const val MAX_RULES = 4096
+        private const val DNS_NAMESPACES = 30
+        private const val DNS_QUARANTINE_MS = 300_000L
+        private val dnsLock = Any()
     }
 }
 

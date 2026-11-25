@@ -179,7 +179,8 @@ internal class HarwVpnService : VpnService() {
         if (hubClaimed) return true
         return runCatching {
             System.loadLibrary("harw_mobile_ffi")
-            nativeSetHubGate(hubToken, true)
+            val namespace = store.reserveDnsNamespace() ?: return false
+            check(nativeSetHubGate(hubToken, true, namespace))
             hubOwner = hubToken
             hubClaimed = true
         }.isSuccess
@@ -199,7 +200,7 @@ internal class HarwVpnService : VpnService() {
 
     private fun releaseHub() {
         if (!hubClaimed) return
-        nativeSetHubGate(hubToken, false)
+        nativeSetHubGate(hubToken, false, 0)
         if (hubOwner == hubToken) hubOwner = 0
         hubClaimed = false
     }
@@ -376,7 +377,7 @@ internal class HarwVpnService : VpnService() {
         hubToken: Long,
         onion: String,
     ): Long
-    private external fun nativeSetHubGate(token: Long, enabled: Boolean)
+    private external fun nativeSetHubGate(token: Long, enabled: Boolean, namespace: Int): Boolean
     private external fun nativeStop(id: Long)
 
     companion object {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -6,7 +7,8 @@ use smoltcp::socket::tcp::State;
 use smoltcp::time::Instant as StackInstant;
 
 use super::{
-    Destination, DialTicket, FlowKey, PacketAction, PacketError, PacketRouter, Policy, TcpStack,
+    Destination, DialTicket, DnsLeases, FlowKey, PacketAction, PacketError, PacketRouter, Policy,
+    TcpStack,
 };
 
 const DNS_TCP_MESSAGE_MAX: usize = 4096;
@@ -49,9 +51,13 @@ pub struct TunnelEngine {
 
 impl TunnelEngine {
     pub fn new(policy: Policy, epoch: Instant, seed: u64) -> Self {
+        Self::with_dns(policy, epoch, seed, Arc::default())
+    }
+
+    pub fn with_dns(policy: Policy, epoch: Instant, seed: u64, dns: Arc<Mutex<DnsLeases>>) -> Self {
         Self {
             epoch,
-            router: PacketRouter::new(policy),
+            router: PacketRouter::with_dns(policy, dns),
             tcp: TcpStack::new(StackInstant::from_millis(0), seed),
             flows: HashMap::new(),
         }
@@ -327,7 +333,7 @@ mod tests {
             u16::from_be_bytes([payload[0], payload[1]]) as usize,
             payload.len() - 2
         );
-        assert_eq!(&payload[payload.len() - 4..], &[198, 18, 0, 1]);
+        assert_eq!(&payload[payload.len() - 4..], &[198, 18, 0, 0]);
     }
 
     #[test]

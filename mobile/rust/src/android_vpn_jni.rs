@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use harw_onion::{OnionClientConfig, OnionLocator, ProtectedOnionClient, RelaySocketProtector};
 use harw_vpn::vpn::{
-    FlowKey, PacketIo, Policy, RouteMode, Scope, TunnelEngine, dial_with_arti, run_tunnel,
+    DnsLeases, FlowKey, PacketIo, Policy, RouteMode, Scope, TunnelEngine, dial_with_arti,
+    run_tunnel,
 };
 use jni::objects::{Global, JByteArray, JObject, JString};
 use jni::{EnvUnowned, JValue, JavaVM, Outcome, errors, jni_sig, jni_str};
@@ -35,6 +36,7 @@ struct HubOwner {
     token: i64,
     locator: Option<OnionLocator>,
     client: Weak<ProtectedOnionClient>,
+    dns: Arc<Mutex<DnsLeases>>,
 }
 
 pub(crate) fn hub_is_held() -> bool {
@@ -74,18 +76,28 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeSetHubGate(
     _service: JObject<'_>,
     token: i64,
     enabled: jni::sys::jboolean,
-) {
-    if let Ok(mut hub) = HUB.lock() {
-        if enabled {
-            *hub = Some(HubOwner {
-                token,
-                locator: None,
-                client: Weak::new(),
-            });
-        } else if hub.as_ref().is_some_and(|owner| owner.token == token) {
-            *hub = None;
-        }
+    namespace: i32,
+) -> jni::sys::jboolean {
+    let Ok(mut hub) = HUB.lock() else {
+        return false;
+    };
+    if enabled {
+        let Some(dns) = u8::try_from(namespace)
+            .ok()
+            .and_then(DnsLeases::in_namespace)
+        else {
+            return false;
+        };
+        *hub = Some(HubOwner {
+            token,
+            locator: None,
+            client: Weak::new(),
+            dns: Arc::new(Mutex::new(dns)),
+        });
+    } else if hub.as_ref().is_some_and(|owner| owner.token == token) {
+        *hub = None;
     }
+    true
 }
 
 fn attach_hub(token: i64, locator: OnionLocator, client: &Arc<ProtectedOnionClient>) -> bool {
@@ -394,7 +406,16 @@ async fn run(
             retry = (retry * 2).min(Duration::from_secs(30));
         }
     });
-    let engine = TunnelEngine::new(policy, Instant::now(), seed);
+    let dns = HUB.lock().ok().and_then(|hub| {
+        hub.as_ref()
+            .filter(|owner| owner.token == hub_token)
+            .map(|owner| owner.dns.clone())
+    });
+    let Some(dns) = dns else {
+        bootstrap.abort();
+        return TOR_FAILED;
+    };
+    let engine = TunnelEngine::with_dns(policy, Instant::now(), seed, dns);
     let result = run_tunnel(
         tun,
         engine,

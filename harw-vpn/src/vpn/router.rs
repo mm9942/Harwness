@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -20,14 +21,18 @@ pub enum PacketAction {
 
 pub struct PacketRouter {
     session: VpnSession,
-    dns: DnsLeases,
+    dns: Arc<Mutex<DnsLeases>>,
 }
 
 impl PacketRouter {
     pub fn new(policy: Policy) -> Self {
+        Self::with_dns(policy, Arc::default())
+    }
+
+    pub(super) fn with_dns(policy: Policy, dns: Arc<Mutex<DnsLeases>>) -> Self {
         Self {
             session: VpnSession::new(policy),
-            dns: DnsLeases::default(),
+            dns,
         }
     }
 
@@ -37,7 +42,7 @@ impl PacketRouter {
 
     /// DNS-over-TCP actors pass each unframed message to this local resolver.
     pub fn resolve_dns_message(&mut self, message: &[u8]) -> Option<Bytes> {
-        self.dns.answer(message)
+        self.dns.lock().ok()?.answer(message)
     }
 
     pub fn ingress(
@@ -52,8 +57,7 @@ impl PacketRouter {
         if is_local_dns(flow.destination) {
             return Ok(match packet.transport {
                 Transport::Udp { payload } => self
-                    .dns
-                    .answer(payload)
+                    .resolve_dns_message(payload)
                     .map(|message| PacketAction::Reply(udp_reply(flow, &message)))
                     .unwrap_or(PacketAction::Drop),
                 Transport::Tcp { initial_syn } => PacketAction::LocalDnsTcp(flow, initial_syn),
@@ -82,7 +86,7 @@ impl PacketRouter {
     }
 
     fn destination(&self, address: SocketAddr) -> Option<Destination> {
-        if let Some(host) = self.dns.lookup(address.ip()) {
+        if let Some(host) = self.dns.lock().ok()?.lookup(address.ip()) {
             if host.ends_with(".onion") {
                 return OnionLocator::new(host, address.port())
                     .ok()
@@ -271,9 +275,9 @@ mod tests {
             0
         );
         assert!(matches!(
-            router.destination(([198, 18, 0, 1], 443).into()),
+            router.destination(([198, 18, 0, 0], 443).into()),
             Some(Destination::PublicName { host, port: 443 }) if host == "example.com"
         ));
-        assert!(router.destination(([198, 18, 0, 2], 443).into()).is_none());
+        assert!(router.destination(([198, 18, 0, 1], 443).into()).is_none());
     }
 }

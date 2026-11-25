@@ -8,17 +8,28 @@ use harw_onion::OnionLocator;
 pub const DNS_V4: Ipv4Addr = Ipv4Addr::new(198, 19, 255, 254);
 pub const DNS_V6: Ipv6Addr = Ipv6Addr::new(0xfd68, 0x6172, 0x7700, 0, 0, 0, 0, 0xfffe);
 const MAX_LEASES: usize = 4096;
+pub const DNS_NAMESPACE_COUNT: u8 = 30;
 const TTL_SECONDS: u32 = 30;
 
 /// Maps synthetic destinations back to names without consulting another resolver.
 /// Slots are never assigned to another name while this instance owns the TUN.
 #[derive(Default)]
 pub struct DnsLeases {
+    namespace: u8,
     index: HashMap<Arc<str>, u16>,
     names: Vec<Arc<str>>,
 }
 
 impl DnsLeases {
+    /// A namespace is reserved across the service lifetime. A newly established
+    /// service must reserve a different namespace until stale answers age out.
+    pub fn in_namespace(namespace: u8) -> Option<Self> {
+        (namespace < DNS_NAMESPACE_COUNT).then(|| Self {
+            namespace,
+            ..Self::default()
+        })
+    }
+
     /// Handle one DNS message, excluding UDP or TCP framing.
     pub fn answer(&mut self, query: &[u8]) -> Option<Bytes> {
         let header = query.get(..12)?;
@@ -44,9 +55,9 @@ impl DnsLeases {
             (
                 0,
                 Some(if qtype == 1 {
-                    IpAddr::V4(ipv4(slot))
+                    IpAddr::V4(ipv4(self.namespace, slot))
                 } else {
-                    IpAddr::V6(ipv6(slot))
+                    IpAddr::V6(ipv6(self.namespace, slot))
                 }),
             )
         } else {
@@ -82,16 +93,19 @@ impl DnsLeases {
     pub fn lookup(&self, address: IpAddr) -> Option<&str> {
         let slot = match address {
             IpAddr::V4(address) => {
-                let [198, 18, high, low] = address.octets() else {
+                let [198, network @ (18 | 19), high, low] = address.octets() else {
                     return None;
                 };
-                u16::from_be_bytes([high, low])
+                let offset = usize::from(network - 18) * 65536
+                    + usize::from(u16::from_be_bytes([high, low]));
+                (offset / MAX_LEASES == usize::from(self.namespace))
+                    .then_some(u16::try_from(offset % MAX_LEASES + 1).ok()?)?
             }
             IpAddr::V6(address) => {
-                let [0xfd68, 0x6172, 0x7700, 0, 0, 0, 0, slot] = address.segments() else {
+                let [0xfd68, 0x6172, 0x7700, 0, 0, 0, namespace, slot] = address.segments() else {
                     return None;
                 };
-                slot
+                (namespace == u16::from(self.namespace)).then_some(slot)?
             }
         };
         self.names
@@ -114,13 +128,15 @@ impl DnsLeases {
     }
 }
 
-fn ipv4(slot: u16) -> Ipv4Addr {
-    let [high, low] = slot.to_be_bytes();
-    Ipv4Addr::new(198, 18, high, low)
+fn ipv4(namespace: u8, slot: u16) -> Ipv4Addr {
+    let address = usize::from(namespace) * MAX_LEASES + usize::from(slot) - 1;
+    let network = 18 + (address >> 16) as u8;
+    let [high, low] = (address as u16).to_be_bytes();
+    Ipv4Addr::new(198, network, high, low)
 }
 
-fn ipv6(slot: u16) -> Ipv6Addr {
-    Ipv6Addr::new(0xfd68, 0x6172, 0x7700, 0, 0, 0, 0, slot)
+fn ipv6(namespace: u8, slot: u16) -> Ipv6Addr {
+    Ipv6Addr::new(0xfd68, 0x6172, 0x7700, 0, 0, 0, u16::from(namespace), slot)
 }
 
 fn read_u16(bytes: &[u8]) -> u16 {
@@ -188,11 +204,11 @@ mod tests {
         let mut dns = DnsLeases::default();
         let a = dns.answer(&query("Example.COM", 1)).unwrap();
         let aaaa = dns.answer(&query("example.com", 28)).unwrap();
-        assert_eq!(&a[a.len() - 4..], &ipv4(1).octets());
-        assert_eq!(&aaaa[aaaa.len() - 16..], &ipv6(1).octets());
-        assert_eq!(dns.lookup(ipv4(1).into()), Some("example.com"));
-        assert_eq!(dns.lookup(ipv6(1).into()), Some("example.com"));
-        assert_eq!(dns.lookup(ipv4(2).into()), None);
+        assert_eq!(&a[a.len() - 4..], &ipv4(0, 1).octets());
+        assert_eq!(&aaaa[aaaa.len() - 16..], &ipv6(0, 1).octets());
+        assert_eq!(dns.lookup(ipv4(0, 1).into()), Some("example.com"));
+        assert_eq!(dns.lookup(ipv6(0, 1).into()), Some("example.com"));
+        assert_eq!(dns.lookup(ipv4(0, 2).into()), None);
     }
 
     #[test]
@@ -201,7 +217,7 @@ mod tests {
         let onion = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion";
         let answer = dns.answer(&query(onion, 1)).unwrap();
         assert_eq!(answer[7], 1);
-        assert_eq!(dns.lookup(ipv4(1).into()), Some(onion));
+        assert_eq!(dns.lookup(ipv4(0, 1).into()), Some(onion));
         for name in [
             "wrong.onion",
             "device.local",
@@ -212,6 +228,18 @@ mod tests {
             let response = dns.answer(&query(name, 1)).unwrap();
             assert_eq!(response[3] & 0x0f, 3);
         }
+    }
+
+    #[test]
+    fn replacement_namespace_cannot_reinterpret_old_answers() {
+        let mut old = DnsLeases::in_namespace(8).unwrap();
+        let mut new = DnsLeases::in_namespace(9).unwrap();
+        old.answer(&query("old.example.com", 1)).unwrap();
+        new.answer(&query("new.example.com", 1)).unwrap();
+        assert_eq!(old.lookup(ipv4(8, 1).into()), Some("old.example.com"));
+        assert_eq!(new.lookup(ipv4(9, 1).into()), Some("new.example.com"));
+        assert_eq!(new.lookup(ipv4(8, 1).into()), None);
+        assert_eq!(new.lookup(ipv6(8, 1).into()), None);
     }
 
     #[test]

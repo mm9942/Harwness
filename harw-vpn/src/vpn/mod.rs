@@ -12,7 +12,7 @@ mod tun;
 
 #[cfg(all(feature = "embedded-arti", unix))]
 pub use arti::dial_with_arti;
-pub use dns::{DNS_V4, DNS_V6, DnsLeases};
+pub use dns::{DNS_NAMESPACE_COUNT, DNS_V4, DNS_V6, DnsLeases};
 pub use engine::{Ingress, StreamRead, TunnelEngine};
 pub use flow::{FLOW_CAPACITY, FLOW_DIRECTION_BYTES, FlowBuffer, STREAM_CHUNK_BYTES};
 pub use policy::{Destination, Policy, RouteMode, Scope};
