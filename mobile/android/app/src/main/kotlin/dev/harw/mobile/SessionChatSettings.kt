@@ -26,6 +26,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -314,6 +315,7 @@ private fun ScopedChatSettings(
                             )
                         }
                         localVisionHint?.invoke()
+                        LocalChatVisionPolicy(sessionId, canChangeModel)
                     } else if (state.manage.support != null) {
                         AssistChip(
                             onClick = openModels,
@@ -422,4 +424,56 @@ private fun ScopedChatSettings(
     if (active && apiImageEditOpen && chatVisionScope != null) {
         ApiImageEditDialog(isCurrentChat = isCurrentImageEditChat, onClose = { apiImageEditOpen = false })
     }
+}
+
+/** The actual GGUF chat input mode, not the separate manual description tool. */
+@Composable
+private fun LocalChatVisionPolicy(sessionId: String, canChange: () -> Boolean) {
+    val context = LocalContext.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var reload by remember(sessionId) { mutableIntStateOf(0) }
+    var busy by remember(sessionId) { mutableStateOf(false) }
+    var error by remember(sessionId) { mutableStateOf<String?>(null) }
+    val direct by androidx.compose.runtime.produceState<Boolean?>(null, sessionId, reload) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                uniffi.harw_mobile_ffi.ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context))
+                    .chatDirectVision(sessionId)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                error = e.message ?: "Bildmodus konnte nicht gelesen werden"
+                null
+            }
+        }
+    }
+    Text("GGUF-Bildeingabe", style = MaterialTheme.typography.titleSmall)
+    TextButton(enabled = !busy && direct != null && canChange(), onClick = {
+        val next = !(direct ?: return@TextButton)
+        if (!canChange()) return@TextButton
+        scope.launch {
+            busy = true
+            try {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    uniffi.harw_mobile_ffi.ProviderStore(context.filesDir.path, AndroidPlatformKeystore(context))
+                        .setChatDirectVision(sessionId, next)
+                }
+                error = null
+                reload++
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                error = e.message ?: "Bildmodus konnte nicht gespeichert werden"
+            } finally {
+                busy = false
+            }
+        }
+    }) {
+        Text(when (direct) {
+            true -> "Direkt multimodal · wechseln"
+            false -> "Lokale Bildbeschreibung · wechseln"
+            null -> "Bildmodus wird gelesen …"
+        })
+    }
+    Text("Direkt: bis zu vier neue Bilder pro Nachricht im Modellprompt. Beschreibung: lokale Einzelanalyse vor der Antwort. Gilt nur für lokale GGUF-Chats.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
 }

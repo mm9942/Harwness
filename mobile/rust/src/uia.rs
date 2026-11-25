@@ -319,6 +319,9 @@ struct Assignments {
     /// Missing means inherit the profile route. Existing backups are valid.
     #[serde(default)]
     models: BTreeMap<String, String>,
+    /// Only explicit local caption overrides are stored; direct is the default.
+    #[serde(default)]
+    caption_chats: std::collections::BTreeSet<String>,
 }
 
 fn assign_path(home: &AppHome) -> PathBuf {
@@ -371,6 +374,43 @@ pub(crate) fn set_chat_model(
         None => { assign.models.remove(session_id); }
     }
     write_assign(home, &mut assign)
+}
+
+pub(crate) fn chat_direct_vision(home: &AppHome, session_id: &str) -> Result<bool, MobileError> {
+    check_key(session_id)?;
+    Ok(!read_assign_checked(home)?.caption_chats.contains(session_id))
+}
+
+pub(crate) fn set_chat_direct_vision(home: &AppHome, session_id: &str, direct: bool) -> Result<(), MobileError> {
+    check_key(session_id)?;
+    let _guard = ASSIGNMENT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut assign = read_assign_checked(home)?;
+    if direct {
+        assign.caption_chats.remove(session_id);
+    } else {
+        if !assign.caption_chats.contains(session_id) && assign.caption_chats.len() >= MAX_ASSIGNMENTS {
+            return Err(rejected("Zu viele Chat-Bildzuordnungen."));
+        }
+        assign.caption_chats.insert(session_id.to_owned());
+    }
+    write_assign(home, &mut assign)
+}
+
+#[cfg(test)]
+#[test]
+fn direct_vision_default_and_caption_override_are_independent() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let dir = tempfile::tempdir()?;
+    let home = AppHome::open(dir.path())?;
+    assert!(chat_direct_vision(&home, "one")?);
+    set_chat_direct_vision(&home, "one", false)?;
+    set_chat_model(&home, "two", Some("local-gguf/qwen".into()))?;
+    let reopened = AppHome::open(dir.path())?;
+    assert!(!chat_direct_vision(&reopened, "one")?);
+    assert!(chat_direct_vision(&reopened, "two")?);
+    set_chat_direct_vision(&reopened, "one", true)?;
+    assert!(chat_direct_vision(&reopened, "one")?);
+    assert_eq!(chat_model(&reopened, "two")?.as_deref(), Some("local-gguf/qwen"));
+    Ok(())
 }
 
 fn write_assign(home: &AppHome, assign: &mut Assignments) -> Result<(), MobileError> {

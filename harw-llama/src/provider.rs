@@ -439,6 +439,10 @@ const MAX_SHOWN_IMAGES: usize = 3;
 /// Most images a message may name for a re-view.
 const MAX_REFERENCED_IMAGES: usize = 4;
 
+/// The ordinary direct-vision chat admits at most this many images per prompt,
+/// including newly attached images. Captions remain a separate explicit mode.
+const MAX_DIRECT_IMAGES: usize = MAX_REFERENCED_IMAGES;
+
 /// Image numbers a user text refers to: "Bild 2", "image 3", "das erste Bild".
 fn referenced_images(text: &str) -> Vec<usize> {
     const ORDINALS: [(&str, usize); 5] = [
@@ -568,25 +572,69 @@ fn visible_images(
     referenced.extend_from_slice(extra_refs);
     referenced.sort_unstable();
     referenced.dedup();
+    let latest_user = items.iter().rposition(|item| matches!(item, ModelMessage::User { .. }));
+    select_visible_images(numbered, latest_user, &referenced)
+}
+
+fn select_visible_images(
+    numbered: &[(usize, usize, bool)],
+    latest_user: Option<usize>,
+    referenced: &[usize],
+) -> HashSet<(usize, usize)> {
     let mut visible = HashSet::new();
-    let by_reference: Vec<_> = referenced
-        .iter()
-        .filter_map(|number| numbered.get(number.wrapping_sub(1)))
-        .filter(|(_, _, has_data)| *has_data)
-        .take(MAX_REFERENCED_IMAGES)
-        .collect();
-    if by_reference.is_empty() {
-        for (index, n, has_data) in numbered.iter().rev().take(MAX_SHOWN_IMAGES) {
-            if *has_data {
-                visible.insert((*index, *n));
-            }
+    // New attachments take precedence over historical references. Never let
+    // "compare with image 1" silently replace the image just attached.
+    for &(index, n, has_data) in numbered {
+        if Some(index) == latest_user && has_data && visible.len() < MAX_DIRECT_IMAGES {
+            visible.insert((index, n));
         }
-    } else {
-        for (index, n, _) in by_reference {
-            visible.insert((*index, *n));
+    }
+    for &number in referenced {
+        if visible.len() >= MAX_DIRECT_IMAGES { break; }
+        if let Some(&(index, n, true)) = numbered.get(number.wrapping_sub(1)) {
+            visible.insert((index, n));
+        }
+    }
+    if referenced.is_empty() {
+        for &(index, n, has_data) in numbered.iter().rev() {
+            if visible.len() >= MAX_SHOWN_IMAGES { break; }
+            if has_data { visible.insert((index, n)); }
         }
     }
     visible
+}
+
+fn validate_latest_chat_images(
+    items: &[ModelMessage],
+    supports_vision: bool,
+    direct: bool,
+) -> Result<(), ModelError> {
+    let Some(images) = items.iter().rev().find_map(|item| match item {
+        ModelMessage::User { images, .. } => Some(images),
+        _ => None,
+    }) else { return Ok(()); };
+    validate_latest_image_slots(images.iter().map(|image| image.data.is_some()), supports_vision, direct)
+}
+
+fn validate_latest_image_slots(
+    available: impl IntoIterator<Item = bool>,
+    supports_vision: bool,
+    direct: bool,
+) -> Result<(), ModelError> {
+    let mut count = 0;
+    for present in available {
+        count += 1;
+        if !present {
+            return Err(ModelError::RequestFailed("Ein angehängtes Bild ist nicht verfügbar. Bitte erneut anhängen.".into()));
+        }
+    }
+    if count > 0 && !supports_vision {
+        return Err(ModelError::RequestFailed("Dieses GGUF-Modell hat keinen geladenen Vision-Projektor. Bitte den passenden Projektor installieren oder ein anderes Modell wählen.".into()));
+    }
+    if direct && count > MAX_DIRECT_IMAGES {
+        return Err(ModelError::RequestFailed(format!("Direktes Bildverständnis unterstützt höchstens {MAX_DIRECT_IMAGES} neue Bilder pro Nachricht. Wähle Bildbeschreibung oder sende weniger Bilder.")));
+    }
+    Ok(())
 }
 
 struct ChatImageRendering<'a> {
@@ -757,8 +805,9 @@ impl LocalGgufProvider {
         forced: &[usize],
         described: &HashMap<usize, String>,
         chat_persona: Option<&str>,
+        describe_mode: bool,
     ) -> Result<Job, ModelError> {
-        self.prepare_with_private_image(request, forced, described, None, chat_persona)
+        self.prepare_with_private_image(request, forced, described, None, chat_persona, describe_mode)
     }
 
     /// One explicit in-memory image on the latest user turn, without registering
@@ -809,7 +858,7 @@ impl LocalGgufProvider {
         }
         let turn = self.config.inference.begin(request.cancel.as_ref()).await
             .ok_or(ModelError::Cancelled)?;
-        let job = self.prepare_with_private_image(&request, &[], &HashMap::new(), Some(Box::new(jpeg)), None)?;
+        let job = self.prepare_with_private_image(&request, &[], &HashMap::new(), Some(Box::new(jpeg)), None, false)?;
         let (handle, _abort_on_drop) =
             self.spawn_job_with_signal(job, &turn, first_output);
         let generated = handle.await
@@ -825,10 +874,8 @@ impl LocalGgufProvider {
         described: &HashMap<usize, String>,
         private_image: Option<Box<dyn AsRef<[u8]> + Send>>,
         chat_persona: Option<&str>,
+        describe_mode: bool,
     ) -> Result<Job, ModelError> {
-        // With a projector every image on the ordinary lean route is described
-        // in its own short pass. The private route uses raw vision instead.
-        let describe_mode = self.config.lean && self.engine.supports_vision();
         let Chat {
             mut messages,
             switch,
@@ -1123,7 +1170,24 @@ impl LocalGgufProvider {
         request: ModelRequest,
         chat_persona: Option<String>,
     ) -> ModelFuture<'_> {
+        self.respond_with_chat_options(request, chat_persona, None)
+    }
+
+    /// Explicit ordinary chat vision policy. None preserves the generic
+    /// provider behavior; Some(true) uses raw image bytes, Some(false)
+    /// uses local captions. Neither mode exports images or uses the vault.
+    pub fn respond_with_chat_options(
+        &self,
+        request: ModelRequest,
+        chat_persona: Option<String>,
+        direct_vision: Option<bool>,
+    ) -> ModelFuture<'_> {
         Box::pin(async move {
+            let vision = self.engine.supports_vision();
+            if let Some(direct) = direct_vision {
+                validate_latest_chat_images(&request.history.to_model_messages(), vision, direct)?;
+            }
+            let describe_mode = vision && direct_vision.map_or(self.config.lean, |direct| !direct);
             let turn = self
                 .config
                 .inference
@@ -1132,13 +1196,13 @@ impl LocalGgufProvider {
                 .ok_or(ModelError::Cancelled)?;
             let mut forced: Vec<usize> = Vec::new();
             let mut round = 0;
-            let described = if self.config.lean && self.engine.supports_vision() {
+            let described = if describe_mode {
                 self.describe_images(&request, &turn).await?
             } else {
                 HashMap::new()
             };
             let (generated, tools, stream) = loop {
-                let job = self.prepare(&request, &forced, &described, chat_persona.as_deref())?;
+                let job = self.prepare(&request, &forced, &described, chat_persona.as_deref(), describe_mode)?;
                 let tools = job.tools.clone();
                 let stream = job.stream.clone();
                 let (handle, _abort_on_drop) = self.spawn_job(job, &turn);
@@ -1380,6 +1444,26 @@ mod tests {
         assert!(apply_lean_chat_persona(&mut messages, true, Some(&"x".repeat(5601))).is_err());
         assert!(apply_lean_chat_persona(&mut messages, true, Some(MEDIA_MARKER)).is_err());
         assert_eq!(messages[0].content, LEAN_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn new_raw_images_take_priority_over_old_references() {
+        let numbered = [(0, 0, true), (2, 0, true), (4, 0, true), (4, 1, true)];
+        let visible = select_visible_images(&numbered, Some(4), &[1]);
+        assert_eq!(visible, HashSet::from([(0, 0), (4, 0), (4, 1)]));
+        let visible = select_visible_images(&numbered, Some(4), &[]);
+        assert!(visible.contains(&(4, 0)) && visible.contains(&(4, 1)));
+        assert_eq!(visible.len(), 3);
+    }
+
+    #[test]
+    fn direct_chat_rejects_missing_projector_missing_bytes_and_excess_images() {
+        assert!(validate_latest_image_slots([true], false, true).is_err());
+        assert!(validate_latest_image_slots([false], true, true).is_err());
+        assert!(validate_latest_image_slots([true; MAX_DIRECT_IMAGES + 1], true, true).is_err());
+        assert!(validate_latest_image_slots([true; MAX_DIRECT_IMAGES], true, true).is_ok());
+        assert!(validate_latest_image_slots([true; MAX_DIRECT_IMAGES + 1], true, false).is_ok());
+        assert!(validate_latest_image_slots([], false, true).is_ok());
     }
 
     #[test]

@@ -588,6 +588,16 @@ impl ProviderStore {
         crate::uia::set_chat_model(&self.home, &session_id, selection)
     }
 
+    /// Local GGUF conversation image policy; independent of standalone
+    /// Library descriptions and private Assistant media.
+    pub fn chat_direct_vision(&self, session_id: String) -> Result<bool, MobileError> {
+        crate::uia::chat_direct_vision(&self.home, &session_id)
+    }
+
+    pub fn set_chat_direct_vision(&self, session_id: String, direct: bool) -> Result<(), MobileError> {
+        crate::uia::set_chat_direct_vision(&self.home, &session_id, direct)
+    }
+
     /// Makes a route and model the active selection.
     pub fn activate_route(&self, route_id: String, model: String) -> Result<(), MobileError> {
         check_id(&route_id).map_err(|_| unknown_route())?;

@@ -748,7 +748,10 @@ impl harw_core::ModelProvider for SwitchingModel {
                     let compact = persona.as_deref().and_then(crate::uia::compact_chat_persona);
                     // Keep the cache locked until the local inference worker
                     // finishes; another chat may not remap the active GGUF.
-                    let response = model.respond_with_chat_persona(request, compact).await;
+                    let direct_vision = session.as_ref().map(|id| {
+                        crate::uia::chat_direct_vision(&self.home, id.as_str())
+                    }).transpose().map_err(|e| harw_core::ModelError::RequestFailed(e.to_string()))?;
+                    let response = model.respond_with_chat_options(request, compact, direct_vision).await;
                     LOCAL_INFERENCE.wait_idle().await;
                     response
                 }
