@@ -61,4 +61,16 @@
     <string name="notification_turn_done_title">Antwort fertig</string>
     <string name="notification_turn_done_text">Eine Session hat ihre Antwort fertig geschrieben</string>
     <string name="model_download_channel">Modell-Downloads</string>
+    <string name="local_backup_title">Lokale Sicherung</string>
+    <string name="local_backup_scope">Anbieter-Einstellungen, lokale Workspace-Chats und UIA-Definitionen sichern. Anmeldedaten, private Tresor-Chats und die private Bibliothek bleiben auf dem Gerät.</string>
+    <string name="local_backup_disconnect">Trenne den lokalen Workspace vor dem Sichern oder Wiederherstellen.</string>
+    <string name="local_backup_export">Lokales Backup erstellen</string>
+    <string name="local_backup_restore">Lokales Backup wiederherstellen</string>
+    <string name="local_backup_restore_detail">Gleichnamige Anbieter-Einstellungen werden ersetzt. Bestehende Chats bleiben erhalten.</string>
+    <string name="local_backup_password">Backup-Passwort (mindestens 12 Zeichen)</string>
+    <string name="local_backup_confirm_password">Backup-Passwort wiederholen</string>
+    <string name="local_backup_exported">Verschlüsseltes Backup gespeichert.</string>
+    <string name="local_backup_restored">%1$d Dateien wiederhergestellt.</string>
+    <string name="local_backup_failed">Backup-Vorgang fehlgeschlagen. Prüfe Datei, Passwort und freien Speicher.</string>
+    <string name="local_backup_disconnect_action">Lokalen Workspace trennen</string>
 </resources>

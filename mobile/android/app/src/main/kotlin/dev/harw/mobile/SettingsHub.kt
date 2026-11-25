@@ -225,6 +225,8 @@ internal fun SettingsHub(
     onOpen: (SettingsRoute) -> Unit,
     diagnosticsConnection: HarwConnection = connection,
     diagnosticsLocal: Boolean = false,
+    localDisconnected: Boolean,
+    disconnectLocal: () -> Unit,
 ) {
     val context = LocalContext.current
     val cloudBlock = manageOpenBlock(state)?.let { stringResource(it) }
@@ -298,6 +300,7 @@ internal fun SettingsHub(
                     openNotificationSettings(context)
                 }
                 AppUpdateHubRow(context)
+                LocalBackupSettings(localDisconnected, disconnectLocal)
                 HubRow(stringResource(R.string.settings_hub_share_diagnostics), stringResource(R.string.settings_hub_share_diagnostics_detail), null) {
                     shareDiagnostic(context, diagnosticReport(state, appVersionOf(context)))
                 }
