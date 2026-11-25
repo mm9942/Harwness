@@ -82,7 +82,10 @@ pub mod anthropic;
 mod anthropic_caps;
 mod anthropic_replay;
 mod azure_foundry;
-pub use azure_foundry::{AzureFoundryChatTokenLimits, azure_foundry_chat_token_limits};
+pub use azure_foundry::{
+    AzureFoundryChatTokenLimits, azure_foundry_chat_token_limits, azure_foundry_vision_deployments,
+    is_azure_foundry_chat,
+};
 pub mod budget;
 pub mod cache_strategy;
 mod chat_reasoning;

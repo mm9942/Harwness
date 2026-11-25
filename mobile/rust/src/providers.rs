@@ -86,6 +86,13 @@ pub fn active_local_model(files_dir: String) -> Result<Option<String>, MobileErr
     AppHome::open(std::path::Path::new(&files_dir))?.active_local_model()
 }
 
+/// Record the app's configured GGUF directory independently of chat routing.
+#[uniffi::export]
+pub fn configure_local_models_dir(files_dir: String, models_dir: String) -> Result<(), MobileError> {
+    crate::models::local_models(models_dir.clone())?;
+    AppHome::open(std::path::Path::new(&files_dir))?.set_local_models_dir(&models_dir)
+}
+
 /// Provider routes, their secrets and the active selection.
 #[derive(uniffi::Object)]
 pub struct ProviderStore {
@@ -349,6 +356,7 @@ impl ProviderStore {
                     .map_err(secret_failure)?;
             }
             write_private_atomic(&self.route_path(&prepared.id), prepared.text.as_bytes())?;
+            self.ensure_model_files(&prepared.id, &prepared.provider, None);
             validation.saved = true;
         }
         Ok(validation)
@@ -684,7 +692,25 @@ impl ProviderStore {
             None if clean.kind == ProviderKind::OpenAiCompatible => (None, None, false),
             None => return Err("an API key is required for this provider".to_owned()),
         };
-        let (text, provider) = render_route(&clean, with_auth)?;
+        let (mut text, mut provider) = render_route(&clean, with_auth)?;
+        #[cfg(feature = "local-host")]
+        if harw_provider_http::is_azure_foundry_chat(&clean.id, &clean.base_url)
+            && let Some((_, previous)) = existing.iter().find(|(id, route)| {
+                id == &clean.id && route.base_url == clean.base_url && route.api == provider.api
+            })
+        {
+            for model in &previous.models {
+                if !provider.models.iter().any(|id| id.eq_ignore_ascii_case(model)) {
+                    provider.models.push(model.clone());
+                }
+            }
+            let mut table: toml::Table = toml::from_str(&text)
+                .map_err(|_| "the rendered provider route is invalid".to_owned())?;
+            table.insert("models".to_owned(), toml::Value::try_from(&provider.models)
+                .map_err(|_| "could not render the provider model list".to_owned())?);
+            text = toml::to_string(&table)
+                .map_err(|_| "could not render the provider route".to_owned())?;
+        }
         Ok(Prepared {
             id: clean.id,
             text,
@@ -908,12 +934,21 @@ fn render_route(clean: &CleanRoute, with_auth: bool) -> Result<(String, Provider
             toml::Value::String(format!("secrets:{}", route_slot(&clean.id))),
         );
     }
-    let models = if clean.model.is_empty() {
-        Vec::new()
-    } else {
-        vec![toml::Value::String(clean.model.clone())]
-    };
-    table.insert("models".to_owned(), toml::Value::Array(models));
+    let mut models: Vec<_> = std::iter::once(clean.model.clone())
+        .filter(|model| !model.is_empty())
+        .collect();
+    #[cfg(feature = "local-host")]
+    if clean.kind == ProviderKind::OpenAiCompatible
+        && harw_provider_http::is_azure_foundry_chat(&clean.id, &clean.base_url)
+    {
+        for model in harw_provider_http::azure_foundry_vision_deployments() {
+            if !models.iter().any(|existing| existing.eq_ignore_ascii_case(model)) {
+                models.push(model.to_owned());
+            }
+        }
+    }
+    table.insert("models".to_owned(), toml::Value::try_from(models)
+        .map_err(|_| "could not render the provider model list".to_owned())?);
     let text =
         toml::to_string(&table).map_err(|_| "could not render the provider route".to_owned())?;
     let provider = toml::from_str::<ProviderToml>(&text)
@@ -1123,6 +1158,17 @@ impl ProviderStore {
             table.insert("id".into(), toml::Value::String(model.clone()));
             table.insert("provider".into(), toml::Value::String(route_id.to_owned()));
             table.insert("context_window".into(), toml::Value::Integer(window as i64));
+            #[cfg(feature = "local-host")]
+            if provider.api == API_OPENAI_CHAT
+                && harw_provider_http::is_azure_foundry_chat(route_id, &provider.base_url)
+                && harw_provider_http::azure_foundry_vision_deployments()
+                    .any(|id| model.eq_ignore_ascii_case(id))
+            {
+                table.insert("input_types".into(), toml::Value::Array(vec![
+                    toml::Value::String("text".into()),
+                    toml::Value::String("image".into()),
+                ]));
+            }
             if let Ok(rendered) = toml::to_string(&table) {
                 let _ = write_private_atomic(&path, rendered.as_bytes());
             }

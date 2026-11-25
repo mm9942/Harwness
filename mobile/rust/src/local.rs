@@ -221,6 +221,7 @@ struct VisionFiles {
 #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
 pub(crate) struct PinnedPrivateAssistantVision {
     selected: (String, VisionFiles),
+    explicit_model: bool,
     home: crate::home::AppHome,
     model: Arc<harw_llama::LocalGgufProvider>,
     _mapping: tokio::sync::OwnedMutexGuard<()>,
@@ -229,7 +230,26 @@ pub(crate) struct PinnedPrivateAssistantVision {
 #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
 impl PinnedPrivateAssistantVision {
     pub(crate) fn is_current(&self) -> bool {
-        private_assistant_vision_selection(&self.home).as_ref() == Some(&self.selected)
+        private_assistant_vision_selection(
+            &self.home, self.explicit_model.then_some(self.selected.0.as_str()),
+        ).as_ref() == Some(&self.selected)
+    }
+
+    pub(crate) async fn describe_library_image(
+        self,
+        image: Arc<[u8]>,
+        cancel: &harw_types::cancel::CancelToken,
+        on_result: &(dyn Fn(harw_llama::LocalImageDescription) + Send + Sync),
+    ) -> Result<(), harw_core::ModelError> {
+        if !self.is_current() || cancel.is_cancelled() {
+            return Err(harw_core::ModelError::Cancelled);
+        }
+        let result = self.model.describe_selected_images(vec![(1, image)], cancel, on_result).await;
+        LOCAL_INFERENCE.wait_idle().await;
+        if !self.is_current() || cancel.is_cancelled() {
+            return Err(harw_core::ModelError::Cancelled);
+        }
+        result
     }
 
     /// Consume the pin. Dispatch cannot load/reselect an engine or fall back
@@ -255,12 +275,17 @@ impl PinnedPrivateAssistantVision {
 
 /// Exact files of the active local profile and explicitly selected GGUF.
 #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
-fn private_assistant_vision_selection(home: &crate::home::AppHome) -> Option<(String, VisionFiles)> {
+fn private_assistant_vision_selection(
+    home: &crate::home::AppHome, model: Option<&str>,
+) -> Option<(String, VisionFiles)> {
     let active = harw_home::active_profile_name(home.home());
     if harw_home::profile_dir(home.home(), &active).ok().as_deref() != Some(home.profile_dir()) {
         return None;
     }
-    let id = home.active_local_model().ok()??;
+    let id = match model {
+        Some(id) => id.to_owned(),
+        None => home.active_local_model().ok()??,
+    };
     let dir = home.local_models_dir()?;
     let projector = crate::models::vision_path_in(std::path::Path::new(&dir), &id)?;
     let model = crate::models::model_path(dir, id.clone()).ok()?;
@@ -388,13 +413,16 @@ impl SwitchingModel {
     /// Pin the locally selected GGUF without constructing or falling back to
     /// an HTTP provider, even if the profile changes while loading.
     pub(crate) async fn pin_local_assistant_model(
-        &self,
+        &self, selected: Option<&str>,
     ) -> Result<Arc<dyn harw_core::ModelProvider>, MobileError> {
         let missing = || MobileError::Session {
             detail: "Wähle zuerst ein lokales GGUF-Modell".into(),
         };
         let selected_file = || -> Result<(String, VisionFileFingerprint), MobileError> {
-            let id = self.home.active_local_model()?.ok_or_else(missing)?;
+            let id = match selected {
+                Some(id) => id.to_owned(),
+                None => self.home.active_local_model()?.ok_or_else(missing)?,
+            };
             let dir = self.home.local_models_dir().ok_or_else(missing)?;
             let path = crate::models::model_path(dir, id.clone()).map_err(|_| missing())?;
             let file = vision_file_fingerprint(&path).ok_or_else(missing)?;
@@ -432,12 +460,12 @@ impl SwitchingModel {
     /// before a durable inference attempt can be created.
     #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
     pub(crate) async fn pin_private_assistant_vision(
-        &self, cancel: &harw_core::cancel::CancelToken,
+        &self, cancel: &harw_core::cancel::CancelToken, model_id: Option<&str>,
     ) -> Result<PinnedPrivateAssistantVision, crate::uia_room::PrivateVisionError> {
         use crate::uia_room::PrivateVisionError::{Busy, Cancelled, Model};
         use harw_core::ModelProvider as _;
 
-        let selected = private_assistant_vision_selection(&self.home).ok_or(Model)?;
+        let selected = private_assistant_vision_selection(&self.home, model_id).ok_or(Model)?;
         let wanted = ModelCacheKey::PrivateAssistantVision(selected.0.clone(), selected.1.clone());
         let mut current = self.current.try_lock().map_err(|_| Busy)?;
         let mut mapping = Arc::clone(&LOCAL_MODEL_LIFECYCLE).try_lock_owned().map_err(|_| Busy)?;
@@ -470,7 +498,7 @@ impl SwitchingModel {
             *current = (wanted, None, None, built);
         }
         if cancel.is_cancelled() { return Err(Cancelled); }
-        if private_assistant_vision_selection(&self.home).as_ref() != Some(&selected) {
+        if private_assistant_vision_selection(&self.home, model_id).as_ref() != Some(&selected) {
             return Err(Model);
         }
         let CachedProvider::Local { model, vision_files: Some(files), .. } = &current.3 else {
@@ -485,8 +513,20 @@ impl SwitchingModel {
         let model = Arc::clone(model);
         drop(current);
         Ok(PinnedPrivateAssistantVision {
-            selected, home: self.home.clone(), model, _mapping: mapping,
+            selected, explicit_model: model_id.is_some(), home: self.home.clone(), model, _mapping: mapping,
         })
+    }
+
+    #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+    pub(crate) fn private_library_vision_models(&self) -> Result<Vec<String>, MobileError> {
+        let Some(dir) = self.home.local_models_dir() else {
+            return Ok(Vec::new());
+        };
+        Ok(crate::models::local_models(dir.clone())?.into_iter()
+            .filter_map(|model| {
+                private_assistant_vision_selection(&self.home, Some(&model.id)).map(|(id, _)| id)
+            })
+            .collect())
     }
 
     pub(crate) fn session_title_local_choices(&self) -> Result<Vec<crate::SessionTitleLocalChoice>, MobileError> {
@@ -571,9 +611,6 @@ impl SwitchingModel {
     ) -> Option<(&'a harw_llama::LocalGgufProvider, u64)> {
         use harw_core::ModelProvider as _;
 
-        let ModelCacheKey::Route(Some((provider, model_id))) = key else {
-            return None;
-        };
         let CachedProvider::Local {
             model,
             vision_files: Some(loaded_files),
@@ -582,9 +619,17 @@ impl SwitchingModel {
         else {
             return None;
         };
-        if provider != crate::home::LOCAL_ROUTE_ID
-            || model_id != selected
+        let matches_selection = match key {
+            ModelCacheKey::Route(Some((provider, id))) => {
+                provider == crate::home::LOCAL_ROUTE_ID && id == selected
+            }
+            #[cfg(all(feature = "vault-uia-chat", target_os = "android"))]
+            ModelCacheKey::PrivateAssistantVision(id, files) => id == selected && files == loaded_files,
+            _ => false,
+        };
+        if !matches_selection
             || self.home.active_local_model().ok()?.as_deref() != Some(selected)
+            || model.pinned_provider_id().as_deref() != Some(harw_llama::LOCAL_PROVIDER_ID)
             || model.pinned_model_id()?.as_str() != selected
             || !model.supports_vision()
         {

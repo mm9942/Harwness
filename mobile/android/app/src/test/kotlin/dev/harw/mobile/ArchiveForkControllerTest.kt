@@ -27,14 +27,13 @@ class ArchiveForkControllerTest {
         }
         override suspend fun describe(at: ArchiveAttachment, checkpointId: String) = issued
         override suspend fun page(at: ArchiveAttachment, request: ArchivePageRequest): ArchivePage {
-            assertEquals(200u.toUShort(), request.limit)
+            assertEquals(64u.toUShort(), request.limit)
             assertEquals("source", request.sessionId)
             assertEquals("historical", request.checkpointId)
-            return pageReply?.invoke(request) ?: when (request.beforeSequence) {
-                null -> ArchivePage("source", "historical", (201..400).map(::row), 201uL)
-                201uL -> ArchivePage("source", "historical", (1..200).map(::row), null)
-                else -> error("unrequested cursor")
-            }
+            pageReply?.invoke(request)?.let { return it }
+            val last = request.beforeSequence?.toInt()?.minus(1) ?: 400
+            val first = (last - request.limit.toInt() + 1).coerceAtLeast(1)
+            return ArchivePage("source", "historical", (first..last).map(::row), first.takeIf { it > 1 }?.toULong())
         }
         override suspend fun fork(at: ArchiveAttachment, request: ArchiveForkRequest): ArchiveForkReply {
             requests += request
@@ -53,16 +52,16 @@ class ArchiveForkControllerTest {
         assertTrue(port.requests.isEmpty())
     }
 
-    @Test fun opensSecondPageBeyondTwoHundredAndUsesExactOlderLocator() = runBlocking {
+    @Test fun pagesBeyondTwoHundredRowsAndUsesExactOlderLocator() = runBlocking {
         val port = Fixture()
         val controller = ArchiveForkController(scope, port, { "operation" })
         controller.issue(revision)
-        assertEquals(201uL, controller.state.value.rows.first().locator.sequence)
-        controller.loadOlder()
+        assertEquals(337uL, controller.state.value.rows.first().locator.sequence)
+        repeat(4) { controller.loadOlder() }
         val older = controller.state.value.rows
-        assertEquals(200, older.size)
-        assertEquals(1uL, older.first().locator.sequence)
-        assertEquals(200uL, older.last().locator.sequence)
+        assertEquals(64, older.size)
+        assertEquals(81uL, older.first().locator.sequence)
+        assertEquals(144uL, older.last().locator.sequence)
         assertEquals("2026-11-23T18:00:00.123Z", older.first().recordedAt)
         assertEquals(2u, older.first().imageCount)
         assertEquals("child", controller.fork(older.first().locator))

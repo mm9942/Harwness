@@ -42,6 +42,7 @@ const CAPTION_CHOICE: i32 = 8;
 const CAPTION: i32 = 9;
 const SAVED_DESCRIPTION: i32 = 10;
 const ROOM_PHOTO_PREVIEW: i32 = 11;
+const VISION_MODELS: i32 = 12;
 const MAX_NAME: usize = 160;
 const MAX_DESCRIPTION: usize = 4096;
 const MAX_JPEG: usize = 180_000;
@@ -128,6 +129,8 @@ pub extern "system" fn Java_dev_harw_mobile_AndroidUiaRoomPinNative_libraryNativ
                 let frame = unsafe { &mut *ptr.cast::<[u8; FRAME_BYTES]>() };
                 let result = if operation == CAPTION_CHOICE && input_len == 0 {
                     vision_choice(&owner, &files)
+                } else if operation == VISION_MODELS && input_len == 0 {
+                    vision_models(&owner, &files)
                 } else {
                     dispatch(&owner, operation, &frame[..input_len])
                 };
@@ -230,6 +233,21 @@ fn vision_choice(
     let mut out = Zeroizing::new(Vec::with_capacity(8 + 4 + MODEL_ID_MAX));
     out.extend_from_slice(&model.loaded_revision.to_be_bytes());
     output_field(&mut out, model.model_id.as_bytes())?;
+    Ok(out)
+}
+
+fn vision_models(
+    owner: &PrivateLibraryOwner,
+    files: &std::path::Path,
+) -> Result<Zeroizing<Vec<u8>>, i64> {
+    owner.open_existing().map_err(status)?.ok_or(NEW)?;
+    let runtime = crate::local::uia_runtime_for(files).ok_or(NO_MODEL)?;
+    let models = runtime.private_library_vision_models().map_err(|_| NO_MODEL)?;
+    let mut out = Zeroizing::new(Vec::new());
+    let ids: Vec<_> = models.iter().filter(|id| !id.is_empty() && id.len() <= MODEL_ID_MAX)
+        .take(256).collect();
+    out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+    for id in ids { output_field(&mut out, id.as_bytes())?; }
     Ok(out)
 }
 

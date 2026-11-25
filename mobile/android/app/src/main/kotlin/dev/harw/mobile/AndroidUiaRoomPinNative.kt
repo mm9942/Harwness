@@ -8,6 +8,7 @@ private const val FrameBytes = 89
 private const val SnapshotBytes = 256 * 1024 + 9 * 128 + 56
 private const val InputBytes = 8192 + 4
 private const val PhotoInputBytes = InputBytes + 8 + 16
+private const val ModelFieldBytes = 2 + 384
 private const val RoomLibrary = "harw_mobile_ffi"
 private const val NativeRecovery = -2L
 private const val NativeUncertain = -5L
@@ -376,12 +377,17 @@ internal class AndroidUiaRoomPinNative private constructor(
             attempt: Long, revision: Long, text: String, image: PrivateLibraryAssistantImage,
         ): Long = runInput(attempt, revision, text, image)
 
+        override fun runSelected(
+            attempt: Long, revision: Long, text: String, image: PrivateLibraryAssistantImage?, modelId: String,
+        ): Long = runInput(attempt, revision, text, image, modelId)
+
         private fun runInput(
-            attempt: Long, revision: Long, text: String, image: PrivateLibraryAssistantImage?,
+            attempt: Long, revision: Long, text: String, image: PrivateLibraryAssistantImage?, modelId: String? = null,
         ): Long {
             val owned = tokenNow()
             if (owned == 0L) return -1L
-            val frame = ByteBuffer.allocateDirect(if (image == null) InputBytes else PhotoInputBytes)
+            val inputSize = if (image == null) InputBytes else PhotoInputBytes
+            val frame = ByteBuffer.allocateDirect(inputSize + if (modelId == null) 0 else ModelFieldBytes)
                 .order(ByteOrder.BIG_ENDIAN)
             try {
                 // Consume the existing reservation with a zero-length frame on
@@ -407,6 +413,13 @@ internal class AndroidUiaRoomPinNative private constructor(
                         val high = opaque[offset].digitToInt(16)
                         val low = opaque[offset + 1].digitToInt(16)
                         frame.put(((high shl 4) or low).toByte())
+                    }
+                }
+                if (modelId != null) {
+                    val encoded = modelId.encodeToByteArray()
+                    if (encoded.size in 1..384) {
+                        frame.position(inputSize)
+                        frame.putShort(encoded.size.toShort()).put(encoded)
                     }
                 }
                 val result = calls.run(owned, attempt, revision, frame)

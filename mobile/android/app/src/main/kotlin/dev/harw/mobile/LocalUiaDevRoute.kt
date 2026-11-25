@@ -1130,7 +1130,51 @@ internal fun LocalUiaDevScreen(
                     }
                     return@Column
                 }
-                TextButton(onClick = { libraryOpen = true }) { Text("Private Library") }
+                var chosenModel by remember(showing.chat, lease) { mutableStateOf<uniffi.harw_mobile_ffi.LocalModel?>(null) }
+                var choosingModel by remember(showing.chat, lease) { mutableStateOf(false) }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    TextButton(onClick = { libraryOpen = true }) { Text("Private Library") }
+                    TextButton(
+                        enabled = (roomState as? UiaRoomState.Open)?.permitsSend == true,
+                        onClick = { choosingModel = true },
+                    ) { Text(chosenModel?.label ?: "Modell wählen") }
+                }
+                if (choosingModel) {
+                    val installed by produceState<List<uniffi.harw_mobile_ffi.LocalModel>?>(null, showing) {
+                        value = optionalVisionChoices {
+                            withContext(Dispatchers.IO) {
+                                val app = context.applicationContext
+                                val dir = ModelStore(app).modelsDir()
+                                uniffi.harw_mobile_ffi.configureLocalModelsDir(app.filesDir.path, dir.path)
+                                uniffi.harw_mobile_ffi.localModels(dir.path).filter {
+                                    it.state == uniffi.harw_mobile_ffi.ModelFileState.COMPLETE
+                                }
+                            }
+                        }.orEmpty()
+                    }
+                    AlertDialog(
+                        onDismissRequest = { choosingModel = false },
+                        title = { Text("Modell für diesen Assistenten") },
+                        text = {
+                            Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                                when {
+                                    installed == null -> Text("Modelle werden geladen …")
+                                    installed.orEmpty().isEmpty() -> Text("Keine lokalen Modelle installiert.")
+                                }
+                                TextButton(onClick = { chosenModel = null; choosingModel = false }) {
+                                    Text("Aktives lokales Modell verwenden")
+                                }
+                                installed.orEmpty().forEach { model ->
+                                    TextButton(onClick = { chosenModel = model; choosingModel = false }) {
+                                        Text(model.label)
+                                    }
+                                }
+                            }
+                        },
+                        confirmButton = {},
+                        dismissButton = { TextButton(onClick = { choosingModel = false }) { Text("Schließen") } },
+                    )
+                }
                 UiaRoomPanel(
                     roomState ?: UiaRoomState.Locked,
                     onRequestUnlock = session::requestReauth,
@@ -1138,7 +1182,7 @@ internal fun LocalUiaDevScreen(
                     onSubmit = { request ->
                         ownerStillCurrent() && session.allowsLocalAction() &&
                             (request.image == null || imageDraft.value === request.image) &&
-                            showing.chat.submit(request, activity, session.profile)
+                            showing.chat.submit(request, activity, session.profile, chosenModel?.id)
                     },
                     onRequestCancel = showing.chat::cancel,
                     onDismissIssue = showing.chat::dismissIssue,

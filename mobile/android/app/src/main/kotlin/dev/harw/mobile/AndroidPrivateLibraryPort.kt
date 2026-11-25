@@ -120,6 +120,14 @@ internal class AndroidPrivateLibraryPort(
         PrivateLibraryCaptionChoice(model, revision)
     }
 
+    override suspend fun captionChoices(): List<PrivateLibraryCaptionChoice> = request(12, {}) { frame ->
+        require(frame.remaining() >= 2)
+        val count = frame.short.toInt() and 0xffff
+        require(count <= 256)
+        List(count) { PrivateLibraryCaptionChoice(readText(frame, 384), 0uL) }
+            .also { require(!frame.hasRemaining()) }
+    }
+
     override suspend fun describeWithLocalModel(
         revision: ULong, id: PrivateLibraryId, choice: PrivateLibraryCaptionChoice,
     ): String = request(9, { frame ->

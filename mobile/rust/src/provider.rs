@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::core::route::{Dialer, ONION_DIAL_TIMEOUT};
+use crate::core::route::{Dialer, ONION_BOOTSTRAP_TIMEOUT, ONION_DIAL_TIMEOUT};
 use crate::identity::ValidatedProfile;
 use crate::{ConnectionRoute, MobileError};
 
@@ -217,7 +217,7 @@ pub(crate) async fn request_provider(
     };
     let timeout = match route {
         ConnectionRoute::Direct => LINK_TIMEOUT,
-        ConnectionRoute::Onion => LINK_TIMEOUT + ONION_DIAL_TIMEOUT,
+        ConnectionRoute::Onion => LINK_TIMEOUT + ONION_BOOTSTRAP_TIMEOUT + ONION_DIAL_TIMEOUT,
     };
     tokio::select! {
         biased;

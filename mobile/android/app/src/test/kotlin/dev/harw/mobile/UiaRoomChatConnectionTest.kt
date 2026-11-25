@@ -14,6 +14,31 @@ class UiaRoomChatConnectionTest {
     private val room = UiaRoomId.parse("uia-local-v1:0123456789abcdef0123456789abcdef")!!
     private val other = UiaRoomId.parse("uia-local-v1:1123456789abcdef0123456789abcdef")!!
 
+    @Test fun selectedModelIsPassedToTheReservedPrivateTurn() = runBlocking {
+        val routed = kotlinx.coroutines.CompletableDeferred<Triple<Long, String, String>>()
+        val port = object : UiaNativeChat {
+            override fun snapshot() = UiaNativeRead.Snapshot(room, 0L, emptyList())
+            override fun reserve(attempt: Long) = true
+            override fun run(attempt: Long, revision: Long, text: String) = error("unexpected default model")
+            override fun runSelected(
+                attempt: Long, revision: Long, text: String, image: PrivateLibraryAssistantImage?, modelId: String,
+            ): Long {
+                routed.complete(Triple(revision, text, modelId))
+                return -6L
+            }
+            override fun cancel(attempt: Long) = Unit
+        }
+        val connection = UiaRoomChatConnection(port)
+        try {
+            val initial = withTimeout(3000) { connection.states.filterIsInstance<UiaRoomState.Open>().first() }
+            val request = checkNotNull(prepareUiaRoomSend(initial, "Hallo"))
+            assertTrue(connection.submit(request, modelId = "local-gguf"))
+            assertEquals(Triple(0L, "Hallo", "local-gguf"), withTimeout(3000) { routed.await() })
+        } finally {
+            connection.onRevoked()
+        }
+    }
+
     @Test fun relockSuppressesLateSuccessfulModelAndReload() = runBlocking {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)

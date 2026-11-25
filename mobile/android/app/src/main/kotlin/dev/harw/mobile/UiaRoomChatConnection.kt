@@ -34,6 +34,9 @@ internal interface UiaNativeChat {
     fun reserve(attempt: Long): Boolean
     fun run(attempt: Long, revision: Long, text: String): Long
     // Older/test ports may not support vision. Never fall back to a text-only send.
+    fun runSelected(
+        attempt: Long, revision: Long, text: String, image: PrivateLibraryAssistantImage?, modelId: String,
+    ): Long = -4L
     fun runPhoto(attempt: Long, revision: Long, text: String, image: PrivateLibraryAssistantImage): Long = -10L
     fun cancel(attempt: Long)
     fun supportsParking(photo: Boolean): Boolean = false
@@ -76,7 +79,7 @@ internal class UiaRoomChatConnection(
         Unit
     }
 
-    fun submit(request: UiaRoomSend, activity: Activity? = null, profile: LocalUiaProfile? = null): Boolean = synchronized(guard) {
+    fun submit(request: UiaRoomSend, activity: Activity? = null, profile: LocalUiaProfile? = null, modelId: String? = null): Boolean = synchronized(guard) {
         val current = state.value
         if (closed || active != null || !request.isFor(current) || current !is UiaRoomState.Open || sequence == Long.MAX_VALUE) {
             return@synchronized false
@@ -109,7 +112,9 @@ internal class UiaRoomChatConnection(
                 }
             val result = if (disposition != 1L) disposition else safely(-8L) {
                 val photo = request.image
-                if (photo == null) port.run(serial, request.expectedRevision, request.text)
+                if (modelId != null) {
+                    port.runSelected(serial, request.expectedRevision, request.text, photo?.selection, modelId)
+                } else if (photo == null) port.run(serial, request.expectedRevision, request.text)
                 else port.runPhoto(serial, request.expectedRevision, request.text, photo.selection)
             }
             val read = if (result == 1L && synchronized(guard) { !closed && active === flight }) safeRead() else null

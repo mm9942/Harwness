@@ -144,7 +144,7 @@ internal val PROVIDER_PRESETS: List<ProviderPreset> = listOf(
         "Azure-Ressourcen-URL mit /openai/v1 am Ende.",
         "Azure-gehostete OpenAI-Modelle verwenden den Bereitstellungsnamen. Ersetzen Sie YOUR_RESOURCE durch den Ressourcennamen.",
         true, "", "Azure-Ressourcen-API-Schlüssel"),
-    ProviderPreset("azure-foundry-chat", "Azure AI Foundry Chat", "azure-foundry-chat", "https://YOUR_RESOURCE.services.ai.azure.com/openai/v1", "",
+    ProviderPreset("azure-foundry-chat", "Azure AI Foundry Chat", "azure-foundry-chat", "https://YOUR_RESOURCE.services.ai.azure.com/openai/v1", "grok-4.6",
         "In Azure AI Foundry konfigurierter Bereitstellungsname.",
         "Azure-AI-Foundry-Ressourcen-URL mit /openai/v1 am Ende.",
         "In Azure AI Foundry bereitgestellte Modelle über die OpenAI-kompatible Chat-Completions-API.",

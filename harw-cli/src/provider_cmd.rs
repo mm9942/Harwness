@@ -47,7 +47,7 @@ pub fn run(g: &GlobalArgs, a: ProviderAction) -> Result<(), String> {
         } => {
             printer.require_text("harw provider scan")?;
             return crate::models::run(
-                g.home.clone(),
+                g,
                 Some(ModelsAction::Scan {
                     provider,
                     add: false,

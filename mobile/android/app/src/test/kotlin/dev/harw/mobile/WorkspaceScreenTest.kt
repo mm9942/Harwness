@@ -83,9 +83,9 @@ class WorkspaceScreenTest {
     }
 
     @Test
-    fun displayTitle_falls_back_to_first_message_then_id() {
+    fun displayTitle_falls_back_to_id_without_showing_first_message() {
         assertEquals("T", row("sess-0001", title = "T").displayTitle())
-        assertEquals("Hallo", row("sess-0001", title = " ", firstMessage = "Hallo").displayTitle())
+        assertEquals("Session sess-000", row("sess-0001", title = " ", firstMessage = "Hallo").displayTitle())
         assertEquals("Session sess-000", row("sess-0001").displayTitle())
     }
 

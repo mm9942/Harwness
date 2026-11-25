@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::backend::{Backend, BackendKind};
-use crate::diagnostics::{BaseLevel, DiagnosticLog, DiagnosticSnapshot, Domain, Level, StreamSignal};
+use crate::diagnostics::{BaseLevel, DiagnosticLog, DiagnosticSnapshot, Domain, Level, OnionFailureStage, StreamSignal};
 use crate::identity::{ValidatedProfile, restore_identity};
 use crate::listener::{CoreListener, Notifier};
 use crate::local::{LOCAL_HOST_UNAVAILABLE, open_local};
@@ -60,6 +60,8 @@ const MAX_PROCESS_SUBMISSIONS: usize = 8192;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_ATTEMPTS: u32 = 8;
+/// Two additional bounded attempts after a transient initial Onion failure.
+const MAX_INITIAL_ONION_RETRIES: u32 = 2;
 /// Polls of the previous on-device host while it stops (5 s in total).
 const LOCAL_STOP_POLLS: u32 = 100;
 const LOCAL_STOP_POLL: Duration = Duration::from_millis(50);
@@ -1954,6 +1956,7 @@ async fn drive_connection(
 ) {
     let mut first = Some(first);
     let mut retry = 0_u32;
+    let mut initial_retries = 0_u32;
     let mut delay = Duration::ZERO;
     let mut entropy = [0_u8; 8];
     let _ = aws_lc_rs::rand::fill(&mut entropy);
@@ -2054,13 +2057,20 @@ async fn drive_connection(
                     break;
                 }
                 Some(Err(error)) => {
-                    let stop = dial_failure(&error) == DialFailure::Final;
+                    let disposition = dial_failure(&error);
+                    if let Some(diagnostic) = &mut onion {
+                        diagnostic.failed(onion_failure_stage(&error), disposition == DialFailure::Retry);
+                    }
+                    let stop = disposition == DialFailure::Final;
                     failures.push((route, error));
                     if stop {
                         break;
                     }
                 }
                 None => {
+                    if let Some(diagnostic) = &mut onion {
+                        diagnostic.cancelled();
+                    }
                     cancelled = true;
                     break;
                 }
@@ -2080,8 +2090,7 @@ async fn drive_connection(
                 }
                 state.detail = Some(detail.clone());
                 shared.notifier.status();
-                if first.is_some() || kind != DialFailure::Retry || retry >= MAX_RECONNECT_ATTEMPTS
-                {
+                if !should_retry_dial(first.is_some(), initial_retries, retry, &failures, &kind) {
                     state.phase = ConnectionPhase::Failed;
                     state.retryable_failure = kind == DialFailure::Retry;
                     state.next_retry_at_ms = None;
@@ -2089,6 +2098,9 @@ async fn drive_connection(
                         let _ = first.send(Err(MobileError::Connect { detail }));
                     }
                     return;
+                }
+                if first.is_some() {
+                    initial_retries = initial_retries.saturating_add(1);
                 }
                 delay = retry_delay(retry, entropy);
                 retry = retry.saturating_add(1);
@@ -2202,6 +2214,49 @@ fn fallback_note(
             .join(", "),
         failure_detail(failures)
     ))
+}
+
+/// Initial Onion recovery is bounded independently of network wakeups, which
+/// may reset the ordinary reconnect backoff counter. Direct-only initial
+/// connections retain their previous fail-fast behavior.
+fn should_retry_dial(
+    initial: bool,
+    initial_retries: u32,
+    retry: u32,
+    failures: &[(ConnectionRoute, RemoteError)],
+    disposition: &DialFailure,
+) -> bool {
+    if *disposition != DialFailure::Retry {
+        return false;
+    }
+    if initial {
+        return initial_retries < MAX_INITIAL_ONION_RETRIES
+            && failures.iter().any(|(route, error)| {
+                *route == ConnectionRoute::Onion && dial_failure(error) == DialFailure::Retry
+            });
+    }
+    retry < MAX_RECONNECT_ATTEMPTS
+}
+
+/// Until the remote transport exposes typed stages, report only known
+/// prefixes and never export the error string itself.
+fn onion_failure_stage(error: &RemoteError) -> OnionFailureStage {
+    let RemoteError::Connect(detail) = error else {
+        return OnionFailureStage::Unknown;
+    };
+    if detail.starts_with("tor: tor bootstrap") {
+        OnionFailureStage::TorBootstrap
+    } else if detail.starts_with("tor: onion connect") {
+        OnionFailureStage::OnionStream
+    } else if detail.starts_with("node transport:") {
+        OnionFailureStage::NodeTransport
+    } else if detail.starts_with("upgrade:") {
+        OnionFailureStage::Upgrade
+    } else if detail.starts_with("session.hello") {
+        OnionFailureStage::SessionHello
+    } else {
+        OnionFailureStage::Unknown
+    }
 }
 
 /// Whether a dial attempt whose every route failed is worth retrying later.
@@ -3227,6 +3282,38 @@ mod route_failure_tests {
 
     fn connect(detail: &str) -> RemoteError {
         RemoteError::Connect(detail.into())
+    }
+
+    #[test]
+    fn initial_onion_retry_is_bounded_even_if_network_wakes_reset_backoff() {
+        let failures = [(ConnectionRoute::Onion, connect("tor: tor bootstrap did not finish within 120s"))];
+        let kind = attempt_failure(&failures);
+        assert!(should_retry_dial(true, 0, 0, &failures, &kind));
+        assert!(should_retry_dial(true, 1, 0, &failures, &kind));
+        assert!(!should_retry_dial(true, 2, 0, &failures, &kind));
+        assert!(should_retry_dial(false, 0, 7, &failures, &kind));
+        assert!(!should_retry_dial(false, 0, 8, &failures, &kind));
+    }
+
+    #[test]
+    fn initial_retry_never_overrides_refusal_or_direct_only_policy() {
+        let direct = [(ConnectionRoute::Direct, connect("tcp connect: refused"))];
+        assert!(!should_retry_dial(true, 0, 0, &direct, &attempt_failure(&direct)));
+        let refused = [
+            (ConnectionRoute::Onion, connect("tor: tor bootstrap failed: x")),
+            (ConnectionRoute::Direct, connect("upgrade: peer did not switch protocols (status 403)")),
+        ];
+        assert!(!should_retry_dial(true, 0, 0, &refused, &attempt_failure(&refused)));
+    }
+
+    #[test]
+    fn diagnostic_stage_uses_fixed_labels_and_unknown_for_unclassified_errors() {
+        assert_eq!(onion_failure_stage(&connect("tor: tor bootstrap failed: private")), OnionFailureStage::TorBootstrap);
+        assert_eq!(onion_failure_stage(&connect("tor: onion connect did not finish within 120s")), OnionFailureStage::OnionStream);
+        assert_eq!(onion_failure_stage(&connect("node transport: node handshake: private")), OnionFailureStage::NodeTransport);
+        assert_eq!(onion_failure_stage(&connect("upgrade: private")), OnionFailureStage::Upgrade);
+        assert_eq!(onion_failure_stage(&connect("session.hello failed: private")), OnionFailureStage::SessionHello);
+        assert_eq!(onion_failure_stage(&connect("unclassified")), OnionFailureStage::Unknown);
     }
 
     #[test]

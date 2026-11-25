@@ -6,6 +6,7 @@ import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.util.Base64
 import android.view.WindowManager
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
@@ -13,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -52,6 +54,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.StateFlow
@@ -150,6 +153,7 @@ internal interface PrivateLibraryPort {
     suspend fun remove(revision: ULong, id: PrivateLibraryId)
     suspend fun captionChoice(): PrivateLibraryCaptionChoice =
         throw PrivateLibraryException(PrivateLibraryIssue.LocalModelUnavailable)
+    suspend fun captionChoices(): List<PrivateLibraryCaptionChoice> = listOf(captionChoice())
     /** Image stays native. Returns a confirmed complete caption, never a partial. */
     suspend fun describeWithLocalModel(
         revision: ULong, id: PrivateLibraryId, choice: PrivateLibraryCaptionChoice,
@@ -187,10 +191,15 @@ private class PrivateLibraryImageEdit(
     val id: PrivateLibraryId,
     val sourceLabel: String,
 )
+private sealed interface LibraryCaptionModel {
+    data class Local(val choice: PrivateLibraryCaptionChoice) : LibraryCaptionModel
+    data class Api(val choice: uniffi.harw_mobile_ffi.ApiVisionChoice) : LibraryCaptionModel
+}
+
 private class LibraryCaptionRequest(
     val revision: ULong,
     val entry: PrivateLibraryEntry,
-    val model: PrivateLibraryCaptionChoice,
+    val models: List<LibraryCaptionModel>,
 )
 private class PreviewTile(val bitmap: Bitmap)
 
@@ -247,6 +256,7 @@ private fun PrivateLibraryUnlocked(
     var imageEdit by remember(port.lease) { mutableStateOf<PrivateLibraryImageEdit?>(null) }
     var remove by remember(port.lease) { mutableStateOf<LibraryRemoval?>(null) }
     var caption by remember(port.lease) { mutableStateOf<LibraryCaptionRequest?>(null) }
+    var captionRun by remember(port.lease) { mutableStateOf<Job?>(null) }
     var captionActive by remember(port.lease) { mutableStateOf<PrivateLibraryId?>(null) }
     var assistantDescription by remember(port.lease) { mutableStateOf<LibraryAssistantDescription?>(null) }
     var assistantPhoto by remember(port.lease) { mutableStateOf<LibraryAssistantPhoto?>(null) }
@@ -263,6 +273,8 @@ private fun PrivateLibraryUnlocked(
         val observer = LifecycleEventObserver { _, _ ->
             if (lifecycle.currentState != Lifecycle.State.RESUMED) {
                 imageEdit = null
+                caption = null
+                captionRun?.cancel()
                 assistantDescription = null
                 assistantPhoto = null
             }
@@ -278,11 +290,11 @@ private fun PrivateLibraryUnlocked(
         selected = selected.intersect(next.entries.mapTo(HashSet()) { it.id })
     }
 
-    fun perform(block: suspend () -> Unit) {
-        if (busy || !port.active.value) return
+    fun perform(block: suspend () -> Unit): Job? {
+        if (busy || !port.active.value) return null
         busy = true
         issue = null
-        scope.launch {
+        return scope.launch {
             try {
                 block()
             } catch (cancelled: CancellationException) {
@@ -398,7 +410,7 @@ private fun PrivateLibraryUnlocked(
                                 }
                             }
                         }
-                        if (captionActive == entry.id) Text("Das lokale Modell erstellt eine Beschreibung …")
+                        if (captionActive == entry.id) Text("Das gewählte Modell erstellt eine Beschreibung …")
                         Row {
                             TextButton(enabled = !busy && photo == null, onClick = { edit = LibraryFieldEdit(current.revision, entry, true) }) {
                                 Text("Umbenennen")
@@ -406,20 +418,36 @@ private fun PrivateLibraryUnlocked(
                             TextButton(enabled = !busy && photo == null, onClick = { edit = LibraryFieldEdit(current.revision, entry, false) }) {
                                 Text("Beschreibung")
                             }
-                            if (port.localCaptionSupported) {
+                            if (port.localCaptionSupported || imageEditSupported) {
                                 TextButton(
                                     enabled = !busy && photo == null,
                                     onClick = {
                                         perform {
-                                            val choice = port.captionChoice()
-                                            if (!port.active.value) throw PrivateLibraryException(PrivateLibraryIssue.Locked)
+                                            val local = if (port.localCaptionSupported) optionalVisionChoices {
+                                                withContext(Dispatchers.IO) {
+                                                    uniffi.harw_mobile_ffi.configureLocalModelsDir(
+                                                        app.filesDir.path, ModelStore(app).modelsDir().path,
+                                                    )
+                                                    port.captionChoices().map { LibraryCaptionModel.Local(it) }
+                                                }
+                                            }.orEmpty() else emptyList()
+                                            val api = if (imageEditSupported) optionalVisionChoices {
+                                                withContext(Dispatchers.IO) {
+                                                    uniffi.harw_mobile_ffi.ProviderStore(app.filesDir.path, AndroidPlatformKeystore(app)).use { store ->
+                                                        store.apiVisionChoices().map { LibraryCaptionModel.Api(it) }
+                                                    }
+                                                }
+                                            }.orEmpty() else emptyList()
+                                            if (!port.active.value || lifecycle.currentState != Lifecycle.State.RESUMED) {
+                                                throw PrivateLibraryException(PrivateLibraryIssue.Locked)
+                                            }
                                             if (snapshot?.revision != current.revision) {
                                                 throw PrivateLibraryException(PrivateLibraryIssue.Changed)
                                             }
-                                            caption = LibraryCaptionRequest(current.revision, entry, choice)
+                                            caption = LibraryCaptionRequest(current.revision, entry, local + api)
                                         }
                                     },
-                                ) { Text("Lokal beschreiben") }
+                                ) { Text("KI-Beschreibung") }
                             }
                             TextButton(enabled = !busy && photo == null, onClick = { remove = LibraryRemoval(current.revision, entry) }) {
                                 Text("Entfernen")
@@ -608,39 +636,81 @@ private fun PrivateLibraryUnlocked(
     }
 
     caption?.let { request ->
-        val replaces = request.entry.description is PrivateLibraryDescription.Ready
+        var model by remember(request) { mutableStateOf<LibraryCaptionModel?>(null) }
         AlertDialog(
             onDismissRequest = { caption = null },
             properties = DialogProperties(securePolicy = if (readScreenshotProtection(context)) SecureFlagPolicy.SecureOn else SecureFlagPolicy.SecureOff),
-            title = { Text("Bild lokal beschreiben?") },
+            title = { Text("Modell für Bildbeschreibung") },
             text = {
-                Text(
-                    if (replaces) "Eine vollständige Antwort von ${request.model.modelId} ersetzt deine bisherige Beschreibung."
-                    else "Nur ${request.model.modelId} auf diesem Gerät analysiert das Bild. Gespeichert wird nur eine vollständige Beschreibung.",
-                )
+                Column {
+                    if (request.models.isEmpty()) Text("Kein Modell für Bildbeschreibungen verfügbar.")
+                    LazyColumn(Modifier.heightIn(max = 280.dp)) {
+                        items(request.models) { option ->
+                            val label = when (option) {
+                                is LibraryCaptionModel.Local -> "Auf dem Gerät · ${option.choice.modelId}"
+                                is LibraryCaptionModel.Api -> "${option.choice.routeId} · ${option.choice.modelId}"
+                            }
+                            TextButton(onClick = { model = option }) {
+                                Text(if (model == option) "✓ $label" else label)
+                            }
+                        }
+                    }
+                    if (model is LibraryCaptionModel.Api) {
+                        Text("Beim Bestätigen wird das ausgewählte Foto an diesen API-Anbieter gesendet.")
+                    }
+                    if (request.entry.description is PrivateLibraryDescription.Ready) {
+                        Text("Eine vollständige Antwort ersetzt deine bisherige Beschreibung.")
+                    }
+                }
             },
             confirmButton = {
                 TextButton(
-                    enabled = !busy && snapshot?.revision == request.revision,
+                    enabled = model != null && !busy && snapshot?.revision == request.revision,
                     onClick = {
+                        val selectedModel = model ?: return@TextButton
                         caption = null
-                        perform {
-                            captionActive = request.entry.id
-                            try {
-                                val verified = port.describeWithLocalModel(request.revision, request.entry.id, request.model)
-                                currentCoroutineContext().ensureActive()
-                                if (!port.active.value) throw PrivateLibraryException(PrivateLibraryIssue.Locked)
+                        captionRun = perform {
+                            fun requireActiveOrigin() {
+                                if (!port.active.value || lifecycle.currentState != Lifecycle.State.RESUMED) {
+                                    throw PrivateLibraryException(PrivateLibraryIssue.Locked)
+                                }
                                 if (snapshot?.revision != request.revision) {
                                     throw PrivateLibraryException(PrivateLibraryIssue.Changed)
                                 }
-                                // Same owner token and optimistic revision CAS;
-                                // no completion, old value replacement, or retry on partial results.
+                            }
+                            captionActive = request.entry.id
+                            try {
+                                requireActiveOrigin()
+                                val verified = when (selectedModel) {
+                                    is LibraryCaptionModel.Local -> port.describeWithLocalModel(
+                                        request.revision, request.entry.id, selectedModel.choice,
+                                    )
+                                    is LibraryCaptionModel.Api -> {
+                                        val jpeg = port.preview(request.revision, request.entry.id)
+                                            ?: throw PrivateLibraryException(PrivateLibraryIssue.InvalidPhoto)
+                                        try {
+                                            requireActiveOrigin()
+                                            uniffi.harw_mobile_ffi.ProviderStore(app.filesDir.path, AndroidPlatformKeystore(app)).use { store ->
+                                                val image = uniffi.harw_mobile_ffi.PromptImage(
+                                                    "image/jpeg", Base64.encodeToString(jpeg, Base64.NO_WRAP),
+                                                )
+                                                val result = store.apiVisionObserve(selectedModel.choice, image)
+                                                result.caption?.takeIf {
+                                                    result.status == uniffi.harw_mobile_ffi.ApiVisionStatus.CAPTION &&
+                                                        it.isNotBlank() && it.toByteArray().size <= 4096
+                                                } ?: throw PrivateLibraryException(PrivateLibraryIssue.CaptionIncomplete)
+                                            }
+                                        } finally { jpeg.fill(0) }
+                                    }
+                                }
+                                currentCoroutineContext().ensureActive()
+                                requireActiveOrigin()
                                 port.describe(request.revision, request.entry.id, verified)
                                 synchronize()
                             } finally { captionActive = null }
                         }
                     },
-                ) { Text("Lokal beschreiben & speichern") }
+                ) { Text(if (model is LibraryCaptionModel.Api) "Foto senden & beschreiben" else "Lokal beschreiben") }
             },
             dismissButton = { TextButton(onClick = { caption = null }) { Text("Abbrechen") } },
         )
@@ -807,7 +877,7 @@ private fun issueText(issue: PrivateLibraryIssue): String = when (issue) {
     PrivateLibraryIssue.Interrupted -> "Der Speichervorgang war unterbrochen. Prüfe den aktualisierten Stand."
     PrivateLibraryIssue.Unavailable -> "Die private Library ist gerade nicht verfügbar."
     PrivateLibraryIssue.LocalModelUnavailable ->
-        "Kein passendes geladenes Bildmodell. Lade ein lokales Vision-Modell in den Einstellungen."
+        "Das gewählte lokale Bildmodell konnte nicht geöffnet werden. Prüfe Modell und Projektor in den Modelleinstellungen."
     PrivateLibraryIssue.CaptionIncomplete -> "Keine vollständige Beschreibung. Es wurde nichts geändert."
     PrivateLibraryIssue.DescriptionMissing -> stringResource(R.string.private_library_assistant_description_missing)
     PrivateLibraryIssue.AssistantDraftUnavailable -> stringResource(R.string.private_library_assistant_draft_unavailable)

@@ -54,6 +54,7 @@ pub(crate) async fn reply_and_commit(
     room_id: &RoomId,
     expected_revision: u64,
     user: &str,
+    selected_model: Option<&str>,
     cancel: CancelToken,
     publish: Arc<dyn RoomPublish>,
     same_profile: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -86,7 +87,7 @@ pub(crate) async fn reply_and_commit(
     let foreground = Arc::downgrade(&vault);
     drop(vault);
     let pinned = model
-        .pin_local_assistant_model()
+        .pin_local_assistant_model(selected_model)
         .await
         .map_err(|_| UiaRoomError::Unavailable)?;
     if cancel.is_cancelled() || !same_profile() { return Err(UiaRoomError::Cancelled); }
@@ -159,6 +160,7 @@ pub(crate) async fn reply_with_photo_and_commit(
     room_id: &RoomId,
     expected_revision: u64,
     user: &str,
+    selected_model: Option<&str>,
     photo: PrivateRoomPhoto,
     cancel: CancelToken,
     publish: Arc<dyn RoomPublish>,
@@ -181,7 +183,7 @@ pub(crate) async fn reply_with_photo_and_commit(
     current.admit_user(user).map_err(|error| UiaRoomError::Room(RoomFailure::Invalid(error)))?;
     let foreground = Arc::downgrade(&vault);
     drop(vault);
-    let pinned = model.pin_private_assistant_vision(&cancel).await.map_err(private_vision_error)?;
+    let pinned = model.pin_private_assistant_vision(&cancel, selected_model).await.map_err(private_vision_error)?;
     if cancel.is_cancelled() || !foreground_admission() { return Err(UiaRoomError::Cancelled); }
     if !pinned.is_current() { return Err(UiaRoomError::Unavailable); }
     let attempt = record_attempt(

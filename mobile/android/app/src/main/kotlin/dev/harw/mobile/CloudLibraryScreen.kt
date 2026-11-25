@@ -466,7 +466,7 @@ private fun CloudLibraryAttached(
 }
 
 
-private suspend fun <T> optionalVisionChoices(load: suspend () -> T): T? =
+internal suspend fun <T> optionalVisionChoices(load: suspend () -> T): T? =
     try { load() } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { null }
 
 @Composable

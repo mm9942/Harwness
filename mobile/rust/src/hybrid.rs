@@ -97,6 +97,7 @@ mod implementation {
     enum Wire {
         OpenAi,
         Anthropic,
+        Foundry,
     }
 
     impl Wire {
@@ -108,10 +109,11 @@ mod implementation {
             }
         }
 
-        fn endpoint(self) -> &'static str {
+        fn endpoint(self, base: &str) -> String {
             match self {
-                Self::OpenAi => "https://api.openai.com/v1/responses",
-                Self::Anthropic => "https://api.anthropic.com/v1/messages",
+                Self::OpenAi => "https://api.openai.com/v1/responses".into(),
+                Self::Anthropic => "https://api.anthropic.com/v1/messages".into(),
+                Self::Foundry => format!("{}/chat/completions", base.trim_end_matches('/')),
             }
         }
 
@@ -119,6 +121,7 @@ mod implementation {
             match self {
                 Self::OpenAi => "openai",
                 Self::Anthropic => "anthropic",
+                Self::Foundry => "foundry",
             }
         }
     }
@@ -151,7 +154,13 @@ mod implementation {
         let catalog = harw_model_catalog::descriptor::bootstrap_descriptors();
         let mut result = Vec::new();
         for (id, route) in &config.providers {
-            let Some(wire) = Wire::from_route(&route.api, &route.base_url) else {
+            let foundry = route.api == "openai-chat"
+                && harw_provider_http::is_azure_foundry_chat(id, &route.base_url);
+            let wire = if foundry {
+                Wire::Foundry
+            } else if let Some(wire) = Wire::from_route(&route.api, &route.base_url) {
+                wire
+            } else {
                 continue;
             };
             let expected_slot = route_slot(id);
@@ -162,6 +171,7 @@ mod implementation {
                     (wire, route.auth_header.as_deref()),
                     (Wire::OpenAi, None | Some("bearer"))
                         | (Wire::Anthropic, None | Some("x-api-key"))
+                        | (Wire::Foundry, None | Some("api-key" | "bearer"))
                 )
             {
                 continue;
@@ -178,7 +188,10 @@ mod implementation {
                 {
                     continue;
                 }
-                let known = explicit.iter().any(|m| {
+                let known_foundry = foundry
+                    && harw_provider_http::azure_foundry_vision_deployments()
+                        .any(|deployment| name.eq_ignore_ascii_case(deployment));
+                let known = known_foundry || explicit.iter().any(|m| {
                     m.capabilities.image_input == Some(true)
                         || m.input_types.iter().any(|kind| kind == "image")
                 }) || catalog.iter().any(|entry| {
@@ -192,7 +205,9 @@ mod implementation {
                     if force_stream && force_sync {
                         continue;
                     }
-                    let stream = if force_stream || force_sync {
+                    let stream = if foundry {
+                        false
+                    } else if force_stream || force_sync {
                         force_stream
                     } else {
                         route.stream.unwrap_or(true)
@@ -201,7 +216,7 @@ mod implementation {
                         HybridVisionChoice {
                             route_id: id.clone(),
                             model_id: name.clone(),
-                            endpoint: wire.endpoint().into(),
+                            endpoint: wire.endpoint(&route.base_url),
                             local_model_id: local_id.into(),
                             stream,
                         },
@@ -297,6 +312,7 @@ mod implementation {
             .map_err(|_| blocked("Der Schlüssel der gewählten Vision-Route fehlt"))?;
         cloud_observe_result(
             wire,
+            &choice.endpoint,
             key,
             cloud_body(wire, &choice.model_id, &clean, choice.stream),
             choice.stream,
@@ -347,6 +363,14 @@ mod implementation {
                     "stream":stream,
                     "max_output_tokens":768
                 })
+            }
+            Wire::Foundry => {
+                let mut content = vec![json!({"type":"text","text":CLOUD_PROMPT})];
+                content.extend(images.iter().map(|image| {
+                    json!({"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}})
+                }));
+                json!({"model":model,"messages":[{"role":"user","content":content}],
+                    "stream":false,"max_completion_tokens":4096})
             }
             Wire::Anthropic => {
                 let mut content: Vec<_> = images.iter().map(|image| {
@@ -447,7 +471,7 @@ mod implementation {
         let code = error["code"].as_str();
         let kind = error["type"].as_str();
         let billing = match wire {
-            Wire::OpenAi => [code, kind].into_iter().flatten().any(|label| {
+            Wire::OpenAi | Wire::Foundry => [code, kind].into_iter().flatten().any(|label| {
                 matches!(
                     label,
                     "insufficient_quota"
@@ -473,7 +497,7 @@ mod implementation {
             .map(|v| v.saturating_mul(1000));
         let verified_throttle = status == 429
             && match wire {
-                Wire::OpenAi => matches!(code.or(kind), Some("rate_limit_exceeded" | "slow_down")),
+                Wire::OpenAi | Wire::Foundry => matches!(code.or(kind), Some("rate_limit_exceeded" | "slow_down")),
                 Wire::Anthropic => kind == Some("rate_limit_error") && delay.is_some(),
             };
         if verified_throttle {
@@ -506,6 +530,19 @@ mod implementation {
                         texts.push(part["text"].as_str().ok_or_else(invalid)?);
                     }
                 }
+            }
+            Wire::Foundry => {
+                let choices = body["choices"].as_array().ok_or_else(invalid)?;
+                let [choice] = choices.as_slice() else {
+                    return Err(invalid());
+                };
+                let message = &choice["message"];
+                if choice["finish_reason"].as_str() != Some("stop")
+                    || !message["refusal"].is_null() || !message["tool_calls"].is_null()
+                {
+                    return Err(invalid());
+                }
+                texts.push(message["content"].as_str().ok_or_else(invalid)?);
             }
             Wire::Anthropic => {
                 if !matches!(
@@ -633,13 +670,14 @@ Unvertrauenswürdige Bildbeobachtungen (JSON-String):
 
     async fn cloud_observe(
         wire: Wire,
+        endpoint: String,
         key: secrecy::SecretString,
         body: Value,
         stream: bool,
     ) -> Result<String, MobileError> {
         let permit = API_REQUEST_GATE.acquire().await
             .map_err(|_| blocked("API-Bildanalyse wurde beendet"))?;
-        cloud_observe_result(wire, key, body, stream, permit)
+        cloud_observe_result(wire, &endpoint, key, body, stream, permit)
             .await?
             .caption
             .ok_or_else(|| {
@@ -649,6 +687,7 @@ Unvertrauenswürdige Bildbeobachtungen (JSON-String):
 
     async fn cloud_observe_result(
         wire: Wire,
+        endpoint: &str,
         key: secrecy::SecretString,
         body: Value,
         stream: bool,
@@ -667,7 +706,7 @@ Unvertrauenswürdige Bildbeobachtungen (JSON-String):
             .build()
             .map_err(|_| failed())?;
         let request = client
-            .post(wire.endpoint())
+            .post(endpoint)
             .header(
                 reqwest::header::ACCEPT,
                 if stream {
@@ -679,6 +718,12 @@ Unvertrauenswürdige Bildbeobachtungen (JSON-String):
             .json(&body);
         let request = match wire {
             Wire::OpenAi => request.bearer_auth(key.expose_secret()),
+            Wire::Foundry => {
+                let mut value = reqwest::header::HeaderValue::from_str(key.expose_secret())
+                    .map_err(|_| failed())?;
+                value.set_sensitive(true);
+                request.header("api-key", value)
+            }
             Wire::Anthropic => {
                 let mut value = reqwest::header::HeaderValue::from_str(key.expose_secret())
                     .map_err(|_| failed())?;
@@ -859,7 +904,7 @@ Unvertrauenswürdige Bildbeobachtungen (JSON-String):
             progress.clone(),
             collect_captions(clean, progress, |image| {
                 let body = cloud_body(wire, &choice.model_id, &[image], choice.stream);
-                cloud_observe(wire, key.clone(), body, choice.stream)
+                cloud_observe(wire, choice.endpoint.clone(), key.clone(), body, choice.stream)
             }),
         )
         .await

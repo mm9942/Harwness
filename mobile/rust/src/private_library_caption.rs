@@ -1,5 +1,5 @@
 //! Explicit native-only captioning of exactly one sealed Library item.
-//! No Java image material, provider lookup, model load, chat turn, or save here.
+//! The local route keeps the selected photo and model execution in Rust.
 
 use std::{
     path::Path,
@@ -43,10 +43,15 @@ pub(crate) fn run(
     pinned_model_id: &str,
     pinned_model_revision: u64,
 ) -> Result<Zeroizing<String>, CaptionError> {
-    let current = loaded_choice(files)?;
-    if current.model_id != pinned_model_id || current.loaded_revision != pinned_model_revision {
-        return Err(CaptionError::MissingModel);
-    }
+    let current = if pinned_model_revision == 0 {
+        None
+    } else {
+        let current = loaded_choice(files)?;
+        if current.model_id != pinned_model_id || current.loaded_revision != pinned_model_revision {
+            return Err(CaptionError::MissingModel);
+        }
+        Some(current)
+    };
     let model = crate::local::uia_runtime_for(files).ok_or(CaptionError::MissingModel)?;
     let caption_job = owner.begin_caption().map_err(CaptionError::Vault)?;
     let store = owner.open_existing().map_err(CaptionError::Vault)?
@@ -79,11 +84,18 @@ pub(crate) fn run(
         | LocalImageDescriptionOutcome::ContextLimit { mut text } => text.zeroize(),
         LocalImageDescriptionOutcome::InvalidInput | LocalImageDescriptionOutcome::Failed => {}
     };
-    crate::local_vision::supervisor_runtime().map_err(|_| CaptionError::MissingModel)?
-        .block_on(model.describe_pinned_local_vision(
-            &current, vec![(1, edited)], caption_job.token(), &consume,
-        ))
-        .map_err(|_| CaptionError::Incomplete)?;
+    let runtime = crate::local_vision::supervisor_runtime().map_err(|_| CaptionError::MissingModel)?;
+    runtime.block_on(async {
+        if let Some(current) = current {
+            model.describe_pinned_local_vision(&current, vec![(1, edited)], caption_job.token(), &consume)
+                .await.map_err(|_| CaptionError::Incomplete)
+        } else {
+            let pinned = model.pin_private_assistant_vision(caption_job.token(), Some(pinned_model_id))
+                .await.map_err(|_| CaptionError::MissingModel)?;
+            pinned.describe_library_image(edited, caption_job.token(), &consume)
+                .await.map_err(|_| CaptionError::Incomplete)
+        }
+    })?;
 
     if !owner.active() || caption_job.token().is_cancelled() {
         return Err(CaptionError::Vault(LibraryError::Locked));

@@ -33,6 +33,9 @@ const PHOTO_CHANGED: i64 = -11;
 const PHOTO_INVALID: i64 = -12;
 const INPUT: usize = 8192 + 4;
 const PHOTO_INPUT: usize = INPUT + 8 + 16;
+const MODEL_FIELD: usize = 2 + 384;
+const SELECTED_INPUT: usize = INPUT + MODEL_FIELD;
+const SELECTED_PHOTO_INPUT: usize = PHOTO_INPUT + MODEL_FIELD;
 const OUTPUT: usize = 256 * 1024 + 9 * 128 + 56;
 const ATTEMPT_INTERRUPTED: u8 = 0xA1;
 const ATTEMPT_STATUS_UNKNOWN: u8 = 0xA2;
@@ -410,24 +413,32 @@ pub extern "system" fn Java_dev_harw_mobile_AndroidUiaRoomPinNative_runRoomNativ
             (1..=8192).contains(&n).then(|| Zeroizing::new(buf[4..4 + n].to_vec()))
         };
         let mut selection = None;
-        let payload = if env.get_direct_buffer_capacity(&input).ok() == Some(PHOTO_INPUT) {
-            frame::<PHOTO_INPUT, _>(env, &input, |buf| {
-                let mut revision = [0; 8];
-                revision.copy_from_slice(&buf[INPUT..INPUT + 8]);
-                let mut id = [0; 16];
-                id.copy_from_slice(&buf[INPUT + 8..]);
-                selection = Some((u64::from_be_bytes(revision), id));
-                let bytes = text_field(buf);
-                buf.zeroize();
-                bytes
-            })?.flatten()
-        } else {
-            frame::<INPUT, _>(env, &input, |buf| {
-                let bytes = text_field(buf);
-                buf.zeroize();
-                bytes
-            })?.flatten()
+        let mut selected_model = None;
+        let capacity = env.get_direct_buffer_capacity(&input).ok();
+        let mut decode = |buf: &mut [u8], photo: bool, explicit: bool| {
+            let decoded = (|| {
+                if photo {
+                    let revision = u64::from_be_bytes(buf[INPUT..INPUT + 8].try_into().ok()?);
+                    let id = buf[INPUT + 8..PHOTO_INPUT].try_into().ok()?;
+                    selection = Some((revision, id));
+                }
+                if explicit {
+                    let offset = if photo { PHOTO_INPUT } else { INPUT };
+                    let len = usize::from(u16::from_be_bytes(buf[offset..offset + 2].try_into().ok()?));
+                    if len == 0 || len > MODEL_FIELD - 2 { return None; }
+                    selected_model = Some(std::str::from_utf8(&buf[offset + 2..offset + 2 + len]).ok()?.to_owned());
+                }
+                text_field(buf)
+            })();
+            buf.zeroize();
+            decoded
         };
+        let payload = match capacity {
+            Some(PHOTO_INPUT) => frame::<PHOTO_INPUT, _>(env, &input, |buf| decode(buf, true, false))?,
+            Some(SELECTED_INPUT) => frame::<SELECTED_INPUT, _>(env, &input, |buf| decode(buf, false, true))?,
+            Some(SELECTED_PHOTO_INPUT) => frame::<SELECTED_PHOTO_INPUT, _>(env, &input, |buf| decode(buf, true, true))?,
+            _ => frame::<INPUT, _>(env, &input, |buf| decode(buf, false, false))?,
+        }.flatten();
         let (Some(payload), Ok(rev)) = (payload, u64::try_from(revision)) else {
             return Ok(INVALID);
         };
@@ -521,7 +532,7 @@ pub extern "system" fn Java_dev_harw_mobile_AndroidUiaRoomPinNative_runRoomNativ
             let foreground = chat.owner.lease();
             drop(chat.owner);
             let result = rt.block_on(uia_room::reply_with_photo_and_commit(
-                &model, foreground, &room_id, rev, text, photo, cancel, publish,
+                &model, foreground, &room_id, rev, text, selected_model.as_deref(), photo, cancel, publish,
                 foreground_admission, same_profile,
             ));
             if !ops.active() || crate::private_library_jni::profile(env, &app)? != Some(profile) {
@@ -537,7 +548,7 @@ pub extern "system" fn Java_dev_harw_mobile_AndroidUiaRoomPinNative_runRoomNativ
         let ops = chat.ops;
         drop(chat.owner);
         let result = rt.block_on(uia_room::reply_and_commit(
-            &model, foreground, &room_id, rev, text, cancel, publish, same_profile.clone(),
+            &model, foreground, &room_id, rev, text, selected_model.as_deref(), cancel, publish, same_profile.clone(),
         ));
         if !ops.active() || !same_profile() {
             return Ok(LOCKED);

@@ -22,29 +22,9 @@ pub fn azure_foundry_chat_token_limits(
     base_url: &str,
     deployment: &str,
 ) -> Option<AzureFoundryChatTokenLimits> {
-    if route_id != "azure-foundry-chat" {
+    if !is_azure_foundry_chat(route_id, base_url) {
         return None;
     }
-    let endpoint = EgressUrl::parse(base_url).ok()?;
-    let url = endpoint.as_url();
-    if !endpoint.is_https()
-        || !endpoint.host_str().ends_with(".services.ai.azure.com")
-        || url.path().trim_end_matches('/') != "/openai/v1"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-
-    const DEPLOYMENTS: &[(&str, u32, u32)] = &[
-        ("grok-4.6", 200_000, 128_000),
-        ("grok-4-20-non-reasoning", 262_000, 8_192),
-        ("mistral-large-4-latest", 128_000, 4_096),
-        ("DeepSeek-V4.1-Flash-1017", 1_000_000, 128_000),
-        ("Kimi-K3.1-Pro", 1_048_576, 262_144),
-        ("Kimi-K2.7-Code", 262_144, 262_144),
-        ("grok-4.3", 200_000, 8_192),
-    ];
     DEPLOYMENTS
         .iter()
         .find(|(id, _, _)| deployment.eq_ignore_ascii_case(id))
@@ -55,3 +35,41 @@ pub fn azure_foundry_chat_token_limits(
             },
         )
 }
+
+/// Checks the canonical Foundry Chat mobile route and its Azure HTTPS endpoint.
+#[must_use]
+pub fn is_azure_foundry_chat(route_id: &str, base_url: &str) -> bool {
+    if route_id != "azure-foundry-chat" {
+        return false;
+    }
+    let Ok(endpoint) = EgressUrl::parse(base_url) else {
+        return false;
+    };
+    let url = endpoint.as_url();
+    if !endpoint.is_https()
+        || !endpoint.host_str().ends_with(".services.ai.azure.com")
+        || url.path().trim_end_matches('/') != "/openai/v1"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Deployment names verified to accept image input via Foundry Chat.
+#[must_use]
+pub fn azure_foundry_vision_deployments() -> impl Iterator<Item = &'static str> {
+    DEPLOYMENTS.iter().map(|(id, _, _)| *id)
+}
+
+const DEPLOYMENTS: &[(&str, u32, u32)] = &[
+    ("grok-4.6", 200_000, 128_000),
+    ("grok-4-20-non-reasoning", 262_000, 8_192),
+    ("mistral-large-4-latest", 128_000, 4_096),
+    ("DeepSeek-V4.1-Flash-1017", 1_000_000, 128_000),
+    ("Kimi-K3.1-Pro", 1_048_576, 262_144),
+    ("Kimi-K2.7-Code", 262_144, 262_144),
+    ("grok-4.3", 200_000, 8_192),
+];
