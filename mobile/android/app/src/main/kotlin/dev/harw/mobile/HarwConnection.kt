@@ -2217,6 +2217,12 @@ internal class HarwConnection(private val context: Context, private val localBac
         return native.cloudLibraryCaptionAccess(scope, revision, assetId)
     }
 
+    suspend fun libraryVisionChoices(): List<uniffi.harw_mobile_ffi.LocalVisionChoice> {
+        val native = core ?: throw MobileException.Disconnected()
+        if (!localBackend || !state.value.online) throw MobileException.Disconnected()
+        return withContext(Dispatchers.IO) { native.libraryVisionChoices() }
+    }
+
     suspend fun cloudLibraryCaptionLocal(
         access: uniffi.harw_mobile_ffi.CloudLibraryCaptionAccess,
         device: HarwConnection,

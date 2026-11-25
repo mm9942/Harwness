@@ -131,7 +131,22 @@ impl MobileCore {
         }
     }
 
-    /// Run on the explicit loaded on-device model, not the gateway/chat route.
+    /// List explicitly selectable installed local Library vision pairs.
+    pub fn library_vision_choices(&self) -> Result<Vec<crate::LocalVisionChoice>, MobileError> {
+        #[cfg(feature = "local-host")]
+        {
+            let link = self.shared.state().active()?;
+            if link.backend.kind() != BackendKind::Local {
+                return Err(MobileError::Disconnected);
+            }
+            let model = link.backend.hybrid_model.clone().ok_or_else(no_complete_caption)?;
+            model.library_vision_choices()
+        }
+        #[cfg(not(feature = "local-host"))]
+        Ok(Vec::new())
+    }
+
+    /// Run on an explicitly selected installed/loaded on-device model, not the gateway/chat route.
     pub async fn cloud_library_caption_local(
         &self, access: Arc<CloudLibraryCaptionAccess>, device: Arc<MobileCore>,
         choice: crate::LocalVisionChoice,
@@ -157,7 +172,7 @@ impl MobileCore {
             tokio::select! {
                 biased;
                 () = link.stop.cancelled() => return Err(MobileError::Disconnected),
-                result = crate::local_vision::describe(
+                result = crate::local_vision::describe_library(
                     model, local_link.stop.clone(), choice,
                     vec![crate::LocalVisionImage { id: 1, image }], sink.clone(),
                 ) => result?,

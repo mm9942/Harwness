@@ -593,6 +593,77 @@ impl SwitchingModel {
         crate::session_title::complete_response(output)
     }
 
+    /// Explicit Library choices from the current profile. A revision of zero
+    /// represents an installed pair, not an assertion that it is loaded.
+    pub(crate) fn library_vision_choices(&self) -> Result<Vec<crate::LocalVisionChoice>, MobileError> {
+        if !harw_llama::engine_available() {
+            return Ok(Vec::new());
+        }
+        let Some(dir) = self.home.local_models_dir() else { return Ok(Vec::new()); };
+        let active = harw_home::active_profile_name(self.home.home());
+        if harw_home::profile_dir(self.home.home(), &active).ok().as_deref() != Some(self.home.profile_dir()) {
+            return Err(MobileError::Disconnected);
+        }
+        let loaded = self.local_vision_choices().unwrap_or_default();
+        let mut choices = Vec::new();
+        for model in crate::models::local_models(dir)?.into_iter().take(256) {
+            if self.library_vision_files(&model.id).is_none() { continue; }
+            let choice = loaded.iter().find(|choice| choice.model_id == model.id).cloned()
+                .unwrap_or(crate::LocalVisionChoice {
+                    model_id: model.id, effective_parallelism: 1, loaded_revision: 0,
+                });
+            choices.push(choice);
+        }
+        Ok(choices)
+    }
+
+    fn library_vision_files(&self, id: &str) -> Option<VisionFiles> {
+        let active = harw_home::active_profile_name(self.home.home());
+        if harw_home::profile_dir(self.home.home(), &active).ok().as_deref() != Some(self.home.profile_dir()) {
+            return None;
+        }
+        let dir = self.home.local_models_dir()?;
+        let projector = crate::models::vision_path_in(std::path::Path::new(&dir), id)?;
+        let model = crate::models::model_path(dir, id.to_owned()).ok()?;
+        vision_files(&model, Some(&projector))
+    }
+
+    /// The remote Library explicitly requests one installed local GGUF. It
+    /// does not activate a profile route or access the private vault.
+    pub(crate) async fn describe_installed_library_vision(
+        &self,
+        choice: &crate::LocalVisionChoice,
+        images: Vec<(u64, Arc<[u8]>)>,
+        cancel: &harw_types::cancel::CancelToken,
+        on_result: &(dyn Fn(harw_llama::LocalImageDescription) + Send + Sync),
+    ) -> Result<(), MobileError> {
+        let unavailable = || MobileError::Session {
+            detail: "Das gewählte Vision-Modell ist nicht verfügbar. Bitte Auswahl aktualisieren.".into(),
+        };
+        if choice.loaded_revision != 0 || images.len() != 1 || cancel.is_cancelled() {
+            return Err(unavailable());
+        }
+        let expected = self.library_vision_files(&choice.model_id).ok_or_else(unavailable)?;
+        let selected = Some((crate::home::LOCAL_ROUTE_ID.to_owned(), choice.model_id.clone()));
+        let current = self.cached_provider_for(selected).await.map_err(|_| unavailable())?;
+        let _mapping = Arc::clone(&LOCAL_MODEL_LIFECYCLE).try_lock_owned()
+            .map_err(|_| local_vision_busy())?;
+        let CachedProvider::Local { model, vision_files: Some(files), .. } = &current.3 else {
+            return Err(unavailable());
+        };
+        if files != &expected || self.library_vision_files(&choice.model_id).as_ref() != Some(&expected)
+            || !model.supports_vision() || cancel.is_cancelled()
+        {
+            return Err(unavailable());
+        }
+        let result = model.describe_selected_images(images, cancel, on_result).await;
+        LOCAL_INFERENCE.wait_idle().await;
+        if self.library_vision_files(&choice.model_id).as_ref() != Some(&expected) || cancel.is_cancelled() {
+            return Err(unavailable());
+        }
+        result.map_err(|_| unavailable())
+    }
+
     pub(crate) fn local_vision_choices(
         &self,
     ) -> Result<Vec<crate::LocalVisionChoice>, MobileError> {

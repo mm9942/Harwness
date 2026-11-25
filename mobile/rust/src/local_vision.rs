@@ -171,6 +171,31 @@ pub(crate) async fn describe(
     images: Vec<LocalVisionImage>,
     progress: Arc<dyn LocalVisionProgress>,
 ) -> Result<(), MobileError> {
+    describe_with_selection(model, stop, choice, images, progress, false).await
+}
+
+/// The Cloud Library alone may explicitly request a complete installed pair
+/// rather than an already-loaded revision. Keep the same cancellation supervisor.
+#[cfg(feature = "local-host")]
+pub(crate) async fn describe_library(
+    model: Arc<crate::local::SwitchingModel>,
+    stop: tokio_util::sync::CancellationToken,
+    choice: LocalVisionChoice,
+    images: Vec<LocalVisionImage>,
+    progress: Arc<dyn LocalVisionProgress>,
+) -> Result<(), MobileError> {
+    describe_with_selection(model, stop, choice, images, progress, true).await
+}
+
+#[cfg(feature = "local-host")]
+async fn describe_with_selection(
+    model: Arc<crate::local::SwitchingModel>,
+    stop: tokio_util::sync::CancellationToken,
+    choice: LocalVisionChoice,
+    images: Vec<LocalVisionImage>,
+    progress: Arc<dyn LocalVisionProgress>,
+    allow_installed: bool,
+) -> Result<(), MobileError> {
     let cancel = CancelToken::new();
     let _guard = CancelOnDrop(cancel.clone());
     let worker = supervisor_runtime()?.spawn(async move {
@@ -181,13 +206,16 @@ pub(crate) async fn describe(
                 tokio::task::spawn_blocking(move || prepare_images(images, &prepare_cancel))
                     .await
                     .map_err(|_| session("Bildvorbereitung fehlgeschlagen."))??;
-            model
-                .describe_pinned_local_vision(&choice, images, &cancel, &move |result| {
-                    if !report_cancel.is_cancelled() {
-                        progress.on_result(result.id, result.outcome.into());
-                    }
-                })
-                .await
+            let report = move |result: harw_llama::LocalImageDescription| {
+                if !report_cancel.is_cancelled() {
+                    progress.on_result(result.id, result.outcome.into());
+                }
+            };
+            if allow_installed && choice.loaded_revision == 0 {
+                model.describe_installed_library_vision(&choice, images, &cancel, &report).await
+            } else {
+                model.describe_pinned_local_vision(&choice, images, &cancel, &report).await
+            }
         };
         tokio::pin!(operation);
         tokio::select! {
