@@ -6,12 +6,12 @@ use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use harw_onion::{OnionClientConfig, ProtectedOnionClient, RelaySocketProtector};
+use harw_onion::{OnionClientConfig, OnionLocator, ProtectedOnionClient, RelaySocketProtector};
 use harw_vpn::vpn::{
     FlowKey, PacketIo, Policy, RouteMode, Scope, TunnelEngine, dial_with_arti, run_tunnel,
 };
@@ -29,10 +29,100 @@ const TOR_FAILED: i32 = 6;
 
 static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
+static HUB: Mutex<Option<HubOwner>> = Mutex::new(None);
+
+struct HubOwner {
+    token: i64,
+    locator: Option<OnionLocator>,
+    client: Weak<ProtectedOnionClient>,
+}
+
+pub(crate) fn hub_is_held() -> bool {
+    HUB.lock().map_or(true, |hub| hub.is_some())
+}
+
+/// None means ordinary networking. A held gate without a matching client fails closed.
+pub(crate) fn hub_client(
+    locator: &OnionLocator,
+) -> Result<Option<Arc<ProtectedOnionClient>>, &'static str> {
+    let hub = HUB.lock().map_err(|_| "VPN route is unavailable")?;
+    let Some(owner) = hub.as_ref() else {
+        return Ok(None);
+    };
+    if owner.locator.as_ref() != Some(locator) {
+        return Err("VPN does not own this hub route");
+    }
+    owner
+        .client
+        .upgrade()
+        .map(Some)
+        .ok_or("VPN Tor is not ready")
+}
+
+pub(crate) fn hub_progress() -> Option<harw_onion::BootstrapProgress> {
+    HUB.lock()
+        .ok()?
+        .as_ref()?
+        .client
+        .upgrade()
+        .map(|client| client.progress())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeSetHubGate(
+    _caller: EnvUnowned<'_>,
+    _service: JObject<'_>,
+    token: i64,
+    enabled: jni::sys::jboolean,
+) {
+    if let Ok(mut hub) = HUB.lock() {
+        if enabled {
+            *hub = Some(HubOwner {
+                token,
+                locator: None,
+                client: Weak::new(),
+            });
+        } else if hub.as_ref().is_some_and(|owner| owner.token == token) {
+            *hub = None;
+        }
+    }
+}
+
+fn attach_hub(token: i64, locator: OnionLocator, client: &Arc<ProtectedOnionClient>) -> bool {
+    let Ok(active) = ACTIVE.lock() else {
+        return false;
+    };
+    if !active
+        .as_ref()
+        .is_some_and(|worker| worker.hub_token == token && worker.stop.is_some())
+    {
+        return false;
+    }
+
+    let Ok(mut hub) = HUB.lock() else {
+        return false;
+    };
+    let Some(owner) = hub.as_mut().filter(|owner| owner.token == token) else {
+        return false;
+    };
+    owner.locator = Some(locator);
+    owner.client = Arc::downgrade(client);
+    true
+}
+
+fn detach_hub(token: i64) {
+    if let Ok(mut hub) = HUB.lock()
+        && let Some(owner) = hub.as_mut().filter(|owner| owner.token == token)
+    {
+        owner.locator = None;
+        owner.client = Weak::new();
+    }
+}
 
 struct Active {
     id: i64,
     stop: Option<oneshot::Sender<()>>,
+    hub_token: i64,
 }
 
 struct Callbacks {
@@ -178,6 +268,8 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStart<'local>(
     mode: i32,
     rules: JByteArray<'local>,
     seed: i64,
+    hub_token: i64,
+    locator: JString<'local>,
 ) -> i64 {
     let result = caller.with_env(|env| -> errors::Result<i64> {
         if descriptor < 0 || rules.len(env)? > 4096 * 5 {
@@ -188,6 +280,9 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStart<'local>(
             return Ok(0);
         };
         let directory = PathBuf::from(directory.try_to_string(env)?);
+        let Ok(locator) = locator.try_to_string(env)?.parse::<OnionLocator>() else {
+            return Ok(0);
+        };
         let vm = env.get_java_vm()?;
         let peer = env.new_global_ref(service)?;
         // SAFETY: the private service method borrows an open ParcelFileDescriptor
@@ -208,6 +303,7 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStart<'local>(
         *active = Some(Active {
             id,
             stop: Some(stop),
+            hub_token,
         });
 
         let launched = std::thread::Builder::new()
@@ -225,9 +321,12 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStart<'local>(
                         seed as u64,
                         stopped,
                         callbacks.clone(),
+                        hub_token,
+                        locator,
                     )),
                     Err(_) => TUN_FAILED,
                 };
+                detach_hub(hub_token);
                 if let Ok(mut active) = ACTIVE.lock() {
                     *active = None;
                 }
@@ -255,6 +354,7 @@ pub extern "system" fn Java_dev_harw_mobile_HarwVpnService_nativeStop(
         && let Some(active) = active.as_mut().filter(|active| active.id == id)
         && let Some(stop) = active.stop.take()
     {
+        detach_hub(active.hub_token);
         let _ = stop.send(());
     }
 }
@@ -266,6 +366,8 @@ async fn run(
     seed: u64,
     stopped: oneshot::Receiver<()>,
     callbacks: Arc<Callbacks>,
+    hub_token: i64,
+    locator: OnionLocator,
 ) -> i32 {
     let Ok(tun) = Tun::new(fd) else {
         return TUN_FAILED;
@@ -282,7 +384,9 @@ async fn run(
         let mut retry = Duration::from_secs(1);
         loop {
             if boot_client.bootstrap().await.is_ok() {
-                boot_callbacks.status(READY);
+                if attach_hub(hub_token, locator, &boot_client) {
+                    boot_callbacks.status(READY);
+                }
                 break;
             }
             boot_callbacks.status(TOR_RETRYING);

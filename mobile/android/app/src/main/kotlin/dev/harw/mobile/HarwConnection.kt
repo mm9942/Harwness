@@ -688,7 +688,8 @@ internal class HarwConnection(private val context: Context, private val localBac
         val profile = start.profile ?: return false
         if (start.stopping || !start.canSetUp) return start.hasConnection
         if (start.hasConnection && !force) return true
-        if (!routeChoiceEnabled(start.routePreference, profile)) {
+        val route = if (HarwVpnService.ownsHub()) RoutePreference.ONION else start.routePreference
+        if (!routeChoiceEnabled(route, profile)) {
             change { it.copy(setupError = context.getString(R.string.harw_route_unavailable)) }
             return false
         }

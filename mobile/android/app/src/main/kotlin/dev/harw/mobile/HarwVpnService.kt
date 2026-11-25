@@ -29,11 +29,13 @@ import java.net.InetSocketAddress
 import java.security.SecureRandom
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
@@ -60,8 +62,14 @@ internal class HarwVpnService : VpnService() {
 
     private var destroyed = false
     private var foreground = false
-    private var desired: Pair<String, ResolvedVpnSettings>? = null
-    private var applied: Pair<String, ResolvedVpnSettings>? = null
+    private data class Selection(val key: String, val onion: String, val settings: ResolvedVpnSettings)
+
+    private var desired: Selection? = null
+    private var applied: Selection? = null
+    private val hubToken = random.nextLong().let { if (it == 0L) 1L else it }
+    private var hubClaimed = false
+    private var handoff: Job? = null
+    private var hubPrepared: String? = null
     private var tun: ParcelFileDescriptor? = null
     private var worker: Long = 0
     private var stoppingWorker = false
@@ -136,7 +144,8 @@ internal class HarwVpnService : VpnService() {
         val profile = connection.state.value.profile
         val key = profile?.routePreferenceKey()
         val settings = key?.let(store::read)
-        if (key == null || settings?.enabled != true || profile?.onion.isNullOrBlank()) {
+        val onion = profile?.onion
+        if (key == null || settings?.enabled != true || onion.isNullOrBlank()) {
             desired = null
             stopWorker()
             if (tun != null || isAlwaysOn) publish(VpnPhase.Blocked)
@@ -152,9 +161,46 @@ internal class HarwVpnService : VpnService() {
             publish(VpnPhase.Blocked)
             return
         }
-        desired = key to resolved
-        if (applied != desired) stopWorker()
-        advance()
+        desired = Selection(key, onion, resolved)
+        if (worker != 0L && applied != desired && !stoppingWorker) restartWorker()
+        if (!claimHub()) {
+            publish(VpnPhase.Blocked)
+            return
+        }
+        if (hubPrepared == key) {
+            advance()
+        } else {
+            prepareHub(key)
+        }
+    }
+
+    private fun claimHub(): Boolean {
+        if (hubClaimed) return true
+        return runCatching {
+            System.loadLibrary("harw_mobile_ffi")
+            nativeSetHubGate(hubToken, true)
+            hubOwner = hubToken
+            hubClaimed = true
+        }.isSuccess
+    }
+
+    private fun prepareHub(key: String) {
+        handoff?.cancel()
+        handoff = jobs.launch {
+            connection.disconnect()
+            connection.state.first { !it.hasConnection && !it.stopping }
+            if (desired?.key == key) {
+                hubPrepared = key
+                advance()
+            }
+        }
+    }
+
+    private fun releaseHub() {
+        if (!hubClaimed) return
+        nativeSetHubGate(hubToken, false)
+        if (hubOwner == hubToken) hubOwner = 0
+        hubClaimed = false
     }
 
     private fun bestNetwork(): Network? = networks.entries.maxByOrNull { (_, capabilities) ->
@@ -163,8 +209,14 @@ internal class HarwVpnService : VpnService() {
     }?.key
 
     private fun updateNetwork() {
-        if (worker != 0L && relayNetwork != bestNetwork()) stopWorker()
+        if (worker != 0L && !stoppingWorker && relayNetwork != bestNetwork()) restartWorker()
         advance()
+    }
+
+    private fun restartWorker() {
+        hubPrepared = null
+        stopWorker()
+        desired?.let { prepareHub(it.key) }
     }
 
     private fun stopWorker() {
@@ -178,8 +230,9 @@ internal class HarwVpnService : VpnService() {
     private fun advance() {
         if (destroyed || worker != 0L) return
         val next = desired ?: return
+        if (hubPrepared != next.key) return
         if (applied != next) {
-            val replacement = runCatching { establishTun(next.second) }.getOrNull()
+            val replacement = runCatching { establishTun(next.settings) }.getOrNull()
             if (replacement == null) {
                 publish(VpnPhase.Blocked)
                 return
@@ -204,8 +257,8 @@ internal class HarwVpnService : VpnService() {
         worker = runCatching {
             System.loadLibrary("harw_mobile_ffi")
             nativeStart(
-                descriptor.fd, configDirectory.absolutePath, next.second.mode,
-                next.second.nativeRules(), random.nextLong(),
+                descriptor.fd, configDirectory.absolutePath, next.settings.mode,
+                next.settings.nativeRules(), random.nextLong(), hubToken, next.onion,
             )
         }.getOrDefault(0)
         if (worker == 0L) relayNetwork = null
@@ -245,10 +298,18 @@ internal class HarwVpnService : VpnService() {
     @Keep
     private fun onNativeState(id: Long, code: Int) {
         main.post {
-            if (destroyed || id != worker) return@post
+            if (id != worker) return@post
+            if (destroyed) {
+                if (code == 3 || code == 4 || code == 6) releaseHub()
+                return@post
+            }
             when (code) {
                 1 -> if (!stoppingWorker) publish(VpnPhase.Starting)
-                2 -> if (!stoppingWorker) publish(VpnPhase.TorReady)
+                2 -> if (!stoppingWorker) {
+                    publish(VpnPhase.TorReady)
+                    connection.connect()
+                    HarwConnectionService.observeVpnHub(this)
+                }
                 5 -> if (!stoppingWorker) publish(VpnPhase.Retrying)
                 3, 4, 6 -> {
                     val restart = stoppingWorker
@@ -293,22 +354,36 @@ internal class HarwVpnService : VpnService() {
     override fun onDestroy() {
         destroyed = true
         jobs.cancel()
+        if (hubClaimed) connection.disconnect()
         stopWorker()
         tun?.close()
         tun = null
+        if (worker == 0L) releaseHub()
         connectivity.unregisterNetworkCallback(callback)
         unregisterReceiver(packagesChanged)
         mutablePhase.value = VpnPhase.Off
         super.onDestroy()
     }
 
-    private external fun nativeStart(fd: Int, directory: String, mode: Int, rules: ByteArray, seed: Long): Long
+    private external fun nativeStart(
+        fd: Int,
+        directory: String,
+        mode: Int,
+        rules: ByteArray,
+        seed: Long,
+        hubToken: Long,
+        onion: String,
+    ): Long
+    private external fun nativeSetHubGate(token: Long, enabled: Boolean)
     private external fun nativeStop(id: Long)
 
     companion object {
         private const val CHANNEL = "harw_vpn"
         private const val NOTIFICATION = 5421
         private const val STOP = "dev.harw.mobile.VPN_STOP"
+        private var hubOwner = 0L
+        fun ownsHub(): Boolean = hubOwner != 0L
+
         private val mutablePhase = MutableStateFlow(VpnPhase.Off)
         val phase = mutablePhase.asStateFlow()
 

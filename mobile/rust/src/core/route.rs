@@ -116,8 +116,23 @@ impl Dialer {
         Ok(())
     }
 
+    #[cfg(all(feature = "android-vpn", feature = "onion", unix))]
+    pub(crate) fn retire_ordinary_tor(&self) {
+        lock(&self.inner.tor).take();
+    }
+
     /// Live Tor bootstrap progress, or `None` until Tor was started.
     pub(crate) fn tor_status(&self) -> Option<TorBootstrap> {
+        #[cfg(all(feature = "android-vpn", unix))]
+        if crate::android_vpn_jni::hub_is_held() {
+            return crate::android_vpn_jni::hub_progress().map(|progress| TorBootstrap {
+                percent: u32::from(progress.percent),
+                ready: progress.ready,
+                blocked: progress.blocked,
+                summary: progress.summary,
+            });
+        }
+
         #[cfg(feature = "onion")]
         {
             let client = lock(&self.inner.tor).clone()?;
@@ -143,6 +158,10 @@ impl Dialer {
         local: &LocalNode,
         mut options: ConnectOptions,
     ) -> Result<RemoteConnection, RemoteError> {
+        #[cfg(all(feature = "android-vpn", unix))]
+        if route == ConnectionRoute::Direct && crate::android_vpn_jni::hub_is_held() {
+            return Err(RemoteError::Connect("VPN requires the hub Onion route".into()));
+        }
         match route {
             ConnectionRoute::Direct => {
                 let direct = profile.direct_endpoint.clone()
@@ -176,6 +195,10 @@ impl Dialer {
         profile: &ValidatedProfile,
         local: &LocalNode,
     ) -> Result<NodeTransportClient, MobileError> {
+        #[cfg(all(feature = "android-vpn", unix))]
+        if route == ConnectionRoute::Direct && crate::android_vpn_jni::hub_is_held() {
+            return Err(MobileError::Connect { detail: "VPN requires the hub Onion route".into() });
+        }
         let connected = match route {
             ConnectionRoute::Direct => {
                 let direct = profile.direct_endpoint.as_ref().ok_or_else(|| MobileError::InvalidProfile {
@@ -211,6 +234,14 @@ impl Dialer {
             .onion
             .as_ref()
             .ok_or_else(|| "this server profile has no .onion route".to_owned())?;
+        #[cfg(all(feature = "android-vpn", unix))]
+        if crate::android_vpn_jni::hub_is_held() {
+            lock(&self.inner.tor).take();
+            if let Some(client) = crate::android_vpn_jni::hub_client(locator)? {
+                return client.dial_hub(locator, ONION_DIAL_TIMEOUT).await.map_err(|error| error.to_string());
+            }
+            return Err("VPN route is changing".into());
+        }
         let client = self.tor_client()?;
         client
             .dial_with_bootstrap_budget(locator, ONION_BOOTSTRAP_TIMEOUT, ONION_DIAL_TIMEOUT)
@@ -248,6 +279,10 @@ impl Dialer {
     /// Returns the running Tor client, starting it on first use.
     #[cfg(feature = "onion")]
     fn tor_client(&self) -> Result<Arc<harw_onion::OnionClient>, String> {
+        #[cfg(all(feature = "android-vpn", unix))]
+        if crate::android_vpn_jni::hub_is_held() {
+            return Err("VPN owns the active Tor transport".into());
+        }
         if let Some(client) = lock(&self.inner.tor).as_ref() {
             return Ok(Arc::clone(client));
         }
