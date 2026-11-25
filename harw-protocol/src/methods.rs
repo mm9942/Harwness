@@ -57,6 +57,8 @@ pub const METHOD_CLOUD_ASSISTANT_STATUS: &str = "cloud_assistant.status";
 pub const METHOD_CLOUD_ASSISTANT_PROVISION: &str = "cloud_assistant.provision";
 pub const METHOD_CLOUD_ASSISTANT_SUBMIT: &str = "cloud_assistant.submit";
 pub const METHOD_CLOUD_ASSISTANT_SUBMIT_WITH_RECALL: &str = "cloud_assistant.submit_with_recall";
+pub const METHOD_CLOUD_ASSISTANT_MODELS: &str = "cloud_assistant.models";
+pub const METHOD_CLOUD_ASSISTANT_SUBMIT_MODEL: &str = "cloud_assistant.submit_model";
 pub const METHOD_CLOUD_ASSISTANT_REVOKE: &str = "cloud_assistant.revoke";
 pub const METHOD_CLOUD_ASSISTANT_SHARED: &str = "cloud_assistant.shared";
 

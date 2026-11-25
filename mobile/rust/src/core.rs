@@ -2008,6 +2008,7 @@ async fn drive_connection(
         options.features = requested_features();
         options.features.push(features::CLOUD_ASSISTANT_V1.to_owned());
         options.features.push(features::CLOUD_ASSISTANT_RECALL_V1.to_owned());
+        options.features.push(features::CLOUD_ASSISTANT_MODELS_V1.to_owned());
         options.features.push(features::CLOUD_ASSISTANT_SHARED_V1.to_owned());
         let plan = {
             let preference = shared.state().preference_for(&profile);

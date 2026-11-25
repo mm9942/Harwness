@@ -155,6 +155,14 @@ pub trait SessionPort: Send + Sync {
     ) -> PortFuture<'_, crate::session_wire::CloudAssistantSnapshot> {
         unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_SUBMIT_WITH_RECALL)
     }
+    fn cloud_assistant_models(&self) -> PortFuture<'_, Vec<String>> {
+        unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_MODELS)
+    }
+    fn cloud_assistant_submit_model(
+        &self, _params: crate::session_wire::CloudAssistantModelSubmitV1,
+    ) -> PortFuture<'_, crate::session_wire::CloudAssistantSnapshot> {
+        unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_SUBMIT_MODEL)
+    }
     fn cloud_assistant_revoke(&self) -> PortFuture<'_, crate::session_wire::CloudAssistantSnapshot> {
         unsupported(crate::methods::METHOD_CLOUD_ASSISTANT_REVOKE)
     }

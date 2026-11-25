@@ -1755,6 +1755,7 @@ internal class HarwConnection(private val context: Context, private val localBac
             CloudAssistantTarget(
                 profile, generation, access,
                 recallSupported = native.cloudAssistantRecallSupported(access),
+                modelsSupported = native.cloudAssistantModelsSupported(access),
                 sharedSupported = shared,
                 sharedDeviceFingerprint = if (shared) native.cloudAssistantSharedDeviceFingerprint(access) else null,
             )
@@ -1774,6 +1775,14 @@ internal class HarwConnection(private val context: Context, private val localBac
         return current && core === native && cloudAssistantSelected(target.profile, target.generation)
     }
 
+    suspend fun cloudAssistantModels(target: CloudAssistantTarget): List<String> {
+        val native = core ?: throw MobileException.Disconnected()
+        if (!target.modelsSupported || !cloudAssistantSelected(target.profile, target.generation)) throw MobileException.Disconnected()
+        val models = withContext(Dispatchers.IO) { native.cloudAssistantModels(target.access) }
+        if (core !== native || !cloudAssistantTargetCurrent(target)) throw MobileException.Disconnected()
+        return models
+    }
+
     /** Explicit specialist RPC only. Never falls through to the normal session composer. */
     suspend fun cloudAssistantCall(
         target: CloudAssistantTarget,
@@ -1788,7 +1797,10 @@ internal class HarwConnection(private val context: Context, private val localBac
                 CloudAssistantCommand.Provision -> native.cloudAssistantProvision(access)
                 CloudAssistantCommand.Revoke -> native.cloudAssistantRevoke(access)
                 is CloudAssistantCommand.Submit -> {
-                    if (operation.recallMessageIds.isEmpty()) {
+                    if (operation.model != null) {
+                        if (!target.modelsSupported) throw MobileException.Denied("Cloud Assistant models not negotiated")
+                        native.cloudAssistantSubmitModel(access, operation.id, operation.text, operation.model, operation.recallMessageIds)
+                    } else if (operation.recallMessageIds.isEmpty()) {
                         native.cloudAssistantSubmit(access, operation.id, operation.text)
                     } else {
                         if (!target.recallSupported) throw MobileException.Denied("Cloud Assistant recall was not negotiated")

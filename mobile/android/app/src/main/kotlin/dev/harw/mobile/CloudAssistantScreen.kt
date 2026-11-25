@@ -46,6 +46,7 @@ internal class CloudAssistantTarget(
     val recallSupported: Boolean = false,
     val sharedSupported: Boolean = false,
     val sharedDeviceFingerprint: String? = null,
+    val modelsSupported: Boolean = false,
 )
 
 internal sealed interface CloudAssistantCommand {
@@ -54,7 +55,7 @@ internal sealed interface CloudAssistantCommand {
     data object Revoke : CloudAssistantCommand
     // Immutable in-memory delivery attempt. Retrying uses the exact same request, not
     // a new read of composer/selection state. The default remains the legacy send.
-    class Submit(val id: String, val text: String, recallIds: List<String> = emptyList()) : CloudAssistantCommand {
+    class Submit(val id: String, val text: String, recallIds: List<String> = emptyList(), val model: String? = null) : CloudAssistantCommand {
         val recallMessageIds: List<String> = recallIds.toList()
     }
 }
@@ -84,6 +85,23 @@ internal fun CloudAssistantScreen(
     var recallMode by remember(owner) { mutableStateOf(false) }
     var selectedRecall by remember(owner) { mutableStateOf(emptySet<String>()) }
     var openSharedRoom by remember(owner) { mutableStateOf(false) }
+    var selectedModel by remember(owner) { mutableStateOf<String?>(null) }
+    var availableModels by remember(owner) { mutableStateOf<List<String>?>(null) }
+    var choosingModel by remember(owner) { mutableStateOf(false) }
+    var modelError by remember(owner) { mutableStateOf<String?>(null) }
+    var modelReload by remember(owner) { mutableStateOf(0) }
+    LaunchedEffect(owner, snapshot?.status, modelReload) {
+        if (owner.modelsSupported && snapshot?.status == MobileCloudAssistantStatus.READY) {
+            try {
+                availableModels = connection.cloudAssistantModels(owner)
+                modelError = null
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                availableModels = null
+                modelError = "Modellliste konnte nicht geladen werden."
+            }
+        }
+    }
     if (openSharedRoom && owner.sharedSupported) {
         CloudSharedAssistantScreen(owner, connection, onBack = { openSharedRoom = false })
         return
@@ -153,7 +171,8 @@ internal fun CloudAssistantScreen(
     }
     val selectedBytes = selectedRecall.sumOf { recallBytes[it] ?: 0 }
     val readyToSelectRecall = owner.recallSupported && idle && pendingMessage == null
-    val canSubmitNew = draft.isNotBlank() && (!recallMode ||
+    val canSubmitNew = draft.isNotBlank() &&
+        (selectedModel == null || availableModels?.contains(selectedModel) == true) && (!recallMode ||
         (owner.recallSupported && selectedRecall.size in 1..AssistantRecallTurns &&
             selectedRecall.all(recallBytes::containsKey) && selectedBytes <= AssistantRecallBytes))
     if (searching && result?.status == MobileCloudAssistantStatus.READY) {
@@ -167,6 +186,35 @@ internal fun CloudAssistantScreen(
             }
         }
         if (!idle) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (result?.status == MobileCloudAssistantStatus.READY && owner.modelsSupported) {
+            TextButton(enabled = idle && pendingMessage == null, onClick = { choosingModel = true }) {
+                Text(selectedModel ?: "Gateway-Standardmodell")
+            }
+            if (selectedModel != null && availableModels?.contains(selectedModel) != true) {
+                Text("Das gewählte Modell ist nicht bestätigt. Bitte Modell erneut wählen.",
+                    color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 16.dp))
+            }
+        }
+        if (choosingModel) {
+            AlertDialog(
+                onDismissRequest = { choosingModel = false },
+                title = { Text("Assistant-Modell wählen") },
+                text = {
+                    LazyColumn {
+                        item {
+                            Text("Nur vom Gateway freigegebene Modelle. Der Cloud-Verlauf wird an den gewählten Anbieter gesendet.")
+                            TextButton(onClick = { selectedModel = null; choosingModel = false }) { Text("Gateway-Standardmodell") }
+                            modelError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                            TextButton(onClick = { modelReload++ }) { Text("Modellliste aktualisieren") }
+                        }
+                        items(availableModels.orEmpty()) { model ->
+                            TextButton(onClick = { selectedModel = model; choosingModel = false }) { Text(model) }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { choosingModel = false }) { Text("Schließen") } },
+            )
+        }
         LazyColumn(
             modifier = Modifier.weight(1f).fillMaxWidth(),
             contentPadding = PaddingValues(16.dp),
@@ -276,7 +324,7 @@ internal fun CloudAssistantScreen(
                             } else emptyList()
                             // Selection mode can never silently send a plain prompt.
                             if (!recallMode || selection.isNotEmpty()) {
-                                enqueue(CloudAssistantCommand.Submit(UUID.randomUUID().toString(), draft, selection))
+                                enqueue(CloudAssistantCommand.Submit(UUID.randomUUID().toString(), draft, selection, selectedModel))
                             }
                         }
                     },
