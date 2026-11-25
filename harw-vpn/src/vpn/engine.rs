@@ -170,8 +170,8 @@ impl TunnelEngine {
                 .map_or(StreamRead::Closed, StreamRead::Data);
         }
         match socket.state() {
-            State::Closed | State::TimeWait => StreamRead::Closed,
-            State::CloseWait | State::LastAck | State::Closing => StreamRead::Eof,
+            State::Closed => StreamRead::Closed,
+            State::CloseWait | State::LastAck | State::Closing | State::TimeWait => StreamRead::Eof,
             _ => StreamRead::Pending,
         }
     }
