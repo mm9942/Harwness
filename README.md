@@ -6,7 +6,7 @@
 
 # Harwness
 
-**Harwness is a modular Rust toolkit for building your own coding harness.** It also ships a ready-to-use harness (`harw`) for running AI agents with explicit permissions, typed tools, durable execution state, and optional host security. The workspace is a collection of reusable crates, not just the source tree of the CLI: embed the agent runtime through the SDK or use selected libraries without taking on the full application.
+**Harwness is a modular Rust toolkit for building your own coding harness.** It also ships a ready-to-use harness (`harw`) for running AI agents with explicit permissions, typed tools, durable execution state, and optional host security. The repository contains **180 first-party Cargo packages** at the [`dev` snapshot counted here](https://github.com/mm9942/Harwness/tree/42b85317b15bc2baef362ebd00b51239d7c89324): 179 in the root workspace and one in the separate mobile Rust workspace. [Embed the agent runtime through the SDK or pick individual crates](#build-your-own-harness) to build an application of your own.
 
 The runtime separates model output from authority. Agents may propose actions, but filesystem access, process execution, network access, spawning, secrets, approvals, and privileged host operations are controlled by Rust components outside the model context.
 
@@ -32,19 +32,33 @@ Use Harwness at the level that fits your application. Embed a session runtime in
 | Build a standalone agent | [`harw-agent-compiler` and `harw-agent-runner`](docs/guides/agent-compiler.md): compile a versioned definition into an artifact with a rights manifest, optionally packaged into a standalone executable. |
 | Host sessions or connect nodes | [`harw-local-host`](harw-local-host/src/lib.rs) composes an in-process session host; [`harw-node-transport`](harw-node-transport/src/lib.rs) provides an authenticated node transport. The transport does not itself grant access to a session. |
 
-### Embed a session
+### Run an agent from your own Rust binary
 
-The [SDK example](harwness-sdk/src/lib.rs) starts from a configured Harw home, an active agent, and a Tokio runtime. With a provider configured, the application-side call looks like this:
+Add the SDK as a path dependency from a local Harwness checkout. This example assumes the checkout is next to your application directory.
+
+```toml
+[dependencies]
+harwness-sdk = { path = "../Harwness/harwness-sdk", default-features = false }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+```
+
+Put this in your application's `src/main.rs`:
 
 ```rust
 use harwness_sdk::prelude::*;
 
-async fn review_workspace() -> Result<TurnReport, SdkError> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), SdkError> {
     let harwness = Harwness::builder().cwd(".").build()?;
     let mut session = harwness.session()?;
-    session.send("Which tests cover this workspace?").await
+    let report = session.send("Which tests cover this workspace?").await?;
+
+    println!("{:?}: {}", report.status, report.text.unwrap_or_default());
+    Ok(())
 }
 ```
+
+Run `cargo run` from your application directory. The SDK runs the session in your process without launching the `harw` executable or connecting to a gateway. The example reads an existing profile from `HARW_HOME` or `~/.harw`, with an active agent and a configured model provider. For a model-free smoke test on a configured profile, see the [offline echo option in the SDK example](harwness-sdk/examples/minimal_chat.rs).
 
 The host application owns the user experience. It can display the turn report, consume live events, and decide how to present approval requests. The SDK is the documented embedding boundary; direct dependencies on lower-level workspace crates do not carry the same compatibility promise. The workspace currently sets `publish = false`; see the source rather than assuming these crates are published independently on crates.io.
 
