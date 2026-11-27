@@ -6,6 +6,12 @@
 
 # Harwness
 
+[![Rust toolkit](https://img.shields.io/badge/Rust-toolkit-blue.svg?style=for-the-badge)](#build-your-own-harness)
+[![License: MIT or Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green.svg?style=for-the-badge)](#license)
+[![Documentation](https://img.shields.io/badge/docs-Harwness-yellow.svg?style=for-the-badge)](docs/README.md)
+[![CI](https://img.shields.io/github/actions/workflow/status/mm9942/Harwness/ci.yml?branch=dev&style=for-the-badge&label=CI)](https://github.com/mm9942/Harwness/actions/workflows/ci.yml?query=branch%3Adev)
+[![GitHub Library](https://img.shields.io/badge/github-lib-black.svg?style=for-the-badge)](https://github.com/mm9942/Harwness/tree/dev)
+
 **Harwness is a modular Rust toolkit for building your own coding harness.** It also ships a ready-to-use harness (`harw`) for running AI agents with explicit permissions, typed tools, durable execution state, and optional host security. The repository contains **180 first-party Cargo packages** at the [`dev` snapshot counted here](https://github.com/mm9942/Harwness/tree/42b85317b15bc2baef362ebd00b51239d7c89324): 179 in the root workspace and one in the separate mobile Rust workspace. [Embed the agent runtime through the SDK or pick individual crates](#build-your-own-harness) to build an application of your own.
 
 The runtime separates model output from authority. Agents may propose actions, but filesystem access, process execution, network access, spawning, secrets, approvals, and privileged host operations are controlled by Rust components outside the model context.
