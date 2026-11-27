@@ -6,7 +6,7 @@
 
 # Harwness
 
-Harwness (`harw`) is a Rust workspace for running governed AI agents with explicit authority, typed tools, durable execution state, and optional host-security enforcement.
+**Harwness is a modular Rust toolkit for building your own coding harness.** It also ships a ready-to-use harness (`harw`) for running AI agents with explicit permissions, typed tools, durable execution state, and optional host security. The workspace is a collection of reusable crates, not just the source tree of the CLI: embed the agent runtime through the SDK or use selected libraries without taking on the full application.
 
 The runtime separates model output from authority. Agents may propose actions, but filesystem access, process execution, network access, spawning, secrets, approvals, and privileged host operations are controlled by Rust components outside the model context.
 
@@ -14,11 +14,45 @@ The runtime separates model output from authority. Agents may propose actions, b
 
 ## What Harwness is for
 
-Harwness is for developers running coding, research, and operational agents that need explicit tool permissions, approvals, durable jobs, and traceable execution. The `harw` command provides the interactive entry point; Rust applications can integrate through `harwness-sdk`.
+Harwness is for developers running coding, research, and operational agents that need explicit tool permissions, approvals, durable jobs, and traceable execution. Use the `harw` command to run the built-in harness, or [start with the SDK and crates](#build-your-own-harness) to build an application of your own.
 
 The workspace also contains Detect · Orient · Defend (DoD), an optional host-security domain with its own sensors and privileged enforcement components. Running the agent harness does not require enabling DoD.
 
-[Get started](#installation) · [CLI reference](docs/cli.md) · [Documentation](docs/README.md) · [Contribute](CONTRIBUTING.md) · [Security policy](SECURITY.md)
+[Build your own harness](#build-your-own-harness) · [Get started](#installation) · [CLI reference](docs/cli.md) · [Documentation](docs/README.md) · [Contribute](CONTRIBUTING.md) · [Security policy](SECURITY.md)
+
+## Build your own harness
+
+Use Harwness at the level that fits your application. Embed a session runtime in a GUI, service, or developer tool; build a distributable agent; or take only the execution or transport layer you need. Depending on the integration, your application can supply its own interface, model configuration, tools, context, and approval flow. It does not have to launch the `harw` CLI to use the libraries.
+
+| If you want to… | Start here |
+| --- | --- |
+| Embed agents in a Rust application | [`harwness-sdk`](harwness-sdk/src/lib.rs): build or resume sessions, send turns, stream events, cancel work, and supply tools, context, and an approval handler. The optional `remote` feature exposes remote sessions. |
+| Turn Rust functions into tools and operations | [`harw-macros`](harw-macros/src/lib.rs) and [`harw-operations`](harw-operations/src/lib.rs): declare tools with typed arguments, or declare which command, model-tool, agent-tool, and web surfaces an operation supports. |
+| Run durable jobs without an agent application | [`harw-job`](harw-job/README.md): submit jobs, collect output, cancel, and recover verified work. Backend selection and reports describe the isolation actually available on the host. |
+| Build a standalone agent | [`harw-agent-compiler` and `harw-agent-runner`](docs/guides/agent-compiler.md): compile a versioned definition into an artifact with a rights manifest, optionally packaged into a standalone executable. |
+| Host sessions or connect nodes | [`harw-local-host`](harw-local-host/src/lib.rs) composes an in-process session host; [`harw-node-transport`](harw-node-transport/src/lib.rs) provides an authenticated node transport. The transport does not itself grant access to a session. |
+
+### Embed a session
+
+The [SDK example](harwness-sdk/src/lib.rs) starts from a configured Harw home, an active agent, and a Tokio runtime. With a provider configured, the application-side call looks like this:
+
+```rust
+use harwness_sdk::prelude::*;
+
+async fn review_workspace() -> Result<TurnReport, SdkError> {
+    let harwness = Harwness::builder().cwd(".").build()?;
+    let mut session = harwness.session()?;
+    session.send("Which tests cover this workspace?").await
+}
+```
+
+The host application owns the user experience. It can display the turn report, consume live events, and decide how to present approval requests. The SDK is the documented embedding boundary; direct dependencies on lower-level workspace crates do not carry the same compatibility promise. The workspace currently sets `publish = false`; see the source rather than assuming these crates are published independently on crates.io.
+
+### Declare a tool once
+
+In [`harw-macros`](harw-macros/src/lib.rs), `#[derive(Tool)]` derives tool metadata and the argument schema from a Rust type. `#[tool]` builds an executor wrapper from an async function and adds the permission or host checks selected in its declaration. For an operation shared across surfaces, [the `status` operation](harw-ops/src/status.rs) shows how one function serves a slash command, a read-only model tool, and a web route. The declaration is the source of truth for those bindings; registering an operation still does not grant a caller authority.
+
+The built-in harness is one composition of these crates. The [Android on-device host](mobile/rust/src/local.rs) is another: it uses the Rust session host in the app process and attaches platform-specific tools through its own integration. It does not need a separate `harw` executable or a gateway for the on-device host. The exact tool set depends on the app build, host configuration, and model route.
 
 ## What you can do with it
 
