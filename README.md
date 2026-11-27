@@ -1,10 +1,4 @@
-<p align="center">
-  <img src="docs/assets/harwness-icon.svg" alt="Harwness lion mark" width="180">
-  &nbsp;&nbsp;&nbsp;
-  <img src="docs/assets/harwness-logo.png" alt="Harwness" width="520">
-</p>
-
-# Harwness
+# Harwness v0.10.0
 
 [![Rust toolkit](https://img.shields.io/badge/Rust-toolkit-blue.svg?style=for-the-badge)](#build-your-own-harness)
 [![License: MIT or Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green.svg?style=for-the-badge)](#license)
